@@ -1,0 +1,42 @@
+.DS_Store
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# JavaScript/TypeScript workspaces
+node_modules/
+dist/
+build/
+coverage/
+lcov.info
+playwright-report/
+test-results/
+*.log
+*.tsbuildinfo
+indexer/subgraph/generated/
+indexer/subgraph/subgraph.yaml
+indexer/subgraph/tests/.bin/
+
+# Foundry outputs
+out/
+cache/
+broadcast/
+**/out/
+**/cache/
+**/broadcast/
+
+# Local editor state
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Historical planning artifacts
+plan/
+docs/
+
+# Local chain/runtime state
+.local/
+deployments/localnet/*.json
+deployments/robinhood/*/*.json

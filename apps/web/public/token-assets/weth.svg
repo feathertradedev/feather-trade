@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img">
+  <title>WETH placeholder token icon</title>
+  <desc>Independent placeholder token badge for Wave 1 development.</desc>
+  <rect width="64" height="64" rx="14" fill="#1f2937"/>
+  <circle cx="32" cy="32" r="24" fill="#eef2ff"/>
+  <path d="M32 13l13 20l-13 8l-13-8z" fill="#7c8cff"/>
+  <path d="M19 37l13 15l13-15l-13 8z" fill="#475569"/>
+  <text x="32" y="35" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" font-weight="700" fill="#ffffff">WETH</text>
+</svg>

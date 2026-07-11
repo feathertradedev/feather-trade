@@ -1,0 +1,14 @@
+Feather Trade web font notices
+
+Schibsted Grotesk
+Copyright 2023 The Schibsted-Grotesk Project Authors
+(https://github.com/schibsted/schibsted-grotesk)
+Distributed by @fontsource/schibsted-grotesk 5.2.8 under the SIL Open Font
+License, Version 1.1.
+
+IBM Plex Mono
+Copyright 2017 IBM Corp. All rights reserved.
+Distributed by @fontsource/ibm-plex-mono 5.2.7 under the SIL Open Font License,
+Version 1.1.
+
+The complete license is available beside this file as OFL-1.1.txt.

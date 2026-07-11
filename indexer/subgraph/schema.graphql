@@ -1,0 +1,184 @@
+type Factory @entity(immutable: false) {
+  id: ID!
+  address: Bytes!
+  pairCount: BigInt!
+  quoteAssetCount: BigInt!
+  presetCount: BigInt!
+  createdAtBlock: BigInt!
+  updatedAtBlock: BigInt!
+}
+
+type Token @entity(immutable: false) {
+  id: ID!
+  address: Bytes!
+  pairCount: BigInt!
+  isQuoteAsset: Boolean!
+  createdAtBlock: BigInt!
+  updatedAtBlock: BigInt!
+}
+
+type Pair @entity(immutable: false) {
+  id: ID!
+  address: Bytes!
+  factory: Factory!
+  tokenX: Token!
+  tokenY: Token!
+  binStep: BigInt!
+  pid: BigInt!
+  activeId: BigInt
+  baseFactor: BigInt
+  filterPeriod: BigInt
+  decayPeriod: BigInt
+  reductionFactor: BigInt
+  variableFeeControl: BigInt
+  protocolShare: BigInt
+  maxVolatilityAccumulator: BigInt
+  reserveX: BigInt!
+  reserveY: BigInt!
+  totalVolumeX: BigInt!
+  totalVolumeY: BigInt!
+  totalFeesX: BigInt!
+  totalFeesY: BigInt!
+  protocolFeesX: BigInt!
+  protocolFeesY: BigInt!
+  ignoredForRouting: Boolean!
+  hooksParameters: Bytes
+  swapCount: BigInt!
+  depositCount: BigInt!
+  withdrawCount: BigInt!
+  transferCount: BigInt!
+  createdAtBlock: BigInt!
+  createdAtTimestamp: BigInt!
+  updatedAtBlock: BigInt!
+}
+
+type FactoryPreset @entity(immutable: false) {
+  id: ID!
+  factory: Factory!
+  binStep: BigInt!
+  baseFactor: BigInt!
+  filterPeriod: BigInt!
+  decayPeriod: BigInt!
+  reductionFactor: BigInt!
+  variableFeeControl: BigInt!
+  protocolShare: BigInt!
+  maxVolatilityAccumulator: BigInt!
+  open: Boolean!
+  removed: Boolean!
+  updatedAtBlock: BigInt!
+}
+
+type Bin @entity(immutable: false) {
+  id: ID!
+  pair: Pair!
+  binId: BigInt!
+  totalSupply: BigInt!
+  reserveX: BigInt!
+  reserveY: BigInt!
+  createdAtBlock: BigInt!
+  updatedAtBlock: BigInt!
+}
+
+type Position @entity(immutable: false) {
+  id: ID!
+  pair: Pair!
+  owner: Bytes!
+  bin: Bin!
+  liquidity: BigInt!
+  updatedAtBlock: BigInt!
+}
+
+type Swap @entity(immutable: true) {
+  id: ID!
+  pair: Pair!
+  sender: Bytes!
+  to: Bytes!
+  activeId: BigInt!
+  amountsIn: Bytes!
+  amountInX: BigInt!
+  amountInY: BigInt!
+  amountsOut: Bytes!
+  amountOutX: BigInt!
+  amountOutY: BigInt!
+  volatilityAccumulator: BigInt!
+  totalFees: Bytes!
+  totalFeeX: BigInt!
+  totalFeeY: BigInt!
+  protocolFees: Bytes!
+  protocolFeeX: BigInt!
+  protocolFeeY: BigInt!
+  blockNumber: BigInt!
+  timestamp: BigInt!
+  transactionHash: Bytes!
+}
+
+type LiquidityEvent @entity(immutable: true) {
+  id: ID!
+  pair: Pair!
+  type: String!
+  sender: Bytes!
+  to: Bytes!
+  ids: [BigInt!]!
+  amounts: [Bytes!]!
+  amountX: BigInt!
+  amountY: BigInt!
+  blockNumber: BigInt!
+  timestamp: BigInt!
+  transactionHash: Bytes!
+}
+
+type TransferBatchEvent @entity(immutable: true) {
+  id: ID!
+  pair: Pair!
+  sender: Bytes!
+  from: Bytes!
+  to: Bytes!
+  ids: [BigInt!]!
+  amounts: [BigInt!]!
+  blockNumber: BigInt!
+  timestamp: BigInt!
+  transactionHash: Bytes!
+}
+
+type FeeEvent @entity(immutable: true) {
+  id: ID!
+  pair: Pair!
+  type: String!
+  sender: Bytes!
+  binId: BigInt
+  totalFees: Bytes
+  totalFeeX: BigInt
+  totalFeeY: BigInt
+  protocolFees: Bytes!
+  protocolFeeX: BigInt!
+  protocolFeeY: BigInt!
+  blockNumber: BigInt!
+  timestamp: BigInt!
+  transactionHash: Bytes!
+}
+
+type StaticFeeParametersEvent @entity(immutable: true) {
+  id: ID!
+  pair: Pair!
+  sender: Bytes!
+  baseFactor: BigInt!
+  filterPeriod: BigInt!
+  decayPeriod: BigInt!
+  reductionFactor: BigInt!
+  variableFeeControl: BigInt!
+  protocolShare: BigInt!
+  maxVolatilityAccumulator: BigInt!
+  blockNumber: BigInt!
+  timestamp: BigInt!
+  transactionHash: Bytes!
+}
+
+type Activity @entity(immutable: true) {
+  id: ID!
+  pair: Pair
+  type: String!
+  account: Bytes
+  blockNumber: BigInt!
+  timestamp: BigInt!
+  transactionHash: Bytes!
+}

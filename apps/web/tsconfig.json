@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "allowSyntheticDefaultImports": true,
+    "composite": true,
+    "jsx": "react-jsx",
+    "lib": ["DOM", "DOM.Iterable", "ES2024"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "target": "ES2024",
+    "types": ["vite/client", "node"],
+    "useDefineForClassFields": true,
+    "paths": {
+      "@robinhood-lb/sdk/abi": ["../../packages/sdk/src/abi.ts"],
+      "@robinhood-lb/sdk/chains": ["../../packages/sdk/src/chains.ts"],
+      "@robinhood-lb/sdk/client": ["../../packages/sdk/src/client.ts"],
+      "@robinhood-lb/sdk/endpoints": ["../../packages/sdk/src/endpoints.ts"],
+      "@robinhood-lb/sdk/liquidity": ["../../packages/sdk/src/liquidity.ts"],
+      "@robinhood-lb/sdk/manifest": ["../../packages/sdk/src/manifest.ts"],
+      "@robinhood-lb/sdk/registry": ["../../packages/sdk/src/registry.ts"],
+      "@robinhood-lb/sdk/swap": ["../../packages/sdk/src/swap.ts"],
+      "@robinhood-lb/sdk/tokens": ["../../packages/sdk/src/tokens.ts"]
+    }
+  },
+  "include": ["src", "../../packages/sdk/src/**/*.ts"]
+}

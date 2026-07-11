@@ -1,0 +1,9 @@
+packages:
+  - "packages/*"
+  - "apps/*"
+  - "indexer/*"
+enableGlobalVirtualStore: false
+minimumReleaseAgeExclude:
+  - '@wagmi/connectors@8.0.22'
+  - '@wagmi/core@3.6.1'
+  - wagmi@3.7.1

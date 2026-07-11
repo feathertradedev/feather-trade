@@ -1,0 +1,36 @@
+{
+  "schemaVersion": "robinhood.observability.tabletop-evidence.v1",
+  "exerciseId": "REPLACE_EXERCISE_ID",
+  "environment": "staging",
+  "release": {
+    "repositoryCommit": "REPLACE_40_CHARACTER_GIT_COMMIT",
+    "manifestSha256": "REPLACE_64_CHARACTER_MANIFEST_SHA256",
+    "chainId": 46630
+  },
+  "scenario": "indexer-stale-or-failed",
+  "startedAt": "REPLACE_ISO_8601",
+  "endedAt": "REPLACE_ISO_8601",
+  "result": "not-run",
+  "incidentCommander": "REPLACE_ROLE_OR_HANDLE",
+  "syntheticAlert": {
+    "monitorId": "indexer-sync",
+    "severity": "critical",
+    "firedAt": "REPLACE_ISO_8601",
+    "acknowledgedAt": "REPLACE_ISO_8601",
+    "acknowledgedBy": "REPLACE_ROLE_OR_HANDLE",
+    "routeRef": "REPLACE_PRIVATE_EVIDENCE_REF"
+  },
+  "responders": [
+    { "role": "release-operator", "acknowledged": false },
+    { "role": "rpc-owner", "acknowledged": false },
+    { "role": "indexer-owner", "acknowledged": false },
+    { "role": "security-reviewer", "acknowledged": false }
+  ],
+  "timeline": [
+    { "at": "REPLACE_ISO_8601", "actor": "REPLACE_ROLE_OR_HANDLE", "action": "REPLACE_ACTION" }
+  ],
+  "evidenceRefs": ["REPLACE_PRIVATE_EVIDENCE_REF"],
+  "unresolvedBlockers": ["REPLACE_OR_REMOVE_BLOCKER"],
+  "followUpRefs": ["REPLACE_OR_REMOVE_FOLLOW_UP"],
+  "notes": "Template only. Do not include credentials, webhook URLs, endpoint URLs, email addresses, or phone numbers."
+}

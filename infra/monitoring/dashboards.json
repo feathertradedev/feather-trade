@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "robinhood.observability.dashboards.v1",
+  "dashboards": [
+    { "id": "rpc-and-replay", "owner": "rpc-owner", "panels": ["chain-id", "head-number", "head-age", "success-rate", "p95-latency", "historical-read"] },
+    { "id": "indexer-sync-and-query", "owner": "indexer-owner", "panels": ["graphql-uptime", "indexing-errors", "indexed-block", "head-lag", "query-p95-latency", "failed-mappings"] },
+    { "id": "web-and-transactions", "owner": "frontend-sdk-owner", "panels": ["web-uptime", "build-id", "manifest-hash", "simulation-failures", "approval-failures", "reverted-submissions"] },
+    { "id": "contract-and-token-watch", "owner": "security-reviewer", "panels": ["owner-and-fee-recipient", "pair-implementation", "pair-creation", "liquidity-events", "privileged-transactions", "token-list-hash"] }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "robinhood.observability.alert-routing.v1",
+  "policy": {
+    "criticalAcknowledgeMinutes": 10,
+    "highAcknowledgeMinutes": 30,
+    "unacknowledgedAction": "escalate-to-incident-commander"
+  },
+  "routes": [
+    { "owner": "release-operator", "destinationRef": "REPLACE_PRIVATE_ROUTE_REF", "escalatesTo": "incident-commander" },
+    { "owner": "rpc-owner", "destinationRef": "REPLACE_PRIVATE_ROUTE_REF", "escalatesTo": "incident-commander" },
+    { "owner": "indexer-owner", "destinationRef": "REPLACE_PRIVATE_ROUTE_REF", "escalatesTo": "incident-commander" },
+    { "owner": "security-reviewer", "destinationRef": "REPLACE_PRIVATE_ROUTE_REF", "escalatesTo": "incident-commander" },
+    { "owner": "frontend-sdk-owner", "destinationRef": "REPLACE_PRIVATE_ROUTE_REF", "escalatesTo": "release-operator" }
+  ]
+}

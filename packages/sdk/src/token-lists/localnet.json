@@ -1,0 +1,46 @@
+{
+  "$schema": "./schema.json",
+  "schemaVersion": "lb.token-list.v1",
+  "environment": "localnet",
+  "chainId": 31337,
+  "name": "Robinhood LB Localnet Token List",
+  "updatedAt": "2026-07-08",
+  "tokens": [
+    {
+      "id": "wnative",
+      "symbol": "WNATIVE",
+      "name": "Wrapped Native",
+      "addressRef": "tokens.wnative",
+      "decimals": 18,
+      "logoURI": "/token-assets/wnative.svg",
+      "tags": ["localnet", "mock", "wrapped-native"]
+    },
+    {
+      "id": "usdc",
+      "symbol": "USDC",
+      "name": "Mock USDC",
+      "addressRef": "tokens.usdc",
+      "decimals": 18,
+      "logoURI": "/token-assets/usdc.svg",
+      "tags": ["localnet", "mock", "quote", "stablecoin"]
+    },
+    {
+      "id": "usdt",
+      "symbol": "USDT",
+      "name": "Mock USDT",
+      "addressRef": "tokens.usdt",
+      "decimals": 18,
+      "logoURI": "/token-assets/usdt.svg",
+      "tags": ["localnet", "mock", "quote", "stablecoin"]
+    },
+    {
+      "id": "weth",
+      "symbol": "WETH",
+      "name": "Mock WETH",
+      "addressRef": "tokens.weth",
+      "decimals": 18,
+      "logoURI": "/token-assets/weth.svg",
+      "tags": ["localnet", "mock", "wrapped-native"]
+    }
+  ]
+}

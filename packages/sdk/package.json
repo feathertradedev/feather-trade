@@ -1,0 +1,30 @@
+{
+  "name": "@robinhood-lb/sdk",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "pnpm build && node --test dist/test/*.test.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "example:localnet": "pnpm build && node dist/examples/localnet-quote-add-liquidity.js",
+    "example:localnet:liquidity": "pnpm build && node dist/examples/localnet-liquidity.js",
+    "example:localnet:swap": "pnpm build && node dist/examples/localnet-swap.js",
+    "e2e:localnet:expected-revert": "pnpm build && node dist/test/localnet-expected-revert-fixture.js"
+  },
+  "dependencies": {
+    "viem": "^2.54.6"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.0",
+    "typescript": "^6.0.3"
+  }
+}

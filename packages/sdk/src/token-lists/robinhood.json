@@ -1,0 +1,38 @@
+{
+  "$schema": "./schema.json",
+  "schemaVersion": "lb.token-list.v1",
+  "environment": "robinhood",
+  "chainId": 4663,
+  "name": "Robinhood Chain Token List",
+  "updatedAt": "2026-07-09",
+  "tokens": [
+    {
+      "id": "weth",
+      "symbol": "WETH",
+      "name": "WETH",
+      "address": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+      "decimals": 18,
+      "logoURI": "/token-assets/weth.svg",
+      "tags": ["canonical", "mainnet", "wrapped-native"],
+      "risk": {
+        "reviewStatus": "standard",
+        "flags": [],
+        "disabledActions": []
+      }
+    },
+    {
+      "id": "usdg",
+      "symbol": "USDG",
+      "name": "Global Dollar",
+      "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+      "decimals": 6,
+      "logoURI": "/token-assets/usdg.svg",
+      "tags": ["canonical", "mainnet", "quote", "stablecoin"],
+      "risk": {
+        "reviewStatus": "standard",
+        "flags": [],
+        "disabledActions": []
+      }
+    }
+  ]
+}

@@ -1,0 +1,49 @@
+services:
+  graph-node:
+    image: graphprotocol/graph-node:v0.44.0@sha256:c14c6d8e2b2b1ed89f6a89babf48d807b18a43e372fda7fb495d3a9050b65b8b
+    platform: linux/amd64
+    restart: unless-stopped
+    depends_on:
+      - ipfs
+      - postgres
+    ports:
+      # Publish GraphQL on loopback by default. Put a TLS reverse proxy in front
+      # of this service for staging/prod instead of exposing admin/status ports.
+      - "127.0.0.1:${GRAPH_NODE_GRAPHQL_PORT:-8000}:8000"
+    environment:
+      postgres_host: postgres
+      postgres_user: graph-node
+      postgres_pass: ${GRAPH_NODE_POSTGRES_PASSWORD:?set GRAPH_NODE_POSTGRES_PASSWORD}
+      postgres_db: graph-node
+      ipfs: "ipfs:5001"
+      ethereum: "${GRAPH_NODE_NETWORK:?set GRAPH_NODE_NETWORK}:${GRAPH_NODE_ARCHIVE_RPC_URL:?set GRAPH_NODE_ARCHIVE_RPC_URL}"
+      GRAPH_LOG: ${GRAPH_LOG:-info}
+      GRAPH_ALLOW_NON_DETERMINISTIC_FULLTEXT_SEARCH: "true"
+      GRAPH_ETHEREUM_MAX_BLOCK_RANGE_SIZE: ${GRAPH_ETHEREUM_MAX_BLOCK_RANGE_SIZE:-1000}
+
+  ipfs:
+    image: ipfs/kubo:v0.29.0@sha256:53236eaeb876c6d837ee7b04a9b0e737a22e5f4471d0f99fb499fba28034aa61
+    restart: unless-stopped
+    volumes:
+      - ipfs-data:/data/ipfs
+
+  postgres:
+    image: postgres:16.13-alpine@sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: graph-node
+      POSTGRES_PASSWORD: ${GRAPH_NODE_POSTGRES_PASSWORD:?set GRAPH_NODE_POSTGRES_PASSWORD}
+      POSTGRES_DB: graph-node
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    command:
+      - postgres
+      - "-cshared_preload_libraries=pg_stat_statements"
+      - "-cshared_buffers=${POSTGRES_SHARED_BUFFERS:-512MB}"
+      - "-cwork_mem=${POSTGRES_WORK_MEM:-16MB}"
+      - "-cmaintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:-256MB}"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+volumes:
+  ipfs-data:
+  postgres-data:

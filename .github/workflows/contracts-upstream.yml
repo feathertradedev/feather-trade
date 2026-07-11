@@ -1,0 +1,105 @@
+name: Contracts Upstream Modes
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Contract test mode to run
+        required: true
+        default: full-local
+        type: choice
+        options:
+          - full-local
+          - fork-router
+          - fork-quoter
+          - fork-priority
+          - fork-all
+          - exhaustive
+  schedule:
+    - cron: "17 8 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs.mode || 'schedule' }}
+  cancel-in-progress: false
+
+env:
+  CI: "true"
+  AVALANCHE_RPC_URL: ${{ secrets.AVALANCHE_RPC_URL }}
+  FUJI_RPC_URL: ${{ secrets.FUJI_RPC_URL }}
+
+jobs:
+  upstream-contract-tests:
+    name: ${{ github.event.inputs.mode || 'full-local' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Setup Foundry
+        uses: foundry-rs/foundry-toolchain@v1.9.0
+        with:
+          version: v1.4.1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6.0.9
+        with:
+          version: 11.7.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Resolve contract test mode
+        id: test-mode
+        run: |
+          mode="${{ github.event.inputs.mode }}"
+          if [ -z "$mode" ]; then
+            mode="full-local"
+          fi
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            mode="full-local"
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "Selected contract test mode: $mode"
+
+      - name: Require fork RPC secret
+        if: steps.test-mode.outputs.mode != 'full-local'
+        run: |
+          if [ -z "$AVALANCHE_RPC_URL" ]; then
+            echo "AVALANCHE_RPC_URL is required for fork and exhaustive contract test modes." >&2
+            exit 1
+          fi
+
+      - name: Run selected contract test mode
+        run: |
+          case "${{ steps.test-mode.outputs.mode }}" in
+            full-local)
+              pnpm contracts:test:full
+              ;;
+            fork-router)
+              pnpm contracts:test:fork:router
+              ;;
+            fork-quoter)
+              pnpm contracts:test:fork:quoter
+              ;;
+            fork-priority)
+              pnpm contracts:test:fork:priority
+              ;;
+            fork-all)
+              pnpm contracts:test:fork
+              ;;
+            exhaustive)
+              pnpm contracts:test:exhaustive
+              ;;
+            *)
+              echo "Unsupported contract test mode: ${{ steps.test-mode.outputs.mode }}" >&2
+              exit 1
+              ;;
+          esac

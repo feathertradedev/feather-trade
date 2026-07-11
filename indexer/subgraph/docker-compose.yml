@@ -1,0 +1,49 @@
+services:
+  graph-node:
+    image: graphprotocol/graph-node:v0.44.0@sha256:c14c6d8e2b2b1ed89f6a89babf48d807b18a43e372fda7fb495d3a9050b65b8b
+    platform: linux/amd64
+    depends_on:
+      - ipfs
+      - postgres
+    ports:
+      - "${GRAPH_NODE_GRAPHQL_PORT:-8000}:8000"
+      - "${GRAPH_NODE_WS_PORT:-8001}:8001"
+      - "${GRAPH_NODE_ADMIN_PORT:-8020}:8020"
+      - "${GRAPH_NODE_STATUS_PORT:-8030}:8030"
+      - "${GRAPH_NODE_METRICS_PORT:-8040}:8040"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      postgres_host: postgres
+      postgres_user: graph-node
+      postgres_pass: graph-node
+      postgres_db: graph-node
+      ipfs: "ipfs:5001"
+      ethereum: "localnet:http://host.docker.internal:${GRAPH_NODE_RPC_PORT:-8545}"
+      GRAPH_LOG: info
+
+  ipfs:
+    image: ipfs/kubo:v0.29.0@sha256:53236eaeb876c6d837ee7b04a9b0e737a22e5f4471d0f99fb499fba28034aa61
+    ports:
+      - "${GRAPH_NODE_IPFS_PORT:-5001}:5001"
+    volumes:
+      - ipfs-data:/data/ipfs
+
+  postgres:
+    image: postgres:16.13-alpine@sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50
+    ports:
+      - "${GRAPH_NODE_POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: graph-node
+      POSTGRES_PASSWORD: graph-node
+      POSTGRES_DB: graph-node
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    command:
+      - postgres
+      - "-cshared_preload_libraries=pg_stat_statements"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+volumes:
+  ipfs-data:
+  postgres-data:

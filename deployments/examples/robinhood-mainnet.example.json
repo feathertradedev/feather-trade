@@ -1,0 +1,70 @@
+{
+  "chainId": 4663,
+  "deployer": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+  "environment": "mainnet",
+  "schemaVersion": "lb.robinhood.v1",
+  "sourceJoeV2Commit": "067c6ccf5b8ff1526d03fa3e4c65ec45d01c1f73",
+  "startBlock": 4636405,
+  "endpoints": {
+    "rpcUrl": "https://rpc.mainnet.chain.robinhood.com",
+    "indexerUrl": null,
+    "apiUrl": null,
+    "tokenListUrl": null
+  },
+  "chain": {
+    "explorerUrl": "https://robinhoodchain.blockscout.com",
+    "name": "Robinhood Chain",
+    "nativeCurrency": "ETH",
+    "rpcEnvVar": "ROBINHOOD_RPC_URL",
+    "verifierUrl": "https://robinhoodchain.blockscout.com/api/"
+  },
+  "contracts": {
+    "lbFactory": "0x0165878A594ca255338adfa4d48449f69242Eb8F",
+    "lbPairImplementation": "0xa513E6E4b8f2a923D98304ec87F64353C4D5C853",
+    "lbQuoter": "0x8A791620dd6260079BF849Dc5567aDC3F2FdC318",
+    "lbRouter": "0x2279B7A0a67DB372996a5FaB50D91eAA73d2eBe6"
+  },
+  "ownership": {
+    "feeRecipient": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    "initialOwner": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    "lbFactoryOwner": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+  },
+  "tokens": {
+    "wrappedNative": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"
+  },
+  "quoteAssets": {
+    "extra0": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+    "extra1": "0x0000000000000000000000000000000000000000",
+    "extra2": "0x0000000000000000000000000000000000000000",
+    "extra3": "0x0000000000000000000000000000000000000000",
+    "wrappedNative": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"
+  },
+  "factoryPreset": {
+    "baseFactor": 10000,
+    "binStep": 10,
+    "decayPeriod": 600,
+    "filterPeriod": 30,
+    "maxVolatilityAccumulator": 350000,
+    "open": true,
+    "protocolShare": 0,
+    "reductionFactor": 5000,
+    "variableFeeControl": 40000
+  },
+  "constructorArgs": {
+    "feeRecipient": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    "flashLoanFee": 5000000000000,
+    "initialOwner": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    "quoterFactoryV1": "0x0000000000000000000000000000000000000000",
+    "quoterFactoryV2_1": "0x0000000000000000000000000000000000000000",
+    "quoterFactoryV2_2": "0x0165878A594ca255338adfa4d48449f69242Eb8F",
+    "quoterLegacyFactoryV2": "0x0000000000000000000000000000000000000000",
+    "quoterLegacyRouterV2": "0x0000000000000000000000000000000000000000",
+    "quoterRouterV2_1": "0x0000000000000000000000000000000000000000",
+    "quoterRouterV2_2": "0x2279B7A0a67DB372996a5FaB50D91eAA73d2eBe6",
+    "routerFactoryV1": "0x0000000000000000000000000000000000000000",
+    "routerFactoryV2_1": "0x0000000000000000000000000000000000000000",
+    "routerLegacyFactoryV2": "0x0000000000000000000000000000000000000000",
+    "routerLegacyRouterV2": "0x0000000000000000000000000000000000000000",
+    "routerWNative": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"
+  }
+}

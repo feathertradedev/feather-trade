@@ -1,0 +1,132 @@
+scalar BigInt
+
+enum AnalyticsStatus {
+  READY
+  PARTIAL
+  UNAVAILABLE
+}
+
+enum CandleInterval {
+  HOUR
+  DAY
+}
+
+type PageInfo {
+  endCursor: String
+  hasNextPage: Boolean!
+  partial: Boolean!
+}
+
+type PoolMetrics {
+  pair: ID!
+  tokenX: ID!
+  tokenY: ID!
+  tvlUsdE18: BigInt
+  volume24hUsdE18: BigInt
+  fees24hUsdE18: BigInt
+  feeToTvlE18: BigInt
+  priceUsdE18: BigInt
+  asOfBlock: BigInt!
+  asOfTimestamp: Int!
+  status: AnalyticsStatus!
+  missingPriceTokens: [ID!]!
+}
+
+type PoolMetricsConnection {
+  nodes: [PoolMetrics!]!
+  pageInfo: PageInfo!
+}
+
+type Candle {
+  pair: ID!
+  interval: CandleInterval!
+  startTimestamp: Int!
+  endTimestamp: Int!
+  openUsdE18: BigInt
+  highUsdE18: BigInt
+  lowUsdE18: BigInt
+  closeUsdE18: BigInt
+  volumeUsdE18: BigInt
+  feesUsdE18: BigInt
+  tvlUsdE18: BigInt
+  swapCount: Int!
+  status: AnalyticsStatus!
+  missingPriceTokens: [ID!]!
+  firstBlock: BigInt!
+  lastBlock: BigInt!
+}
+
+type CandleConnection {
+  nodes: [Candle!]!
+  pageInfo: PageInfo!
+}
+
+type PositionBinAccounting {
+  binId: BigInt!
+  liquidity: BigInt!
+  costBasisUsdE18: BigInt
+  currentValueUsdE18: BigInt
+  realizedPnlUsdE18: BigInt
+  unrealizedPnlUsdE18: BigInt
+  amountX: BigInt
+  amountY: BigInt
+  asOfBlock: BigInt
+  asOfTimestamp: Int
+  status: AnalyticsStatus!
+  missingPriceTokens: [ID!]!
+}
+
+type WalletPairPosition {
+  owner: ID!
+  pair: ID!
+  bins: [PositionBinAccounting!]!
+  costBasisUsdE18: BigInt
+  currentValueUsdE18: BigInt
+  realizedPnlUsdE18: BigInt
+  unrealizedPnlUsdE18: BigInt
+  status: AnalyticsStatus!
+  missingPriceTokens: [ID!]!
+  asOfBlock: BigInt
+  asOfTimestamp: Int
+}
+
+type WalletPairPositionConnection {
+  nodes: [WalletPairPosition!]!
+  pageInfo: PageInfo!
+}
+
+type AnalyticsHealth {
+  status: AnalyticsStatus!
+  headBlock: BigInt
+  headHash: String
+  headTimestamp: Int
+  canonicalBlockCount: Int!
+  reorgCount: Int!
+  partialEventCount: Int!
+  missingPriceTokens: [ID!]!
+  fresh: Boolean!
+  headLagSeconds: Int
+  maxHeadLagSeconds: Int!
+  backfillStatus: String!
+  backfillCursor: String
+  backfillError: String
+  coverageStartTimestamp: BigInt
+  coverageThroughTimestamp: BigInt
+  prices: [PriceHealth!]!
+}
+
+type PriceHealth {
+  token: ID!
+  source: String!
+  feedId: String!
+  status: String!
+  observedAt: Int
+  ageSeconds: Int
+}
+
+type Query {
+  poolMetrics(first: Int!, after: String, asOfTimestamp: Int): PoolMetricsConnection!
+  pairCandles(pair: ID!, interval: CandleInterval!, fromTimestamp: Int!, toTimestamp: Int!, first: Int!, after: String): CandleConnection!
+  walletPositions(owner: ID!, first: Int!, after: String): WalletPairPositionConnection!
+  analyticsHealth: AnalyticsHealth!
+}

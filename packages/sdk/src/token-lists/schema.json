@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://robinhood-lb.local/schemas/token-list.v1.json",
+  "title": "Robinhood LB Token List",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "environment", "chainId", "name", "updatedAt", "tokens"],
+  "properties": {
+    "schemaVersion": {
+      "const": "lb.token-list.v1"
+    },
+    "environment": {
+      "enum": ["localnet", "robinhoodTestnet", "robinhood"]
+    },
+    "chainId": {
+      "enum": [31337, 46630, 4663]
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "updatedAt": {
+      "type": "string",
+      "format": "date"
+    },
+    "tokens": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "symbol", "name", "decimals", "logoURI", "tags"],
+        "oneOf": [
+          {
+            "required": ["address"],
+            "not": {
+              "required": ["addressRef"]
+            }
+          },
+          {
+            "required": ["addressRef"],
+            "not": {
+              "required": ["address"]
+            }
+          }
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]*$"
+          },
+          "symbol": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 16
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "address": {
+            "type": "string",
+            "pattern": "^0x[a-fA-F0-9]{40}$"
+          },
+          "addressRef": {
+            "enum": ["tokens.wnative", "tokens.usdc", "tokens.usdt", "tokens.weth"]
+          },
+          "decimals": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255
+          },
+          "logoURI": {
+            "type": "string",
+            "pattern": "^/token-assets/[a-z0-9-]+\\.svg$"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "enum": ["canonical", "localnet", "mainnet", "mock", "quote", "stablecoin", "testnet", "wrapped-native"]
+            },
+            "uniqueItems": true
+          },
+          "risk": {
+            "$ref": "#/$defs/tokenRiskPolicy"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "tokenRiskPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reviewStatus", "flags", "disabledActions"],
+      "properties": {
+        "reviewStatus": {
+          "enum": ["standard", "restricted", "blocked"]
+        },
+        "flags": {
+          "type": "array",
+          "items": {
+            "enum": ["fee-on-transfer", "rebasing", "blacklistable", "upgradeable", "suspicious"]
+          },
+          "uniqueItems": true
+        },
+        "disabledActions": {
+          "type": "array",
+          "items": {
+            "enum": ["swap", "add-liquidity", "remove-liquidity"]
+          },
+          "uniqueItems": true
+        },
+        "notes": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

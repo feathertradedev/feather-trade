@@ -1,0 +1,243 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://robinhood-lb.local/schemas/deployment-manifest.v1.json",
+  "title": "Robinhood LB Deployment Manifest",
+  "oneOf": [
+    { "$ref": "#/$defs/localnetManifest" },
+    { "$ref": "#/$defs/robinhoodManifest" }
+  ],
+  "$defs": {
+    "address": {
+      "type": "string",
+      "pattern": "^0x[a-fA-F0-9]{40}$"
+    },
+    "nonZeroAddress": {
+      "allOf": [{ "$ref": "#/$defs/address" }],
+      "not": { "const": "0x0000000000000000000000000000000000000000" }
+    },
+    "nullableNonEmptyString": {
+      "anyOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }]
+    },
+    "endpointConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rpcUrl"],
+      "properties": {
+        "rpcUrl": { "type": "string", "minLength": 1 },
+        "indexerUrl": { "$ref": "#/$defs/nullableNonEmptyString" },
+        "apiUrl": { "$ref": "#/$defs/nullableNonEmptyString" },
+        "tokenListUrl": { "$ref": "#/$defs/nullableNonEmptyString" }
+      }
+    },
+    "contracts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lbFactory", "lbPairImplementation", "lbRouter", "lbQuoter"],
+      "properties": {
+        "lbFactory": { "$ref": "#/$defs/nonZeroAddress" },
+        "lbPairImplementation": { "$ref": "#/$defs/nonZeroAddress" },
+        "lbRouter": { "$ref": "#/$defs/nonZeroAddress" },
+        "lbQuoter": { "$ref": "#/$defs/nonZeroAddress" }
+      }
+    },
+    "factoryPreset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "baseFactor",
+        "binStep",
+        "decayPeriod",
+        "filterPeriod",
+        "maxVolatilityAccumulator",
+        "open",
+        "protocolShare",
+        "reductionFactor",
+        "variableFeeControl"
+      ],
+      "properties": {
+        "baseFactor": { "type": "integer" },
+        "binStep": { "type": "integer" },
+        "decayPeriod": { "type": "integer" },
+        "filterPeriod": { "type": "integer" },
+        "maxVolatilityAccumulator": { "type": "integer" },
+        "open": { "type": "boolean" },
+        "protocolShare": { "type": "integer" },
+        "reductionFactor": { "type": "integer" },
+        "variableFeeControl": { "type": "integer" }
+      }
+    },
+    "ownership": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["feeRecipient", "initialOwner", "lbFactoryOwner"],
+      "properties": {
+        "feeRecipient": { "$ref": "#/$defs/nonZeroAddress" },
+        "initialOwner": { "$ref": "#/$defs/nonZeroAddress" },
+        "lbFactoryOwner": { "$ref": "#/$defs/nonZeroAddress" }
+      }
+    },
+    "disabledLegacyRoutingConstructorArgs": {
+      "type": "object",
+      "required": [
+        "routerFactoryV1",
+        "routerFactoryV2_1",
+        "routerLegacyFactoryV2",
+        "routerLegacyRouterV2"
+      ],
+      "properties": {
+        "routerFactoryV1": { "const": "0x0000000000000000000000000000000000000000" },
+        "routerFactoryV2_1": { "const": "0x0000000000000000000000000000000000000000" },
+        "routerLegacyFactoryV2": { "const": "0x0000000000000000000000000000000000000000" },
+        "routerLegacyRouterV2": { "const": "0x0000000000000000000000000000000000000000" }
+      }
+    },
+    "root": {
+      "type": "object",
+      "required": [
+        "chainId",
+        "contracts",
+        "constructorArgs",
+        "deployer",
+        "endpoints",
+        "environment",
+        "factoryPreset",
+        "ownership",
+        "schemaVersion",
+        "sourceJoeV2Commit",
+        "startBlock",
+        "tokens"
+      ],
+      "properties": {
+        "chainId": { "type": "integer" },
+        "deployer": { "$ref": "#/$defs/nonZeroAddress" },
+        "endpoints": { "$ref": "#/$defs/endpointConfig" },
+        "contracts": { "$ref": "#/$defs/contracts" },
+        "constructorArgs": { "$ref": "#/$defs/disabledLegacyRoutingConstructorArgs" },
+        "factoryPreset": { "$ref": "#/$defs/factoryPreset" },
+        "ownership": { "$ref": "#/$defs/ownership" },
+        "sourceJoeV2Commit": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{40}$"
+        },
+        "startBlock": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "localnetManifest": {
+      "unevaluatedProperties": false,
+      "allOf": [
+        { "$ref": "#/$defs/root" },
+        {
+          "type": "object",
+          "required": ["schemaVersion", "environment", "seededPools", "smoke"],
+          "properties": {
+            "schemaVersion": { "const": "lb.localnet.v1" },
+            "environment": { "const": "localnet" },
+            "chainId": { "type": "integer", "minimum": 1 },
+            "tokens": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["wnative", "usdc", "usdt", "weth"],
+              "properties": {
+                "wnative": { "$ref": "#/$defs/nonZeroAddress" },
+                "usdc": { "$ref": "#/$defs/nonZeroAddress" },
+                "usdt": { "$ref": "#/$defs/nonZeroAddress" },
+                "weth": { "$ref": "#/$defs/nonZeroAddress" }
+              }
+            },
+            "seededPools": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["wnativeUsdc"],
+              "properties": {
+                "wnativeUsdc": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["activeId", "binStep", "pair", "tokenX", "tokenY"],
+                  "properties": {
+                    "activeId": { "type": "integer" },
+                    "binStep": { "type": "integer", "minimum": 1 },
+                    "pair": { "$ref": "#/$defs/nonZeroAddress" },
+                    "tokenX": { "$ref": "#/$defs/nonZeroAddress" },
+                    "tokenY": { "$ref": "#/$defs/nonZeroAddress" }
+                  }
+                }
+              }
+            },
+            "smoke": {
+              "type": "object",
+              "required": ["swapTokenIn", "swapTokenOut"],
+              "properties": {
+                "swapTokenIn": { "$ref": "#/$defs/nonZeroAddress" },
+                "swapTokenOut": { "$ref": "#/$defs/nonZeroAddress" }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "robinhoodManifest": {
+      "unevaluatedProperties": false,
+      "allOf": [
+        { "$ref": "#/$defs/root" },
+        {
+          "type": "object",
+          "required": ["schemaVersion", "environment", "chain", "quoteAssets"],
+          "properties": {
+            "schemaVersion": { "const": "lb.robinhood.v1" },
+            "environment": { "enum": ["testnet", "mainnet"] },
+            "constructorArgs": { "$ref": "#/$defs/disabledLegacyRoutingConstructorArgs" },
+            "chain": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["explorerUrl", "name", "nativeCurrency", "rpcEnvVar", "verifierUrl"],
+              "properties": {
+                "explorerUrl": { "type": "string", "minLength": 1 },
+                "name": { "type": "string", "minLength": 1 },
+                "nativeCurrency": { "const": "ETH" },
+                "rpcEnvVar": { "type": "string", "minLength": 1 },
+                "verifierUrl": { "type": "string", "minLength": 1 }
+              }
+            },
+            "tokens": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["wrappedNative"],
+              "properties": {
+                "wrappedNative": { "$ref": "#/$defs/nonZeroAddress" }
+              }
+            },
+            "quoteAssets": {
+              "type": "object",
+              "required": ["wrappedNative"],
+              "properties": {
+                "wrappedNative": { "$ref": "#/$defs/nonZeroAddress" }
+              },
+              "additionalProperties": { "$ref": "#/$defs/address" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "environment": { "const": "testnet" } },
+            "required": ["environment"]
+          },
+          "then": {
+            "properties": { "chainId": { "const": 46630 } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "environment": { "const": "mainnet" } },
+            "required": ["environment"]
+          },
+          "then": {
+            "properties": { "chainId": { "const": 4663 } }
+          }
+        }
+      ]
+    }
+  }
+}

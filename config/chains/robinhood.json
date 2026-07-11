@@ -1,0 +1,44 @@
+{
+  "source": {
+    "retrievedAt": "2026-07-08",
+    "officialDocs": [
+      "https://docs.robinhood.com/chain/connecting/",
+      "https://docs.robinhood.com/chain/deploy-smart-contracts/",
+      "https://docs.robinhood.com/chain/add-network-to-wallet/",
+      "https://docs.robinhood.com/chain/contracts/",
+      "https://docs.robinhood.com/chain/protocol-contracts/"
+    ]
+  },
+  "mainnet": {
+    "name": "Robinhood Chain",
+    "chainId": 4663,
+    "nativeCurrency": {
+      "name": "Ether",
+      "symbol": "ETH",
+      "decimals": 18
+    },
+    "rpcEnvVar": "ROBINHOOD_RPC_URL",
+    "publicRpcUrl": "https://rpc.mainnet.chain.robinhood.com",
+    "providerRpcUrlTemplate": "https://robinhood-mainnet.g.alchemy.com/v2/{API_KEY}",
+    "publicSequencerFeedUrl": "wss://feed.mainnet.chain.robinhood.com",
+    "canonicalWrappedNative": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+    "blockExplorerUrl": "https://robinhoodchain.blockscout.com",
+    "blockscoutApiUrl": "https://robinhoodchain.blockscout.com/api/"
+  },
+  "testnet": {
+    "name": "Robinhood Chain Testnet",
+    "chainId": 46630,
+    "nativeCurrency": {
+      "name": "Ether",
+      "symbol": "ETH",
+      "decimals": 18
+    },
+    "rpcEnvVar": "ROBINHOOD_TESTNET_RPC_URL",
+    "publicRpcUrl": "https://rpc.testnet.chain.robinhood.com",
+    "providerRpcUrlTemplate": "https://robinhood-testnet.g.alchemy.com/v2/{API_KEY}",
+    "publicSequencerFeedUrl": "wss://feed.testnet.chain.robinhood.com",
+    "canonicalWrappedNative": "0x7943e237c7F95DA44E0301572D358911207852Fa",
+    "blockExplorerUrl": "https://explorer.testnet.chain.robinhood.com",
+    "blockscoutApiUrl": "https://explorer.testnet.chain.robinhood.com/api/"
+  }
+}

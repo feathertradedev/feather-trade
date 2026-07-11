@@ -1,0 +1,89 @@
+# Generated from a deployment manifest. For localnet, run pnpm indexer:generate:local.
+# For Robinhood testnet/mainnet, run pnpm indexer:generate:robinhood.
+specVersion: 1.3.0
+description: Robinhood LB v2.2 core subgraph
+repository: https://github.com/feathertradedev/feather-trade
+schema:
+  file: ./schema.graphql
+indexerHints:
+  prune: auto
+dataSources:
+  - kind: ethereum/contract
+    name: LBFactory
+    network: {{network}}
+    source:
+      address: "{{lbFactory}}"
+      abi: LBFactory
+      startBlock: {{startBlock}}
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.9
+      language: wasm/assemblyscript
+      entities:
+        - Factory
+        - Pair
+        - Token
+        - FactoryPreset
+        - Activity
+      abis:
+        - name: LBFactory
+          file: ./abis/LBFactory.json
+        - name: LBPair
+          file: ./abis/LBPair.json
+      eventHandlers:
+        - event: LBPairCreated(indexed address,indexed address,indexed uint256,address,uint256)
+          handler: handleLBPairCreated
+        - event: LBPairIgnoredStateChanged(indexed address,bool)
+          handler: handleLBPairIgnoredStateChanged
+        - event: PresetSet(indexed uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256)
+          handler: handlePresetSet
+        - event: PresetOpenStateChanged(indexed uint256,indexed bool)
+          handler: handlePresetOpenStateChanged
+        - event: PresetRemoved(indexed uint256)
+          handler: handlePresetRemoved
+        - event: QuoteAssetAdded(indexed address)
+          handler: handleQuoteAssetAdded
+        - event: QuoteAssetRemoved(indexed address)
+          handler: handleQuoteAssetRemoved
+      file: ./src/factory.ts
+templates:
+  - kind: ethereum/contract
+    name: LBPair
+    network: {{network}}
+    source:
+      abi: LBPair
+    mapping:
+      kind: ethereum/events
+      apiVersion: 0.0.9
+      language: wasm/assemblyscript
+      entities:
+        - Pair
+        - Bin
+        - Position
+        - Swap
+        - LiquidityEvent
+        - TransferBatchEvent
+        - FeeEvent
+        - StaticFeeParametersEvent
+        - Activity
+      abis:
+        - name: LBPair
+          file: ./abis/LBPair.json
+      eventHandlers:
+        - event: Swap(indexed address,indexed address,uint24,bytes32,bytes32,uint24,bytes32,bytes32)
+          handler: handleSwap
+        - event: DepositedToBins(indexed address,indexed address,uint256[],bytes32[])
+          handler: handleDepositedToBins
+        - event: WithdrawnFromBins(indexed address,indexed address,uint256[],bytes32[])
+          handler: handleWithdrawnFromBins
+        - event: TransferBatch(indexed address,indexed address,indexed address,uint256[],uint256[])
+          handler: handleTransferBatch
+        - event: CompositionFees(indexed address,uint24,bytes32,bytes32)
+          handler: handleCompositionFees
+        - event: CollectedProtocolFees(indexed address,bytes32)
+          handler: handleCollectedProtocolFees
+        - event: StaticFeeParametersSet(indexed address,uint16,uint16,uint16,uint16,uint24,uint16,uint24)
+          handler: handleStaticFeeParametersSet
+        - event: HooksParametersSet(indexed address,bytes32)
+          handler: handleHooksParametersSet
+      file: ./src/pair.ts

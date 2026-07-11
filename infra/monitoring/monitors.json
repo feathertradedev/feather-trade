@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "robinhood.observability.monitors.v1",
+  "monitors": [
+    { "id": "rpc-chain-head", "surface": "rpc", "signal": "chain_id, head_number, head_age_seconds", "condition": "chain_id mismatch OR head below deployment start block OR head_age_seconds > 300", "severity": "critical", "owner": "rpc-owner", "runbook": "rpc-provider-degradation" },
+    { "id": "rpc-request-quality", "surface": "rpc", "signal": "request_success_rate, p95_latency_ms", "condition": "approved SLO breached for 5 minutes", "severity": "high", "owner": "rpc-owner", "runbook": "rpc-provider-degradation" },
+    { "id": "indexer-sync", "surface": "indexer", "signal": "has_indexing_errors, head_lag_blocks", "condition": "has_indexing_errors != false OR head_lag_blocks > 20 for 5 minutes", "severity": "critical", "owner": "indexer-owner", "runbook": "indexer-stale-or-failed" },
+    { "id": "indexer-query-quality", "surface": "indexer", "signal": "query_success_rate, p95_latency_ms", "condition": "approved SLO breached for 5 minutes", "severity": "high", "owner": "indexer-owner", "runbook": "indexer-stale-or-failed" },
+    { "id": "contract-privilege-drift", "surface": "contracts", "signal": "factory_owner, fee_recipient, pair_implementation", "condition": "observed value differs from approved release manifest or ownership record", "severity": "critical", "owner": "security-reviewer", "runbook": "key-compromise-or-privilege-drift" },
+    { "id": "contract-activity-watch", "surface": "contracts", "signal": "pair_creation, swaps, liquidity_events, privileged_transactions", "condition": "unexpected privileged transaction OR approved anomaly threshold breached", "severity": "high", "owner": "security-reviewer", "runbook": "suspicious-contract-activity" },
+    { "id": "web-release-health", "surface": "web", "signal": "uptime, build_id, manifest_hash, endpoint_config", "condition": "unreachable for 5 minutes OR runtime release metadata differs from approved release", "severity": "critical", "owner": "frontend-sdk-owner", "runbook": "frontend-rollback" },
+    { "id": "transaction-failures", "surface": "web", "signal": "simulation_failures, approval_failures, reverted_submissions, wrong_chain_attempts", "condition": "approved error-rate SLO breached for 5 minutes", "severity": "high", "owner": "frontend-sdk-owner", "runbook": "frontend-transaction-failures" }
+  ]
+}

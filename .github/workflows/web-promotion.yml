@@ -1,0 +1,205 @@
+name: Protected Web Promotion
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Public Robinhood environment"
+        required: true
+        type: choice
+        options: [testnet, mainnet]
+      immutable_commit:
+        description: "Lowercase 40-character commit SHA to build and promote"
+        required: true
+        type: string
+      manifest:
+        description: "Repository-relative deployment manifest at that commit"
+        required: true
+        type: string
+      deployed_url:
+        description: "Credential-free HTTPS URL that the provider adapter must update"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-promotion-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  trusted-preflight:
+    name: Validate trusted dispatch inputs
+    if: ${{ github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main' && github.workflow_ref == format('{0}/.github/workflows/web-promotion.yml@refs/heads/main', github.repository) }}
+    runs-on: ubuntu-latest
+    outputs:
+      deployed_origin: ${{ steps.url.outputs.deployed_origin }}
+    steps:
+      - name: Checkout trusted workflow revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Verify exact trusted checkout
+        env:
+          TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: test "$(git rev-parse HEAD)" = "$TRUSTED_WORKFLOW_SHA"
+      - name: Validate and canonicalize deployed URL
+        id: url
+        env:
+          DEPLOYED_URL: ${{ inputs.deployed_url }}
+        run: node scripts/release/write-web-promotion-evidence.cjs --validate-url "$DEPLOYED_URL" --github-output "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and seal public artifact
+    needs: trusted-preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Reject mutable or malformed inputs
+        shell: bash
+        env:
+          IMMUTABLE_COMMIT: ${{ inputs.immutable_commit }}
+        run: |
+          [[ "$IMMUTABLE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::immutable_commit must be a lowercase 40-character SHA"; exit 1; }
+
+      - name: Checkout immutable commit with full history
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ inputs.immutable_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify exact checkout
+        env:
+          IMMUTABLE_COMMIT: ${{ inputs.immutable_commit }}
+          TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$IMMUTABLE_COMMIT"
+          git cat-file -e "$TRUSTED_WORKFLOW_SHA^{commit}"
+          git merge-base --is-ancestor "$IMMUTABLE_COMMIT" "$TRUSTED_WORKFLOW_SHA" || {
+            echo "::error::immutable_commit must equal or be an ancestor of the trusted main workflow revision"
+            exit 1
+          }
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          version: 11.7.0
+
+      - name: Setup Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build public artifact once
+        shell: bash
+        env:
+          TARGET_ENVIRONMENT: ${{ inputs.environment }}
+          SELECTED_MANIFEST: ${{ inputs.manifest }}
+        run: |
+          if [[ "$TARGET_ENVIRONMENT" == testnet ]]; then
+            VITE_ROBINHOOD_TESTNET_MANIFEST_PATH="$SELECTED_MANIFEST" pnpm web:build:public:testnet
+          else
+            VITE_ROBINHOOD_MANIFEST_PATH="$SELECTED_MANIFEST" pnpm web:build:public:mainnet
+          fi
+
+      - name: Validate and seal artifact custody
+        shell: bash
+        env:
+          TARGET_ENVIRONMENT: ${{ inputs.environment }}
+          IMMUTABLE_COMMIT: ${{ inputs.immutable_commit }}
+          SELECTED_MANIFEST: ${{ inputs.manifest }}
+        run: |
+          public_environment=robinhood
+          [[ "$TARGET_ENVIRONMENT" == testnet ]] && public_environment=robinhoodTestnet
+          pnpm web:check:public-artifact -- --environment "$public_environment" --manifest "$SELECTED_MANIFEST" --dist apps/web/dist
+          node scripts/release/web-promotion-custody.cjs create --environment "$TARGET_ENVIRONMENT" --commit "$IMMUTABLE_COMMIT" --manifest "$SELECTED_MANIFEST" --dist apps/web/dist --output .local/web-promotion/bundle
+
+      - name: Upload sealed artifact and manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: web-promotion-${{ inputs.environment }}-${{ inputs.immutable_commit }}
+          path: .local/web-promotion/bundle
+          if-no-files-found: error
+          retention-days: 30
+
+  promote:
+    name: Approve, promote, and smoke sealed artifact
+    needs: [trusted-preflight, build]
+    if: ${{ always() && needs.trusted-preflight.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: web-${{ inputs.environment }}
+      url: ${{ needs.trusted-preflight.outputs.deployed_origin }}
+    steps:
+      - name: Checkout trusted workflow revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify exact trusted checkout
+        env:
+          TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          IMMUTABLE_COMMIT: ${{ inputs.immutable_commit }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$TRUSTED_WORKFLOW_SHA"
+          git cat-file -e "$IMMUTABLE_COMMIT^{commit}"
+          git merge-base --is-ancestor "$IMMUTABLE_COMMIT" "$TRUSTED_WORKFLOW_SHA" || {
+            echo "::error::immutable_commit must equal or be an ancestor of the trusted main workflow revision"
+            exit 1
+          }
+
+      - name: Download sealed artifact
+        if: ${{ needs.build.result == 'success' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: web-promotion-${{ inputs.environment }}-${{ inputs.immutable_commit }}
+          path: .local/web-promotion/bundle
+
+      - name: Verify custody without rebuilding
+        if: ${{ needs.build.result == 'success' }}
+        env:
+          TARGET_ENVIRONMENT: ${{ inputs.environment }}
+          IMMUTABLE_COMMIT: ${{ inputs.immutable_commit }}
+        run: node scripts/release/web-promotion-custody.cjs verify --environment "$TARGET_ENVIRONMENT" --commit "$IMMUTABLE_COMMIT" --bundle .local/web-promotion/bundle --output .local/web-promotion/verified
+
+      - name: Invoke provider adapter
+        if: ${{ needs.build.result == 'success' }}
+        env:
+          WEB_PROMOTION_ARTIFACT: .local/web-promotion/verified/dist
+          WEB_PROMOTION_MANIFEST: .local/web-promotion/verified/manifest.json
+          WEB_PROMOTION_DEPLOYED_URL: ${{ needs.trusted-preflight.outputs.deployed_origin }}
+        run: bash scripts/release/promote-web-provider.sh
+
+      - name: Smoke hosted release against sealed artifact
+        if: ${{ needs.build.result == 'success' }}
+        env:
+          DEPLOYED_URL: ${{ needs.trusted-preflight.outputs.deployed_origin }}
+        run: node scripts/web/check-hosted-release.cjs --url "$DEPLOYED_URL" --dist .local/web-promotion/verified/dist
+
+      - name: Write sanitized promotion and rollback-readiness evidence
+        if: always()
+        env:
+          TARGET_ENVIRONMENT: ${{ inputs.environment }}
+          IMMUTABLE_COMMIT: ${{ inputs.immutable_commit }}
+          DEPLOYED_URL: ${{ needs.trusted-preflight.outputs.deployed_origin }}
+          PROMOTION_OUTCOME: ${{ needs.build.result != 'success' && 'blocked' || (job.status == 'success' && 'promoted' || 'failed') }}
+        run: node scripts/release/write-web-promotion-evidence.cjs --environment "$TARGET_ENVIRONMENT" --commit "$IMMUTABLE_COMMIT" --custody .local/web-promotion/bundle/custody.json --deployed-url "$DEPLOYED_URL" --output .local/web-promotion/evidence --outcome "$PROMOTION_OUTCOME"
+
+      - name: Upload sanitized evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: web-promotion-evidence-${{ inputs.environment }}-${{ github.run_id }}
+          path: .local/web-promotion/evidence
+          if-no-files-found: error
+          retention-days: 30
