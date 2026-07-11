@@ -40,13 +40,14 @@ import {
   Server,
   Wallet
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type ComponentType } from "react";
-import { isAddressEqual, type Address, type Chain, formatUnits, parseUnits } from "viem";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
+import { encodeFunctionData, isAddressEqual, keccak256, type Address, type Chain, formatUnits, parseUnits } from "viem";
 import {
   useAccount,
   useChainId,
   useConnect,
   useDisconnect,
+  useReconnect,
   useSendTransaction,
   useSwitchChain,
   useWaitForTransactionReceipt,
@@ -110,6 +111,7 @@ import {
   type SwapExecutionContext
 } from "./transaction-safety";
 import { wagmiConfig } from "./wagmi";
+import { SUPPORTED_WALLET_RDNS, walletFailure, walletSessionIdentity, type WalletFailure } from "./wallet-lifecycle";
 
 const queryClient = new QueryClient();
 const SNAPSHOT_REFRESH_INTERVAL_MS = 10_000;
@@ -173,6 +175,48 @@ interface ApprovalRefreshState {
   status: "refreshing" | "awaiting-render" | "ready" | "error";
 }
 
+interface SubmittedTransactionRecord {
+  account: Address;
+  calldataFingerprint: string;
+  chainId: number;
+  deploymentEpoch: string;
+  environment: EnvironmentKey;
+  executionFingerprint: string;
+  hash: Address;
+  intent: "add-liquidity" | "approval" | "remove-liquidity" | "swap";
+  providerId: string;
+  providerUid: string;
+  submittedAt: number;
+  target: Address;
+  value: bigint;
+}
+
+interface ExactGasReview {
+  action: string;
+  bufferedWei: bigint;
+  executionFingerprint: string;
+  gasLimit: bigint;
+  gasPrice: bigint;
+  requiredWei: bigint;
+  transactionValue: bigint;
+}
+
+const GAS_BUFFER_BPS = 12_500n;
+
+function deploymentEpoch(registry: DexRegistry): string {
+  return [
+    registry.chainId,
+    registry.startBlock,
+    registry.endpoints.rpcUrl,
+    registry.contracts.lbFactory,
+    registry.contracts.lbPairImplementation,
+    registry.contracts.lbQuoter,
+    registry.contracts.lbRouter
+  ].join("|");
+}
+
+const SubmittedTransactionJournalContext = createContext<((record: SubmittedTransactionRecord) => void) | null>(null);
+
 type SnapshotRefetch = () => Promise<QueryObserverResult<AppSnapshot, Error>>;
 
 const routeIcons: Record<RouteKey, ComponentType<{ size?: number }>> = {
@@ -186,18 +230,66 @@ const routeIcons: Record<RouteKey, ComponentType<{ size?: number }>> = {
 
 export function App() {
   return (
-    <WagmiProvider config={wagmiConfig}>
+    <WagmiProvider config={wagmiConfig} reconnectOnMount={false}>
       <QueryClientProvider client={queryClient}>
+        <SafeWalletReconnect />
         <DexShell />
       </QueryClientProvider>
     </WagmiProvider>
   );
 }
 
+function SafeWalletReconnect() {
+  const attempted = useRef(false);
+  const account = useAccount();
+  const { connectors, reconnect } = useReconnect();
+
+  useEffect(() => {
+    if (account.status === "connected") {
+      attempted.current = true;
+      return;
+    }
+    if (attempted.current || connectors.length === 0 || account.status !== "disconnected") return;
+    const timeout = window.setTimeout(() => {
+      if (attempted.current) return;
+      attempted.current = true;
+      void Promise.resolve(wagmiConfig.storage?.getItem("recentConnectorId") ?? null).then((recentConnectorId) => {
+        if (typeof recentConnectorId !== "string" || !SUPPORTED_WALLET_RDNS.has(recentConnectorId)) return;
+        const connector = connectors.find((candidate) => candidate.id === recentConnectorId);
+        if (connector && wagmiConfig.state.status === "disconnected") reconnect({ connectors: [connector] });
+      });
+    }, 100);
+    return () => window.clearTimeout(timeout);
+  }, [account.status, connectors, reconnect]);
+
+  return null;
+}
+
 function DexShell() {
   const [environmentKey, setEnvironmentKey] = useState<EnvironmentKey>(defaultEnvironmentKey);
   const [routeKey, setRouteKey, poolDetailId, liquiditySection, actionPoolId, positionDetailId, portfolioAction] = useHashRoute();
   const registry = registries[environmentKey];
+  const account = useAccount();
+  const walletChainId = useChainId();
+  const walletSessionKey = walletSessionIdentity({
+    address: account.address,
+    chainId: walletChainId,
+    connectorUid: account.connector?.uid,
+    environment: `${environmentKey}|${deploymentEpoch(registry)}`,
+    status: account.status
+  });
+  const walletPanelKey = account.status === "connected" ? walletSessionKey : `${environmentKey}:disconnected`;
+  const previousWalletSessionKey = useRef(walletSessionKey);
+  const [submittedTransactions, setSubmittedTransactions] = useState<SubmittedTransactionRecord[]>([]);
+  const recordSubmittedTransaction = useCallback((record: SubmittedTransactionRecord) => {
+    setSubmittedTransactions((records) => records.some((existing) =>
+      existing.environment === record.environment &&
+      existing.deploymentEpoch === record.deploymentEpoch &&
+      existing.chainId === record.chainId &&
+      existing.account.toLowerCase() === record.account.toLowerCase() &&
+      existing.hash.toLowerCase() === record.hash.toLowerCase()
+    ) ? records : [...records, record]);
+  }, []);
   const snapshotQuery = useQuery({
     queryKey: [
       "dashboard",
@@ -212,6 +304,23 @@ function DexShell() {
     refetchOnWindowFocus: "always"
   });
   const snapshot = snapshotQuery.data;
+
+  useEffect(() => {
+    if (previousWalletSessionKey.current === walletSessionKey) return;
+    previousWalletSessionKey.current = walletSessionKey;
+    const ownerQueryPrefixes = new Set([
+      "liquidityPortfolioIntent",
+      "liquidityPositions",
+      "liquiditySelectedBurnSnapshot",
+      "liquidityWallet",
+      "poolDetailPositions",
+      "positionHistory",
+      "swapWallet",
+      "walletPortfolio"
+    ]);
+    void queryClient.cancelQueries({ predicate: (query) => ownerQueryPrefixes.has(String(query.queryKey[0] ?? "")) });
+    queryClient.removeQueries({ predicate: (query) => ownerQueryPrefixes.has(String(query.queryKey[0] ?? "")) });
+  }, [walletSessionKey]);
 
   useEffect(() => {
     window.scrollTo({ behavior: "auto", left: 0, top: 0 });
@@ -267,7 +376,7 @@ function DexShell() {
               <span>Runtime health is shown beside the environment selector.</span>
             </div>
           </details>
-          <WalletPanel activeChain={registry.chain} />
+          <WalletPanel activeChain={registry.chain} key={walletPanelKey} />
         </div>
       </header>
 
@@ -297,6 +406,18 @@ function DexShell() {
           <MetricTile label="Active Bin" value={formatActiveBin(snapshot)} tone="neutral" />
           <MetricTile label="Indexer Head" value={snapshot?.indexer.blockNumber ?? "offline"} tone={snapshot?.indexer.status === "ready" ? "good" : "warn"} />
         </section>
+        {submittedTransactions.length > 0 ? (
+          <details className="transaction-journal" data-testid="submitted-transaction-journal">
+            <summary>Submitted transactions ({submittedTransactions.length})</summary>
+            <div>
+              {submittedTransactions.map((transaction) => (
+                <span data-transaction-hash={transaction.hash} key={`${transaction.environment}:${transaction.deploymentEpoch}:${transaction.chainId}:${transaction.account}:${transaction.hash}`}>
+                  {transaction.intent} · {formatCompactAddress(transaction.hash)} · {formatCompactAddress(transaction.account)} · {transaction.environment} · chain {transaction.chainId}
+                </span>
+              ))}
+            </div>
+          </details>
+        ) : null}
         {snapshot?.indexer.message ? (
           <p
             className={`snapshot-message ${snapshot.indexer.status}`}
@@ -307,18 +428,21 @@ function DexShell() {
           </p>
         ) : null}
 
-        <ContentView
-          environmentKey={environmentKey}
-          actionPoolId={actionPoolId}
-          liquiditySection={liquiditySection}
-          poolDetailId={poolDetailId}
-          portfolioAction={portfolioAction}
-          positionDetailId={positionDetailId}
-          routeKey={routeKey}
-          snapshot={snapshot}
-          snapshotState={snapshotQuery.isLoading ? "loading" : snapshotQuery.isError ? "error" : snapshot?.indexer.status ?? "loading"}
-          onRefresh={() => snapshotQuery.refetch()}
-        />
+        <SubmittedTransactionJournalContext.Provider value={recordSubmittedTransaction}>
+          <ContentView
+            key={walletSessionKey}
+            environmentKey={environmentKey}
+            actionPoolId={actionPoolId}
+            liquiditySection={liquiditySection}
+            poolDetailId={poolDetailId}
+            portfolioAction={portfolioAction}
+            positionDetailId={positionDetailId}
+            routeKey={routeKey}
+            snapshot={snapshot}
+            snapshotState={snapshotQuery.isLoading ? "loading" : snapshotQuery.isError ? "error" : snapshot?.indexer.status ?? "loading"}
+            onRefresh={() => snapshotQuery.refetch()}
+          />
+        </SubmittedTransactionJournalContext.Provider>
       </section>
     </main>
   );
@@ -440,29 +564,89 @@ function EnvironmentSwitch({
 }
 
 function WalletPanel({ activeChain }: { activeChain: Chain }) {
+  const [localFailure, setLocalFailure] = useState<WalletFailure | null>(null);
+  const [discoverySettled, setDiscoverySettled] = useState(false);
   const account = useAccount();
   const activeWalletChainId = useChainId();
-  const { connect, connectors, error: connectError, isPending } = useConnect();
+  const { connect, connectors, error: connectError, isPending, reset: resetConnect } = useConnect();
   const { disconnect } = useDisconnect();
-  const { switchChain, isPending: isSwitching } = useSwitchChain();
-  const injectedConnector = connectors[0];
+  const { error: switchError, switchChain, isPending: isSwitching, reset: resetSwitch } = useSwitchChain();
+  const discoveredConnectors = connectors.filter((connector) => connector.id !== "injected");
+  const supportedDiscoveredConnectors = discoveredConnectors.filter(
+    (connector, index, all) => SUPPORTED_WALLET_RDNS.has(connector.id) && all.findIndex((candidate) => candidate.id === connector.id) === index
+  );
+  const availableConnectors = discoveredConnectors.length > 0 ? supportedDiscoveredConnectors : connectors;
+  const injectedConnector = availableConnectors[0];
   const connected = account.status === "connected";
   const onWrongChain = connected && activeWalletChainId !== activeChain.id;
+  const unsupportedProviderFailure: WalletFailure | null =
+    discoveredConnectors.length > 0 && supportedDiscoveredConnectors.length === 0
+      ? { action: "No supported wallet was found. Enable MetaMask or Brave Wallet, then reload this page.", kind: "missing" }
+      : null;
+  const noProviderFailure: WalletFailure | null = discoverySettled && connectors.length === 0
+    ? { action: "No wallet provider was found. Enable MetaMask or Brave Wallet, then reload this page.", kind: "missing" }
+    : null;
+  const connectionFailure = localFailure ?? (connectError ? walletFailure(connectError, "connect") : unsupportedProviderFailure ?? noProviderFailure);
+  const switchingFailure = switchError ? walletFailure(switchError, "switch") : null;
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => setDiscoverySettled(true), 100);
+    return () => window.clearTimeout(timeout);
+  }, []);
+
+  const connectWith = async (connector: (typeof connectors)[number]) => {
+    resetConnect();
+    setLocalFailure(null);
+    const provider = await connector.getProvider().catch(() => undefined) as {
+      _metamask?: { isUnlocked?: () => Promise<boolean> };
+    } | undefined;
+    if (!provider) {
+      setLocalFailure({ action: "Install or enable an EIP-1193 wallet, then reload this page.", kind: "missing" });
+      return;
+    }
+    if (provider._metamask?.isUnlocked && !await provider._metamask.isUnlocked().catch(() => true)) {
+      setLocalFailure({ action: "Unlock the selected wallet, then connect again.", kind: "locked" });
+      return;
+    }
+    connect({ connector });
+  };
 
   if (!connected) {
     return (
-      <div className="wallet-cluster">
-        <button
-          className="primary-button"
-          data-testid="wallet-connect-button"
-          disabled={!injectedConnector || isPending}
-          onClick={() => injectedConnector && connect({ connector: injectedConnector })}
-          type="button"
-        >
-          {isPending ? <LoaderCircle className="spin" size={18} /> : <Wallet size={18} />}
-          <span>{injectedConnector ? "Connect" : "No wallet"}</span>
-        </button>
-        {connectError ? <span className="inline-error">{connectError.message}</span> : null}
+      <div className="wallet-cluster" data-testid="wallet-disconnected-state">
+        {availableConnectors.length > 1 ? (
+          <div className="wallet-provider-choices" data-testid="wallet-provider-choices" role="group" aria-label="Choose wallet provider">
+            {availableConnectors.map((connector) => (
+              <button
+                className="secondary-button"
+                data-provider-id={connector.id}
+                disabled={isPending}
+                key={connector.uid}
+                onClick={() => void connectWith(connector)}
+                type="button"
+              >
+                <Wallet size={18} />
+                <span>{isPending ? "Connecting" : connector.name}</span>
+              </button>
+            ))}
+          </div>
+        ) : (
+          <button
+            className="primary-button"
+            data-testid="wallet-connect-button"
+            disabled={!injectedConnector || isPending}
+            onClick={() => injectedConnector && void connectWith(injectedConnector)}
+            type="button"
+          >
+            {isPending ? <LoaderCircle className="spin" size={18} /> : <Wallet size={18} />}
+            <span>{injectedConnector ? "Connect" : "No wallet"}</span>
+          </button>
+        )}
+        {connectionFailure ? (
+          <span className="inline-error" data-testid="wallet-status" data-wallet-state={connectionFailure.kind} role="alert">
+            {connectionFailure.action}
+          </span>
+        ) : null}
       </div>
     );
   }
@@ -474,17 +658,25 @@ function WalletPanel({ activeChain }: { activeChain: Chain }) {
           className="warn-button"
           data-testid="wallet-switch-button"
           disabled={isSwitching}
-          onClick={() => switchChain({ chainId: activeChain.id })}
+          onClick={() => {
+            resetSwitch();
+            switchChain({ chainId: activeChain.id });
+          }}
           type="button"
         >
           {isSwitching ? <LoaderCircle className="spin" size={18} /> : <Network size={18} />}
-          <span>Switch</span>
+          <span>{isSwitching ? "Adding or switching" : "Switch"}</span>
         </button>
       ) : null}
       <button className="secondary-button" data-testid="wallet-account-button" onClick={() => disconnect()} type="button">
         <Wallet size={18} />
         <span>{formatCompactAddress(account.address)}</span>
       </button>
+      {onWrongChain ? (
+        <span className="wallet-network-state" data-testid="wallet-status" data-wallet-state={switchingFailure?.kind ?? "wrong-chain"} role={switchingFailure ? "alert" : "status"}>
+          {switchingFailure?.action ?? `Wallet is on chain ${activeWalletChainId}. Switch to ${activeChain.name} (${activeChain.id}); the wallet may ask to add it first.`}
+        </span>
+      ) : null}
     </div>
   );
 }
@@ -747,11 +939,17 @@ function SwapView({
   const [approvalSimulationPending, setApprovalSimulationPending] = useState(false);
   const [swapSimulationError, setSwapSimulationError] = useState<string | null>(null);
   const [swapSimulationPending, setSwapSimulationPending] = useState(false);
+  const [gasReviewError, setGasReviewError] = useState<string | null>(null);
+  const [gasReview, setGasReview] = useState<ExactGasReview | null>(null);
   const [approvalConfirmation, setApprovalConfirmation] = useState<{ confirmedAt: number; hash: Address } | null>(null);
   const [approvalRefresh, setApprovalRefresh] = useState<ApprovalRefreshState | null>(null);
   const approvalRefreshGeneration = useRef(0);
+  const swapOperationGeneration = useRef(0);
+  const approvalSubmitInFlight = useRef(false);
+  const swapSubmitInFlight = useRef(false);
   const [handledApprovalHash, setHandledApprovalHash] = useState<Address | null>(null);
   const [handledSwapHash, setHandledSwapHash] = useState<Address | null>(null);
+  const recordSubmittedTransaction = useContext(SubmittedTransactionJournalContext);
   const registry = registries[environmentKey];
   const localnetRegistry = isLocalnetRegistry(registry) ? registry : null;
   const account = useAccount();
@@ -760,6 +958,7 @@ function SwapView({
   const swapWrite = useWriteContract();
   const approvalReceipt = useWaitForTransactionReceipt({ hash: approvalWrite.data });
   const swapReceipt = useWaitForTransactionReceipt({ hash: swapWrite.data });
+
   const selectedPool = buildPoolDescriptor({
     action: "swap",
     localnetRegistry,
@@ -802,6 +1001,13 @@ function SwapView({
     walletChainId: activeWalletChainId
   };
   const swapContextFingerprint = swapExecutionContextFingerprint(swapExecutionContext);
+  const swapOperationContext = useRef(swapContextFingerprint);
+  if (swapOperationContext.current !== swapContextFingerprint) {
+    swapOperationContext.current = swapContextFingerprint;
+    swapOperationGeneration.current += 1;
+    approvalSubmitInFlight.current = false;
+    swapSubmitInFlight.current = false;
+  }
   const latestSwapContextFingerprint = useRef(swapContextFingerprint);
   latestSwapContextFingerprint.current = swapContextFingerprint;
   const approvalIntentFingerprint = swapExecutionContextFingerprint({
@@ -813,6 +1019,15 @@ function SwapView({
   });
   const latestApprovalIntentFingerprint = useRef(approvalIntentFingerprint);
   latestApprovalIntentFingerprint.current = approvalIntentFingerprint;
+
+  useEffect(() => {
+    return () => {
+      swapOperationGeneration.current += 1;
+      approvalSubmitInFlight.current = false;
+      swapSubmitInFlight.current = false;
+    };
+  }, []);
+
   const approvalRefreshReady =
     approvalConfirmation === null ||
     (approvalRefresh?.status === "ready" &&
@@ -853,7 +1068,7 @@ function SwapView({
         throw new Error("Wallet reads are not available");
       }
 
-      const [balance, allowance] = await Promise.all([
+      const [balance, allowance, nativeBalance] = await Promise.all([
         publicClient.readContract({
           address: tokenInAddress,
           abi: erc20Abi,
@@ -865,13 +1080,15 @@ function SwapView({
           abi: erc20Abi,
           functionName: "allowance",
           args: [account.address, registry.contracts.lbRouter]
-        })
+        }),
+        publicClient.getBalance({ address: account.address })
       ]);
 
       return {
         approvalHash: approvalConfirmation?.hash ?? null,
         balance: balance.toString(),
-        allowance: allowance.toString()
+        allowance: allowance.toString(),
+        nativeBalance: nativeBalance.toString()
       };
     },
     enabled: approvalRefreshReady && connected && swapMarketReady && tokenInAddress !== null,
@@ -896,8 +1113,9 @@ function SwapView({
   const priceImpactBps = exactQuote ? estimatePriceImpactBps(exactQuote) ?? 0n : null;
   const walletBalance = walletQuery.data ? BigInt(walletQuery.data.balance) : null;
   const walletAllowance = walletQuery.data ? BigInt(walletQuery.data.allowance) : null;
+  const nativeBalance = walletQuery.data ? BigInt(walletQuery.data.nativeBalance) : null;
   const walletReadsMatchApproval = walletQuery.data?.approvalHash === (approvalConfirmation?.hash ?? null);
-  const walletReadsReady = walletReadsMatchApproval && walletBalance !== null && walletAllowance !== null;
+  const walletReadsReady = walletReadsMatchApproval && walletBalance !== null && walletAllowance !== null && nativeBalance !== null;
   const walletError = walletQuery.error ? `Wallet read failed: ${getWriteError(walletQuery.error) ?? "balance and allowance unavailable"}` : null;
   const walletReadsPending = connected && swapMarketReady && tokenInAddress !== null && !walletReadsReady && walletError === null;
   const needsApproval = parsedAmount !== null && walletAllowance !== null && walletAllowance < parsedAmount;
@@ -1017,6 +1235,7 @@ function SwapView({
   const actionError =
     approvalSimulationError ??
     swapSimulationError ??
+    gasReviewError ??
     getWriteError(approvalWrite.error) ??
     getWriteError(swapWrite.error) ??
     getWriteError(approvalReceipt.error) ??
@@ -1094,6 +1313,8 @@ function SwapView({
   useEffect(() => {
     setApprovalSimulationError(null);
     setSwapSimulationError(null);
+    setGasReviewError(null);
+    setGasReview(null);
   }, [swapContextFingerprint, swapQuoteIdentity]);
 
   useEffect(() => {
@@ -1170,10 +1391,14 @@ function SwapView({
   ]);
 
   const handleApprove = async () => {
-    if (!canApprove || tokenInAddress === null || !account.address || parsedAmount === null) return;
+    if (approvalSubmitInFlight.current || !canApprove || tokenInAddress === null || !account.address || parsedAmount === null) return;
+    approvalSubmitInFlight.current = true;
+    setGasReviewError(null);
+    try {
 
     const simulatedContextFingerprint = swapContextFingerprint;
     const simulatedQuoteIdentity = swapQuoteIdentity;
+    const operationGeneration = swapOperationGeneration.current;
     const args = [registry.contracts.lbRouter, parsedAmount] as const;
     const simulated = await runPreSubmitSimulation(
       () =>
@@ -1192,25 +1417,63 @@ function SwapView({
     if (
       latestSwapContextFingerprint.current !== simulatedContextFingerprint ||
       latestSwapQuoteIdentity.current !== simulatedQuoteIdentity ||
+      swapOperationGeneration.current !== operationGeneration ||
       quoteIsStale(quoteUpdatedAt, Date.now())
     ) {
       setApprovalSimulationError("Execution context changed during simulation; refresh and try again");
       return;
     }
-
-    approvalWrite.writeContract({
-      address: tokenInAddress,
-      abi: erc20Abi,
-      functionName: "approve",
-      args
+    const gasReviewIsCurrent = () =>
+      swapOperationGeneration.current === operationGeneration &&
+      latestSwapContextFingerprint.current === simulatedContextFingerprint &&
+      latestSwapQuoteIdentity.current === simulatedQuoteIdentity &&
+      !quoteIsStale(quoteUpdatedAt, Date.now());
+    const gasApproved = await reviewExactGas({
+      action: `${tokenSymbol(tokenIn)} approval`,
+      currentReview: gasReview,
+      estimateGas: () => publicClient.estimateContractGas(simulated.request),
+      executionFingerprint: simulatedContextFingerprint,
+      getBalance: () => publicClient.getBalance({ address: account.address }),
+      getGasPrice: () => publicClient.getGasPrice(),
+      isCurrent: gasReviewIsCurrent,
+      setError: setGasReviewError,
+      setReview: setGasReview
     });
+    if (!gasApproved || !gasReviewIsCurrent()) return;
+    const submittedContext = {
+      account: account.address,
+      calldataFingerprint: keccak256(encodeFunctionData({ abi: erc20Abi, functionName: "approve", args })),
+      chainId: activeWalletChainId,
+      deploymentEpoch: deploymentEpoch(registry),
+      environment: environmentKey,
+      executionFingerprint: simulatedContextFingerprint,
+      intent: "approval" as const,
+      providerId: account.connector?.id ?? "unknown",
+      providerUid: account.connector?.uid ?? "unknown",
+      submittedAt: Date.now(),
+      target: tokenInAddress,
+      value: 0n
+    };
+    try {
+      const hash = await approvalWrite.writeContractAsync(simulated.request);
+      recordSubmittedTransaction?.({ ...submittedContext, hash });
+    } catch {
+      // The wagmi mutation retains the rejection for the originating mounted session.
+    }
+    } finally {
+      approvalSubmitInFlight.current = false;
+    }
   };
 
   const handleSwap = async () => {
-    if (!canSwap || !account.address || !exactQuote || parsedAmount === null || amountOutMin === null || deadlineMinutes === null) return;
+    if (swapSubmitInFlight.current || !canSwap || !account.address || !exactQuote || parsedAmount === null || amountOutMin === null || deadlineMinutes === null) return;
+    swapSubmitInFlight.current = true;
+    setGasReviewError(null);
+    try {
 
     const simulatedContextFingerprint = swapContextFingerprint;
     const simulatedQuoteIdentity = swapQuoteIdentity;
+    const operationGeneration = swapOperationGeneration.current;
     const deadline = deadlineFromNow(deadlineMinutes);
     const args = [
       parsedAmount,
@@ -1236,18 +1499,52 @@ function SwapView({
     if (
       latestSwapContextFingerprint.current !== simulatedContextFingerprint ||
       latestSwapQuoteIdentity.current !== simulatedQuoteIdentity ||
+      swapOperationGeneration.current !== operationGeneration ||
       quoteIsStale(quoteUpdatedAt, Date.now())
     ) {
       setSwapSimulationError("Execution context changed during simulation; refresh the quote and try again");
       return;
     }
-
-    swapWrite.writeContract({
-      address: registry.contracts.lbRouter,
-      abi: lbRouterAbi,
-      functionName: "swapExactTokensForTokens",
-      args
+    const gasReviewIsCurrent = () =>
+      swapOperationGeneration.current === operationGeneration &&
+      latestSwapContextFingerprint.current === simulatedContextFingerprint &&
+      latestSwapQuoteIdentity.current === simulatedQuoteIdentity &&
+      !quoteIsStale(quoteUpdatedAt, Date.now());
+    const gasApproved = await reviewExactGas({
+      action: "swap",
+      currentReview: gasReview,
+      estimateGas: () => publicClient.estimateContractGas(simulated.request),
+      executionFingerprint: simulatedContextFingerprint,
+      getBalance: () => publicClient.getBalance({ address: account.address }),
+      getGasPrice: () => publicClient.getGasPrice(),
+      isCurrent: gasReviewIsCurrent,
+      setError: setGasReviewError,
+      setReview: setGasReview
     });
+    if (!gasApproved || !gasReviewIsCurrent()) return;
+    const submittedContext = {
+      account: account.address,
+      calldataFingerprint: keccak256(encodeFunctionData({ abi: lbRouterAbi, functionName: "swapExactTokensForTokens", args })),
+      chainId: activeWalletChainId,
+      deploymentEpoch: deploymentEpoch(registry),
+      environment: environmentKey,
+      executionFingerprint: simulatedContextFingerprint,
+      intent: "swap" as const,
+      providerId: account.connector?.id ?? "unknown",
+      providerUid: account.connector?.uid ?? "unknown",
+      submittedAt: Date.now(),
+      target: registry.contracts.lbRouter,
+      value: 0n
+    };
+    try {
+      const hash = await swapWrite.writeContractAsync(simulated.request);
+      recordSubmittedTransaction?.({ ...submittedContext, hash });
+    } catch {
+      // The wagmi mutation retains the rejection for the originating mounted session.
+    }
+    } finally {
+      swapSubmitInFlight.current = false;
+    }
   };
 
   return (
@@ -1312,7 +1609,10 @@ function SwapView({
           <MiniMetric label="Minimum received" value={amountOutMin !== null ? formatTokenAmount(amountOutMin.toString(), tokenOut) : "n/a"} />
           <MiniMetric label="Quote freshness" value={quoteFreshnessLabel} />
           <MiniMetric data-testid="swap-allowance-value" label="Allowance" value={walletQuery.data ? formatTokenAmount(walletQuery.data.allowance, tokenIn) : "n/a"} />
+          <MiniMetric data-testid="swap-native-balance" label="ETH for gas" value={nativeBalance !== null ? `${formatUnits(nativeBalance, 18)} ETH` : connected ? "loading" : "connect wallet"} />
         </div>
+
+        <GasReview review={gasReview} />
 
         <ApprovalDetails
           asset={tokenSymbol(tokenIn)}
@@ -1345,6 +1645,7 @@ function SwapView({
                 onWrongChain,
                 needsApproval,
                 insufficientBalance,
+                insufficientGas: actionError?.startsWith("Insufficient ETH for gas") === true,
                 invalidInput: inputError !== null,
                 quoteLoading: quoteQuery.isFetching,
                 quoteReady: quote !== undefined,
@@ -1369,6 +1670,7 @@ function SwapView({
           approvalReverted={approvalReverted}
           approvalSuccess={approvalSuccess}
           insufficientBalance={insufficientBalance}
+          insufficientGas={actionError?.startsWith("Insufficient ETH for gas") === true}
           quoteError={quoteQuery.error}
           swapHash={swapWrite.data}
           swapReverted={swapReverted}
@@ -1752,6 +2054,7 @@ function SwapStateRows({
   approvalReverted,
   approvalSuccess,
   insufficientBalance,
+  insufficientGas,
   quoteError,
   swapHash,
   swapReverted,
@@ -1764,6 +2067,7 @@ function SwapStateRows({
   approvalReverted: boolean;
   approvalSuccess: boolean;
   insufficientBalance: boolean;
+  insufficientGas: boolean;
   quoteError: Error | null;
   swapHash: Address | undefined;
   swapReverted: boolean;
@@ -1775,6 +2079,7 @@ function SwapStateRows({
     receiptFailure ??
     amountError ??
     (insufficientBalance ? "Insufficient token balance" : null) ??
+    (insufficientGas ? "Insufficient ETH for gas" : null) ??
     (quoteError ? quoteError.message : null) ??
     walletError ??
     actionError;
@@ -2011,6 +2316,7 @@ function buttonLabel({
   connected,
   invalidInput,
   insufficientBalance,
+  insufficientGas,
   needsApproval,
   onWrongChain,
   poolReady,
@@ -2023,6 +2329,7 @@ function buttonLabel({
   connected: boolean;
   invalidInput: boolean;
   insufficientBalance: boolean;
+  insufficientGas: boolean;
   needsApproval: boolean;
   onWrongChain: boolean;
   poolReady: boolean;
@@ -2039,6 +2346,7 @@ function buttonLabel({
   if (walletLoading) return "Loading wallet";
   if (invalidInput) return "Check settings";
   if (insufficientBalance) return "Insufficient balance";
+  if (insufficientGas) return "Insufficient ETH for gas";
   if (needsApproval) return "Approve first";
   if (safetyReason) return safetyReason;
   if (quoteLoading) return "Quoting";
@@ -2071,26 +2379,82 @@ function isRevertedReceiptError(error: unknown): boolean {
   return false;
 }
 
-async function runPreSubmitSimulation(
-  simulate: () => Promise<unknown>,
+async function runPreSubmitSimulation<T>(
+  simulate: () => Promise<T>,
   setError: (message: string | null) => void,
   setPending: (pending: boolean) => void,
   isCurrent: () => boolean = () => true
-): Promise<boolean> {
+): Promise<T | null> {
   setError(null);
   setPending(true);
 
   try {
-    await simulate();
-    return isCurrent();
+    const result = await simulate();
+    return isCurrent() ? result : null;
   } catch (error) {
     if (isCurrent()) {
       setError(`Simulation failed: ${getWriteError(error) ?? "Transaction simulation failed"}`);
     }
-    return false;
+    return null;
   } finally {
     if (isCurrent()) setPending(false);
   }
+}
+
+async function reviewExactGas(input: {
+  action: string;
+  currentReview: ExactGasReview | null;
+  estimateGas: () => Promise<bigint>;
+  executionFingerprint: string;
+  getBalance: () => Promise<bigint>;
+  getGasPrice: () => Promise<bigint>;
+  isCurrent: () => boolean;
+  setError: (message: string | null) => void;
+  setReview: (review: ExactGasReview | null) => void;
+  transactionValue?: bigint;
+}): Promise<boolean> {
+  try {
+    const [gasLimit, gasPrice, nativeBalance] = await Promise.all([input.estimateGas(), input.getGasPrice(), input.getBalance()]);
+    if (!input.isCurrent()) return false;
+    const bufferedWei = (gasLimit * gasPrice * GAS_BUFFER_BPS + 9_999n) / 10_000n;
+    const transactionValue = input.transactionValue ?? 0n;
+    const requiredWei = bufferedWei + transactionValue;
+    const review = { action: input.action, bufferedWei, executionFingerprint: input.executionFingerprint, gasLimit, gasPrice, requiredWei, transactionValue };
+    if (nativeBalance < requiredWei) {
+      input.setReview(review);
+      input.setError(`Insufficient ETH for gas and value: exact buffered requirement is ${formatUnits(requiredWei, 18)} ETH, but this wallet has ${formatUnits(nativeBalance, 18)} ETH`);
+      return false;
+    }
+    if (
+      input.currentReview === null ||
+      input.currentReview.action !== input.action ||
+      input.currentReview.executionFingerprint !== input.executionFingerprint ||
+      requiredWei > input.currentReview.requiredWei
+    ) {
+      input.setReview(review);
+      input.setError(null);
+      return false;
+    }
+    input.setReview(review);
+    input.setError(null);
+    return true;
+  } catch (error) {
+    if (input.isCurrent()) {
+      input.setReview(null);
+      input.setError(`Gas estimation failed: ${getWriteError(error) ?? "gas limit or gas price unavailable"}`);
+    }
+    return false;
+  }
+}
+
+function GasReview({ review }: { review: ExactGasReview | null }) {
+  if (review === null) return null;
+  return (
+    <div className="state-row warning" data-testid="gas-review" role="status">
+      <CircleDollarSign size={16} />
+      <span>Gas review for {review.action}: limit {review.gasLimit.toString()} × {formatUnits(review.gasPrice, 9)} gwei + 25% gas buffer{review.transactionValue > 0n ? ` + ${formatUnits(review.transactionValue, 18)} ETH value` : ""} = {formatUnits(review.requiredWei, 18)} ETH required. Submit again to re-estimate and open the wallet.</span>
+    </div>
+  );
 }
 
 type PoolCategory = "all" | "active" | "stables";
@@ -2466,6 +2830,8 @@ function LiquidityView({
   const [deadlineInput, setDeadlineInput] = useState("20");
   const [liquiditySimulationError, setLiquiditySimulationError] = useState<string | null>(null);
   const [liquiditySimulationPending, setLiquiditySimulationPending] = useState(false);
+  const [gasReviewError, setGasReviewError] = useState<string | null>(null);
+  const [gasReview, setGasReview] = useState<ExactGasReview | null>(null);
   const [removeQuoteReviewRequired, setRemoveQuoteReviewRequired] = useState<string | null>(null);
   const [selectedPositionIds, setSelectedPositionIds] = useState<string[]>([]);
   const [removePercentInput, setRemovePercentInput] = useState("100");
@@ -2499,6 +2865,7 @@ function LiquidityView({
   const approveLbReceipt = useWaitForTransactionReceipt({ hash: approveLbWrite.data });
   const addReceipt = useWaitForTransactionReceipt({ hash: addWrite.data });
   const removeReceipt = useWaitForTransactionReceipt({ hash: removeWrite.data });
+  const recordSubmittedTransaction = useContext(SubmittedTransactionJournalContext);
   const publicClient = useMemo(() => createDexPublicClient(registry.chain, registry.endpoints.rpcUrl), [registry]);
 
   useEffect(() => {
@@ -2543,6 +2910,7 @@ function LiquidityView({
     initialSection ?? "",
     portfolioAction ?? ""
   ].join("|");
+
   const rpcReady = runtimeIsReady(snapshot, registry.chainId);
   const activeBin =
     selectedPool.activeId ??
@@ -2598,7 +2966,7 @@ function LiquidityView({
         throw new Error("Liquidity wallet reads are not available");
       }
 
-      const [balanceX, balanceY, allowanceX, allowanceY, lbApproved] = await Promise.all([
+      const [balanceX, balanceY, allowanceX, allowanceY, lbApproved, nativeBalance] = await Promise.all([
         publicClient.readContract({
           address: pool.tokenX,
           abi: erc20Abi,
@@ -2628,7 +2996,8 @@ function LiquidityView({
           abi: lbPairAbi,
           functionName: "isApprovedForAll",
           args: [account.address, registry.contracts.lbRouter]
-        })
+        }),
+        publicClient.getBalance({ address: account.address })
       ]);
 
       return {
@@ -2636,7 +3005,8 @@ function LiquidityView({
         balanceY: balanceY.toString(),
         allowanceX: allowanceX.toString(),
         allowanceY: allowanceY.toString(),
-        lbApproved
+        lbApproved,
+        nativeBalance: nativeBalance.toString()
       };
     },
     enabled: rpcReady && connected && pool !== null && (selectedPool.ready || removeSelectedPool.ready),
@@ -2651,6 +3021,7 @@ function LiquidityView({
   const walletBalanceY = walletData ? BigInt(walletData.balanceY) : null;
   const walletAllowanceX = walletData ? BigInt(walletData.allowanceX) : null;
   const walletAllowanceY = walletData ? BigInt(walletData.allowanceY) : null;
+  const nativeBalance = walletData ? BigInt(walletData.nativeBalance) : null;
   const needsXApproval = amountX !== null && amountX > 0n && walletAllowanceX !== null && walletAllowanceX < amountX;
   const needsYApproval = amountY !== null && amountY > 0n && walletAllowanceY !== null && walletAllowanceY < amountY;
   const insufficientX = amountX !== null && amountX > 0n && walletBalanceX !== null && walletBalanceX < amountX;
@@ -2959,6 +3330,7 @@ function LiquidityView({
   const currentLbApprovalReverted = liquidityReceiptPhase === "lb-approval" && approveLbReverted;
   const liquidityActionError =
     liquiditySimulationError ??
+    gasReviewError ??
     getWriteError(approveXWrite.error) ??
     getWriteError(approveYWrite.error) ??
     getWriteError(approveLbWrite.error) ??
@@ -3145,6 +3517,8 @@ function LiquidityView({
 
   useEffect(() => {
     setLiquiditySimulationError(null);
+    setGasReviewError(null);
+    setGasReview(null);
     setRemoveQuoteReviewRequired(null);
   }, [
     account.address,
@@ -3224,6 +3598,7 @@ function LiquidityView({
     const token = pool.tokenX;
     const args = [registry.contracts.lbRouter, amountX] as const;
     approveXSubmitInFlightRef.current = submittedOperationGeneration;
+    setGasReviewError(null);
     const operationIsCurrent = () =>
       liquidityOperationGenerationRef.current === submittedOperationGeneration &&
       approveXSubmitInFlightRef.current === submittedOperationGeneration;
@@ -3249,9 +3624,42 @@ function LiquidityView({
         setLiquiditySimulationError("Token X approval context, amount, strategy, range, or composition changed during simulation; review the current approval and try again");
         return;
       }
-
-      approveXWrite.writeContract({ address: token, abi: erc20Abi, functionName: "approve", args });
-      submitted = true;
+      const gasReviewIsCurrent = () =>
+        operationIsCurrent() &&
+        latestApproveXExecutionFingerprint.current === submittedExecutionFingerprint;
+      const gasApproved = await reviewExactGas({
+        action: `${tokenSymbol(tokenX)} approval`,
+        currentReview: gasReview,
+        estimateGas: () => publicClient.estimateContractGas(simulated.request),
+        executionFingerprint: submittedExecutionFingerprint,
+        getBalance: () => publicClient.getBalance({ address: account.address }),
+        getGasPrice: () => publicClient.getGasPrice(),
+        isCurrent: gasReviewIsCurrent,
+        setError: setGasReviewError,
+        setReview: setGasReview
+      });
+      if (!gasApproved || !gasReviewIsCurrent()) return;
+      const submittedContext = {
+        account: account.address,
+        calldataFingerprint: keccak256(encodeFunctionData({ abi: erc20Abi, functionName: "approve", args })),
+        chainId: activeWalletChainId,
+        deploymentEpoch: deploymentEpoch(registry),
+        environment: environmentKey,
+        executionFingerprint: submittedExecutionFingerprint,
+        intent: "approval" as const,
+        providerId: account.connector?.id ?? "unknown",
+        providerUid: account.connector?.uid ?? "unknown",
+        submittedAt: Date.now(),
+        target: token,
+        value: 0n
+      };
+      try {
+        const hash = await approveXWrite.writeContractAsync(simulated.request);
+        recordSubmittedTransaction?.({ ...submittedContext, hash });
+        submitted = true;
+      } catch {
+        // The wagmi mutation retains the rejection for the originating mounted session.
+      }
     } finally {
       if (!submitted && approveXSubmitInFlightRef.current === submittedOperationGeneration) {
         approveXSubmitInFlightRef.current = null;
@@ -3267,6 +3675,7 @@ function LiquidityView({
     const token = pool.tokenY;
     const args = [registry.contracts.lbRouter, amountY] as const;
     approveYSubmitInFlightRef.current = submittedOperationGeneration;
+    setGasReviewError(null);
     const operationIsCurrent = () =>
       liquidityOperationGenerationRef.current === submittedOperationGeneration &&
       approveYSubmitInFlightRef.current === submittedOperationGeneration;
@@ -3292,9 +3701,42 @@ function LiquidityView({
         setLiquiditySimulationError("Token Y approval context, amount, strategy, range, or composition changed during simulation; review the current approval and try again");
         return;
       }
-
-      approveYWrite.writeContract({ address: token, abi: erc20Abi, functionName: "approve", args });
-      submitted = true;
+      const gasReviewIsCurrent = () =>
+        operationIsCurrent() &&
+        latestApproveYExecutionFingerprint.current === submittedExecutionFingerprint;
+      const gasApproved = await reviewExactGas({
+        action: `${tokenSymbol(tokenY)} approval`,
+        currentReview: gasReview,
+        estimateGas: () => publicClient.estimateContractGas(simulated.request),
+        executionFingerprint: submittedExecutionFingerprint,
+        getBalance: () => publicClient.getBalance({ address: account.address }),
+        getGasPrice: () => publicClient.getGasPrice(),
+        isCurrent: gasReviewIsCurrent,
+        setError: setGasReviewError,
+        setReview: setGasReview
+      });
+      if (!gasApproved || !gasReviewIsCurrent()) return;
+      const submittedContext = {
+        account: account.address,
+        calldataFingerprint: keccak256(encodeFunctionData({ abi: erc20Abi, functionName: "approve", args })),
+        chainId: activeWalletChainId,
+        deploymentEpoch: deploymentEpoch(registry),
+        environment: environmentKey,
+        executionFingerprint: submittedExecutionFingerprint,
+        intent: "approval" as const,
+        providerId: account.connector?.id ?? "unknown",
+        providerUid: account.connector?.uid ?? "unknown",
+        submittedAt: Date.now(),
+        target: token,
+        value: 0n
+      };
+      try {
+        const hash = await approveYWrite.writeContractAsync(simulated.request);
+        recordSubmittedTransaction?.({ ...submittedContext, hash });
+        submitted = true;
+      } catch {
+        // The wagmi mutation retains the rejection for the originating mounted session.
+      }
     } finally {
       if (!submitted && approveYSubmitInFlightRef.current === submittedOperationGeneration) {
         approveYSubmitInFlightRef.current = null;
@@ -3309,6 +3751,7 @@ function LiquidityView({
     const submittedExecutionFingerprint = lbApprovalExecutionFingerprint;
     const args = [registry.contracts.lbRouter, true] as const;
     approveLbSubmitInFlightRef.current = submittedOperationGeneration;
+    setGasReviewError(null);
     const operationIsCurrent = () =>
       liquidityOperationGenerationRef.current === submittedOperationGeneration &&
       approveLbSubmitInFlightRef.current === submittedOperationGeneration;
@@ -3391,14 +3834,43 @@ function LiquidityView({
       }
 
       if (!operationIsCurrent()) return;
-      setLiquidityReceiptPhase("lb-approval");
-      approveLbWrite.writeContract({
-        address: pool.pair,
-        abi: lbPairAbi,
-        functionName: "approveForAll",
-        args
+      const gasReviewIsCurrent = () =>
+        operationIsCurrent() &&
+        latestLbApprovalExecutionFingerprint.current === submittedExecutionFingerprint;
+      const gasApproved = await reviewExactGas({
+        action: "LB operator approval",
+        currentReview: gasReview,
+        estimateGas: () => publicClient.estimateContractGas(simulated.request),
+        executionFingerprint: submittedExecutionFingerprint,
+        getBalance: () => publicClient.getBalance({ address: account.address }),
+        getGasPrice: () => publicClient.getGasPrice(),
+        isCurrent: gasReviewIsCurrent,
+        setError: setGasReviewError,
+        setReview: setGasReview
       });
-      submitted = true;
+      if (!gasApproved || !gasReviewIsCurrent()) return;
+      setLiquidityReceiptPhase("lb-approval");
+      const submittedContext = {
+        account: account.address,
+        calldataFingerprint: keccak256(encodeFunctionData({ abi: lbPairAbi, functionName: "approveForAll", args })),
+        chainId: activeWalletChainId,
+        deploymentEpoch: deploymentEpoch(registry),
+        environment: environmentKey,
+        executionFingerprint: submittedExecutionFingerprint,
+        intent: "approval" as const,
+        providerId: account.connector?.id ?? "unknown",
+        providerUid: account.connector?.uid ?? "unknown",
+        submittedAt: Date.now(),
+        target: pool.pair,
+        value: 0n
+      };
+      try {
+        const hash = await approveLbWrite.writeContractAsync(simulated.request);
+        recordSubmittedTransaction?.({ ...submittedContext, hash });
+        submitted = true;
+      } catch {
+        // The wagmi mutation retains the rejection for the originating mounted session.
+      }
     } finally {
       if (!submitted && approveLbSubmitInFlightRef.current === submittedOperationGeneration) {
         approveLbSubmitInFlightRef.current = null;
@@ -3432,6 +3904,7 @@ function LiquidityView({
       }
     ] as const;
     addSubmitInFlightRef.current = submittedOperationGeneration;
+    setGasReviewError(null);
     const operationIsCurrent = () =>
       liquidityOperationGenerationRef.current === submittedOperationGeneration &&
       addSubmitInFlightRef.current === submittedOperationGeneration;
@@ -3457,14 +3930,42 @@ function LiquidityView({
         setLiquiditySimulationError("Liquidity execution context, safety settings, strategy, range, or composition changed during simulation; review the projected bins and try again");
         return;
       }
-
-      addWrite.writeContract({
-        address: registry.contracts.lbRouter,
-        abi: lbRouterAbi,
-        functionName: "addLiquidity",
-        args
+      const gasReviewIsCurrent = () =>
+        operationIsCurrent() &&
+        latestAddExecutionFingerprint.current === submittedExecutionFingerprint;
+      const gasApproved = await reviewExactGas({
+        action: "add liquidity",
+        currentReview: gasReview,
+        estimateGas: () => publicClient.estimateContractGas(simulated.request),
+        executionFingerprint: submittedExecutionFingerprint,
+        getBalance: () => publicClient.getBalance({ address: account.address }),
+        getGasPrice: () => publicClient.getGasPrice(),
+        isCurrent: gasReviewIsCurrent,
+        setError: setGasReviewError,
+        setReview: setGasReview
       });
-      submitted = true;
+      if (!gasApproved || !gasReviewIsCurrent()) return;
+      const submittedContext = {
+        account: account.address,
+        calldataFingerprint: keccak256(encodeFunctionData({ abi: lbRouterAbi, functionName: "addLiquidity", args })),
+        chainId: activeWalletChainId,
+        deploymentEpoch: deploymentEpoch(registry),
+        environment: environmentKey,
+        executionFingerprint: submittedExecutionFingerprint,
+        intent: "add-liquidity" as const,
+        providerId: account.connector?.id ?? "unknown",
+        providerUid: account.connector?.uid ?? "unknown",
+        submittedAt: Date.now(),
+        target: registry.contracts.lbRouter,
+        value: 0n
+      };
+      try {
+        const hash = await addWrite.writeContractAsync(simulated.request);
+        recordSubmittedTransaction?.({ ...submittedContext, hash });
+        submitted = true;
+      } catch {
+        // The wagmi mutation retains the rejection for the originating mounted session.
+      }
     } finally {
       if (!submitted && addSubmitInFlightRef.current === submittedOperationGeneration) {
         addSubmitInFlightRef.current = null;
@@ -3494,6 +3995,7 @@ function LiquidityView({
     setLiquidityReceiptPhase("idle");
     setSubmittedRemoveReceiptContext(null);
     setLiquiditySimulationError(null);
+    setGasReviewError(null);
     setRemoveQuoteReviewRequired(null);
     let submitted = false;
     try {
@@ -3698,10 +4200,47 @@ function LiquidityView({
       }
 
       if (!operationIsCurrent()) return;
+      const gasReviewIsCurrent = () =>
+        operationIsCurrent() &&
+        latestRemoveExecutionContextFingerprint.current === submittedExecutionContextFingerprint &&
+        latestRemoveBurnQuoteExecutionFingerprint.current === submittedBurnQuoteExecutionFingerprint &&
+        latestRemoveDataFreshnessIssue.current === null;
+      const gasApproved = await reviewExactGas({
+        action: fullExit ? "full liquidity exit" : "liquidity withdrawal",
+        currentReview: gasReview,
+        estimateGas: () => publicClient.estimateGas({ account: account.address, to: transaction.to, data: transaction.data, value: transaction.value }),
+        executionFingerprint: submittedExecutionContextFingerprint,
+        getBalance: () => publicClient.getBalance({ address: account.address }),
+        getGasPrice: () => publicClient.getGasPrice(),
+        isCurrent: gasReviewIsCurrent,
+        setError: setGasReviewError,
+        setReview: setGasReview,
+        transactionValue: transaction.value
+      });
+      if (!gasApproved || !gasReviewIsCurrent()) return;
       setLiquidityReceiptPhase("remove");
       setSubmittedRemoveReceiptContext(removeReviewFingerprint);
-      removeWrite.sendTransaction(transaction);
-      submitted = true;
+      const submittedContext = {
+        account: account.address,
+        calldataFingerprint: keccak256(transaction.data),
+        chainId: activeWalletChainId,
+        deploymentEpoch: deploymentEpoch(registry),
+        environment: environmentKey,
+        executionFingerprint: submittedExecutionContextFingerprint,
+        intent: "remove-liquidity" as const,
+        providerId: account.connector?.id ?? "unknown",
+        providerUid: account.connector?.uid ?? "unknown",
+        submittedAt: Date.now(),
+        target: transaction.to,
+        value: transaction.value
+      };
+      try {
+        const hash = await removeWrite.sendTransactionAsync(transaction);
+        recordSubmittedTransaction?.({ ...submittedContext, hash });
+        submitted = true;
+      } catch {
+        // The wagmi mutation retains the rejection for the originating mounted session.
+      }
     } finally {
       if (!submitted && removeSubmitInFlightRef.current === submittedOperationGeneration) {
         removeSubmitInFlightRef.current = null;
@@ -3806,7 +4345,10 @@ function LiquidityView({
         <div className="quote-grid">
           <MiniMetric label={`${tokenSymbol(tokenX)} balance`} value={walletData ? formatTokenAmount(walletData.balanceX, tokenX) : connected ? "loading" : "connect"} />
           <MiniMetric label={`${tokenSymbol(tokenY)} balance`} value={walletData ? formatTokenAmount(walletData.balanceY, tokenY) : connected ? "loading" : "connect"} />
+          <MiniMetric data-testid="liquidity-native-balance" label="ETH for gas" value={nativeBalance !== null ? `${formatUnits(nativeBalance, 18)} ETH` : connected ? "loading" : "connect"} />
         </div>
+
+        <GasReview review={gasReview} />
 
         <fieldset className="strategy-picker" aria-label="Liquidity strategy">
           <legend>Volatility strategy</legend>
@@ -3926,7 +4468,7 @@ function LiquidityView({
           </button>
           <button className="primary-button wide" data-testid="liquidity-add-button" type="button" disabled={!addReady} onClick={handleAddLiquidity}>
             {liquiditySimulationPending || addWrite.isPending || addReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <Droplets size={18} />}
-            <span>{liquidityButtonLabel({ poolReady: addPoolReady, connected, onWrongChain, walletReadsReady, walletReadErrored: walletQuery.isError, invalidInput: addInputError !== null, needsApproval: needsXApproval || needsYApproval, insufficientBalance: insufficientX || insufficientY, ready: distributionResult.distribution !== null })}</span>
+            <span>{liquidityButtonLabel({ poolReady: addPoolReady, connected, onWrongChain, walletReadsReady, walletReadErrored: walletQuery.isError, invalidInput: addInputError !== null, needsApproval: needsXApproval || needsYApproval, insufficientBalance: insufficientX || insufficientY, insufficientGas: liquiditySimulationError?.startsWith("Insufficient ETH for gas") === true, ready: distributionResult.distribution !== null })}</span>
           </button>
         </div>
 
@@ -4039,7 +4581,7 @@ function LiquidityView({
           </button>
           <button className="primary-button wide" data-testid="liquidity-remove-button" type="button" disabled={!removeReady} onClick={handleRemoveLiquidity}>
             {liquiditySimulationPending || removeWrite.isPending || removeReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <Droplets size={18} />}
-            <span>{removeButtonLabel({ poolReady: removePoolReady, connected, fullExit, onWrongChain, invalidInput: removeInputError !== null, hasPosition: hasSelectedPositions, needsApproval: walletData?.lbApproved === false })}</span>
+            <span>{removeButtonLabel({ poolReady: removePoolReady, connected, fullExit, onWrongChain, invalidInput: removeInputError !== null, hasPosition: hasSelectedPositions, needsApproval: walletData?.lbApproved === false, insufficientGas: liquiditySimulationError?.startsWith("Insufficient ETH for gas") === true })}</span>
           </button>
         </div>
 
@@ -4417,6 +4959,7 @@ function sameStringArray(left: readonly string[], right: readonly string[]): boo
 function liquidityButtonLabel({
   connected,
   insufficientBalance,
+  insufficientGas,
   invalidInput,
   needsApproval,
   onWrongChain,
@@ -4427,6 +4970,7 @@ function liquidityButtonLabel({
 }: {
   connected: boolean;
   insufficientBalance: boolean;
+  insufficientGas: boolean;
   invalidInput: boolean;
   needsApproval: boolean;
   onWrongChain: boolean;
@@ -4442,6 +4986,7 @@ function liquidityButtonLabel({
   if (walletReadErrored) return "Wallet read failed";
   if (!walletReadsReady) return "Loading wallet";
   if (insufficientBalance) return "Insufficient balance";
+  if (insufficientGas) return "Insufficient ETH for gas";
   if (needsApproval) return "Approve first";
   if (!ready) return "Invalid range";
 
@@ -4452,6 +4997,7 @@ function removeButtonLabel({
   connected,
   fullExit,
   hasPosition,
+  insufficientGas,
   invalidInput,
   needsApproval,
   onWrongChain,
@@ -4460,6 +5006,7 @@ function removeButtonLabel({
   connected: boolean;
   fullExit: boolean;
   hasPosition: boolean;
+  insufficientGas: boolean;
   invalidInput: boolean;
   needsApproval: boolean;
   onWrongChain: boolean;
@@ -4471,6 +5018,7 @@ function removeButtonLabel({
   if (!hasPosition) return "No position";
   if (invalidInput) return "Check remove";
   if (needsApproval) return "Approve LB first";
+  if (insufficientGas) return "Insufficient ETH for gas";
 
   return fullExit ? "Full exit" : "Withdraw liquidity";
 }
