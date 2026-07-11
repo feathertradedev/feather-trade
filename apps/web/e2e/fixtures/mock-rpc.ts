@@ -47,6 +47,10 @@ export interface MockRpcOptions {
   blockNumber?: bigint;
   chainId?: number;
   dashboardPoolLimit?: number;
+  estimatedGas?: bigint;
+  gasEstimateMode?: "ready" | "error";
+  gasEstimateDelayMs?: number;
+  gasPrice?: bigint;
   includePairs?: boolean;
   includePositions?: boolean;
   indexerBlockNumber?: bigint;
@@ -93,7 +97,9 @@ export interface MockRpcOptions {
 
 export interface MockRpcSnapshot {
   ethCalls: Array<{ address: string | null; blockTag: string | null; data: Hex; functionName: string; value: string | null }>;
+  gasEstimatesCompleted: number;
   graphQueries: string[];
+  graphRequests: Array<{ query: string; variables: GraphRequest["variables"] }>;
   methods: string[];
 }
 
@@ -130,7 +136,9 @@ export async function installMockRpc(page: Page, options: MockRpcOptions = {}): 
   const currentOptions = { ...options };
   const state: MockRpcSnapshot = {
     ethCalls: [],
+    gasEstimatesCompleted: 0,
     graphQueries: [],
+    graphRequests: [],
     methods: []
   };
 
@@ -162,6 +170,7 @@ export async function installMockRpc(page: Page, options: MockRpcOptions = {}): 
 
     const body = JSON.parse(request.postData() ?? "{}") as GraphRequest;
     state.graphQueries.push(body.query ?? "");
+    state.graphRequests.push({ query: body.query ?? "", variables: body.variables });
     if (currentOptions.indexerDelayMs !== undefined) {
       await delay(currentOptions.indexerDelayMs);
     }
@@ -184,6 +193,7 @@ export async function installMockRpc(page: Page, options: MockRpcOptions = {}): 
     }
     const body = JSON.parse(request.postData() ?? "{}") as GraphRequest;
     state.graphQueries.push(body.query ?? "");
+    state.graphRequests.push({ query: body.query ?? "", variables: body.variables });
     await route.fulfill({
       body: JSON.stringify(mockAnalyticsResponse(body, currentOptions)),
       contentType: "application/json",
@@ -195,7 +205,9 @@ export async function installMockRpc(page: Page, options: MockRpcOptions = {}): 
   return {
     snapshot: () => ({
       ethCalls: [...state.ethCalls],
+      gasEstimatesCompleted: state.gasEstimatesCompleted,
       graphQueries: [...state.graphQueries],
+      graphRequests: state.graphRequests.map((request) => ({ query: request.query, variables: request.variables ? { ...request.variables } : undefined })),
       methods: [...state.methods]
     }),
     update: (nextOptions) => Object.assign(currentOptions, nextOptions)
@@ -395,7 +407,12 @@ async function handleRpc(request: RpcRequest, options: MockRpcOptions, state: Mo
           number: request.params?.[0] ?? numberToHex(options.blockNumber ?? DEFAULT_BLOCK_NUMBER)
         });
       case "eth_estimateGas":
-        return rpcResult(request, numberToHex(500_000n));
+        if (options.gasEstimateDelayMs !== undefined) await delay(options.gasEstimateDelayMs);
+        state.gasEstimatesCompleted += 1;
+        if (options.gasEstimateMode === "error") return rpcError(request, -32_000, "Mock gas estimation failed");
+        return rpcResult(request, numberToHex(options.estimatedGas ?? 500_000n));
+      case "eth_gasPrice":
+        return rpcResult(request, numberToHex(options.gasPrice ?? 1_000_000_000n));
       case "eth_getTransactionReceipt":
         if ((options.receiptStatus ?? "success") === "success") {
           if (options.allowanceAfterReceipt !== undefined) options.allowance = options.allowanceAfterReceipt;

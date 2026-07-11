@@ -1290,6 +1290,45 @@ a {
   align-items: center;
 }
 
+.wallet-cluster {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.wallet-provider-choices {
+  display: flex;
+  gap: 8px;
+}
+
+.wallet-network-state,
+.wallet-cluster > .inline-error {
+  flex-basis: 100%;
+  max-width: 420px;
+  font-size: 12px;
+  text-align: right;
+}
+
+.transaction-journal {
+  padding: 10px 14px;
+  border: 1px solid #dce4e8;
+  border-radius: 8px;
+  background: #f8fafb;
+}
+
+.transaction-journal summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.transaction-journal div {
+  display: grid;
+  gap: 6px;
+  padding-top: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
 .icon-button,
 .primary-button,
 .secondary-button,
@@ -2511,6 +2550,15 @@ a {
   .wallet-cluster {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .wallet-provider-choices {
+    display: grid;
+  }
+
+  .wallet-network-state,
+  .wallet-cluster > .inline-error {
+    text-align: left;
   }
 
   .segmented {

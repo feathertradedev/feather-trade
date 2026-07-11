@@ -127,12 +127,12 @@ test("actual UI submits approve, swap, add, LB approval, and remove transactions
   await connectWallet(page);
   await expect.poll(() => page.locator("#swap-output").inputValue()).not.toBe("0");
   await expect(page.getByTestId("swap-approve-button")).toBeEnabled();
-  await page.getByTestId("swap-approve-button").click();
+  await clickReviewedAction(page, "swap-approve-button");
   await expect.poll(async () => (await readUnlockedRpcWallet(page)).transactionHashes.length).toBe(1);
   await expect(page.getByText("Approval confirmed")).toBeVisible();
 
   await expect(page.getByTestId("swap-submit-button")).toBeEnabled();
-  await page.getByTestId("swap-submit-button").click();
+  await clickReviewedAction(page, "swap-submit-button");
   await expect.poll(async () => (await readUnlockedRpcWallet(page)).transactionHashes.length).toBe(2);
   await expect(page.getByText("Swap confirmed")).toBeVisible();
 
@@ -146,21 +146,21 @@ test("actual UI submits approve, swap, add, LB approval, and remove transactions
   await page.locator("#range-upper").fill("0");
 
   await expect(page.getByTestId("liquidity-approve-x-button")).toBeEnabled();
-  await page.getByTestId("liquidity-approve-x-button").click();
+  await clickReviewedAction(page, "liquidity-approve-x-button");
   await expect.poll(async () => (await readUnlockedRpcWallet(page)).transactionHashes.length).toBe(3);
   await expect(page.getByTestId("liquidity-approve-y-button")).toBeEnabled();
-  await page.getByTestId("liquidity-approve-y-button").click();
+  await clickReviewedAction(page, "liquidity-approve-y-button");
   await expect.poll(async () => (await readUnlockedRpcWallet(page)).transactionHashes.length).toBe(4);
 
   await expect(page.getByTestId("liquidity-add-button")).toBeEnabled();
-  await page.getByTestId("liquidity-add-button").click();
+  await clickReviewedAction(page, "liquidity-add-button");
   await expect.poll(async () => (await readUnlockedRpcWallet(page)).transactionHashes.length).toBe(5);
   await expect(page.getByText("Liquidity added")).toBeVisible();
   const lbBalanceAfterAdd = await readLbBalance();
   expect(lbBalanceAfterAdd).toBeGreaterThan(lbBalanceBeforeAdd);
 
   await expect(page.getByTestId("liquidity-approve-lb-button")).toBeEnabled();
-  await page.getByTestId("liquidity-approve-lb-button").click();
+  await clickReviewedAction(page, "liquidity-approve-lb-button");
   await expect.poll(async () => (await readUnlockedRpcWallet(page)).transactionHashes.length).toBe(6);
   await expect(page.getByText("LB approval confirmed")).toBeVisible();
 
@@ -169,7 +169,7 @@ test("actual UI submits approve, swap, add, LB approval, and remove transactions
   await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "50%" }).click();
   await expect(page.getByTestId("withdraw-transaction-review")).toContainText("Partial withdrawal");
   await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled();
-  await page.getByTestId("liquidity-remove-button").click();
+  await clickReviewedAction(page, "liquidity-remove-button");
   await expect.poll(async () => (await readUnlockedRpcWallet(page)).transactionHashes.length).toBe(7);
   await expect(page.getByText("Liquidity removed")).toBeVisible();
   const lbBalanceAfterPartial = await readLbBalance();
@@ -187,7 +187,7 @@ test("actual UI submits approve, swap, add, LB approval, and remove transactions
   await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled();
   await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "Max" }).click();
   await expect(page.getByTestId("withdraw-transaction-review")).toContainText("Full exit");
-  await page.getByTestId("liquidity-remove-button").click();
+  await clickReviewedAction(page, "liquidity-remove-button");
   await expect.poll(async () => (await readUnlockedRpcWallet(page)).transactionHashes.length).toBe(1);
   await expect(page.getByText("Liquidity removed")).toBeVisible();
   expect(await readLbBalance()).toBe(lbBalanceBeforeAdd);
@@ -220,11 +220,19 @@ test("actual UI submits approve, swap, add, LB approval, and remove transactions
   expect(normalizeAddress(wallet.sentTransactions[7]?.to)).toBe(manifest.contracts.lbRouter.toLowerCase());
   expect(rpcControl.simulations).toEqual([
     { functionName: "approve", to: pool.tokenX.toLowerCase() },
+    { functionName: "approve", to: pool.tokenX.toLowerCase() },
+    { functionName: "swapExactTokensForTokens", to: manifest.contracts.lbRouter.toLowerCase() },
     { functionName: "swapExactTokensForTokens", to: manifest.contracts.lbRouter.toLowerCase() },
     { functionName: "approve", to: pool.tokenX.toLowerCase() },
+    { functionName: "approve", to: pool.tokenX.toLowerCase() },
+    { functionName: "approve", to: pool.tokenY.toLowerCase() },
     { functionName: "approve", to: pool.tokenY.toLowerCase() },
     { functionName: "addLiquidity", to: manifest.contracts.lbRouter.toLowerCase() },
+    { functionName: "addLiquidity", to: manifest.contracts.lbRouter.toLowerCase() },
     { functionName: "approveForAll", to: pool.pair.toLowerCase() },
+    { functionName: "approveForAll", to: pool.pair.toLowerCase() },
+    { functionName: "removeLiquidity", to: manifest.contracts.lbRouter.toLowerCase() },
+    { functionName: "removeLiquidity", to: manifest.contracts.lbRouter.toLowerCase() },
     { functionName: "removeLiquidity", to: manifest.contracts.lbRouter.toLowerCase() },
     { functionName: "removeLiquidity", to: manifest.contracts.lbRouter.toLowerCase() }
   ]);
@@ -248,11 +256,11 @@ test("actual UI deposits one-sided liquidity above and below the active bin with
   await expect(page.getByTestId("liquidity-amount-y")).toHaveValue("0");
   await expect(page.getByTestId("liquidity-approve-x-button")).toBeEnabled();
   await expect(page.getByTestId("liquidity-approve-y-button")).toBeDisabled();
-  await page.getByTestId("liquidity-approve-x-button").click();
+  await clickReviewedAction(page, "liquidity-approve-x-button");
   await expect.poll(async () => (await readUnlockedRpcWallet(page)).transactionHashes.length).toBe(1);
   await expect(page.getByTestId("liquidity-add-button")).toBeEnabled();
 
-  await page.getByTestId("liquidity-add-button").click();
+  await clickReviewedAction(page, "liquidity-add-button");
   await expect.poll(async () => (await readUnlockedRpcWallet(page)).transactionHashes.length).toBe(2);
   await expect(page.getByText("Liquidity added")).toBeVisible();
   expect(await readLbBalanceAcross(aboveBinIds)).toBeGreaterThan(aboveBalanceBefore);
@@ -264,10 +272,10 @@ test("actual UI deposits one-sided liquidity above and below the active bin with
   await expect(page.getByTestId("liquidity-amount-x")).toHaveValue("0");
   await expect(page.getByTestId("liquidity-approve-x-button")).toBeDisabled();
   await expect(page.getByTestId("liquidity-approve-y-button")).toBeEnabled();
-  await page.getByTestId("liquidity-approve-y-button").click();
+  await clickReviewedAction(page, "liquidity-approve-y-button");
   await expect.poll(async () => (await readUnlockedRpcWallet(page)).transactionHashes.length).toBe(3);
   await expect(page.getByTestId("liquidity-add-button")).toBeEnabled();
-  await page.getByTestId("liquidity-add-button").click();
+  await clickReviewedAction(page, "liquidity-add-button");
   await expect.poll(async () => (await readUnlockedRpcWallet(page)).transactionHashes.length).toBe(4);
   await expect(page.getByText("Liquidity added")).toBeVisible();
   expect(await readLbBalanceAcross(belowBinIds)).toBeGreaterThan(belowBalanceBefore);
@@ -291,8 +299,12 @@ test("actual UI deposits one-sided liquidity above and below the active bin with
   expect(belowParameters.distributionY.some((weight) => weight > 0n)).toBe(true);
   expect(rpcControl.simulations.map((simulation) => simulation.functionName)).toEqual([
     "approve",
+    "approve",
+    "addLiquidity",
     "addLiquidity",
     "approve",
+    "approve",
+    "addLiquidity",
     "addLiquidity"
   ]);
   expect(rpcControl.simulations.map((simulation) => simulation.functionName)).not.toContain("swapExactTokensForTokens");
@@ -461,6 +473,12 @@ async function connectWallet(page: Page): Promise<void> {
   await expect(page.getByTestId("wallet-account-button")).toContainText(
     new RegExp(`${browserAccount.slice(0, 6)}\\.\\.\\.${browserAccount.slice(-4)}`, "i")
   );
+}
+
+async function clickReviewedAction(page: Page, testId: string): Promise<void> {
+  await page.getByTestId(testId).click();
+  await expect(page.getByTestId("gas-review")).toBeVisible();
+  await page.getByTestId(testId).click();
 }
 
 async function bypassDisabledButtonAndClick(page: Page, testId: string): Promise<void> {

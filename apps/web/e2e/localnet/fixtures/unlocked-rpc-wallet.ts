@@ -59,6 +59,7 @@ export async function installUnlockedRpcWallet(page: Page, options: UnlockedRpcW
       }
 
       const provider = {
+        _metamask: { isUnlocked: async () => true },
         isMetaMask: true,
         async request({ method, params }: { method: string; params?: unknown[] }): Promise<unknown> {
           state.calls.push(method);
@@ -125,7 +126,7 @@ export async function installUnlockedRpcWallet(page: Page, options: UnlockedRpcW
               info: {
                 icon: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'/>",
                 name: "Unlocked Anvil Wallet",
-                rdns: "com.robinhood-lb.anvil-wallet",
+                rdns: "io.metamask",
                 uuid: "robinhood-lb-anvil-wallet"
               },
               provider
