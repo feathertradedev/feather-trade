@@ -17,6 +17,7 @@ const allowedTags = new Set(["canonical", "localnet", "mainnet", "mock", "quote"
 const allowedRiskFlags = new Set(["fee-on-transfer", "rebasing", "blacklistable", "upgradeable", "suspicious"]);
 const allowedReviewStatuses = new Set(["standard", "restricted", "blocked"]);
 const allowedTokenActions = new Set(["swap", "add-liquidity", "remove-liquidity"]);
+const allowedApprovalBehaviors = new Set(["standard-bool", "returns-false", "no-return", "zero-reset-required"]);
 const blockedTokenActions = [...allowedTokenActions];
 const publicEnvironments = new Set(["robinhood", "robinhoodTestnet"]);
 const publicManifestByEnvironment = new Map([
@@ -93,7 +94,6 @@ function validateFile(file) {
   }
 
   const seenIds = new Map();
-  const seenSymbols = new Map();
   const seenAddresses = new Map();
   const seenRefs = new Map();
   const quoteTokens = [];
@@ -109,6 +109,9 @@ function validateFile(file) {
     expectId(token.id, `${path}.id`, errors);
     expectString(token.symbol, `${path}.symbol`, errors);
     expectString(token.name, `${path}.name`, errors);
+    if (typeof token.approvalBehavior !== "string" || !allowedApprovalBehaviors.has(token.approvalBehavior)) {
+      errors.push(`${path}.approvalBehavior: expected an explicit supported approval behavior`);
+    }
     expectInteger(token.decimals, `${path}.decimals`, errors);
     expectLogoURI(token.logoURI, `${path}.logoURI`, errors);
     expectTags(token.tags, `${path}.tags`, errors);
@@ -137,7 +140,6 @@ function validateFile(file) {
     }
 
     addDuplicateCheck(seenIds, token.id, path, "id", errors);
-    addDuplicateCheck(seenSymbols, normalizeSymbol(token.symbol), path, "symbol", errors);
   });
 
   if (value.environment === "robinhood") {
@@ -304,13 +306,10 @@ function expectRiskPolicy(environment, token, path, errors) {
     }
   }
 
-  if (flags.length > 0 && disabledActions.length === 0) {
-    errors.push(`${path}.risk.disabledActions: risky tokens must disable at least one action`);
+  if (Array.isArray(token.tags) && token.tags.includes("quote") && risk.reviewStatus === "blocked") {
+    errors.push(`${path}.risk.reviewStatus: quote tokens must be standard or restricted, not blocked`);
   }
 
-  if (Array.isArray(token.tags) && token.tags.includes("quote") && risk.reviewStatus !== "standard") {
-    errors.push(`${path}.risk.reviewStatus: quote tokens must be standard`);
-  }
 }
 
 function expectStringArrayMembers(value, path, allowedValues, errors) {

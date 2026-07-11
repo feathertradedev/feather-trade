@@ -29,7 +29,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "symbol", "name", "decimals", "logoURI", "tags"],
+        "required": ["id", "symbol", "name", "decimals", "logoURI", "tags", "approvalBehavior"],
         "oneOf": [
           {
             "required": ["address"],
@@ -45,6 +45,9 @@
           }
         ],
         "properties": {
+          "approvalBehavior": {
+            "enum": ["standard-bool", "returns-false", "no-return", "zero-reset-required"]
+          },
           "id": {
             "type": "string",
             "pattern": "^[a-z0-9][a-z0-9-]*$"

@@ -373,6 +373,7 @@ function poolRow(overrides) {
 function token(id, symbol, address, chainId, decimals, risk = {}) {
   return {
     address: getAddress(address),
+    approvalBehavior: risk.approvalBehavior ?? "standard-bool",
     chainId,
     decimals,
     id,

@@ -359,6 +359,73 @@ textarea {
   border: 1px solid var(--hairline);
 }
 
+.token-max-button {
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  border-radius: 999px;
+  color: var(--accent);
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 0.24rem 0.48rem;
+}
+
+.token-max-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.token-identity {
+  align-items: center;
+  background: color-mix(in srgb, var(--panel-2) 84%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  display: grid;
+  gap: 0.7rem;
+  grid-template-columns: auto minmax(0, 1fr) minmax(0, 1fr);
+  margin: 0.45rem 0 0.8rem;
+  padding: 0.65rem;
+}
+
+.token-identity > span:not(.token-logo-fallback) {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.token-identity code,
+.token-identity small {
+  color: var(--muted);
+  font-size: 0.68rem;
+  overflow-wrap: anywhere;
+}
+
+.pair-name small {
+  overflow-wrap: anywhere;
+}
+
+.token-logo-fallback {
+  align-items: center;
+  border-radius: 50%;
+  color: #fff;
+  display: inline-flex;
+  font-size: 0.68rem;
+  font-weight: 800;
+  height: 2rem;
+  justify-content: center;
+  overflow: hidden;
+  width: 2rem;
+}
+
+.token-logo-fallback img {
+  height: 100%;
+  width: 100%;
+}
+
+@media (max-width: 700px) {
+  .token-identity { grid-template-columns: auto 1fr; }
+  .token-identity > span:last-child { grid-column: 2; }
+}
+
 .status-badge,
 .status-pill {
   font-weight: 400;
@@ -1576,7 +1643,7 @@ a {
 
 .amount-box {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto auto;
   gap: 12px;
   align-items: center;
   min-height: 66px;
@@ -1592,6 +1659,7 @@ a {
 
 .amount-box.output {
   background: #f9faf5;
+  grid-template-columns: minmax(0, 1fr) auto;
 }
 
 .amount-box input {

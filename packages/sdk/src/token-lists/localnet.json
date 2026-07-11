@@ -4,10 +4,11 @@
   "environment": "localnet",
   "chainId": 31337,
   "name": "Robinhood LB Localnet Token List",
-  "updatedAt": "2026-07-08",
+  "updatedAt": "2026-07-11",
   "tokens": [
     {
       "id": "wnative",
+      "approvalBehavior": "standard-bool",
       "symbol": "WNATIVE",
       "name": "Wrapped Native",
       "addressRef": "tokens.wnative",
@@ -17,6 +18,7 @@
     },
     {
       "id": "usdc",
+      "approvalBehavior": "standard-bool",
       "symbol": "USDC",
       "name": "Mock USDC",
       "addressRef": "tokens.usdc",
@@ -26,6 +28,7 @@
     },
     {
       "id": "usdt",
+      "approvalBehavior": "standard-bool",
       "symbol": "USDT",
       "name": "Mock USDT",
       "addressRef": "tokens.usdt",
@@ -35,12 +38,19 @@
     },
     {
       "id": "weth",
+      "approvalBehavior": "standard-bool",
       "symbol": "WETH",
       "name": "Mock WETH",
       "addressRef": "tokens.weth",
       "decimals": 18,
       "logoURI": "/token-assets/weth.svg",
-      "tags": ["localnet", "mock", "wrapped-native"]
+      "tags": ["localnet", "mock", "wrapped-native"],
+      "risk": {
+        "reviewStatus": "blocked",
+        "flags": [],
+        "disabledActions": ["swap", "add-liquidity", "remove-liquidity"],
+        "notes": "Localnet-only WETH test token; quarantined from ordinary actions while ETH/WETH onboarding UX is not yet supported."
+      }
     }
   ]
 }

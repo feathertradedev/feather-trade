@@ -9,6 +9,8 @@ import {
   LOCALNET_INDEXER_URL,
   SECOND_WNATIVE_USDC_PAIR,
   WNATIVE,
+  WNATIVE_WETH_PAIR,
+  WETH,
   WNATIVE_USDC_PAIR,
   type InstalledMockRpc,
   type MockRpcOptions
@@ -32,6 +34,57 @@ test("disconnected wallet state disables guarded swap actions", async ({ page })
   await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
   await expect(page.getByTestId("swap-approve-button")).toBeDisabled();
   await expect(page.getByTestId("swap-balance-value")).toHaveText("connect wallet");
+});
+
+test("broken token logos render a deterministic address-derived fallback", async ({ page }) => {
+  await page.route("**/token-assets/wnative.svg", (route) => route.abort());
+  await installMockRpc(page);
+  await page.goto("/#/swap");
+
+  await expect(page.getByTestId("swap-token-in-identity-logo")).toHaveAttribute("data-fallback", "true");
+  await expect(page.getByTestId("swap-token-in-identity-logo")).toHaveText("WN");
+});
+
+test("blocked token markets are stopped before quote, simulation, or wallet", async ({ page }) => {
+  const rpc = await installMockRpc(page, {
+    includePairs: true,
+    pairAddress: WNATIVE_WETH_PAIR,
+    pairTokenX: WNATIVE,
+    pairTokenY: WETH
+  });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
+  await page.goto("/#/swap");
+  await connectWallet(page);
+  await expect(page.getByTestId("swap-market-recovery")).toContainText("does not support swap");
+  await expect(page.getByTestId("swap-token-out-identity")).toContainText("ETH/WETH onboarding UX is not yet supported");
+  await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
+  await expect(page.getByTestId("swap-approve-button")).toBeDisabled();
+  await bypassDisabledButtonAndClick(page, "swap-submit-button");
+  await bypassDisabledButtonAndClick(page, "swap-approve-button");
+  await waitForForcedClickEffects(page);
+  expect(simulatedFunctions(rpc)).toEqual([]);
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
+test("financial pool choice searches name, symbol, and full token address", async ({ page }) => {
+  await installMockRpc(page, {
+    includePairs: true,
+    pairAddress: WNATIVE_WETH_PAIR,
+    pairTokenX: WNATIVE,
+    pairTokenY: WETH,
+    poolCount: 2
+  });
+  await page.goto("/#/swap");
+
+  const search = page.getByTestId("swap-pool-search");
+  const options = page.locator("#swap-pool option");
+  await search.fill("Mock WETH");
+  await expect(options.filter({ hasText: WETH })).toHaveCount(1);
+  await search.fill(WETH);
+  await expect(options.filter({ hasText: WETH })).toHaveCount(1);
+  await search.fill("WETH");
+  await expect(options.filter({ hasText: "Mock WETH" })).toHaveCount(1);
+  await expect(options.filter({ hasText: WETH })).toContainText(WETH);
 });
 
 test("missing injected provider is distinguished from an ordinary disconnected wallet", async ({ page }) => {
@@ -506,6 +559,22 @@ test("approval-needed state enables approval but guards swap until allowance exi
   assertTransactionMatchesSimulation((await readMockWallet(page)).sentTransactions[0], rpc, "approve");
 });
 
+test("revoked allowance returns an approved swap to exact approval-required state", async ({ page }) => {
+  const rpc = await setupConnectedSwap(page, { allowance: 5n * ONE_TOKEN, balance: 5n * ONE_TOKEN });
+  await expect(page.getByTestId("swap-approve-button")).toContainText("Approved");
+  await expect(page.getByTestId("swap-submit-button")).toBeEnabled();
+
+  rpc.update({ allowance: 0n });
+  await page.evaluate(() => window.__mockWalletControl.setAccounts([]));
+  await expect(page.getByTestId("wallet-connect-button")).toBeVisible();
+  await page.evaluate((account) => window.__mockWalletControl.setAccounts([account]), DEFAULT_ACCOUNT);
+
+  await expect(page.getByTestId("swap-approve-button")).toContainText("Approve WNATIVE");
+  await expect(page.getByTestId("swap-approve-button")).toBeEnabled();
+  await expect(page.getByTestId("swap-submit-button")).toContainText("Approve first");
+  await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
+});
+
 test("approval confirmation invalidates the reviewed quote until fresh wallet, market, and quote reads complete", async ({ page }) => {
   const rpc = await setupConnectedSwap(page, {
     allowance: 0n,
@@ -827,6 +896,72 @@ test("swap submission is cancelled when execution context changes during simulat
     "Execution context changed during simulation; refresh the quote and try again"
   );
   expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
+test("Swap Max binds the exact token balance and invalidates an in-flight stale simulation", async ({ page }) => {
+  const rpc = await setupConnectedSwap(page, {
+    allowance: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    simulationDelayMs: 500
+  });
+
+  await page.getByTestId("swap-submit-button").click();
+  await expect.poll(() => simulatedFunctions(rpc).filter((name) => name === "swapExactTokensForTokens").length).toBe(1);
+  await page.getByTestId("swap-max-button").click();
+  await expect(page.locator("#swap-amount")).toHaveValue("5");
+  await expect(page.getByTestId("swap-failure-state")).toContainText("Execution context changed during simulation");
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
+test("Swap Max approval discloses and sends the exact raw balance", async ({ page }) => {
+  const balance = 5_123_456_789_012_345_678n;
+  await setupConnectedSwap(page, { allowance: 0n, balance });
+
+  await page.getByTestId("swap-max-button").click();
+  await expect(page.locator("#swap-amount")).toHaveValue("5.123456789012345678");
+  await expect(page.locator("#swap-approval-details")).toContainText(`${balance.toString()}`);
+  await expect(page.locator("#swap-approval-details")).toContainText(WNATIVE);
+  await expect(page.locator("#swap-approval-details")).toContainText("standard-bool");
+  await clickReviewedAction(page, "swap-approve-button");
+
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+
+  const transaction = (await readMockWallet(page)).sentTransactions[0];
+  const decoded = decodeFunctionData({ abi: erc20Abi, data: transaction.data });
+  expect(decoded.functionName).toBe("approve");
+  expect(decoded.args).toEqual([LB_ROUTER, balance]);
+});
+
+test("nonzero token dust remains visible and Max preserves its exact unit", async ({ page }) => {
+  await setupConnectedSwap(page, { allowance: 1n, balance: 1n });
+
+  await expect(page.getByTestId("swap-balance-value")).toHaveText("<0.000001");
+  await page.getByTestId("swap-max-button").click();
+  await expect(page.locator("#swap-amount")).toHaveValue("0.000000000000000001");
+  await expect(page.locator("#swap-approval-details")).toContainText("18 / 1");
+});
+
+test("LP Max binds exact balances and disables the unused one-sided token", async ({ page }) => {
+  const balance = 5_123_456_789_012_345_678n;
+  await setupConnectedLiquidity(page, { allowance: 0n, balance });
+
+  await page.getByTestId("liquidity-max-x").click();
+  await page.getByTestId("liquidity-max-y").click();
+  await expect(page.getByTestId("liquidity-amount-x")).toHaveValue("5.123456789012345678");
+  await expect(page.getByTestId("liquidity-amount-y")).toHaveValue("5.123456789012345678");
+  await expect(page.locator("#liquidity-x-approval-details")).toContainText(`18 / ${balance.toString()}`);
+  await clickReviewedAction(page, "liquidity-approve-x-button");
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+  const decoded = decodeFunctionData({ abi: erc20Abi, data: (await readMockWallet(page)).sentTransactions[0].data });
+  expect(decoded.functionName).toBe("approve");
+  expect(decoded.args).toEqual([LB_ROUTER, balance]);
+
+  await page.locator("#range-lower").fill("1");
+  await page.locator("#range-upper").fill("2");
+  await expect(page.getByTestId("liquidity-range-mode")).toContainText("above the active bin");
+  await expect(page.getByTestId("liquidity-max-y")).toBeDisabled();
+  await expect(page.getByTestId("liquidity-amount-y")).toBeDisabled();
+  await expect(page.getByTestId("liquidity-amount-y")).toHaveValue("0");
 });
 
 test("dashboard polling advances RPC and indexer heads through stale, error, and recovery states", async ({ page }, testInfo) => {
@@ -1920,6 +2055,7 @@ test("approval disclosures expose full spenders, scope, asset, and current state
 });
 
 test("mobile viewport renders core wallet and swap controls without overlap-critical hiding", async ({ page }) => {
+  await page.setViewportSize({ height: 800, width: 320 });
   await installMockRpc(page);
   await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/swap");
@@ -1927,6 +2063,12 @@ test("mobile viewport renders core wallet and swap controls without overlap-crit
   await expect(page.getByRole("link", { name: "Feather Trade home" })).toBeVisible();
   await expect(page.getByTestId("wallet-connect-button")).toBeVisible();
   await expect(page.getByTestId("swap-submit-button")).toBeVisible();
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+
+  await page.getByRole("link", { name: "Pools" }).click();
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  await page.getByRole("link", { name: "Liquidity" }).click();
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
 test("mobile viewport reaches every core route", async ({ page }) => {

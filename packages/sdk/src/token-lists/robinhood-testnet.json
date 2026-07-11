@@ -4,10 +4,11 @@
   "environment": "robinhoodTestnet",
   "chainId": 46630,
   "name": "Robinhood Chain Testnet Token List",
-  "updatedAt": "2026-07-09",
+  "updatedAt": "2026-07-11",
   "tokens": [
     {
       "id": "weth",
+      "approvalBehavior": "standard-bool",
       "symbol": "WETH",
       "name": "WETH",
       "address": "0x7943e237c7F95DA44E0301572D358911207852Fa",
@@ -15,9 +16,10 @@
       "logoURI": "/token-assets/weth.svg",
       "tags": ["canonical", "testnet", "wrapped-native"],
       "risk": {
-        "reviewStatus": "standard",
-        "flags": [],
-        "disabledActions": []
+        "reviewStatus": "restricted",
+        "flags": ["upgradeable"],
+        "disabledActions": [],
+        "notes": "This WETH contract is upgradeable; its implementation and behavior can change through the proxy administrator."
       }
     }
   ]

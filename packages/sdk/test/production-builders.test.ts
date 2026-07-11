@@ -23,6 +23,7 @@ import {
   deadlineFromNow,
   getBestExactInQuote,
   getTokens,
+  findTokenBySymbol,
   lbRouterAbi,
   quoteLiquidityBurn,
   readDeploymentManifest,
@@ -68,16 +69,18 @@ test("normalizes a Robinhood testnet manifest into chain, token, and contract re
       usdc: lowerAddress(addresses.usdc)
     }
   });
-  const registry = registryFromRobinhoodManifest(manifest);
+  const registry = fixtureRegistry(manifest);
   const tokens = getTokens(registry);
 
   assert.equal(manifest.chainId, ROBINHOOD_TESTNET_CHAIN_ID);
   assert.equal(registry.environment, "robinhoodTestnet");
   assert.equal(registry.chain, robinhoodTestnetChain);
   assert.equal(registry.contracts.lbRouter, addresses.router);
-  assert.equal(tokens.WETH.address, addresses.weth);
-  assert.equal(tokens.WETH.chainId, ROBINHOOD_TESTNET_CHAIN_ID);
-  assert.equal(tokens.WETH.tags.includes("wrapped-native"), true);
+  const weth = findTokenBySymbol(tokens, "WETH");
+  assert.ok(weth);
+  assert.equal(weth.address, addresses.weth);
+  assert.equal(weth.chainId, ROBINHOOD_TESTNET_CHAIN_ID);
+  assert.equal(weth.tags.includes("wrapped-native"), true);
 });
 
 test("rejects removed Zap fields instead of silently accepting legacy manifests", () => {
@@ -135,7 +138,7 @@ test("rejects every legacy routing constructor slot in Robinhood and localnet ma
 });
 
 test("builds exact-in swap calldata from a non-localnet registry with slippage and deadline helpers", () => {
-  const registry = registryFromRobinhoodManifest(readManifestFixture());
+  const registry = fixtureRegistry(readManifestFixture());
   const amountIn = 1_000_000_000_000_000_000n;
   const quotedOut = 2_000_000n;
   const amountOutMin = calculateAmountOutMin(quotedOut, 50n);
@@ -217,7 +220,7 @@ test("builds exact-in swap calldata from a non-localnet registry with slippage a
 });
 
 test("accepts structurally complete multi-hop V2.2 swap routes", () => {
-  const registry = registryFromRobinhoodManifest(readManifestFixture());
+  const registry = fixtureRegistry(readManifestFixture());
   const quote: ExactInQuote = {
     route: [addresses.weth, addresses.usdc, addresses.recipient],
     pairs: [addresses.pair, addresses.router],
@@ -232,7 +235,7 @@ test("accepts structurally complete multi-hop V2.2 swap routes", () => {
 });
 
 test("ranks direct and one-intermediary V2.2 quotes without binding to a selected pair", async () => {
-  const registry = registryFromRobinhoodManifest(readManifestFixture());
+  const registry = fixtureRegistry(readManifestFixture());
   const baseToken = Object.values(registry.tokens)[0];
   assert.ok(baseToken);
   const routingRegistry = {
@@ -277,7 +280,7 @@ test("ranks direct and one-intermediary V2.2 quotes without binding to a selecte
 });
 
 test("rejects quoter responses that do not match the exact-in request context", async () => {
-  const registry = registryFromRobinhoodManifest(readManifestFixture());
+  const registry = fixtureRegistry(readManifestFixture());
   const requestedAmountIn = 1_000n;
   const baseQuote: ExactInQuote = {
     route: [addresses.weth, addresses.usdc],
@@ -314,7 +317,7 @@ test("rejects quoter responses that do not match the exact-in request context", 
 });
 
 test("rejects V1, V2, and V2.1 in direct and mixed V2.2 swap paths", () => {
-  const registry = registryFromRobinhoodManifest(readManifestFixture());
+  const registry = fixtureRegistry(readManifestFixture());
   const legacyVersions = [
     { label: "V1", version: 0 },
     { label: "V2", version: 1 },
@@ -348,7 +351,7 @@ test("rejects V1, V2, and V2.1 in direct and mixed V2.2 swap paths", () => {
 });
 
 test("builds one-sided liquidity ranges above and below the active bin without an atomic swap", () => {
-  const registry = registryFromRobinhoodManifest(readManifestFixture());
+  const registry = fixtureRegistry(readManifestFixture());
   const above = buildLiquidityDistribution(8_388_608, 1, 3);
   const below = buildLiquidityDistribution(8_388_608, -3, -1);
 
@@ -425,7 +428,7 @@ test("builds deterministic Spot, Curve, and Bid-Ask distributions within the 69-
   assert.throws(() => buildLiquidityDistribution(8_388_608, -34, 35, "spot"), /between 1 and 69 bins/);
   const seventyBins = Array.from({ length: 70 }, (_, index) => BigInt(index));
   assert.throws(
-    () => buildAddLiquidityTransaction(registryFromRobinhoodManifest(readManifestFixture()), {
+    () => buildAddLiquidityTransaction(fixtureRegistry(readManifestFixture()), {
       tokenX: addresses.weth,
       tokenY: addresses.usdc,
       binStep: 25,
@@ -444,7 +447,7 @@ test("builds deterministic Spot, Curve, and Bid-Ask distributions within the 69-
 });
 
 test("builds liquidity calldata against a manifest-driven production router", () => {
-  const registry = registryFromRobinhoodManifest(readManifestFixture());
+  const registry = fixtureRegistry(readManifestFixture());
   const distribution = buildLiquidityDistribution(8_388_608, -1, 1);
   const amountX = 10_000_000_000_000_000n;
   const amountY = 20_000_000n;
@@ -842,6 +845,31 @@ function baseLocalnetManifest(): LocalnetDeploymentManifest {
     },
     smoke: {}
   };
+}
+
+function fixtureRegistry(manifest: RobinhoodDeploymentManifest) {
+  const registry = registryFromRobinhoodManifest(manifest);
+  const template = Object.values(registry.tokens)[0];
+  assert.ok(template);
+  registry.tokens[addresses.usdc.toLowerCase()] = {
+    ...template,
+    address: addresses.usdc,
+    decimals: 6,
+    id: "fixture-usdc",
+    name: "Fixture USDC",
+    symbol: "USDC",
+    tags: ["quote"]
+  };
+  registry.tokens[addresses.recipient.toLowerCase()] = {
+    ...template,
+    address: addresses.recipient,
+    decimals: 18,
+    id: "fixture-bridge",
+    name: "Fixture Bridge",
+    symbol: "BRIDGE",
+    tags: []
+  };
+  return registry;
 }
 
 function lowerAddress(address: Address): Address {

@@ -2,7 +2,7 @@ import { encodeFunctionData, isAddressEqual, zeroAddress, type Address, type Hex
 
 import { lbQuoterAbi, lbRouterAbi } from "./abi.js";
 import type { DexRegistry } from "./registry.js";
-import { tokenAllowsAction, type TokenMetadataMap } from "./tokens.js";
+import { assertTokenActionAllowed, tokenAllowsAction, type TokenMetadataMap } from "./tokens.js";
 
 export const LB_ROUTER_VERSION_V2_2 = 3;
 export const BPS_DENOMINATOR = 10_000n;
@@ -64,6 +64,8 @@ export async function getBestExactInQuote(
   if (amountIn > UINT128_MAX) {
     throw new Error("Amount in exceeds the LBQuoter uint128 limit");
   }
+
+  assertTokenActionAllowed(registry.tokens, [tokenIn, tokenOut], "swap");
 
   const paths = buildExactInCandidatePaths(registry.tokens, tokenIn, tokenOut);
   const results = await Promise.all(
@@ -162,13 +164,14 @@ export function buildExactInSwapPath(quote: ExactInQuote): ExactInPath {
 }
 
 export function buildExactInSwapTransaction(
-  registry: Pick<DexRegistry, "contracts">,
+  registry: Pick<DexRegistry, "contracts" | "tokens">,
   quote: ExactInQuote,
   amountIn: bigint,
   amountOutMin: bigint,
   to: Address,
   deadline: bigint
 ): BuiltSwapTransaction {
+  assertTokenActionAllowed(registry.tokens, quote.route, "swap");
   if (quote.amounts[0] !== amountIn) {
     throw new Error("Exact-in swap amount does not match the quote input amount");
   }

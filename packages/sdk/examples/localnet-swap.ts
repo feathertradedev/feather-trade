@@ -11,6 +11,7 @@ import {
   createDexPublicClient,
   deadlineFromNow,
   erc20Abi,
+  findTokenBySymbol,
   getBestExactInQuote,
   getQuoteAmountOut,
   readDeploymentManifest,
@@ -37,7 +38,10 @@ const walletClient = createWalletClient({
   transport: http(rpcUrl)
 });
 
-const amountIn = parseUnits(process.env.SDK_EXAMPLE_SWAP_AMOUNT_IN ?? "0.01", registry.tokens.WNATIVE.decimals);
+const wnative = findTokenBySymbol(registry.tokens, "WNATIVE");
+const usdc = findTokenBySymbol(registry.tokens, "USDC");
+if (wnative === null || usdc === null) throw new Error("Required localnet token identity is unavailable or ambiguous");
+const amountIn = parseUnits(process.env.SDK_EXAMPLE_SWAP_AMOUNT_IN ?? "0.01", wnative.decimals);
 const slippageBps = BigInt(process.env.SDK_EXAMPLE_SLIPPAGE_BPS ?? "50");
 const deadline = deadlineFromNow(Number(process.env.SDK_EXAMPLE_DEADLINE_MINUTES ?? "20"));
 const pool = registry.seededPools.wnativeUsdc;
@@ -95,12 +99,12 @@ console.log(
       manifestPath,
       chainId: registry.chainId,
       account: account.address,
-      tokenIn: registry.tokens.WNATIVE.symbol,
-      tokenOut: registry.tokens.USDC.symbol,
+      tokenIn: wnative.symbol,
+      tokenOut: usdc.symbol,
       amountIn: amountIn.toString(),
-      amountInFormatted: formatUnits(amountIn, registry.tokens.WNATIVE.decimals),
+      amountInFormatted: formatUnits(amountIn, wnative.decimals),
       amountOut: amountOut.toString(),
-      amountOutFormatted: formatUnits(amountOut, registry.tokens.USDC.decimals),
+      amountOutFormatted: formatUnits(amountOut, usdc.decimals),
       amountOutMin: amountOutMin.toString(),
       approvalHash,
       swapHash,

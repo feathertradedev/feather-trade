@@ -785,9 +785,15 @@ export function formatCompactAddress(value: string | null | undefined): string {
 
 export function formatTokenAmount(value: string | bigint, token: TokenMetadata | null): string {
   const decimals = token?.decimals ?? 18;
-  const formatted = formatUnits(BigInt(value), decimals);
+  const raw = BigInt(value);
+  const formatted = formatUnits(raw, decimals);
   const [whole, fraction = ""] = formatted.split(".");
-  const trimmedFraction = fraction.slice(0, whole === "0" ? 6 : 4).replace(/0+$/, "");
+  const displayedDecimals = whole === "0" ? Math.min(6, decimals) : Math.min(4, decimals);
+  const trimmedFraction = fraction.slice(0, displayedDecimals).replace(/0+$/, "");
+
+  if (raw > 0n && whole === "0" && trimmedFraction.length === 0 && decimals > displayedDecimals) {
+    return `<0.${"0".repeat(Math.max(0, displayedDecimals - 1))}1`;
+  }
 
   return trimmedFraction.length > 0 ? `${whole}.${trimmedFraction}` : whole;
 }

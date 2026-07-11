@@ -25,7 +25,7 @@ import {
   quoteToRouteSteps,
   type ExactInQuote
 } from "@robinhood-lb/sdk/swap";
-import { tokenAllowsAction, type TokenAction, type TokenMetadata } from "@robinhood-lb/sdk/tokens";
+import { tokenAllowsAction, tokenApprovalCapabilityLabel, type TokenAction, type TokenMetadata } from "@robinhood-lb/sdk/tokens";
 import {
   Activity,
   AlertTriangle,
@@ -41,7 +41,7 @@ import {
   Wallet
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ComponentType } from "react";
-import { encodeFunctionData, isAddressEqual, keccak256, type Address, type Chain, formatUnits, parseUnits } from "viem";
+import { encodeFunctionData, isAddressEqual, keccak256, type Address, type Chain, formatUnits } from "viem";
 import {
   useAccount,
   useChainId,
@@ -114,6 +114,14 @@ import { wagmiConfig } from "./wagmi";
 import { SUPPORTED_WALLET_RDNS, walletFailure, walletSessionIdentity, type WalletFailure } from "./wallet-lifecycle";
 import { TransactionJournalProvider, useTransactionJournal, type TransactionJournalApi } from "./transaction-journal-react";
 import { isUserRejectedSubmission, type ReviewedTransactionIntent } from "./transaction-journal";
+import {
+  assertExecutableTokenAction,
+  deterministicTokenFallback,
+  poolChoiceIdentityLabel,
+  maxAmountInput,
+  parseTokenAmount,
+  tokenAmountErrorMessage
+} from "./token-safety";
 
 const queryClient = new QueryClient();
 const SNAPSHOT_REFRESH_INTERVAL_MS = 10_000;
@@ -1015,7 +1023,8 @@ function SwapView({
   const tokenOut = swapForY ? tokenY : tokenX;
   const tokenInAddress = swapForY ? selectedPool.tokenXAddress : selectedPool.tokenYAddress;
   const tokenOutAddress = swapForY ? selectedPool.tokenYAddress : selectedPool.tokenXAddress;
-  const parsedAmount = parseTokenAmountInput(amount, tokenIn?.decimals ?? 18);
+  const parsedAmountResult = parseTokenAmount(amount, tokenIn?.decimals ?? 18);
+  const parsedAmount = parsedAmountResult.amount;
   const slippageBps = parseSlippageToBps(slippageInput);
   const deadlineMinutes = parseDeadlineMinutes(deadlineInput);
   const publicClient = useMemo(() => createDexPublicClient(registry.chain, registry.endpoints.rpcUrl), [registry]);
@@ -1221,11 +1230,9 @@ function SwapView({
     tokenSymbol: tokenSymbol(tokenIn)
   });
   const inputError =
-    amount.trim().length > 0 && parsedAmount === null
-      ? "Enter a valid token amount"
-      : parsedAmount === 0n
-        ? "Enter an amount greater than zero"
-        : slippageBps === null
+    parsedAmountResult.error !== null
+      ? tokenAmountErrorMessage(parsedAmountResult.error, tokenIn?.decimals ?? 18)
+      : slippageBps === null
           ? "Enter slippage between 0% and 100%"
           : slippageBps > DANGEROUS_SLIPPAGE_BPS
             ? "Slippage exceeds 10% safety limit"
@@ -1443,6 +1450,13 @@ function SwapView({
     setGasReviewError(null);
     try {
 
+    try {
+      assertExecutableTokenAction([tokenIn], "swap");
+    } catch (error) {
+      setApprovalSimulationError(getWriteError(error));
+      return;
+    }
+
     const simulatedContextFingerprint = swapContextFingerprint;
     const simulatedQuoteIdentity = swapQuoteIdentity;
     const operationGeneration = swapOperationGeneration.current;
@@ -1461,6 +1475,10 @@ function SwapView({
     );
 
     if (!simulated) return;
+    if (simulated.result !== true) {
+      setApprovalSimulationError("Approval simulation did not return true; this token is excluded");
+      return;
+    }
     if (
       latestSwapContextFingerprint.current !== simulatedContextFingerprint ||
       latestSwapQuoteIdentity.current !== simulatedQuoteIdentity ||
@@ -1530,6 +1548,13 @@ function SwapView({
     setSubmittedSwapReceiptContext(null);
     setGasReviewError(null);
     try {
+
+    try {
+      assertExecutableTokenAction([tokenIn, tokenOut], "swap");
+    } catch (error) {
+      setSwapSimulationError(getWriteError(error));
+      return;
+    }
 
     const simulatedContextFingerprint = swapContextFingerprint;
     const simulatedQuoteIdentity = swapQuoteIdentity;
@@ -1647,7 +1672,17 @@ function SwapView({
         <div className="amount-box">
           <input id="swap-amount" inputMode="decimal" onChange={(event) => setAmount(event.target.value)} value={amount} />
           <span>{tokenSymbol(tokenIn)}</span>
+          <button
+            className="token-max-button"
+            data-testid="swap-max-button"
+            disabled={walletBalance === null || tokenIn === null}
+            onClick={() => {
+              if (walletBalance !== null && tokenIn !== null) setAmount(maxAmountInput({ asset: "token", balance: walletBalance, decimals: tokenIn.decimals }));
+            }}
+            type="button"
+          >Max</button>
         </div>
+        <TokenIdentity token={tokenIn} networkName={registry.chain.name} testId="swap-token-in-identity" />
         <div className="balance-line">
           <span>Balance</span>
           <strong data-testid="swap-balance-value">{walletQuery.data ? formatTokenAmount(walletQuery.data.balance, tokenIn) : connected ? "loading" : "connect wallet"}</strong>
@@ -1664,6 +1699,7 @@ function SwapView({
           <input id="swap-output" readOnly value={formatSwapOutput(quoteQuery.isFetching, amountOut, tokenOut)} />
           <span>{tokenSymbol(tokenOut)}</span>
         </div>
+        <TokenIdentity token={tokenOut} networkName={registry.chain.name} testId="swap-token-out-identity" />
 
         <div className="swap-settings">
           <label htmlFor="swap-slippage">
@@ -1687,11 +1723,13 @@ function SwapView({
 
         <ApprovalDetails
           asset={tokenSymbol(tokenIn)}
+          amount={parsedAmount}
           currentState={walletQuery.data ? `${formatTokenAmount(walletQuery.data.allowance, tokenIn)} allowance${needsApproval ? " (approval needed)" : " (sufficient)"}` : "unavailable"}
           id="swap-approval-details"
           requested={parsedAmount !== null ? formatTokenAmount(parsedAmount.toString(), tokenIn) : "invalid amount"}
           scope="Exact token amount for this swap"
           spender={registry.contracts.lbRouter}
+          token={tokenIn}
         />
 
         <div className="action-stack">
@@ -1909,20 +1947,38 @@ function PoolSelect({
   pools: PoolRow[];
   selectedPoolId: string;
 }) {
+  const [query, setQuery] = useState("");
+  const normalizedQuery = query.trim().toLowerCase();
+  const filteredPools = pools.filter((pool) => {
+    if (pool.id === selectedPoolId || normalizedQuery.length === 0) return true;
+    return [pool.id, pool.address, pool.tokenX?.name, pool.tokenX?.symbol, pool.tokenXAddress, pool.tokenY?.name, pool.tokenY?.symbol, pool.tokenYAddress]
+      .join(" ")
+      .toLowerCase()
+      .includes(normalizedQuery);
+  });
   return (
     <>
       <label className="field-label" htmlFor={id}>
         {label}
       </label>
+      <input
+        aria-label={`${label} search by token name, symbol, or address`}
+        className="select-input"
+        data-testid={`${id}-search`}
+        onChange={(event) => setQuery(event.target.value)}
+        placeholder="Search token name, symbol, token address, or pool address"
+        type="search"
+        value={query}
+      />
       <select className="select-input" id={id} value={selectedPoolId} onChange={(event) => onChange(event.target.value)} disabled={pools.length === 0}>
-        {pools.length > 0 ? (
-          pools.map((pool) => (
+        {filteredPools.length > 0 ? (
+          filteredPools.map((pool) => (
             <option key={pool.id} value={pool.id}>
-              {tokenSymbol(pool.tokenX)} / {tokenSymbol(pool.tokenY)} - {formatCompactAddress(pool.address)}
+              {poolChoiceIdentityLabel(pool)}
             </option>
           ))
         ) : (
-          <option value="">No indexed pools</option>
+          <option value="">No matching indexed pools</option>
         )}
       </select>
     </>
@@ -2183,31 +2239,57 @@ function MiniMetric({ label, value, "data-testid": dataTestId }: { label: string
 }
 
 function ApprovalDetails({
+  amount,
   asset,
   currentState,
   id,
   requested,
   scope,
-  spender
+  spender,
+  token
 }: {
+  amount: bigint | null;
   asset: string;
   currentState: string;
   id: string;
   requested: string;
   scope: string;
   spender: Address | null;
+  token: TokenMetadata | null;
 }) {
   return (
     <section className="approval-disclosure" id={id} aria-label={`${asset} approval details`}>
       <strong>Approval details</strong>
       <dl>
         <div><dt>Token / asset</dt><dd>{asset}</dd></div>
+        <div><dt>Token address</dt><dd><code className="approval-address">{token?.address ?? "not an ERC-20 token"}</code></dd></div>
+        <div><dt>Network</dt><dd>{token ? `Chain ${token.chainId}` : "current wallet network"}</dd></div>
+        <div><dt>Decimals / raw amount</dt><dd>{token?.decimals ?? "n/a"} / {amount?.toString() ?? "n/a"}</dd></div>
+        <div><dt>Approval behavior</dt><dd>{token ? `${token.approvalBehavior} · ${tokenApprovalCapabilityLabel(token)}` : "special operator approval"}</dd></div>
         <div><dt>Requested</dt><dd>{requested}</dd></div>
         <div><dt>Scope</dt><dd>{scope}</dd></div>
         <div><dt>Current state</dt><dd>{currentState}</dd></div>
         <div><dt>Spender / operator</dt><dd><code className="approval-address" data-testid={`${id}-spender`}>{spender ?? "not configured"}</code></dd></div>
       </dl>
     </section>
+  );
+}
+
+function TokenIdentity({ networkName, testId, token }: { networkName: string; testId: string; token: TokenMetadata | null }) {
+  const [logoFailed, setLogoFailed] = useState(false);
+  useEffect(() => setLogoFailed(false), [token?.address]);
+  if (token === null) return <div className="token-identity warning" data-testid={testId}>Token identity unavailable</div>;
+  const fallback = deterministicTokenFallback(token);
+  const risk = token.risk.flags.length > 0 ? token.risk.flags.join(", ") : "no listed risk flags";
+  const reviewReason = token.risk.notes ? ` · note: ${token.risk.notes}` : "";
+  return (
+    <div className="token-identity" data-testid={testId}>
+      <span className="token-logo-fallback" data-fallback={logoFailed ? "true" : "false"} data-testid={`${testId}-logo`} style={{ background: fallback.color }} aria-hidden="true">
+        {logoFailed ? fallback.label : <img alt="" src={token.logoURI} onError={() => setLogoFailed(true)} />}
+      </span>
+      <span><strong>{token.name} · {token.symbol}</strong><code>{token.address}</code></span>
+      <span><strong>{networkName} · chain {token.chainId}</strong><small>Feather allowlist · review: {token.risk.reviewStatus} · {risk} · capability: {token.approvalBehavior}{reviewReason}</small></span>
+    </div>
   );
 }
 
@@ -2345,20 +2427,6 @@ function tokenLabelForAddress(address: Address, tokenIn: TokenMetadata | null, t
 
 function sameAddress(left: Address, right: Address): boolean {
   return left.toLowerCase() === right.toLowerCase();
-}
-
-function parseTokenAmountInput(value: string, decimals: number): bigint | null {
-  const trimmed = value.trim();
-
-  if (!/^\d*(\.\d*)?$/.test(trimmed) || trimmed.length === 0 || trimmed === ".") {
-    return null;
-  }
-
-  try {
-    return parseUnits(trimmed, decimals);
-  } catch {
-    return null;
-  }
 }
 
 function parseSlippageToBps(value: string): bigint | null {
@@ -2551,7 +2619,16 @@ function PoolsView({ pools, snapshot, snapshotState }: { pools: PoolRow[]; snaps
         }
         if (normalizedQuery.length === 0) return true;
 
-        return [tokenSymbol(pool.tokenX), tokenSymbol(pool.tokenY), pool.address, pool.id]
+        return [
+          tokenSymbol(pool.tokenX),
+          pool.tokenX?.name,
+          pool.tokenXAddress,
+          tokenSymbol(pool.tokenY),
+          pool.tokenY?.name,
+          pool.tokenYAddress,
+          pool.address,
+          pool.id
+        ]
           .join(" ")
           .toLowerCase()
           .includes(normalizedQuery);
@@ -2620,6 +2697,8 @@ function PoolsView({ pools, snapshot, snapshotState }: { pools: PoolRow[]; snaps
                   <a className="pair-name" href={`#/pools/${encodeURIComponent(pool.id)}`}>
                     {tokenSymbol(pool.tokenX)} / {tokenSymbol(pool.tokenY)}
                     <small>DLMM · bin step {pool.binStep} · {formatCompactAddress(pool.address)}</small>
+                    <small>{pool.tokenX?.name ?? "Unknown token"} · {pool.tokenXAddress} · chain {pool.tokenX?.chainId ?? "?"} · review {pool.tokenX?.risk.reviewStatus ?? "unlisted"}</small>
+                    <small>{pool.tokenY?.name ?? "Unknown token"} · {pool.tokenYAddress} · chain {pool.tokenY?.chainId ?? "?"} · review {pool.tokenY?.risk.reviewStatus ?? "unlisted"}</small>
                   </a>
                   <span>
                     {formatTokenAmount(pool.reserveX, pool.tokenX)} {tokenSymbol(pool.tokenX)} · {formatTokenAmount(pool.reserveY, pool.tokenY)} {tokenSymbol(pool.tokenY)}
@@ -2995,8 +3074,10 @@ function LiquidityView({
       : localnetRegistry !== null
         ? snapshot?.runtime.seededActiveId ?? null
         : null);
-  const parsedAmountX = parseTokenAmountInput(amountXInput, tokenX?.decimals ?? 18);
-  const parsedAmountY = parseTokenAmountInput(amountYInput, tokenY?.decimals ?? 18);
+  const parsedAmountXResult = parseTokenAmount(amountXInput, tokenX?.decimals ?? 18);
+  const parsedAmountYResult = parseTokenAmount(amountYInput, tokenY?.decimals ?? 18);
+  const parsedAmountX = parsedAmountXResult.amount;
+  const parsedAmountY = parsedAmountYResult.amount;
   const lowerDelta = parseIntegerInput(lowerDeltaInput);
   const upperDelta = parseIntegerInput(upperDeltaInput);
   const slippageBps = parseSlippageToBps(slippageInput);
@@ -3371,10 +3452,14 @@ function LiquidityView({
   const removeBurnPlanIssue = positionBurnSubmissionError(removeBurnPlan);
   const addInputError =
     distributionResult.error ??
-    (amountX === null
-      ? "Enter a valid X amount"
-      : amountY === null
-        ? "Enter a valid Y amount"
+    (liquidityMode !== "token-y" && parsedAmountXResult.error !== null
+      ? tokenAmountErrorMessage(parsedAmountXResult.error, tokenX?.decimals ?? 18)
+      : liquidityMode !== "token-x" && parsedAmountYResult.error !== null
+        ? tokenAmountErrorMessage(parsedAmountYResult.error, tokenY?.decimals ?? 18)
+      : amountX === null
+        ? "Enter a valid X amount"
+        : amountY === null
+          ? "Enter a valid Y amount"
         : liquidityMode === "token-x" && amountX <= 0n
           ? "Enter a positive token X amount for this above-active one-sided range"
           : liquidityMode === "token-y" && amountY <= 0n
@@ -3704,6 +3789,12 @@ function LiquidityView({
       approveXSubmitInFlightRef.current === submittedOperationGeneration;
     let submitted = false;
     try {
+      try {
+        assertExecutableTokenAction([tokenX], "add-liquidity");
+      } catch (error) {
+        setLiquiditySimulationError(getWriteError(error));
+        return;
+      }
       const simulated = await runPreSubmitSimulation(
         () =>
           publicClient.simulateContract({
@@ -3719,6 +3810,10 @@ function LiquidityView({
       );
 
       if (!simulated) return;
+      if (simulated.result !== true) {
+        setLiquiditySimulationError("Approval simulation did not return true; this token is excluded");
+        return;
+      }
       if (liquidityOperationGenerationRef.current !== submittedOperationGeneration) return;
       if (latestApproveXExecutionFingerprint.current !== submittedExecutionFingerprint) {
         setLiquiditySimulationError("Token X approval context, amount, strategy, range, or composition changed during simulation; review the current approval and try again");
@@ -3794,6 +3889,12 @@ function LiquidityView({
       approveYSubmitInFlightRef.current === submittedOperationGeneration;
     let submitted = false;
     try {
+      try {
+        assertExecutableTokenAction([tokenY], "add-liquidity");
+      } catch (error) {
+        setLiquiditySimulationError(getWriteError(error));
+        return;
+      }
       const simulated = await runPreSubmitSimulation(
         () =>
           publicClient.simulateContract({
@@ -3809,6 +3910,10 @@ function LiquidityView({
       );
 
       if (!simulated) return;
+      if (simulated.result !== true) {
+        setLiquiditySimulationError("Approval simulation did not return true; this token is excluded");
+        return;
+      }
       if (liquidityOperationGenerationRef.current !== submittedOperationGeneration) return;
       if (latestApproveYExecutionFingerprint.current !== submittedExecutionFingerprint) {
         setLiquiditySimulationError("Token Y approval context, amount, strategy, range, or composition changed during simulation; review the current approval and try again");
@@ -4049,6 +4154,12 @@ function LiquidityView({
       addSubmitInFlightRef.current === submittedOperationGeneration;
     let submitted = false;
     try {
+      try {
+        assertExecutableTokenAction([tokenX, tokenY], "add-liquidity");
+      } catch (error) {
+        setLiquiditySimulationError(getWriteError(error));
+        return;
+      }
       const simulated = await runPreSubmitSimulation(
         () =>
           publicClient.simulateContract({
@@ -4464,6 +4575,9 @@ function LiquidityView({
               onChange={(event) => setAmountXInput(event.target.value)}
             />
             <span>{tokenSymbol(tokenX)}</span>
+            <button className="token-max-button" data-testid="liquidity-max-x" disabled={walletBalanceX === null || tokenX === null || liquidityMode === "token-y"} onClick={() => {
+              if (walletBalanceX !== null && tokenX !== null) setAmountXInput(maxAmountInput({ asset: "token", balance: walletBalanceX, decimals: tokenX.decimals }));
+            }} type="button">Max</button>
           </div>
           <div className="amount-box compact">
             <input
@@ -4474,8 +4588,13 @@ function LiquidityView({
               onChange={(event) => setAmountYInput(event.target.value)}
             />
             <span>{tokenSymbol(tokenY)}</span>
+            <button className="token-max-button" data-testid="liquidity-max-y" disabled={walletBalanceY === null || tokenY === null || liquidityMode === "token-x"} onClick={() => {
+              if (walletBalanceY !== null && tokenY !== null) setAmountYInput(maxAmountInput({ asset: "token", balance: walletBalanceY, decimals: tokenY.decimals }));
+            }} type="button">Max</button>
           </div>
         </div>
+        <TokenIdentity token={tokenX} networkName={registry.chain.name} testId="liquidity-token-x-identity" />
+        <TokenIdentity token={tokenY} networkName={registry.chain.name} testId="liquidity-token-y-identity" />
         <div className="state-row" data-testid="liquidity-range-mode">
           <Droplets size={16} />
           <span>{liquidityModeDescription(liquidityMode, tokenSymbol(tokenX), tokenSymbol(tokenY))}</span>
@@ -4573,20 +4692,24 @@ function LiquidityView({
         </div>
 
         <ApprovalDetails
+          amount={amountX}
           asset={tokenSymbol(tokenX)}
           currentState={walletData ? `${formatTokenAmount(walletData.allowanceX, tokenX)} allowance${needsXApproval ? " (approval needed)" : " (sufficient)"}` : "unavailable"}
           id="liquidity-x-approval-details"
           requested={amountX !== null ? formatTokenAmount(amountX.toString(), tokenX) : "invalid amount"}
           scope="Exact token amount for this add-liquidity action"
           spender={registry.contracts.lbRouter}
+          token={tokenX}
         />
         <ApprovalDetails
+          amount={amountY}
           asset={tokenSymbol(tokenY)}
           currentState={walletData ? `${formatTokenAmount(walletData.allowanceY, tokenY)} allowance${needsYApproval ? " (approval needed)" : " (sufficient)"}` : "unavailable"}
           id="liquidity-y-approval-details"
           requested={amountY !== null ? formatTokenAmount(amountY.toString(), tokenY) : "invalid amount"}
           scope="Exact token amount for this add-liquidity action"
           spender={registry.contracts.lbRouter}
+          token={tokenY}
         />
 
         <LiquidityDistributionPreview bins={distributionResult.preview} />
@@ -4707,13 +4830,18 @@ function LiquidityView({
           <span>Minimum receipts apply {slippageInput}% slippage protection before wallet confirmation.</span>
         </section>
 
+        <TokenIdentity token={tokenX} networkName={registry.chain.name} testId="withdraw-token-x-identity" />
+        <TokenIdentity token={tokenY} networkName={registry.chain.name} testId="withdraw-token-y-identity" />
+
         <ApprovalDetails
+          amount={null}
           asset={`LB pair ${pool?.pair ?? "not selected"}`}
           currentState={walletData ? (walletData.lbApproved ? "Approved" : "Not approved") : "unavailable"}
           id="remove-lb-approval-details"
           requested={`Operator access for ${selectedBinSummary}`}
           scope="All LB token IDs for this pair"
           spender={registry.contracts.lbRouter}
+          token={null}
         />
 
         <div className="action-stack">

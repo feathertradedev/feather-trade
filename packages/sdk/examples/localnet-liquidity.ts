@@ -14,6 +14,7 @@ import {
   createDexPublicClient,
   deadlineFromNow,
   erc20Abi,
+  findTokenBySymbol,
   lbPairAbi,
   quoteLiquidityBurn,
   readDeploymentManifest,
@@ -40,8 +41,11 @@ const walletClient = createWalletClient({
   transport: http(rpcUrl)
 });
 const pool = registry.seededPools.wnativeUsdc;
-const amountX = parseUnits(process.env.SDK_EXAMPLE_LIQUIDITY_AMOUNT_X ?? "0.01", registry.tokens.WNATIVE.decimals);
-const amountY = parseUnits(process.env.SDK_EXAMPLE_LIQUIDITY_AMOUNT_Y ?? "1", registry.tokens.USDC.decimals);
+const wnative = findTokenBySymbol(registry.tokens, "WNATIVE");
+const usdc = findTokenBySymbol(registry.tokens, "USDC");
+if (wnative === null || usdc === null) throw new Error("Required localnet token identity is unavailable or ambiguous");
+const amountX = parseUnits(process.env.SDK_EXAMPLE_LIQUIDITY_AMOUNT_X ?? "0.01", wnative.decimals);
+const amountY = parseUnits(process.env.SDK_EXAMPLE_LIQUIDITY_AMOUNT_Y ?? "1", usdc.decimals);
 const lowerDelta = Number(process.env.SDK_EXAMPLE_LIQUIDITY_LOWER_DELTA ?? "-1");
 const upperDelta = Number(process.env.SDK_EXAMPLE_LIQUIDITY_UPPER_DELTA ?? "1");
 const slippageBps = BigInt(process.env.SDK_EXAMPLE_SLIPPAGE_BPS ?? "50");
@@ -196,9 +200,9 @@ console.log(
       activeId: pool.activeId.toString(),
       range: { lowerDelta, upperDelta },
       amountX: amountX.toString(),
-      amountXFormatted: formatUnits(amountX, registry.tokens.WNATIVE.decimals),
+      amountXFormatted: formatUnits(amountX, wnative.decimals),
       amountY: amountY.toString(),
-      amountYFormatted: formatUnits(amountY, registry.tokens.USDC.decimals),
+      amountYFormatted: formatUnits(amountY, usdc.decimals),
       ids: ids.map((id) => id.toString()),
       mintedAmounts: mintedAmounts.map((amount) => amount.toString()),
       addHash,
