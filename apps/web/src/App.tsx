@@ -40,7 +40,7 @@ import {
   Server,
   Wallet
 } from "lucide-react";
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
+import { useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { encodeFunctionData, isAddressEqual, keccak256, type Address, type Chain, formatUnits, parseUnits } from "viem";
 import {
   useAccount,
@@ -112,6 +112,8 @@ import {
 } from "./transaction-safety";
 import { wagmiConfig } from "./wagmi";
 import { SUPPORTED_WALLET_RDNS, walletFailure, walletSessionIdentity, type WalletFailure } from "./wallet-lifecycle";
+import { TransactionJournalProvider, useTransactionJournal, type TransactionJournalApi } from "./transaction-journal-react";
+import { isUserRejectedSubmission, type ReviewedTransactionIntent } from "./transaction-journal";
 
 const queryClient = new QueryClient();
 const SNAPSHOT_REFRESH_INTERVAL_MS = 10_000;
@@ -175,22 +177,6 @@ interface ApprovalRefreshState {
   status: "refreshing" | "awaiting-render" | "ready" | "error";
 }
 
-interface SubmittedTransactionRecord {
-  account: Address;
-  calldataFingerprint: string;
-  chainId: number;
-  deploymentEpoch: string;
-  environment: EnvironmentKey;
-  executionFingerprint: string;
-  hash: Address;
-  intent: "add-liquidity" | "approval" | "remove-liquidity" | "swap";
-  providerId: string;
-  providerUid: string;
-  submittedAt: number;
-  target: Address;
-  value: bigint;
-}
-
 interface ExactGasReview {
   action: string;
   bufferedWei: bigint;
@@ -215,7 +201,64 @@ function deploymentEpoch(registry: DexRegistry): string {
   ].join("|");
 }
 
-const SubmittedTransactionJournalContext = createContext<((record: SubmittedTransactionRecord) => void) | null>(null);
+function reviewedTransactionIntent(
+  input: {
+    account: Address;
+    calldataFingerprint: string;
+    chainId: number;
+    deploymentEpoch: string;
+    environment: EnvironmentKey;
+    executionFingerprint: string;
+    intent: ReviewedTransactionIntent["intent"];
+    target: Address;
+    value: bigint;
+  },
+  binding: { poolId: string | null; recipient: Address | null; refundRecipient: Address | null; settingsFingerprint: string }
+): ReviewedTransactionIntent {
+  return {
+    account: input.account,
+    calldataFingerprint: input.calldataFingerprint as `0x${string}`,
+    chainId: input.chainId,
+    contractsFingerprint: input.deploymentEpoch,
+    deploymentEpoch: input.deploymentEpoch,
+    environment: input.environment,
+    executionFingerprint: input.executionFingerprint,
+    intent: input.intent,
+    poolId: binding.poolId,
+    recipient: binding.recipient,
+    refundRecipient: binding.refundRecipient,
+    settingsFingerprint: binding.settingsFingerprint,
+    target: input.target,
+    value: input.value.toString()
+  };
+}
+
+async function submitJournaledTransaction(input: {
+  isCurrent: () => boolean;
+  journal: TransactionJournalApi;
+  reviewed: ReviewedTransactionIntent;
+  send: () => Promise<Address>;
+}): Promise<Address | null> {
+  const handle = await input.journal.begin(input.reviewed);
+  if (!input.isCurrent()) {
+    await input.journal.abort(handle);
+    return null;
+  }
+  try {
+    const hash = await input.send();
+    try {
+      await input.journal.submitted(handle, hash);
+    } catch {
+      throw new Error(`Wallet returned ${formatCompactAddress(hash)}, but durable hash persistence failed; retry remains blocked in this session`);
+    }
+    return hash;
+  } catch (error) {
+    if (!(error instanceof Error && error.message.includes("durable hash persistence failed"))) {
+      await input.journal.fail(handle, error);
+    }
+    throw error;
+  }
+}
 
 type SnapshotRefetch = () => Promise<QueryObserverResult<AppSnapshot, Error>>;
 
@@ -233,7 +276,9 @@ export function App() {
     <WagmiProvider config={wagmiConfig} reconnectOnMount={false}>
       <QueryClientProvider client={queryClient}>
         <SafeWalletReconnect />
-        <DexShell />
+        <TransactionJournalProvider>
+          <DexShell />
+        </TransactionJournalProvider>
       </QueryClientProvider>
     </WagmiProvider>
   );
@@ -280,16 +325,14 @@ function DexShell() {
   });
   const walletPanelKey = account.status === "connected" ? walletSessionKey : `${environmentKey}:disconnected`;
   const previousWalletSessionKey = useRef(walletSessionKey);
-  const [submittedTransactions, setSubmittedTransactions] = useState<SubmittedTransactionRecord[]>([]);
-  const recordSubmittedTransaction = useCallback((record: SubmittedTransactionRecord) => {
-    setSubmittedTransactions((records) => records.some((existing) =>
-      existing.environment === record.environment &&
-      existing.deploymentEpoch === record.deploymentEpoch &&
-      existing.chainId === record.chainId &&
-      existing.account.toLowerCase() === record.account.toLowerCase() &&
-      existing.hash.toLowerCase() === record.hash.toLowerCase()
-    ) ? records : [...records, record]);
-  }, []);
+  const transactionJournal = useTransactionJournal();
+  const visibleJournalRecords = account.status === "connected" && account.address
+    ? transactionJournal.records.filter((record) =>
+        record.reviewed.account.toLowerCase() === account.address!.toLowerCase() &&
+        record.reviewed.chainId === walletChainId &&
+        record.reviewed.environment === environmentKey &&
+        record.reviewed.deploymentEpoch === deploymentEpoch(registry))
+    : [];
   const snapshotQuery = useQuery({
     queryKey: [
       "dashboard",
@@ -406,13 +449,13 @@ function DexShell() {
           <MetricTile label="Active Bin" value={formatActiveBin(snapshot)} tone="neutral" />
           <MetricTile label="Indexer Head" value={snapshot?.indexer.blockNumber ?? "offline"} tone={snapshot?.indexer.status === "ready" ? "good" : "warn"} />
         </section>
-        {submittedTransactions.length > 0 ? (
+        {visibleJournalRecords.length > 0 ? (
           <details className="transaction-journal" data-testid="submitted-transaction-journal">
-            <summary>Submitted transactions ({submittedTransactions.length})</summary>
+            <summary>Transaction history ({visibleJournalRecords.length})</summary>
             <div>
-              {submittedTransactions.map((transaction) => (
-                <span data-transaction-hash={transaction.hash} key={`${transaction.environment}:${transaction.deploymentEpoch}:${transaction.chainId}:${transaction.account}:${transaction.hash}`}>
-                  {transaction.intent} · {formatCompactAddress(transaction.hash)} · {formatCompactAddress(transaction.account)} · {transaction.environment} · chain {transaction.chainId}
+              {visibleJournalRecords.map((transaction) => (
+                <span data-transaction-hash={transaction.activeHash ?? undefined} key={transaction.id}>
+                  {transaction.reviewed.intent} · {transaction.activeHash ? formatCompactAddress(transaction.activeHash) : "hash pending"} · {transaction.status} · {formatCompactAddress(transaction.reviewed.account)} · {transaction.reviewed.environment} · chain {transaction.reviewed.chainId}
                 </span>
               ))}
             </div>
@@ -428,7 +471,6 @@ function DexShell() {
           </p>
         ) : null}
 
-        <SubmittedTransactionJournalContext.Provider value={recordSubmittedTransaction}>
           <ContentView
             key={walletSessionKey}
             environmentKey={environmentKey}
@@ -442,7 +484,6 @@ function DexShell() {
             snapshotState={snapshotQuery.isLoading ? "loading" : snapshotQuery.isError ? "error" : snapshot?.indexer.status ?? "loading"}
             onRefresh={() => snapshotQuery.refetch()}
           />
-        </SubmittedTransactionJournalContext.Provider>
       </section>
     </main>
   );
@@ -949,7 +990,9 @@ function SwapView({
   const swapSubmitInFlight = useRef(false);
   const [handledApprovalHash, setHandledApprovalHash] = useState<Address | null>(null);
   const [handledSwapHash, setHandledSwapHash] = useState<Address | null>(null);
-  const recordSubmittedTransaction = useContext(SubmittedTransactionJournalContext);
+  const [submittedApprovalReceiptContext, setSubmittedApprovalReceiptContext] = useState<string | null>(null);
+  const [submittedSwapReceiptContext, setSubmittedSwapReceiptContext] = useState<string | null>(null);
+  const transactionJournal = useTransactionJournal();
   const registry = registries[environmentKey];
   const localnetRegistry = isLocalnetRegistry(registry) ? registry : null;
   const account = useAccount();
@@ -1124,10 +1167,12 @@ function SwapView({
   const feeLabel = exactQuote ? formatBps(getTotalFeeBps(exactQuote)) : "n/a";
   const priceImpactLabel = priceImpactBps !== null ? formatBps(priceImpactBps) : "n/a";
   const quoteFreshnessLabel = formatQuoteFreshness(quoteUpdatedAt, safetyNow);
-  const approvalSuccess = approvalReceipt.data?.status === "success";
-  const approvalReverted = approvalReceipt.data?.status === "reverted" || isRevertedReceiptError(approvalReceipt.error);
-  const swapSuccess = swapReceipt.data?.status === "success";
-  const swapReverted = swapReceipt.data?.status === "reverted" || isRevertedReceiptError(swapReceipt.error);
+  const approvalReceiptMatchesCurrentIntent = submittedApprovalReceiptContext === approvalIntentFingerprint;
+  const swapReceiptMatchesCurrentIntent = submittedSwapReceiptContext === swapContextFingerprint;
+  const approvalSuccess = approvalReceiptMatchesCurrentIntent && approvalReceipt.data?.status === "success";
+  const approvalReverted = approvalReceiptMatchesCurrentIntent && (approvalReceipt.data?.status === "reverted" || isRevertedReceiptError(approvalReceipt.error));
+  const swapSuccess = swapReceiptMatchesCurrentIntent && swapReceipt.data?.status === "success";
+  const swapReverted = swapReceiptMatchesCurrentIntent && (swapReceipt.data?.status === "reverted" || isRevertedReceiptError(swapReceipt.error));
   const quoteRequestMismatch =
     exactQuote !== null &&
     (tokenInAddress === null ||
@@ -1236,10 +1281,10 @@ function SwapView({
     approvalSimulationError ??
     swapSimulationError ??
     gasReviewError ??
-    getWriteError(approvalWrite.error) ??
-    getWriteError(swapWrite.error) ??
-    getWriteError(approvalReceipt.error) ??
-    getWriteError(swapReceipt.error);
+    (approvalReceiptMatchesCurrentIntent ? getWriteError(approvalWrite.error) : null) ??
+    (swapReceiptMatchesCurrentIntent ? getWriteError(swapWrite.error) : null) ??
+    (approvalReceiptMatchesCurrentIntent ? getWriteError(approvalReceipt.error) : null) ??
+    (swapReceiptMatchesCurrentIntent ? getWriteError(swapReceipt.error) : null);
   const startApprovalRefresh = (hash: Address, confirmedAt: number, intentFingerprint: string) => {
     const generation = approvalRefreshGeneration.current + 1;
     approvalRefreshGeneration.current = generation;
@@ -1393,6 +1438,8 @@ function SwapView({
   const handleApprove = async () => {
     if (approvalSubmitInFlight.current || !canApprove || tokenInAddress === null || !account.address || parsedAmount === null) return;
     approvalSubmitInFlight.current = true;
+    approvalWrite.reset();
+    setSubmittedApprovalReceiptContext(null);
     setGasReviewError(null);
     try {
 
@@ -1455,9 +1502,20 @@ function SwapView({
       value: 0n
     };
     try {
-      const hash = await approvalWrite.writeContractAsync(simulated.request);
-      recordSubmittedTransaction?.({ ...submittedContext, hash });
-    } catch {
+      setSubmittedApprovalReceiptContext(approvalIntentFingerprint);
+      await submitJournaledTransaction({
+        isCurrent: gasReviewIsCurrent,
+        journal: transactionJournal,
+        reviewed: reviewedTransactionIntent(submittedContext, {
+          poolId: (primaryPool?.id ?? selectedPoolId) || null,
+          recipient: null,
+          refundRecipient: null,
+          settingsFingerprint: [account.address, activeWalletChainId, tokenInAddress, registry.contracts.lbRouter, parsedAmount.toString()].join("|")
+        }),
+        send: () => approvalWrite.writeContractAsync(simulated.request)
+      });
+    } catch (error) {
+      if (!isUserRejectedSubmission(error)) setApprovalSimulationError(getWriteError(error) ?? "Transaction journal blocked approval submission");
       // The wagmi mutation retains the rejection for the originating mounted session.
     }
     } finally {
@@ -1468,6 +1526,8 @@ function SwapView({
   const handleSwap = async () => {
     if (swapSubmitInFlight.current || !canSwap || !account.address || !exactQuote || parsedAmount === null || amountOutMin === null || deadlineMinutes === null) return;
     swapSubmitInFlight.current = true;
+    swapWrite.reset();
+    setSubmittedSwapReceiptContext(null);
     setGasReviewError(null);
     try {
 
@@ -1537,9 +1597,20 @@ function SwapView({
       value: 0n
     };
     try {
-      const hash = await swapWrite.writeContractAsync(simulated.request);
-      recordSubmittedTransaction?.({ ...submittedContext, hash });
-    } catch {
+      setSubmittedSwapReceiptContext(simulatedContextFingerprint);
+      await submitJournaledTransaction({
+        isCurrent: gasReviewIsCurrent,
+        journal: transactionJournal,
+        reviewed: reviewedTransactionIntent(submittedContext, {
+          poolId: (primaryPool?.id ?? selectedPoolId) || null,
+          recipient: account.address,
+          refundRecipient: null,
+          settingsFingerprint: approvalIntentFingerprint
+        }),
+        send: () => swapWrite.writeContractAsync(simulated.request)
+      });
+    } catch (error) {
+      if (!isUserRejectedSubmission(error)) setSwapSimulationError(getWriteError(error) ?? "Transaction journal blocked swap submission");
       // The wagmi mutation retains the rejection for the originating mounted session.
     }
     } finally {
@@ -2837,6 +2908,10 @@ function LiquidityView({
   const [removePercentInput, setRemovePercentInput] = useState("100");
   const [liquidityReceiptPhase, setLiquidityReceiptPhase] = useState<"idle" | "lb-approval" | "remove">("idle");
   const [submittedRemoveReceiptContext, setSubmittedRemoveReceiptContext] = useState<string | null>(null);
+  const [submittedApproveXReceiptContext, setSubmittedApproveXReceiptContext] = useState<string | null>(null);
+  const [submittedApproveYReceiptContext, setSubmittedApproveYReceiptContext] = useState<string | null>(null);
+  const [submittedLbApprovalReceiptContext, setSubmittedLbApprovalReceiptContext] = useState<string | null>(null);
+  const [submittedAddReceiptContext, setSubmittedAddReceiptContext] = useState<string | null>(null);
   const intentionalEmptySelectionRef = useRef(false);
   const portfolioPrefillKeyRef = useRef<string | null>(null);
   const liquidityOperationGenerationRef = useRef(0);
@@ -2865,7 +2940,7 @@ function LiquidityView({
   const approveLbReceipt = useWaitForTransactionReceipt({ hash: approveLbWrite.data });
   const addReceipt = useWaitForTransactionReceipt({ hash: addWrite.data });
   const removeReceipt = useWaitForTransactionReceipt({ hash: removeWrite.data });
-  const recordSubmittedTransaction = useContext(SubmittedTransactionJournalContext);
+  const transactionJournal = useTransactionJournal();
   const publicClient = useMemo(() => createDexPublicClient(registry.chain, registry.endpoints.rpcUrl), [registry]);
 
   useEffect(() => {
@@ -2954,6 +3029,21 @@ function LiquidityView({
     distributionResult.distribution?.deltaIds.join(",") ?? "",
     distributionResult.distribution?.distributionX.join(",") ?? "",
     distributionResult.distribution?.distributionY.join(",") ?? ""
+  ].join("|");
+  const addRetrySettingsFingerprint = [
+    environmentKey,
+    registry.chainId.toString(),
+    activeWalletChainId?.toString() ?? "",
+    account.address ?? "",
+    pool?.pair ?? "",
+    amountX?.toString() ?? "",
+    amountY?.toString() ?? "",
+    slippageBps?.toString() ?? "",
+    idSlippage?.toString() ?? "",
+    deadlineMinutes?.toString() ?? "",
+    liquidityStrategy,
+    lowerDelta?.toString() ?? "",
+    upperDelta?.toString() ?? ""
   ].join("|");
   const latestAddExecutionFingerprint = useRef(addExecutionFingerprint);
   latestAddExecutionFingerprint.current = addExecutionFingerprint;
@@ -3087,6 +3177,14 @@ function LiquidityView({
     registry.contracts.lbRouter,
     selectedPositionsKey,
     walletData?.lbApproved === false ? "approval-required" : "approval-not-required"
+  ].join("|");
+  const lbApprovalFormFingerprint = [
+    account.address ?? "",
+    pool?.pair ?? "",
+    registry.chain.id.toString(),
+    activeWalletChainId?.toString() ?? "",
+    registry.contracts.lbRouter,
+    selectedPositionsKey
   ].join("|");
   const latestLbApprovalExecutionFingerprint = useRef(lbApprovalExecutionFingerprint);
   latestLbApprovalExecutionFingerprint.current = lbApprovalExecutionFingerprint;
@@ -3312,18 +3410,18 @@ function LiquidityView({
                 : selectedBurnSnapshotQuery.isLoading
                   ? "Burn output quote is loading"
                   : removeBurnQuoteView.error));
-  const approveXSuccess = approveXReceipt.data?.status === "success";
-  const approveYSuccess = approveYReceipt.data?.status === "success";
-  const approveLbSuccess = approveLbReceipt.data?.status === "success";
-  const addSuccess = addReceipt.data?.status === "success";
+  const approveXSuccess = submittedApproveXReceiptContext === approveXExecutionFingerprint && approveXReceipt.data?.status === "success";
+  const approveYSuccess = submittedApproveYReceiptContext === approveYExecutionFingerprint && approveYReceipt.data?.status === "success";
+  const approveLbSuccess = submittedLbApprovalReceiptContext === lbApprovalFormFingerprint && approveLbReceipt.data?.status === "success";
+  const addSuccess = submittedAddReceiptContext === addExecutionFingerprint && addReceipt.data?.status === "success";
   const removeSuccess = removeReceipt.data?.status === "success";
-  const approveXReverted = approveXReceipt.data?.status === "reverted" || isRevertedReceiptError(approveXReceipt.error);
-  const approveYReverted = approveYReceipt.data?.status === "reverted" || isRevertedReceiptError(approveYReceipt.error);
-  const approveLbReverted = approveLbReceipt.data?.status === "reverted" || isRevertedReceiptError(approveLbReceipt.error);
-  const addReverted = addReceipt.data?.status === "reverted" || isRevertedReceiptError(addReceipt.error);
+  const approveXReverted = submittedApproveXReceiptContext === approveXExecutionFingerprint && (approveXReceipt.data?.status === "reverted" || isRevertedReceiptError(approveXReceipt.error));
+  const approveYReverted = submittedApproveYReceiptContext === approveYExecutionFingerprint && (approveYReceipt.data?.status === "reverted" || isRevertedReceiptError(approveYReceipt.error));
+  const approveLbReverted = submittedLbApprovalReceiptContext === lbApprovalFormFingerprint && (approveLbReceipt.data?.status === "reverted" || isRevertedReceiptError(approveLbReceipt.error));
+  const addReverted = submittedAddReceiptContext === addExecutionFingerprint && (addReceipt.data?.status === "reverted" || isRevertedReceiptError(addReceipt.error));
   const removeReverted = removeReceipt.data?.status === "reverted" || isRevertedReceiptError(removeReceipt.error);
   const removeReceiptMatchesCurrentIntent =
-    liquidityReceiptPhase === "remove" && submittedRemoveReceiptContext !== null;
+    liquidityReceiptPhase === "remove" && submittedRemoveReceiptContext === removeReviewFingerprint;
   const currentRemoveSuccess = removeReceiptMatchesCurrentIntent && removeSuccess;
   const currentRemoveReverted = removeReceiptMatchesCurrentIntent && removeReverted;
   const currentLbApprovalSuccess = liquidityReceiptPhase === "lb-approval" && approveLbSuccess;
@@ -3331,16 +3429,16 @@ function LiquidityView({
   const liquidityActionError =
     liquiditySimulationError ??
     gasReviewError ??
-    getWriteError(approveXWrite.error) ??
-    getWriteError(approveYWrite.error) ??
-    getWriteError(approveLbWrite.error) ??
-    getWriteError(addWrite.error) ??
-    getWriteError(removeWrite.error) ??
-    getWriteError(approveXReceipt.error) ??
-    getWriteError(approveYReceipt.error) ??
-    getWriteError(approveLbReceipt.error) ??
-    getWriteError(addReceipt.error) ??
-    getWriteError(removeReceipt.error);
+    (submittedApproveXReceiptContext === approveXExecutionFingerprint ? getWriteError(approveXWrite.error) : null) ??
+    (submittedApproveYReceiptContext === approveYExecutionFingerprint ? getWriteError(approveYWrite.error) : null) ??
+    (submittedLbApprovalReceiptContext === lbApprovalFormFingerprint ? getWriteError(approveLbWrite.error) : null) ??
+    (submittedAddReceiptContext === addExecutionFingerprint ? getWriteError(addWrite.error) : null) ??
+    (removeReceiptMatchesCurrentIntent ? getWriteError(removeWrite.error) : null) ??
+    (submittedApproveXReceiptContext === approveXExecutionFingerprint ? getWriteError(approveXReceipt.error) : null) ??
+    (submittedApproveYReceiptContext === approveYExecutionFingerprint ? getWriteError(approveYReceipt.error) : null) ??
+    (submittedLbApprovalReceiptContext === lbApprovalFormFingerprint ? getWriteError(approveLbReceipt.error) : null) ??
+    (submittedAddReceiptContext === addExecutionFingerprint ? getWriteError(addReceipt.error) : null) ??
+    (removeReceiptMatchesCurrentIntent ? getWriteError(removeReceipt.error) : null);
   const addPoolReady = selectedPool.ready && pool !== null;
   const removePoolReady = removeSelectedPool.ready && pool !== null;
   const addReady =
@@ -3598,6 +3696,8 @@ function LiquidityView({
     const token = pool.tokenX;
     const args = [registry.contracts.lbRouter, amountX] as const;
     approveXSubmitInFlightRef.current = submittedOperationGeneration;
+    approveXWrite.reset();
+    setSubmittedApproveXReceiptContext(null);
     setGasReviewError(null);
     const operationIsCurrent = () =>
       liquidityOperationGenerationRef.current === submittedOperationGeneration &&
@@ -3654,10 +3754,21 @@ function LiquidityView({
         value: 0n
       };
       try {
-        const hash = await approveXWrite.writeContractAsync(simulated.request);
-        recordSubmittedTransaction?.({ ...submittedContext, hash });
-        submitted = true;
-      } catch {
+        setSubmittedApproveXReceiptContext(submittedExecutionFingerprint);
+        const hash = await submitJournaledTransaction({
+          isCurrent: gasReviewIsCurrent,
+          journal: transactionJournal,
+          reviewed: reviewedTransactionIntent(submittedContext, {
+            poolId: pool.pair,
+            recipient: null,
+            refundRecipient: null,
+            settingsFingerprint: [account.address, activeWalletChainId, token, registry.contracts.lbRouter, amountX.toString()].join("|")
+          }),
+          send: () => approveXWrite.writeContractAsync(simulated.request)
+        });
+        submitted = hash !== null;
+      } catch (error) {
+        if (!isUserRejectedSubmission(error)) setLiquiditySimulationError(getWriteError(error) ?? "Transaction journal blocked token approval submission");
         // The wagmi mutation retains the rejection for the originating mounted session.
       }
     } finally {
@@ -3675,6 +3786,8 @@ function LiquidityView({
     const token = pool.tokenY;
     const args = [registry.contracts.lbRouter, amountY] as const;
     approveYSubmitInFlightRef.current = submittedOperationGeneration;
+    approveYWrite.reset();
+    setSubmittedApproveYReceiptContext(null);
     setGasReviewError(null);
     const operationIsCurrent = () =>
       liquidityOperationGenerationRef.current === submittedOperationGeneration &&
@@ -3731,10 +3844,21 @@ function LiquidityView({
         value: 0n
       };
       try {
-        const hash = await approveYWrite.writeContractAsync(simulated.request);
-        recordSubmittedTransaction?.({ ...submittedContext, hash });
-        submitted = true;
-      } catch {
+        setSubmittedApproveYReceiptContext(submittedExecutionFingerprint);
+        const hash = await submitJournaledTransaction({
+          isCurrent: gasReviewIsCurrent,
+          journal: transactionJournal,
+          reviewed: reviewedTransactionIntent(submittedContext, {
+            poolId: pool.pair,
+            recipient: null,
+            refundRecipient: null,
+            settingsFingerprint: [account.address, activeWalletChainId, token, registry.contracts.lbRouter, amountY.toString()].join("|")
+          }),
+          send: () => approveYWrite.writeContractAsync(simulated.request)
+        });
+        submitted = hash !== null;
+      } catch (error) {
+        if (!isUserRejectedSubmission(error)) setLiquiditySimulationError(getWriteError(error) ?? "Transaction journal blocked token approval submission");
         // The wagmi mutation retains the rejection for the originating mounted session.
       }
     } finally {
@@ -3751,6 +3875,8 @@ function LiquidityView({
     const submittedExecutionFingerprint = lbApprovalExecutionFingerprint;
     const args = [registry.contracts.lbRouter, true] as const;
     approveLbSubmitInFlightRef.current = submittedOperationGeneration;
+    approveLbWrite.reset();
+    setSubmittedLbApprovalReceiptContext(null);
     setGasReviewError(null);
     const operationIsCurrent = () =>
       liquidityOperationGenerationRef.current === submittedOperationGeneration &&
@@ -3850,6 +3976,7 @@ function LiquidityView({
       });
       if (!gasApproved || !gasReviewIsCurrent()) return;
       setLiquidityReceiptPhase("lb-approval");
+      setSubmittedLbApprovalReceiptContext(lbApprovalFormFingerprint);
       const submittedContext = {
         account: account.address,
         calldataFingerprint: keccak256(encodeFunctionData({ abi: lbPairAbi, functionName: "approveForAll", args })),
@@ -3865,10 +3992,20 @@ function LiquidityView({
         value: 0n
       };
       try {
-        const hash = await approveLbWrite.writeContractAsync(simulated.request);
-        recordSubmittedTransaction?.({ ...submittedContext, hash });
-        submitted = true;
-      } catch {
+        const hash = await submitJournaledTransaction({
+          isCurrent: gasReviewIsCurrent,
+          journal: transactionJournal,
+          reviewed: reviewedTransactionIntent(submittedContext, {
+            poolId: pool.pair,
+            recipient: null,
+            refundRecipient: null,
+            settingsFingerprint: [account.address, activeWalletChainId, pool.pair, registry.contracts.lbRouter, "true"].join("|")
+          }),
+          send: () => approveLbWrite.writeContractAsync(simulated.request)
+        });
+        submitted = hash !== null;
+      } catch (error) {
+        if (!isUserRejectedSubmission(error)) setLiquiditySimulationError(getWriteError(error) ?? "Transaction journal blocked LB approval submission");
         // The wagmi mutation retains the rejection for the originating mounted session.
       }
     } finally {
@@ -3904,6 +4041,8 @@ function LiquidityView({
       }
     ] as const;
     addSubmitInFlightRef.current = submittedOperationGeneration;
+    addWrite.reset();
+    setSubmittedAddReceiptContext(null);
     setGasReviewError(null);
     const operationIsCurrent = () =>
       liquidityOperationGenerationRef.current === submittedOperationGeneration &&
@@ -3960,10 +4099,16 @@ function LiquidityView({
         value: 0n
       };
       try {
-        const hash = await addWrite.writeContractAsync(simulated.request);
-        recordSubmittedTransaction?.({ ...submittedContext, hash });
-        submitted = true;
-      } catch {
+        setSubmittedAddReceiptContext(submittedExecutionFingerprint);
+        const hash = await submitJournaledTransaction({
+          isCurrent: gasReviewIsCurrent,
+          journal: transactionJournal,
+          reviewed: reviewedTransactionIntent(submittedContext, { poolId: pool.pair, recipient: account.address, refundRecipient: account.address, settingsFingerprint: addRetrySettingsFingerprint }),
+          send: () => addWrite.writeContractAsync(simulated.request)
+        });
+        submitted = hash !== null;
+      } catch (error) {
+        if (!isUserRejectedSubmission(error)) setLiquiditySimulationError(getWriteError(error) ?? "Transaction journal blocked add-liquidity submission");
         // The wagmi mutation retains the rejection for the originating mounted session.
       }
     } finally {
@@ -4235,10 +4380,15 @@ function LiquidityView({
         value: transaction.value
       };
       try {
-        const hash = await removeWrite.sendTransactionAsync(transaction);
-        recordSubmittedTransaction?.({ ...submittedContext, hash });
-        submitted = true;
-      } catch {
+        const hash = await submitJournaledTransaction({
+          isCurrent: gasReviewIsCurrent,
+          journal: transactionJournal,
+          reviewed: reviewedTransactionIntent(submittedContext, { poolId: pool.pair, recipient: account.address, refundRecipient: null, settingsFingerprint: removeReviewFingerprint }),
+          send: () => removeWrite.sendTransactionAsync(transaction)
+        });
+        submitted = hash !== null;
+      } catch (error) {
+        if (!isUserRejectedSubmission(error)) setLiquiditySimulationError(getWriteError(error) ?? "Transaction journal blocked withdrawal submission");
         // The wagmi mutation retains the rejection for the originating mounted session.
       }
     } finally {

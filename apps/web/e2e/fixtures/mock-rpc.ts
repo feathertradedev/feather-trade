@@ -401,6 +401,8 @@ async function handleRpc(request: RpcRequest, options: MockRpcOptions, state: Mo
         return rpcResult(request, numberToHex(options.chainId ?? LOCALNET_CHAIN_ID));
       case "eth_blockNumber":
         return rpcResult(request, numberToHex(options.blockNumber ?? DEFAULT_BLOCK_NUMBER));
+      case "eth_getTransactionCount":
+        return rpcResult(request, "0x0");
       case "eth_getBlockByNumber":
         return rpcResult(request, {
           hash: options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222",
