@@ -1,7 +1,7 @@
 import type { Page } from "@playwright/test";
 import { decodeFunctionData, encodeFunctionResult, numberToHex, type Address, type Hex } from "viem";
 
-import { erc20Abi, lbPairAbi, lbQuoterAbi, lbRouterAbi } from "../../../../packages/sdk/src/abi";
+import { erc20Abi, lbFactoryAbi, lbPairAbi, lbQuoterAbi, lbRouterAbi } from "../../../../packages/sdk/src/abi";
 
 export const LOCALNET_RPC_URL = "http://127.0.0.1:8545";
 export const LOCALNET_INDEXER_URL = "http://127.0.0.1:8000/subgraphs/name/robinhood-lb/localnet";
@@ -18,6 +18,7 @@ export const USDT_USDC_PAIR = "0x1111111111111111111111111111111111111103";
 export const WNATIVE_WETH_PAIR = "0x1111111111111111111111111111111111111104";
 export const WETH_USDC_PAIR = "0x1111111111111111111111111111111111111105";
 export const LB_ROUTER = "0x0165878A594ca255338adfa4d48449f69242Eb8F";
+export const LB_FACTORY = "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9";
 export const DEFAULT_ACCOUNT = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
 
 const LOCALNET_CHAIN_ID = 31_337;
@@ -27,7 +28,8 @@ const DEFAULT_ALLOWANCE = 10_000_000_000_000_000_000n;
 const DEFAULT_BLOCK_NUMBER = 42n;
 const DEFAULT_POSITION_LIQUIDITY = 2_000_000_000_000_000_000n;
 const TX_HASH = "0x1111111111111111111111111111111111111111111111111111111111111111";
-const RPC_ABI = [...erc20Abi, ...lbPairAbi, ...lbQuoterAbi, ...lbRouterAbi] as const;
+const RPC_ABI = [...erc20Abi, ...lbFactoryAbi, ...lbPairAbi, ...lbQuoterAbi, ...lbRouterAbi] as const;
+const ZERO_HOOKS = `0x${"0".repeat(64)}` as Hex;
 
 export interface MockRpcOptions {
   analyticsIncludeOtherOwner?: boolean;
@@ -52,6 +54,16 @@ export interface MockRpcOptions {
   gasEstimateMode?: "ready" | "error";
   gasEstimateDelayMs?: number;
   gasPrice?: bigint;
+  factoryAddress?: Address;
+  factoryLookupIgnored?: boolean;
+  factoryLookupPair?: Address;
+  hookAddress?: Address;
+  hookCode?: Hex;
+  hooksParameters?: Hex;
+  indexedHooksParameters?: Hex | null;
+  pairCode?: Hex;
+  pairCodeDelayMs?: number;
+  pairFactoryAddress?: Address;
   includePairs?: boolean;
   includePositions?: boolean;
   indexerBlockNumber?: bigint;
@@ -70,6 +82,9 @@ export interface MockRpcOptions {
   pairReserveY?: bigint;
   pairAddress?: string;
   pairBinStep?: string;
+  pairRuntimeBinStep?: number;
+  pairRuntimeTokenX?: Address;
+  pairRuntimeTokenY?: Address;
   pairTokenX?: string;
   pairTokenXAfterReceipt?: string;
   pairTokenY?: string;
@@ -292,9 +307,7 @@ function mockGraphResponse(body: GraphRequest, options: MockRpcOptions): Record<
 
   if (query.includes("PairById")) {
     if (options.pairByIdMode === "error") return { errors: [{ message: "Mock pair lookup failed" }] };
-    const pair = Array.from({ length: options.poolCount ?? 1 }, (_, index) => mockPair(options, index)).find(
-      (candidate) => candidate.id === body.variables?.id?.toLowerCase()
-    ) ?? null;
+    const pair = typeof body.variables?.id === "string" ? mockPairByAddress(options, body.variables.id) : null;
     return { data: { pair } };
   }
   if (query.includes("PairsPage")) {
@@ -431,6 +444,17 @@ async function handleRpc(request: RpcRequest, options: MockRpcOptions, state: Mo
         return rpcResult(request, transactionByHash(options.blockNumber ?? DEFAULT_BLOCK_NUMBER, state));
       case "eth_getBalance":
         return rpcResult(request, numberToHex(options.nativeBalance ?? DEFAULT_BALANCE));
+      case "eth_getCode": {
+        const address = String(request.params?.[0] ?? "").toLowerCase();
+        if (options.hookAddress && address === options.hookAddress.toLowerCase()) {
+          return rpcResult(request, options.hookCode ?? "0x6001600055");
+        }
+        if (allPairMetadata(options).some((item) => item.pair.toLowerCase() === address)) {
+          if (options.pairCodeDelayMs) await delay(options.pairCodeDelayMs);
+          return rpcResult(request, options.pairCode ?? "0x6001600055");
+        }
+        return rpcResult(request, "0x6001600055");
+      }
       case "eth_call":
         if (
           options.receiptStatus === "reverted" &&
@@ -490,11 +514,54 @@ async function handleEthCall(
   }
 
   if (functionName === "getTokenX") {
-    return encodeFunctionResult({ abi: lbPairAbi, functionName, result: WNATIVE });
+    return encodeFunctionResult({ abi: lbPairAbi, functionName, result: options.pairRuntimeTokenX ?? pairMetadata(call.to, options).tokenX });
   }
 
   if (functionName === "getTokenY") {
-    return encodeFunctionResult({ abi: lbPairAbi, functionName, result: USDC });
+    return encodeFunctionResult({ abi: lbPairAbi, functionName, result: options.pairRuntimeTokenY ?? pairMetadata(call.to, options).tokenY });
+  }
+
+  if (functionName === "getFactory") {
+    const pairCall = allPairMetadata(options).some((item) => addressEquals(item.pair, call.to ?? ""));
+    return encodeFunctionResult({ abi: lbPairAbi, functionName, result: pairCall ? options.pairFactoryAddress ?? options.factoryAddress ?? LB_FACTORY : options.factoryAddress ?? LB_FACTORY });
+  }
+
+  if (functionName === "getFactoryV2_2") {
+    return encodeFunctionResult({ abi: lbQuoterAbi, functionName, result: options.factoryAddress ?? LB_FACTORY });
+  }
+
+  if (functionName === "getRouterV2_2") {
+    return encodeFunctionResult({ abi: lbQuoterAbi, functionName, result: LB_ROUTER });
+  }
+
+  if (functionName === "implementation" || functionName === "getLBPairImplementation") {
+    const implementation = "0x5FC8d32690cc91D4c39d9d3abcBD16989F875707" as Address;
+    return encodeFunctionResult({ abi: functionName === "implementation" ? lbPairAbi : lbFactoryAbi, functionName, result: implementation });
+  }
+
+  if (functionName === "getBinStep") {
+    return encodeFunctionResult({ abi: lbPairAbi, functionName, result: options.pairRuntimeBinStep ?? pairMetadata(call.to, options).binStep });
+  }
+
+  if (functionName === "getLBHooksParameters") {
+    return encodeFunctionResult({ abi: lbPairAbi, functionName, result: options.hooksParameters ?? ZERO_HOOKS });
+  }
+
+  if (functionName === "getLBPairInformation") {
+    const [tokenX, tokenY, requestedBinStep] = decoded.args as readonly [Address, Address, bigint];
+    const metadata = allPairMetadata(options).find((item) =>
+      item.binStep === Number(requestedBinStep) && tokenPairKey(item.tokenX, item.tokenY) === tokenPairKey(tokenX, tokenY)
+    );
+    return encodeFunctionResult({
+      abi: lbFactoryAbi,
+      functionName,
+      result: {
+        LBPair: options.factoryLookupPair ?? metadata?.pair ?? "0x0000000000000000000000000000000000000000",
+        binStep: options.pairRuntimeBinStep ?? metadata?.binStep ?? Number(requestedBinStep),
+        createdByOwner: false,
+        ignoredForRouting: options.factoryLookupIgnored ?? false
+      }
+    });
   }
 
   if (functionName === "getActiveId") {
@@ -665,6 +732,9 @@ function mockPair(options: MockRpcOptions, index = 0): Record<string, unknown> {
     address: index === 0 ? options.pairAddress ?? address : address,
     binStep: index === 0 ? options.pairBinStep ?? String(10 + index) : String(10 + index),
     depositCount: "1",
+    hooksParameters: options.indexedHooksParameters === undefined ? options.hooksParameters ?? ZERO_HOOKS : options.indexedHooksParameters,
+    ignoredForRouting: options.factoryLookupIgnored ?? false,
+    factory: { id: LB_FACTORY.toLowerCase() },
     id: address.toLowerCase(),
     reserveX: (options.pairReserveX ?? 50n * DEFAULT_POSITION_LIQUIDITY).toString(),
     reserveY: (options.pairReserveY ?? 50n * DEFAULT_POSITION_LIQUIDITY).toString(),
@@ -677,6 +747,47 @@ function mockPair(options: MockRpcOptions, index = 0): Record<string, unknown> {
     totalVolumeY: "0",
     updatedAtBlock: (options.indexerBlockNumber ?? DEFAULT_BLOCK_NUMBER).toString()
   };
+}
+
+function mockPairByAddress(options: MockRpcOptions, requested: string): Record<string, unknown> | null {
+  const metadata = allPairMetadata(options).find((item) => item.pair.toLowerCase() === requested.toLowerCase());
+  if (!metadata) return null;
+  return {
+    activeId: ACTIVE_ID.toString(),
+    address: metadata.pair,
+    binStep: metadata.binStep.toString(),
+    depositCount: "1",
+    factory: { id: LB_FACTORY.toLowerCase() },
+    hooksParameters: options.indexedHooksParameters === undefined ? options.hooksParameters ?? ZERO_HOOKS : options.indexedHooksParameters,
+    id: metadata.pair.toLowerCase(),
+    ignoredForRouting: options.factoryLookupIgnored ?? false,
+    reserveX: (options.pairReserveX ?? 50n * DEFAULT_POSITION_LIQUIDITY).toString(),
+    reserveY: (options.pairReserveY ?? 50n * DEFAULT_POSITION_LIQUIDITY).toString(),
+    swapCount: "1",
+    tokenX: { address: metadata.tokenX },
+    tokenY: { address: metadata.tokenY },
+    totalFeesX: "0",
+    totalFeesY: "0",
+    totalVolumeX: "0",
+    totalVolumeY: "0",
+    updatedAtBlock: (options.indexerBlockNumber ?? DEFAULT_BLOCK_NUMBER).toString()
+  };
+}
+
+function pairMetadata(address: Address | undefined, options: MockRpcOptions) {
+  return allPairMetadata(options).find((item) => addressEquals(item.pair, address ?? "")) ?? allPairMetadata(options)[0];
+}
+
+function allPairMetadata(options: MockRpcOptions) {
+  return [
+    { pair: (options.pairAddress ?? WNATIVE_USDC_PAIR) as Address, tokenX: (options.pairTokenX ?? WNATIVE) as Address, tokenY: (options.pairTokenY ?? USDC) as Address, binStep: Number(options.pairBinStep ?? 10) },
+    { pair: ALT_WNATIVE_USDC_PAIR as Address, tokenX: WNATIVE as Address, tokenY: USDC as Address, binStep: 20 },
+    { pair: WNATIVE_USDT_PAIR as Address, tokenX: WNATIVE as Address, tokenY: USDT as Address, binStep: 11 },
+    { pair: USDT_USDC_PAIR as Address, tokenX: USDT as Address, tokenY: USDC as Address, binStep: 12 },
+    { pair: WNATIVE_WETH_PAIR as Address, tokenX: WNATIVE as Address, tokenY: WETH as Address, binStep: 13 },
+    { pair: WETH_USDC_PAIR as Address, tokenX: WETH as Address, tokenY: USDC as Address, binStep: 14 },
+    { pair: SECOND_WNATIVE_USDC_PAIR as Address, tokenX: WNATIVE as Address, tokenY: USDC as Address, binStep: 11 }
+  ];
 }
 
 function mockBin(index: number, count: number): Record<string, unknown> {

@@ -1,5 +1,24 @@
 export const lbRouterAbi = [
   {
+    type: "function",
+    name: "createLBPair",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "tokenX", type: "address" },
+      { name: "tokenY", type: "address" },
+      { name: "activeId", type: "uint24" },
+      { name: "binStep", type: "uint16" }
+    ],
+    outputs: [{ name: "pair", type: "address" }]
+  },
+  {
+    type: "function",
+    name: "getFactory",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "factory", type: "address" }]
+  },
+  {
     type: "error",
     name: "LBRouter__DeadlineExceeded",
     inputs: [
@@ -104,6 +123,20 @@ export const lbRouterAbi = [
 export const lbQuoterAbi = [
   {
     type: "function",
+    name: "getFactoryV2_2",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "factory", type: "address" }]
+  },
+  {
+    type: "function",
+    name: "getRouterV2_2",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "router", type: "address" }]
+  },
+  {
+    type: "function",
     name: "findBestPathFromAmountIn",
     stateMutability: "view",
     inputs: [
@@ -175,6 +208,20 @@ export const erc20Abi = [
 export const lbPairAbi = [
   {
     type: "function",
+    name: "implementation",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "implementation", type: "address" }]
+  },
+  {
+    type: "function",
+    name: "getFactory",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "factory", type: "address" }]
+  },
+  {
+    type: "function",
     name: "getTokenX",
     stateMutability: "view",
     inputs: [],
@@ -193,6 +240,20 @@ export const lbPairAbi = [
     stateMutability: "view",
     inputs: [],
     outputs: [{ name: "activeId", type: "uint24" }]
+  },
+  {
+    type: "function",
+    name: "getBinStep",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "binStep", type: "uint16" }]
+  },
+  {
+    type: "function",
+    name: "getLBHooksParameters",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "hooksParameters", type: "bytes32" }]
   },
   {
     type: "function",
@@ -240,5 +301,77 @@ export const lbPairAbi = [
       { name: "approved", type: "bool" }
     ],
     outputs: []
+  }
+] as const;
+
+export const lbFactoryAbi = [
+  {
+    type: "function",
+    name: "isQuoteAsset",
+    stateMutability: "view",
+    inputs: [{ name: "token", type: "address" }],
+    outputs: [{ name: "isQuote", type: "bool" }]
+  },
+  {
+    type: "function",
+    name: "getPreset",
+    stateMutability: "view",
+    inputs: [{ name: "binStep", type: "uint256" }],
+    outputs: [
+      { name: "baseFactor", type: "uint256" },
+      { name: "filterPeriod", type: "uint256" },
+      { name: "decayPeriod", type: "uint256" },
+      { name: "reductionFactor", type: "uint256" },
+      { name: "variableFeeControl", type: "uint256" },
+      { name: "protocolShare", type: "uint256" },
+      { name: "maxVolatilityAccumulator", type: "uint256" },
+      { name: "isOpen", type: "bool" }
+    ]
+  },
+  {
+    type: "function",
+    name: "getLBPairImplementation",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "implementation", type: "address" }]
+  },
+  {
+    type: "function",
+    name: "getLBPairInformation",
+    stateMutability: "view",
+    inputs: [
+      { name: "tokenX", type: "address" },
+      { name: "tokenY", type: "address" },
+      { name: "binStep", type: "uint256" }
+    ],
+    outputs: [
+      {
+        name: "lbPairInformation",
+        type: "tuple",
+        components: [
+          { name: "binStep", type: "uint16" },
+          { name: "LBPair", type: "address" },
+          { name: "createdByOwner", type: "bool" },
+          { name: "ignoredForRouting", type: "bool" }
+        ]
+      }
+    ]
+  }
+] as const;
+
+export const lbHooksAbi = [
+  {
+    type: "function",
+    name: "getLBPair",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "pair", type: "address" }]
+  },
+  {
+    type: "function",
+    name: "isLinked",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "linked", type: "bool" }]
   }
 ] as const;

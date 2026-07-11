@@ -29,6 +29,9 @@ const fixtures = {
     tokenY: { address: tokenYAddress },
     activeId: String(8_388_608 + index),
     binStep: "10",
+    factory: { id: factoryAddress.toLowerCase() },
+    hooksParameters: `0x${"0".repeat(64)}`,
+    ignoredForRouting: false,
     reserveX: "1000000000000000000",
     reserveY: "2000000000000000000",
     totalVolumeX: "3000000000000000000",
@@ -92,6 +95,8 @@ try {
   assert.equal(snapshot.indexer.pools.length, fixtures.pairs.length);
   assert.equal(snapshot.indexer.pools[0]?.tokenXAddress, tokenXAddress);
   assert.equal(snapshot.indexer.pools[0]?.tokenYAddress, tokenYAddress);
+  assert.equal(snapshot.indexer.pools[0]?.factoryAddress, factoryAddress);
+  assert.equal(snapshot.indexer.pools[0]?.hooksParameters, `0x${"0".repeat(64)}`);
   assert.equal(snapshot.indexer.pools.at(-1)?.tokenXAddress, tokenXAddress);
   assert.equal(snapshot.indexer.pools.at(-1)?.tokenYAddress, tokenYAddress);
   assert.equal(snapshot.indexer.positions.length, fixtures.positions.length);

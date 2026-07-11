@@ -8,6 +8,7 @@ import {
   LB_ROUTER,
   LOCALNET_INDEXER_URL,
   SECOND_WNATIVE_USDC_PAIR,
+  USDC,
   WNATIVE,
   WNATIVE_WETH_PAIR,
   WETH,
@@ -64,6 +65,66 @@ test("blocked token markets are stopped before quote, simulation, or wallet", as
   await waitForForcedClickEffects(page);
   expect(simulatedFunctions(rpc)).toEqual([]);
   expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
+test("unknown hooks fail every selected-market write before simulation or wallet", async ({ page }) => {
+  const unknownHook = "0x9000000000000000000000000000000000000009";
+  const hooksParameters = `0x${((1n << 160n) | BigInt(unknownHook)).toString(16).padStart(64, "0")}` as Hex;
+  const rpc = await setupConnectedLiquidity(page, { allowance: 0n, hooksParameters, lbApproved: false });
+
+  await expect(page.getByTestId("pair-attestation-review").first()).toContainText(/not in this deployment's allowlist|identity or flags/i);
+  for (const action of ["liquidity-approve-x-button", "liquidity-approve-y-button", "liquidity-add-button", "liquidity-approve-lb-button", "liquidity-remove-button"]) {
+    if (await page.getByTestId(action).count()) await bypassDisabledButtonAndClick(page, action);
+  }
+  await waitForForcedClickEffects(page);
+  expect(simulatedFunctions(rpc).filter((name) => ["approve", "approveForAll", "addLiquidity", "removeLiquidity"].includes(name))).toEqual([]);
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
+test("unknown route hooks block swap approval and swap before simulation or wallet", async ({ page }) => {
+  const unknownHook = "0x9000000000000000000000000000000000000009";
+  const hooksParameters = `0x${((1n << 160n) | BigInt(unknownHook)).toString(16).padStart(64, "0")}` as Hex;
+  const rpc = await setupConnectedSwap(page, { allowance: 0n, balance: 5n * ONE_TOKEN, hooksParameters });
+  await expect(page.getByTestId("pair-attestation-review").first()).toContainText(/not in this deployment's allowlist|identity or flags/i);
+  await bypassDisabledButtonAndClick(page, "swap-approve-button");
+  await bypassDisabledButtonAndClick(page, "swap-submit-button");
+  await waitForForcedClickEffects(page);
+  expect(simulatedFunctions(rpc).filter((name) => name === "approve" || name === "swapExactTokensForTokens")).toEqual([]);
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
+for (const [label, options, expected] of [
+  ["indexer and RPC hook mismatch", { indexedHooksParameters: `0x${"0".repeat(64)}`, hooksParameters: `0x${"0".repeat(63)}1` }, /hooks changed|differ/i],
+  ["foreign pair factory", { pairFactoryAddress: LB_ROUTER }, /foreign factory/i],
+  ["runtime token order mismatch", { pairRuntimeTokenX: USDC }, /token order/i],
+  ["runtime bin-step mismatch", { pairRuntimeBinStep: 11 }, /bin step/i]
+] as const) {
+  test(`${label} blocks swap before simulation or wallet`, async ({ page }) => {
+    const rpc = await setupConnectedSwap(page, { allowance: 5n * ONE_TOKEN, balance: 5n * ONE_TOKEN, ...options });
+    await expect(page.getByTestId("pair-attestation-review").first()).toContainText(expected);
+    await bypassDisabledButtonAndClick(page, "swap-submit-button");
+    await waitForForcedClickEffects(page);
+    expect(simulatedFunctions(rpc)).not.toContain("swapExactTokensForTokens");
+    expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+  });
+}
+
+test("a pair code change during durable pre-wallet review aborts without broadcast or retry lock", async ({ page }) => {
+  const rpc = await setupConnectedSwap(page, { allowance: 5n * ONE_TOKEN, balance: 5n * ONE_TOKEN, pairCodeDelayMs: 500 });
+  await page.getByTestId("swap-submit-button").click();
+  await expect(page.getByTestId("gas-review")).toBeVisible();
+
+  const secondClick = page.getByTestId("swap-submit-button").click();
+  await expect(page.getByTestId("submitted-transaction-journal")).toContainText("awaiting-wallet");
+  rpc.update({ pairCode: "0x" });
+  await secondClick;
+  await expect(page.getByTestId("submitted-transaction-journal")).toContainText("aborted");
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+
+  rpc.update({ pairCode: "0x6001600055" });
+  await page.locator("#swap-amount").fill("1.1");
+  await page.locator("#swap-amount").fill("1.0");
+  await expect(page.getByTestId("swap-submit-button")).toBeEnabled();
 });
 
 test("financial pool choice searches name, symbol, and full token address", async ({ page }) => {
@@ -1702,7 +1763,7 @@ test("one-sided live burn quotes keep only the truly zero output minimum at zero
 });
 
 test("withdrawal wallet rejection and reverted receipts remain retryable without false success", async ({ page }) => {
-  const rpc = await installMockRpc(page, { includePositions: true, lbApproved: false });
+  const rpc = await installMockRpc(page, { includePairs: true, includePositions: true, lbApproved: false });
   await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/liquidity");
   await connectWallet(page);
@@ -1721,7 +1782,7 @@ test("withdrawal wallet rejection and reverted receipts remain retryable without
 });
 
 test("withdrawal percentage precision and subset Max semantics fail safe", async ({ page }) => {
-  await installMockRpc(page, { includePositions: true, lbApproved: true, ownerPositionCount: 2 });
+  await installMockRpc(page, { includePairs: true, includePositions: true, lbApproved: true, ownerPositionCount: 2 });
   await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/liquidity");
   await connectWallet(page);
@@ -1742,7 +1803,7 @@ test("withdrawal percentage precision and subset Max semantics fail safe", async
 });
 
 test("withdrawal reverted receipt is explicit and never reports success", async ({ page }) => {
-  await installMockRpc(page, { includePositions: true, lbApproved: true, receiptStatus: "reverted" });
+  await installMockRpc(page, { includePairs: true, includePositions: true, lbApproved: true, receiptStatus: "reverted" });
   await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/liquidity");
   await connectWallet(page);
@@ -2037,7 +2098,7 @@ test("burn outputs recompute for selection, percentage, slippage, live pool stat
 });
 
 test("approval disclosures expose full spenders, scope, asset, and current state on every path", async ({ page }) => {
-  await installMockRpc(page, { allowance: 0n, balance: 5n * ONE_TOKEN, includePositions: true, lbApproved: false });
+  await installMockRpc(page, { allowance: 0n, balance: 5n * ONE_TOKEN, includePairs: true, includePositions: true, lbApproved: false });
   await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/swap");
   await connectWallet(page);
@@ -2424,7 +2485,7 @@ async function setupConnectedSwap(page: Parameters<typeof installMockRpc>[0], rp
 }
 
 async function setupConnectedLiquidity(page: Parameters<typeof installMockRpc>[0], rpcOptions: MockRpcOptions = {}): Promise<InstalledMockRpc> {
-  const rpc = await installMockRpc(page, { includePositions: true, ...rpcOptions });
+  const rpc = await installMockRpc(page, { includePairs: true, includePositions: true, ...rpcOptions });
   await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/liquidity");
   await connectWallet(page);
