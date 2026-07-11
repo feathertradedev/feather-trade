@@ -1,7 +1,7 @@
 import type { Address, Chain } from "viem";
 
 import type { EndpointConfig } from "./endpoints.js";
-import type { LocalnetDeploymentManifest, RobinhoodDeploymentManifest } from "./manifest.js";
+import type { LocalnetDeploymentManifest, RobinhoodDeploymentManifest, SupportedHook } from "./manifest.js";
 import { assertLegacyRoutingDisabled } from "./routing-policy.js";
 import { localnetChain, robinhoodChain, robinhoodTestnetChain } from "./chains.js";
 import { localnetTokenListFromManifest, robinhoodTokenListFromManifest, type TokenMetadata } from "./tokens.js";
@@ -19,6 +19,8 @@ export interface DexRegistry {
   };
   tokens: Record<string, TokenMetadata>;
   endpoints: EndpointConfig;
+  supportedHooks: SupportedHook[];
+  supportedPairImplementations: Address[];
 }
 
 export interface LocalnetDexRegistry extends DexRegistry {
@@ -35,6 +37,8 @@ export function registryFromLocalnetManifest(manifest: LocalnetDeploymentManifes
     contracts: manifest.contracts,
     tokens: localnetTokenListFromManifest(manifest),
     endpoints: manifest.endpoints,
+    supportedHooks: manifest.supportedHooks ?? [],
+    supportedPairImplementations: manifest.supportedPairImplementations ?? [manifest.contracts.lbPairImplementation],
     seededPools: manifest.seededPools
   };
 }
@@ -52,7 +56,9 @@ export function registryFromRobinhoodManifest(manifest: RobinhoodDeploymentManif
     startBlock: manifest.startBlock,
     contracts: manifest.contracts,
     tokens: robinhoodTokenListFromManifest(manifest),
-    endpoints: manifest.endpoints
+    endpoints: manifest.endpoints,
+    supportedHooks: manifest.supportedHooks ?? [],
+    supportedPairImplementations: manifest.supportedPairImplementations ?? [manifest.contracts.lbPairImplementation]
   };
 }
 

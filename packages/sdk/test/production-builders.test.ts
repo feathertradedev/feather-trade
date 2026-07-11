@@ -83,6 +83,84 @@ test("normalizes a Robinhood testnet manifest into chain, token, and contract re
   assert.equal(weth.tags.includes("wrapped-native"), true);
 });
 
+test("normalizes reviewed pair implementations and immutable or EIP-1967 hook policies", () => {
+  const immutableHook = {
+    address: addresses.pair,
+    behavior: "Reviews swaps",
+    codeHash: `0x${"11".repeat(32)}`,
+    flags: 1,
+    identity: "Reviewed immutable hook",
+    risk: "low",
+    upgradeability: "immutable"
+  } as const;
+  const proxyHook = {
+    address: addresses.recipient,
+    behavior: "Reviews liquidity",
+    codeHash: `0x${"22".repeat(32)}`,
+    flags: 48,
+    identity: "Reviewed proxy hook",
+    implementationAddress: addresses.refund,
+    implementationCodeHash: `0x${"33".repeat(32)}`,
+    risk: "medium",
+    upgradeability: "eip1967"
+  } as const;
+  const manifest = readManifestFixture({
+    supportedHooks: [immutableHook, proxyHook],
+    supportedPairImplementations: [addresses.pairImplementation, addresses.pair]
+  });
+  const registry = fixtureRegistry(manifest);
+
+  assert.deepEqual(registry.supportedPairImplementations, [addresses.pairImplementation, addresses.pair]);
+  assert.equal(registry.supportedHooks[0]?.upgradeability, "immutable");
+  assert.equal(registry.supportedHooks[1]?.implementationAddress, addresses.refund);
+  assert.equal(registry.supportedHooks[1]?.implementationCodeHash, proxyHook.implementationCodeHash);
+});
+
+test("rejects ambiguous or incomplete pair and hook allowlist metadata", () => {
+  const validHook = {
+    address: addresses.pair,
+    behavior: "Reviews swaps",
+    codeHash: `0x${"11".repeat(32)}`,
+    flags: 1,
+    identity: "Reviewed hook",
+    risk: "low",
+    upgradeability: "immutable"
+  };
+  const invalidHookCases: Array<[string, Record<string, unknown>, RegExp]> = [
+    ["zero flags", { ...validHook, flags: 0 }, /integer >= 1/],
+    ["missing upgradeability", (({ upgradeability: _, ...hook }) => hook)(validHook), /upgradeability/],
+    ["blank identity", { ...validHook, identity: "  " }, /identity must not be blank/],
+    ["blank behavior", { ...validHook, behavior: "  " }, /behavior must not be blank/],
+    ["bad runtime hash", { ...validHook, codeHash: "0x12" }, /bytes32 hex value/],
+    ["proxy without implementation", { ...validHook, upgradeability: "eip1967" }, /require implementationAddress and implementationCodeHash/],
+    ["immutable with implementation", { ...validHook, implementationAddress: addresses.refund }, /immutable hooks cannot declare proxy implementation fields/]
+  ];
+
+  for (const [name, hook, pattern] of invalidHookCases) {
+    assert.throws(
+      () => readManifestFixture({ supportedHooks: [hook] } as unknown as Partial<RobinhoodDeploymentManifest>),
+      pattern,
+      name
+    );
+  }
+  assert.throws(
+    () => readManifestFixture({ supportedHooks: [validHook, validHook] } as unknown as Partial<RobinhoodDeploymentManifest>),
+    /Duplicate supported hook address/
+  );
+  assert.throws(
+    () => readManifestFixture({ supportedPairImplementations: [] }),
+    /nonempty address array/
+  );
+  assert.throws(
+    () => readManifestFixture({ supportedPairImplementations: [addresses.pairImplementation, addresses.pairImplementation] }),
+    /contains duplicates/
+  );
+  assert.throws(
+    () => readManifestFixture({ supportedPairImplementations: [addresses.pair] }),
+    /must include contracts\.lbPairImplementation/
+  );
+});
+
 test("rejects removed Zap fields instead of silently accepting legacy manifests", () => {
   assert.throws(
     () => readManifestFixture({ zap: { pair: addresses.pair } } as Partial<RobinhoodDeploymentManifest>),

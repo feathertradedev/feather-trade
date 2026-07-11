@@ -25,6 +25,18 @@ export interface CoreContracts {
   lbQuoter: Address;
 }
 
+export interface SupportedHook {
+  address: Address;
+  behavior: string;
+  codeHash: `0x${string}`;
+  flags: number;
+  identity: string;
+  implementationAddress?: Address;
+  implementationCodeHash?: `0x${string}`;
+  risk: "low" | "medium" | "high";
+  upgradeability: "eip1967" | "immutable";
+}
+
 export interface DeploymentOwnership {
   feeRecipient: Address;
   initialOwner: Address;
@@ -48,6 +60,8 @@ export interface LocalnetDeploymentManifest {
     weth: Address;
   };
   factoryPreset: FactoryPreset;
+  supportedHooks?: SupportedHook[];
+  supportedPairImplementations?: Address[];
   seededPools: {
     wnativeUsdc: {
       pair: Address;
@@ -83,6 +97,8 @@ export interface RobinhoodDeploymentManifestBase {
   };
   quoteAssets: Record<string, Address>;
   factoryPreset: FactoryPreset;
+  supportedHooks?: SupportedHook[];
+  supportedPairImplementations?: Address[];
   constructorArgs: Record<string, unknown>;
 }
 
@@ -127,6 +143,7 @@ function normalizeLocalnetManifest(value: Record<string, unknown>, path: string)
   const environment = expectString(value.environment, "environment");
   const chainId = expectInteger(value.chainId, "chainId", { min: 1 });
   const deployer = expectAddress(value.deployer, "deployer", { allowZero: false });
+  const normalizedContracts = normalizeCoreContracts(contracts);
 
   assertNoLegacyZapConstructorArgs(constructorArgs);
 
@@ -144,7 +161,7 @@ function normalizeLocalnetManifest(value: Record<string, unknown>, path: string)
     startBlock: expectInteger(value.startBlock, "startBlock", { min: 0 }),
     deployer,
     endpoints: normalizeEndpoints(value.endpoints, defaultEndpoints.localnet),
-    contracts: normalizeCoreContracts(contracts),
+    contracts: normalizedContracts,
     ownership: normalizeOwnership(value.ownership, constructorArgs, deployer),
     tokens: {
       wnative: expectAddress(tokens.wnative, "tokens.wnative", { allowZero: false }),
@@ -153,6 +170,8 @@ function normalizeLocalnetManifest(value: Record<string, unknown>, path: string)
       weth: expectAddress(tokens.weth, "tokens.weth", { allowZero: false })
     },
     factoryPreset: normalizeFactoryPreset(preset),
+    supportedHooks: normalizeSupportedHooks(value.supportedHooks),
+    supportedPairImplementations: normalizeSupportedPairImplementations(value.supportedPairImplementations, normalizedContracts.lbPairImplementation),
     seededPools: {
       wnativeUsdc: {
         pair: expectAddress(wnativeUsdc.pair, "seededPools.wnativeUsdc.pair", { allowZero: false }),
@@ -212,9 +231,75 @@ function normalizeRobinhoodManifest(value: Record<string, unknown>, path: string
     },
     quoteAssets: normalizedQuoteAssets,
     factoryPreset: normalizeFactoryPreset(preset),
+    supportedHooks: normalizeSupportedHooks(value.supportedHooks),
+    supportedPairImplementations: normalizeSupportedPairImplementations(value.supportedPairImplementations, normalizedContracts.lbPairImplementation),
     contracts: normalizedContracts,
     constructorArgs
   };
+}
+
+function normalizeSupportedPairImplementations(value: unknown, current: Address): Address[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0) throw new Error("supportedPairImplementations must be a nonempty address array");
+  const addresses = value.map((entry, index) => expectAddress(entry, `supportedPairImplementations[${index}]`, { allowZero: false }));
+  if (new Set(addresses.map((address) => address.toLowerCase())).size !== addresses.length) throw new Error("supportedPairImplementations contains duplicates");
+  if (!addresses.some((address) => address.toLowerCase() === current.toLowerCase())) {
+    throw new Error("supportedPairImplementations must include contracts.lbPairImplementation");
+  }
+  return addresses;
+}
+
+function normalizeSupportedHooks(value: unknown): SupportedHook[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error("supportedHooks must be an array");
+
+  const seen = new Set<string>();
+  return value.map((entry, index) => {
+    const hook = expectObject(entry, `supportedHooks[${index}]`);
+    expectOnlyKeys(hook, `supportedHooks[${index}]`, ["address", "behavior", "codeHash", "flags", "identity", "implementationAddress", "implementationCodeHash", "risk", "upgradeability"]);
+    const address = expectAddress(hook.address, `supportedHooks[${index}].address`, { allowZero: false });
+    const key = address.toLowerCase();
+    if (seen.has(key)) throw new Error(`Duplicate supported hook address ${address}`);
+    seen.add(key);
+    const flags = expectInteger(hook.flags, `supportedHooks[${index}].flags`, { min: 1 });
+    if (flags < 1 || flags > 0x3ff) throw new Error(`supportedHooks[${index}].flags must enable one or more of the 10 declared LB hook flags`);
+    const codeHash = expectString(hook.codeHash, `supportedHooks[${index}].codeHash`);
+    if (!/^0x[0-9a-fA-F]{64}$/.test(codeHash)) throw new Error(`supportedHooks[${index}].codeHash must be a bytes32 hex value`);
+    const risk = expectString(hook.risk, `supportedHooks[${index}].risk`);
+    if (risk !== "low" && risk !== "medium" && risk !== "high") {
+      throw new Error(`supportedHooks[${index}].risk must be low, medium, or high`);
+    }
+    const upgradeability = expectString(hook.upgradeability, `supportedHooks[${index}].upgradeability`);
+    if (upgradeability !== "immutable" && upgradeability !== "eip1967") {
+      throw new Error(`supportedHooks[${index}].upgradeability must be immutable or eip1967`);
+    }
+    const implementationAddress = hook.implementationAddress === undefined ? undefined : expectAddress(hook.implementationAddress, `supportedHooks[${index}].implementationAddress`, { allowZero: false });
+    const implementationCodeHash = hook.implementationCodeHash === undefined ? undefined : expectString(hook.implementationCodeHash, `supportedHooks[${index}].implementationCodeHash`).toLowerCase() as `0x${string}`;
+    if (upgradeability === "eip1967") {
+      if (implementationAddress === undefined || implementationCodeHash === undefined || !/^0x[0-9a-f]{64}$/.test(implementationCodeHash)) {
+        throw new Error(`supportedHooks[${index}] eip1967 hooks require implementationAddress and implementationCodeHash`);
+      }
+    } else if (implementationAddress !== undefined || implementationCodeHash !== undefined) {
+      throw new Error(`supportedHooks[${index}] immutable hooks cannot declare proxy implementation fields`);
+    }
+    return {
+      address,
+      behavior: expectNonBlankString(hook.behavior, `supportedHooks[${index}].behavior`),
+      codeHash: codeHash.toLowerCase() as `0x${string}`,
+      flags,
+      identity: expectNonBlankString(hook.identity, `supportedHooks[${index}].identity`),
+      implementationAddress,
+      implementationCodeHash,
+      risk,
+      upgradeability
+    };
+  });
+}
+
+function expectNonBlankString(value: unknown, path: string): string {
+  const result = expectString(value, path);
+  if (result.trim().length === 0) throw new Error(`${path} must not be blank`);
+  return result;
 }
 
 function normalizeCoreContracts(value: Record<string, unknown>): CoreContracts {

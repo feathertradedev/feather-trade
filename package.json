@@ -73,6 +73,7 @@
     "web:preview": "pnpm --filter @robinhood-lb/web preview",
     "web:test:e2e": "pnpm --filter @robinhood-lb/web test:e2e",
     "web:test:pagination": "pnpm --filter @robinhood-lb/web test:pagination",
+    "web:test:pair-attestation": "pnpm --filter @robinhood-lb/web test:pair-attestation",
     "web:test:pool-selection": "pnpm --filter @robinhood-lb/web test:pool-selection",
     "web:test:positions": "pnpm --filter @robinhood-lb/web test:positions",
     "web:test:safety": "pnpm --filter @robinhood-lb/web test:safety",

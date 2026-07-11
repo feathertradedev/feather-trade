@@ -49,6 +49,9 @@ export interface PoolRow {
   volumeY: string;
   feesX: string;
   feesY: string;
+  factoryAddress: Address;
+  hooksParameters: `0x${string}` | null;
+  ignoredForRouting: boolean;
   swapCount: string;
   depositCount: string;
   updatedAtBlock: string;
@@ -204,6 +207,7 @@ interface DashboardGraph {
     tokenY: { address: string };
     activeId: string | null;
     binStep: string;
+    factory: { id: string };
     reserveX: string;
     reserveY: string;
     totalVolumeX: string;
@@ -213,6 +217,8 @@ interface DashboardGraph {
     swapCount: string;
     depositCount: string;
     updatedAtBlock: string;
+    hooksParameters: `0x${string}` | null;
+    ignoredForRouting: boolean;
   }>;
   swaps: Array<{
     id: string;
@@ -295,6 +301,9 @@ const PAIRS_PAGE_QUERY = `
       }
       activeId
       binStep
+      factory { id }
+      hooksParameters
+      ignoredForRouting
       reserveX
       reserveY
       totalVolumeX
@@ -317,6 +326,9 @@ const PAIR_BY_ID_QUERY = `
       tokenY { address }
       activeId
       binStep
+      factory { id }
+      hooksParameters
+      ignoredForRouting
       reserveX
       reserveY
       totalVolumeX
@@ -1189,6 +1201,9 @@ function toPoolRow(registry: DexRegistry, pair: DashboardGraph["pairs"][number])
     volumeY: pair.totalVolumeY,
     feesX: pair.totalFeesX,
     feesY: pair.totalFeesY,
+    factoryAddress: pair.factory.id as Address,
+    hooksParameters: pair.hooksParameters,
+    ignoredForRouting: pair.ignoredForRouting,
     swapCount: pair.swapCount,
     depositCount: pair.depositCount,
     updatedAtBlock: pair.updatedAtBlock

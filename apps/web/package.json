@@ -9,6 +9,7 @@
     "preview": "vite preview --host 127.0.0.1",
     "test:e2e": "playwright test",
     "test:pagination": "node scripts/test-graphql-pagination.mjs",
+    "test:pair-attestation": "node scripts/test-pair-attestation.mjs",
     "test:pool-selection": "node scripts/test-pool-selection.mjs",
     "test:positions": "node scripts/test-position-burn-plan.mjs",
     "test:safety": "node scripts/test-transaction-safety.mjs",

@@ -93,6 +93,13 @@ import {
   type SelectedPoolDescriptor,
   type SelectedPoolRuntimeFlags
 } from "./pool-selection";
+import {
+  PairAttestationError,
+  attestPairForWrite,
+  attestSwapRouteForWrite,
+  poolRowToPairClaim,
+  type PairAttestation
+} from "./pair-attestation";
 import { buildPositionBurnPlan, type PositionBurnLiveBalanceRow, type PositionBurnPlanResult } from "./position-burn-plan";
 import {
   BLOCKING_PRICE_IMPACT_BPS,
@@ -244,6 +251,7 @@ function reviewedTransactionIntent(
 async function submitJournaledTransaction(input: {
   isCurrent: () => boolean;
   journal: TransactionJournalApi;
+  preWalletGuard?: () => Promise<void>;
   reviewed: ReviewedTransactionIntent;
   send: () => Promise<Address>;
 }): Promise<Address | null> {
@@ -251,6 +259,15 @@ async function submitJournaledTransaction(input: {
   if (!input.isCurrent()) {
     await input.journal.abort(handle);
     return null;
+  }
+  if (input.preWalletGuard) {
+    try {
+      await input.preWalletGuard();
+      if (!input.isCurrent()) throw new PairAttestationError("context-changed", "Transaction context changed during the final pre-wallet guard");
+    } catch (error) {
+      await input.journal.abort(handle);
+      throw error;
+    }
   }
   try {
     const hash = await input.send();
@@ -1031,6 +1048,17 @@ function SwapView({
   const connected = account.status === "connected" && account.address !== undefined;
   const onWrongChain = connected && activeWalletChainId !== registry.chainId;
   const rpcReady = runtimeIsReady(snapshot, registry.chainId);
+  const swapPairClaim = primaryPool === null ? null : poolRowToPairClaim(primaryPool, "swap");
+  const pairAttestationQuery = useQuery({
+    queryKey: ["swapPairAttestation", deploymentEpoch(registry), swapPairClaim],
+    queryFn: async () => {
+      if (swapPairClaim === null) throw new PairAttestationError("unindexed-pair", "Selected pair is not present in the current indexer snapshot");
+      return attestPairForWrite(publicClient, registry, swapPairClaim);
+    },
+    enabled: rpcReady && swapPairClaim !== null,
+    refetchInterval: rpcReady && swapPairClaim !== null ? 10_000 : false,
+    retry: false
+  });
   const swapMarketError = swapMarketReadinessError(selectedPool, rpcReady);
   const swapMarketReady = swapMarketError === null;
   const swapExecutionContext: SwapExecutionContext = {
@@ -1155,6 +1183,33 @@ function SwapView({
     contextualQuote.approvalHash === (approvalConfirmation?.hash ?? null);
   const quote = quoteContextMatches ? contextualQuote?.quote : undefined;
   const exactQuote = quote ? deserializeExactInQuote(quote) : null;
+  const attestCurrentSwapRoute = async () => {
+    if (exactQuote === null) throw new PairAttestationError("missing-route", "A current quote is required for live pair attestation");
+    return attestSwapRouteForWrite(publicClient, registry, {
+      binSteps: exactQuote.binSteps,
+      pairs: exactQuote.pairs,
+      pools: poolOptions,
+      resolvePool: (pair) => loadPoolById(registry, pair),
+      route: exactQuote.route,
+      versions: exactQuote.versions
+    });
+  };
+  const routeAttestationQuery = useQuery({
+    queryKey: [
+      "swapRouteAttestation",
+      deploymentEpoch(registry),
+      quote,
+      snapshot?.indexer.blockHash ?? null,
+      exactQuote?.pairs.map((pair) => {
+        const pool = poolOptions.find((candidate) => candidate.address.toLowerCase() === pair.toLowerCase());
+        return pool ? [pool.address, pool.factoryAddress, pool.tokenXAddress, pool.tokenYAddress, pool.binStep, pool.hooksParameters, pool.ignoredForRouting, pool.updatedAtBlock] : [pair, "resolved-by-id"];
+      }) ?? []
+    ],
+    queryFn: attestCurrentSwapRoute,
+    enabled: rpcReady && exactQuote !== null,
+    refetchInterval: rpcReady && exactQuote !== null ? 10_000 : false,
+    retry: false
+  });
   const amountOut = exactQuote ? getQuoteAmountOut(exactQuote) : null;
   const amountOutMin = exactQuote && amountOut !== null && slippageBps !== null ? calculateAmountOutMin(amountOut, slippageBps) : null;
   const routeSteps = exactQuote ? quoteToRouteStepViews(exactQuote, tokenIn, tokenOut) : [];
@@ -1263,6 +1318,8 @@ function SwapView({
     inputError === null &&
     !swapSafety.blocked &&
     !insufficientBalance &&
+    routeAttestationQuery.data !== undefined &&
+    routeAttestationQuery.error === null &&
     approvalSimulationError === null &&
     !approvalSimulationPending;
   const canSwap =
@@ -1282,6 +1339,8 @@ function SwapView({
     !postApprovalReviewPending &&
     !needsApproval &&
     !insufficientBalance &&
+    routeAttestationQuery.data !== undefined &&
+    routeAttestationQuery.error === null &&
     !swapWrite.isPending &&
     !swapReceipt.isLoading;
   const actionError =
@@ -1451,6 +1510,13 @@ function SwapView({
     try {
 
     try {
+      await attestCurrentSwapRoute();
+    } catch (error) {
+      setApprovalSimulationError(getWriteError(error));
+      return;
+    }
+
+    try {
       assertExecutableTokenAction([tokenIn], "swap");
     } catch (error) {
       setApprovalSimulationError(getWriteError(error));
@@ -1505,6 +1571,12 @@ function SwapView({
       setReview: setGasReview
     });
     if (!gasApproved || !gasReviewIsCurrent()) return;
+    try {
+      await attestCurrentSwapRoute();
+    } catch (error) {
+      setApprovalSimulationError(getWriteError(error));
+      return;
+    }
     const submittedContext = {
       account: account.address,
       calldataFingerprint: keccak256(encodeFunctionData({ abi: erc20Abi, functionName: "approve", args })),
@@ -1530,6 +1602,10 @@ function SwapView({
           refundRecipient: null,
           settingsFingerprint: [account.address, activeWalletChainId, tokenInAddress, registry.contracts.lbRouter, parsedAmount.toString()].join("|")
         }),
+        preWalletGuard: async () => {
+          await attestCurrentSwapRoute();
+          if (!gasReviewIsCurrent()) throw new PairAttestationError("context-changed", "Swap context changed during final pair attestation");
+        },
         send: () => approvalWrite.writeContractAsync(simulated.request)
       });
     } catch (error) {
@@ -1548,6 +1624,13 @@ function SwapView({
     setSubmittedSwapReceiptContext(null);
     setGasReviewError(null);
     try {
+
+    try {
+      await attestCurrentSwapRoute();
+    } catch (error) {
+      setSwapSimulationError(getWriteError(error));
+      return;
+    }
 
     try {
       assertExecutableTokenAction([tokenIn, tokenOut], "swap");
@@ -1607,6 +1690,12 @@ function SwapView({
       setReview: setGasReview
     });
     if (!gasApproved || !gasReviewIsCurrent()) return;
+    try {
+      await attestCurrentSwapRoute();
+    } catch (error) {
+      setSwapSimulationError(getWriteError(error));
+      return;
+    }
     const submittedContext = {
       account: account.address,
       calldataFingerprint: keccak256(encodeFunctionData({ abi: lbRouterAbi, functionName: "swapExactTokensForTokens", args })),
@@ -1632,6 +1721,10 @@ function SwapView({
           refundRecipient: null,
           settingsFingerprint: approvalIntentFingerprint
         }),
+        preWalletGuard: async () => {
+          await attestCurrentSwapRoute();
+          if (!gasReviewIsCurrent()) throw new PairAttestationError("context-changed", "Swap context changed during final pair attestation");
+        },
         send: () => swapWrite.writeContractAsync(simulated.request)
       });
     } catch (error) {
@@ -1665,6 +1758,16 @@ function SwapView({
           pool={primaryPool}
           readiness={selectedPool}
         />
+
+        {routeAttestationQuery.error === null && routeAttestationQuery.data?.length ? routeAttestationQuery.data.map((attestation, index) => (
+          <PairAttestationReview attestation={attestation} error={null} key={`${attestation.pair}-${index}`} loading={false} />
+        )) : (
+          <PairAttestationReview
+            attestation={pairAttestationQuery.data ?? null}
+            error={routeAttestationQuery.error ?? pairAttestationQuery.error}
+            loading={routeAttestationQuery.isLoading || routeAttestationQuery.isFetching || pairAttestationQuery.isLoading}
+          />
+        )}
 
         <label className="field-label" htmlFor="swap-amount">
           Sell
@@ -2596,6 +2699,28 @@ function GasReview({ review }: { review: ExactGasReview | null }) {
   );
 }
 
+function PairAttestationReview({
+  attestation,
+  error,
+  loading
+}: {
+  attestation: PairAttestation | null;
+  error: unknown;
+  loading: boolean;
+}) {
+  const message = error instanceof PairAttestationError ? error.message : error ? "Live pair attestation is unavailable" : null;
+  return (
+    <div className={`state-row ${message ? "failure" : attestation ? "success" : "pending"}`} data-testid="pair-attestation-review" role="status">
+      {message ? <AlertTriangle size={16} /> : attestation ? <CheckCircle2 size={16} /> : <LoaderCircle className={loading ? "spin" : undefined} size={16} />}
+      <span>
+        {message ?? (attestation
+          ? `Pair verified · ${attestation.hookIdentity}${attestation.hookAddress ? ` · ${attestation.hookAddress}` : ""} · risk ${attestation.hookRisk} · ${attestation.behavior}${attestation.hookFlags.length ? ` · ${attestation.hookFlags.join(", ")}` : ""}`
+          : "Verifying factory, pair implementation, token order, bin step, and hooks")}
+      </span>
+    </div>
+  );
+}
+
 type PoolCategory = "all" | "active" | "stables";
 type PoolSort = "swaps" | "deposits" | "updated";
 
@@ -3066,6 +3191,31 @@ function LiquidityView({
   ].join("|");
 
   const rpcReady = runtimeIsReady(snapshot, registry.chainId);
+  const liquidityPairClaim = primaryPool === null ? null : poolRowToPairClaim(primaryPool, "add-liquidity");
+  const liquidityAttestationQuery = useQuery({
+    queryKey: ["liquidityPairAttestation", deploymentEpoch(registry), liquidityPairClaim],
+    queryFn: async () => {
+      if (liquidityPairClaim === null) throw new PairAttestationError("unindexed-pair", "Selected pair is not present in the current indexer snapshot");
+      return attestPairForWrite(publicClient, registry, liquidityPairClaim);
+    },
+    enabled: rpcReady && liquidityPairClaim !== null,
+    refetchInterval: rpcReady && liquidityPairClaim !== null ? 10_000 : false,
+    retry: false
+  });
+  const liquidityExitAttestationQuery = useQuery({
+    queryKey: ["liquidityExitPairAttestation", deploymentEpoch(registry), primaryPool],
+    queryFn: async () => {
+      if (primaryPool === null) throw new PairAttestationError("unindexed-pair", "Selected pair is not present in the current indexer snapshot");
+      return attestPairForWrite(publicClient, registry, poolRowToPairClaim(primaryPool, "remove-liquidity"));
+    },
+    enabled: rpcReady && primaryPool !== null,
+    refetchInterval: rpcReady && primaryPool !== null ? 10_000 : false,
+    retry: false
+  });
+  const attestLiquidityPair = async (operation: "add-liquidity" | "remove-liquidity") => {
+    if (primaryPool === null) throw new PairAttestationError("unindexed-pair", "Selected pair is not present in the current indexer snapshot");
+    return attestPairForWrite(publicClient, registry, poolRowToPairClaim(primaryPool, operation));
+  };
   const activeBin =
     selectedPool.activeId ??
     pool?.activeId ??
@@ -3544,6 +3694,8 @@ function LiquidityView({
     !needsYApproval &&
     !insufficientX &&
     !insufficientY &&
+    liquidityAttestationQuery.data !== undefined &&
+    liquidityAttestationQuery.error === null &&
     !addWrite.isPending &&
     !addReceipt.isLoading;
   const removeReady =
@@ -3557,6 +3709,8 @@ function LiquidityView({
     removeBurnQuoteView.minimums !== null &&
     deadlineMinutes !== null &&
     removeInputError === null &&
+    liquidityExitAttestationQuery.data !== undefined &&
+    liquidityExitAttestationQuery.error === null &&
     walletData?.lbApproved === true &&
     !removeBurnPlan.blocked &&
     liquiditySimulationError === null &&
@@ -3570,6 +3724,8 @@ function LiquidityView({
     needsXApproval &&
     addInputError === null &&
     !insufficientX &&
+    liquidityAttestationQuery.data !== undefined &&
+    liquidityAttestationQuery.error === null &&
     liquiditySimulationError === null &&
     !liquiditySimulationPending &&
     !approveXWrite.isPending &&
@@ -3581,6 +3737,8 @@ function LiquidityView({
     needsYApproval &&
     addInputError === null &&
     !insufficientY &&
+    liquidityAttestationQuery.data !== undefined &&
+    liquidityAttestationQuery.error === null &&
     liquiditySimulationError === null &&
     !liquiditySimulationPending &&
     !approveYWrite.isPending &&
@@ -3592,6 +3750,8 @@ function LiquidityView({
     hasSelectedPositions &&
     walletData?.lbApproved === false &&
     removeInputError === null &&
+    liquidityExitAttestationQuery.data !== undefined &&
+    liquidityExitAttestationQuery.error === null &&
     liquiditySimulationError === null &&
     !liquiditySimulationPending &&
     !approveLbWrite.isPending &&
@@ -3790,6 +3950,12 @@ function LiquidityView({
     let submitted = false;
     try {
       try {
+        await attestLiquidityPair("add-liquidity");
+      } catch (error) {
+        setLiquiditySimulationError(getWriteError(error));
+        return;
+      }
+      try {
         assertExecutableTokenAction([tokenX], "add-liquidity");
       } catch (error) {
         setLiquiditySimulationError(getWriteError(error));
@@ -3834,6 +4000,12 @@ function LiquidityView({
         setReview: setGasReview
       });
       if (!gasApproved || !gasReviewIsCurrent()) return;
+      try {
+        await attestLiquidityPair("add-liquidity");
+      } catch (error) {
+        setLiquiditySimulationError(getWriteError(error));
+        return;
+      }
       const submittedContext = {
         account: account.address,
         calldataFingerprint: keccak256(encodeFunctionData({ abi: erc20Abi, functionName: "approve", args })),
@@ -3859,6 +4031,10 @@ function LiquidityView({
             refundRecipient: null,
             settingsFingerprint: [account.address, activeWalletChainId, token, registry.contracts.lbRouter, amountX.toString()].join("|")
           }),
+          preWalletGuard: async () => {
+            await attestLiquidityPair("add-liquidity");
+            if (!gasReviewIsCurrent()) throw new PairAttestationError("context-changed", "Liquidity context changed during final pair attestation");
+          },
           send: () => approveXWrite.writeContractAsync(simulated.request)
         });
         submitted = hash !== null;
@@ -3889,6 +4065,12 @@ function LiquidityView({
       approveYSubmitInFlightRef.current === submittedOperationGeneration;
     let submitted = false;
     try {
+      try {
+        await attestLiquidityPair("add-liquidity");
+      } catch (error) {
+        setLiquiditySimulationError(getWriteError(error));
+        return;
+      }
       try {
         assertExecutableTokenAction([tokenY], "add-liquidity");
       } catch (error) {
@@ -3934,6 +4116,12 @@ function LiquidityView({
         setReview: setGasReview
       });
       if (!gasApproved || !gasReviewIsCurrent()) return;
+      try {
+        await attestLiquidityPair("add-liquidity");
+      } catch (error) {
+        setLiquiditySimulationError(getWriteError(error));
+        return;
+      }
       const submittedContext = {
         account: account.address,
         calldataFingerprint: keccak256(encodeFunctionData({ abi: erc20Abi, functionName: "approve", args })),
@@ -3959,6 +4147,10 @@ function LiquidityView({
             refundRecipient: null,
             settingsFingerprint: [account.address, activeWalletChainId, token, registry.contracts.lbRouter, amountY.toString()].join("|")
           }),
+          preWalletGuard: async () => {
+            await attestLiquidityPair("add-liquidity");
+            if (!gasReviewIsCurrent()) throw new PairAttestationError("context-changed", "Liquidity context changed during final pair attestation");
+          },
           send: () => approveYWrite.writeContractAsync(simulated.request)
         });
         submitted = hash !== null;
@@ -3988,6 +4180,12 @@ function LiquidityView({
       approveLbSubmitInFlightRef.current === submittedOperationGeneration;
     let submitted = false;
     try {
+      try {
+        await attestLiquidityPair("remove-liquidity");
+      } catch (error) {
+        setLiquiditySimulationError(getWriteError(error));
+        return;
+      }
       setLiquiditySimulationError(null);
       setLiquiditySimulationPending(true);
       let freshPreflight: { snapshot: AppSnapshot; positions: PaginatedRows<PositionRow> };
@@ -4080,6 +4278,12 @@ function LiquidityView({
         setReview: setGasReview
       });
       if (!gasApproved || !gasReviewIsCurrent()) return;
+      try {
+        await attestLiquidityPair("remove-liquidity");
+      } catch (error) {
+        setLiquiditySimulationError(getWriteError(error));
+        return;
+      }
       setLiquidityReceiptPhase("lb-approval");
       setSubmittedLbApprovalReceiptContext(lbApprovalFormFingerprint);
       const submittedContext = {
@@ -4106,6 +4310,10 @@ function LiquidityView({
             refundRecipient: null,
             settingsFingerprint: [account.address, activeWalletChainId, pool.pair, registry.contracts.lbRouter, "true"].join("|")
           }),
+          preWalletGuard: async () => {
+            await attestLiquidityPair("remove-liquidity");
+            if (!gasReviewIsCurrent()) throw new PairAttestationError("context-changed", "Withdrawal context changed during final pair attestation");
+          },
           send: () => approveLbWrite.writeContractAsync(simulated.request)
         });
         submitted = hash !== null;
@@ -4155,6 +4363,12 @@ function LiquidityView({
     let submitted = false;
     try {
       try {
+        await attestLiquidityPair("add-liquidity");
+      } catch (error) {
+        setLiquiditySimulationError(getWriteError(error));
+        return;
+      }
+      try {
         assertExecutableTokenAction([tokenX, tokenY], "add-liquidity");
       } catch (error) {
         setLiquiditySimulationError(getWriteError(error));
@@ -4195,6 +4409,12 @@ function LiquidityView({
         setReview: setGasReview
       });
       if (!gasApproved || !gasReviewIsCurrent()) return;
+      try {
+        await attestLiquidityPair("add-liquidity");
+      } catch (error) {
+        setLiquiditySimulationError(getWriteError(error));
+        return;
+      }
       const submittedContext = {
         account: account.address,
         calldataFingerprint: keccak256(encodeFunctionData({ abi: lbRouterAbi, functionName: "addLiquidity", args })),
@@ -4215,6 +4435,10 @@ function LiquidityView({
           isCurrent: gasReviewIsCurrent,
           journal: transactionJournal,
           reviewed: reviewedTransactionIntent(submittedContext, { poolId: pool.pair, recipient: account.address, refundRecipient: account.address, settingsFingerprint: addRetrySettingsFingerprint }),
+          preWalletGuard: async () => {
+            await attestLiquidityPair("add-liquidity");
+            if (!gasReviewIsCurrent()) throw new PairAttestationError("context-changed", "Liquidity context changed during final pair attestation");
+          },
           send: () => addWrite.writeContractAsync(simulated.request)
         });
         submitted = hash !== null;
@@ -4255,6 +4479,12 @@ function LiquidityView({
     setRemoveQuoteReviewRequired(null);
     let submitted = false;
     try {
+      try {
+        await attestLiquidityPair("remove-liquidity");
+      } catch (error) {
+        setLiquiditySimulationError(getWriteError(error));
+        return;
+      }
       setLiquiditySimulationPending(true);
       let freshPlan: PositionBurnPlanResult;
       let freshBurnSnapshot: LiveBurnSnapshot;
@@ -4474,6 +4704,12 @@ function LiquidityView({
         transactionValue: transaction.value
       });
       if (!gasApproved || !gasReviewIsCurrent()) return;
+      try {
+        await attestLiquidityPair("remove-liquidity");
+      } catch (error) {
+        setLiquiditySimulationError(getWriteError(error));
+        return;
+      }
       setLiquidityReceiptPhase("remove");
       setSubmittedRemoveReceiptContext(liquidityLifecycleKey);
       const submittedContext = {
@@ -4495,6 +4731,10 @@ function LiquidityView({
           isCurrent: gasReviewIsCurrent,
           journal: transactionJournal,
           reviewed: reviewedTransactionIntent(submittedContext, { poolId: pool.pair, recipient: account.address, refundRecipient: null, settingsFingerprint: removeReviewFingerprint }),
+          preWalletGuard: async () => {
+            await attestLiquidityPair("remove-liquidity");
+            if (!gasReviewIsCurrent()) throw new PairAttestationError("context-changed", "Withdrawal context changed during final pair attestation");
+          },
           send: () => removeWrite.sendTransactionAsync(transaction)
         });
         submitted = hash !== null;
@@ -4618,6 +4858,12 @@ function LiquidityView({
         </div>
 
         <GasReview review={gasReview} />
+
+        <PairAttestationReview
+          attestation={liquidityAttestationQuery.data ?? null}
+          error={liquidityAttestationQuery.error}
+          loading={liquidityAttestationQuery.isLoading || liquidityAttestationQuery.isFetching}
+        />
 
         <fieldset className="strategy-picker" aria-label="Liquidity strategy">
           <legend>Volatility strategy</legend>
@@ -4829,6 +5075,12 @@ function LiquidityView({
           <span>Expected receipts include proportional principal and accrued fee growth. There is no separate fee claim or rent refund.</span>
           <span>Minimum receipts apply {slippageInput}% slippage protection before wallet confirmation.</span>
         </section>
+
+        <PairAttestationReview
+          attestation={liquidityExitAttestationQuery.error === null ? liquidityExitAttestationQuery.data ?? null : null}
+          error={liquidityExitAttestationQuery.error}
+          loading={liquidityExitAttestationQuery.isLoading || liquidityExitAttestationQuery.isFetching}
+        />
 
         <TokenIdentity token={tokenX} networkName={registry.chain.name} testId="withdraw-token-x-identity" />
         <TokenIdentity token={tokenY} networkName={registry.chain.name} testId="withdraw-token-y-identity" />
