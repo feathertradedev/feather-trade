@@ -162,6 +162,17 @@ interface BurnQuoteView {
   quote: LiquidityBurnQuote | null;
 }
 
+interface ApprovalRefreshState {
+  confirmedAt: number;
+  error: string | null;
+  generation: number;
+  hash: Address;
+  intentFingerprint: string;
+  refreshedContextFingerprint: string | null;
+  snapshotIdentity: string | null;
+  status: "refreshing" | "awaiting-render" | "ready" | "error";
+}
+
 type SnapshotRefetch = () => Promise<QueryObserverResult<AppSnapshot, Error>>;
 
 const routeIcons: Record<RouteKey, ComponentType<{ size?: number }>> = {
@@ -736,6 +747,9 @@ function SwapView({
   const [approvalSimulationPending, setApprovalSimulationPending] = useState(false);
   const [swapSimulationError, setSwapSimulationError] = useState<string | null>(null);
   const [swapSimulationPending, setSwapSimulationPending] = useState(false);
+  const [approvalConfirmation, setApprovalConfirmation] = useState<{ confirmedAt: number; hash: Address } | null>(null);
+  const [approvalRefresh, setApprovalRefresh] = useState<ApprovalRefreshState | null>(null);
+  const approvalRefreshGeneration = useRef(0);
   const [handledApprovalHash, setHandledApprovalHash] = useState<Address | null>(null);
   const [handledSwapHash, setHandledSwapHash] = useState<Address | null>(null);
   const registry = registries[environmentKey];
@@ -790,9 +804,29 @@ function SwapView({
   const swapContextFingerprint = swapExecutionContextFingerprint(swapExecutionContext);
   const latestSwapContextFingerprint = useRef(swapContextFingerprint);
   latestSwapContextFingerprint.current = swapContextFingerprint;
-  const canQuote = swapMarketReady && parsedAmount !== null && parsedAmount > 0n;
+  const approvalIntentFingerprint = swapExecutionContextFingerprint({
+    ...swapExecutionContext,
+    activeId: null,
+    reserveX: null,
+    reserveY: null,
+    updatedAtBlock: null
+  });
+  const latestApprovalIntentFingerprint = useRef(approvalIntentFingerprint);
+  latestApprovalIntentFingerprint.current = approvalIntentFingerprint;
+  const approvalRefreshReady =
+    approvalConfirmation === null ||
+    (approvalRefresh?.status === "ready" &&
+      approvalRefresh.hash === approvalConfirmation.hash &&
+      approvalRefresh.intentFingerprint === approvalIntentFingerprint);
+  const approvalConfirmationKey =
+    approvalConfirmation === null
+      ? "pre-approval"
+      : approvalRefreshReady
+        ? `${approvalConfirmation.hash}:${swapContextFingerprint}`
+        : `${approvalConfirmation.hash}:refreshing`;
+  const canQuote = approvalRefreshReady && swapMarketReady && parsedAmount !== null && parsedAmount > 0n;
   const quoteQuery = useQuery({
-    queryKey: ["swapQuote", swapContextFingerprint],
+    queryKey: ["swapQuote", swapContextFingerprint, approvalConfirmationKey],
     queryFn: async () => {
       if (!swapMarketReady || tokenInAddress === null || tokenOutAddress === null || parsedAmount === null) {
         throw new Error("Swap quote is not available");
@@ -801,8 +835,10 @@ function SwapView({
       const quote = await getBestExactInQuote(publicClient, registry, tokenInAddress, tokenOutAddress, parsedAmount);
 
       return {
+        approvalHash: approvalConfirmation?.hash ?? null,
         contextFingerprint: swapContextFingerprint,
-        quote: serializeExactInQuote(quote)
+        quote: serializeExactInQuote(quote),
+        reviewedAt: Math.max(Date.now(), (approvalConfirmation?.confirmedAt ?? 0) + 1)
       };
     },
     enabled: canQuote,
@@ -811,7 +847,7 @@ function SwapView({
     retry: false
   });
   const walletQuery = useQuery({
-    queryKey: ["swapWallet", registry.chainId, tokenInAddress, account.address],
+    queryKey: ["swapWallet", registry.chainId, tokenInAddress, account.address, approvalConfirmationKey],
     queryFn: async () => {
       if (tokenInAddress === null || !account.address) {
         throw new Error("Wallet reads are not available");
@@ -832,27 +868,36 @@ function SwapView({
         })
       ]);
 
-      return { balance: balance.toString(), allowance: allowance.toString() };
+      return {
+        approvalHash: approvalConfirmation?.hash ?? null,
+        balance: balance.toString(),
+        allowance: allowance.toString()
+      };
     },
-    enabled: connected && swapMarketReady && tokenInAddress !== null,
-    refetchInterval: connected && swapMarketReady ? 10_000 : false,
+    enabled: approvalRefreshReady && connected && swapMarketReady && tokenInAddress !== null,
+    refetchInterval: approvalRefreshReady && connected && swapMarketReady ? 10_000 : false,
     retry: false
   });
   const contextualQuote = quoteQuery.data;
-  const quoteContextMatches = contextualQuote?.contextFingerprint === swapContextFingerprint;
+  const quoteContextMatches =
+    approvalRefreshReady &&
+    swapMarketReady &&
+    contextualQuote?.contextFingerprint === swapContextFingerprint &&
+    contextualQuote.approvalHash === (approvalConfirmation?.hash ?? null);
   const quote = quoteContextMatches ? contextualQuote?.quote : undefined;
   const exactQuote = quote ? deserializeExactInQuote(quote) : null;
   const amountOut = exactQuote ? getQuoteAmountOut(exactQuote) : null;
   const amountOutMin = exactQuote && amountOut !== null && slippageBps !== null ? calculateAmountOutMin(amountOut, slippageBps) : null;
   const routeSteps = exactQuote ? quoteToRouteStepViews(exactQuote, tokenIn, tokenOut) : [];
-  const quoteUpdatedAt = quote !== undefined && quoteContextMatches ? quoteQuery.dataUpdatedAt : null;
+  const quoteUpdatedAt = quote !== undefined && quoteContextMatches ? contextualQuote.reviewedAt : null;
   const swapQuoteIdentity = quote !== undefined && quoteUpdatedAt !== null ? `${swapContextFingerprint}:${quoteUpdatedAt}` : null;
   const latestSwapQuoteIdentity = useRef(swapQuoteIdentity);
   latestSwapQuoteIdentity.current = swapQuoteIdentity;
   const priceImpactBps = exactQuote ? estimatePriceImpactBps(exactQuote) ?? 0n : null;
   const walletBalance = walletQuery.data ? BigInt(walletQuery.data.balance) : null;
   const walletAllowance = walletQuery.data ? BigInt(walletQuery.data.allowance) : null;
-  const walletReadsReady = walletBalance !== null && walletAllowance !== null;
+  const walletReadsMatchApproval = walletQuery.data?.approvalHash === (approvalConfirmation?.hash ?? null);
+  const walletReadsReady = walletReadsMatchApproval && walletBalance !== null && walletAllowance !== null;
   const walletError = walletQuery.error ? `Wallet read failed: ${getWriteError(walletQuery.error) ?? "balance and allowance unavailable"}` : null;
   const walletReadsPending = connected && swapMarketReady && tokenInAddress !== null && !walletReadsReady && walletError === null;
   const needsApproval = parsedAmount !== null && walletAllowance !== null && walletAllowance < parsedAmount;
@@ -861,12 +906,37 @@ function SwapView({
   const feeLabel = exactQuote ? formatBps(getTotalFeeBps(exactQuote)) : "n/a";
   const priceImpactLabel = priceImpactBps !== null ? formatBps(priceImpactBps) : "n/a";
   const quoteFreshnessLabel = formatQuoteFreshness(quoteUpdatedAt, safetyNow);
+  const approvalSuccess = approvalReceipt.data?.status === "success";
+  const approvalReverted = approvalReceipt.data?.status === "reverted" || isRevertedReceiptError(approvalReceipt.error);
+  const swapSuccess = swapReceipt.data?.status === "success";
+  const swapReverted = swapReceipt.data?.status === "reverted" || isRevertedReceiptError(swapReceipt.error);
   const quoteRequestMismatch =
     exactQuote !== null &&
     (tokenInAddress === null ||
       tokenOutAddress === null ||
       parsedAmount === null ||
       !quoteMatchesSwapRequest(exactQuote, tokenInAddress, tokenOutAddress, parsedAmount));
+  const approvalReceiptAwaitingRefresh =
+    approvalSuccess && approvalWrite.data !== undefined && approvalWrite.data !== approvalConfirmation?.hash;
+  const postApprovalReviewPending =
+    approvalReceiptAwaitingRefresh ||
+    (approvalConfirmation !== null &&
+      (!approvalRefreshReady || quoteUpdatedAt === null || quoteUpdatedAt <= approvalConfirmation.confirmedAt || !walletReadsReady));
+  const postApprovalRefreshError =
+    approvalConfirmation === null
+      ? null
+      : approvalRefresh?.error ??
+        (approvalRefresh?.intentFingerprint !== approvalIntentFingerprint
+          ? "Swap context changed after approval confirmation; return to the reviewed settings and refresh again"
+          : null) ??
+        walletError ??
+        (quoteQuery.error
+          ? `Post-approval quote refresh failed: ${getWriteError(quoteQuery.error) ?? "quote unavailable"}`
+          : null);
+  const approvalRefreshRetryRequired =
+    approvalConfirmation !== null &&
+    !approvalRefreshReady &&
+    (approvalRefresh?.status === "error" || approvalRefresh?.intentFingerprint !== approvalIntentFingerprint);
   const swapSafety = evaluateTransactionSafety(
     {
       connected,
@@ -906,6 +976,8 @@ function SwapView({
                     ? "Quoted route does not match the current token pair and amount"
                   : !swapMarketReady
                     ? swapMarketError
+                    : postApprovalReviewPending
+                      ? postApprovalRefreshError ?? "Refreshing balance, allowance, and quote after approval"
                     : null;
   const canApprove =
     swapMarketReady &&
@@ -937,14 +1009,11 @@ function SwapView({
     !swapSafety.blocked &&
     swapSimulationError === null &&
     !swapSimulationPending &&
+    !postApprovalReviewPending &&
     !needsApproval &&
     !insufficientBalance &&
     !swapWrite.isPending &&
     !swapReceipt.isLoading;
-  const approvalSuccess = approvalReceipt.data?.status === "success";
-  const approvalReverted = approvalReceipt.data?.status === "reverted" || isRevertedReceiptError(approvalReceipt.error);
-  const swapSuccess = swapReceipt.data?.status === "success";
-  const swapReverted = swapReceipt.data?.status === "reverted" || isRevertedReceiptError(swapReceipt.error);
   const actionError =
     approvalSimulationError ??
     swapSimulationError ??
@@ -952,6 +1021,69 @@ function SwapView({
     getWriteError(swapWrite.error) ??
     getWriteError(approvalReceipt.error) ??
     getWriteError(swapReceipt.error);
+  const startApprovalRefresh = (hash: Address, confirmedAt: number, intentFingerprint: string) => {
+    const generation = approvalRefreshGeneration.current + 1;
+    approvalRefreshGeneration.current = generation;
+    setApprovalRefresh({
+      confirmedAt,
+      error: null,
+      generation,
+      hash,
+      intentFingerprint,
+      refreshedContextFingerprint: null,
+      snapshotIdentity: null,
+      status: "refreshing"
+    });
+    void onRefresh()
+      .then((result) => {
+        setApprovalRefresh((current) => {
+          if (
+            current?.hash !== hash ||
+            current.intentFingerprint !== intentFingerprint ||
+            current.generation !== generation ||
+            current.status !== "refreshing"
+          ) return current;
+          if (latestApprovalIntentFingerprint.current !== intentFingerprint) {
+            return {
+              ...current,
+              error: "Swap context changed while refreshing the selected market after approval; restore or review the settings, then refresh again",
+              status: "error"
+            };
+          }
+          if (result.isError || result.data === undefined) {
+            return {
+              ...current,
+              error: `Selected-market refresh failed after approval: ${getWriteError(result.error) ?? "snapshot unavailable"}`,
+              status: "error"
+            };
+          }
+
+          return {
+            ...current,
+            snapshotIdentity: swapSnapshotIdentity(result.data, primaryPool?.id ?? selectedPoolId),
+            status: "awaiting-render"
+          };
+        });
+      })
+      .catch((error) => {
+        setApprovalRefresh((current) =>
+          current?.hash === hash &&
+          current.intentFingerprint === intentFingerprint &&
+          current.generation === generation &&
+          current.status === "refreshing"
+            ? {
+                ...current,
+                error: `Selected-market refresh failed after approval: ${getWriteError(error) ?? "snapshot unavailable"}`,
+                status: "error"
+              }
+            : current
+        );
+      });
+  };
+  const retryApprovalRefresh = () => {
+    if (approvalConfirmation === null) return;
+    startApprovalRefresh(approvalConfirmation.hash, approvalConfirmation.confirmedAt, approvalIntentFingerprint);
+  };
 
   useEffect(() => {
     const interval = window.setInterval(() => setSafetyNow(Date.now()), 1_000);
@@ -966,8 +1098,12 @@ function SwapView({
 
   useEffect(() => {
     if (approvalSuccess && approvalWrite.data && approvalWrite.data !== handledApprovalHash) {
-      void walletQuery.refetch();
-      setHandledApprovalHash(approvalWrite.data);
+      const hash = approvalWrite.data;
+      const confirmedAt = Date.now();
+      const intentFingerprint = approvalIntentFingerprint;
+      setApprovalConfirmation({ confirmedAt, hash });
+      startApprovalRefresh(hash, confirmedAt, intentFingerprint);
+      setHandledApprovalHash(hash);
     }
 
     if (swapSuccess && swapWrite.data && swapWrite.data !== handledSwapHash) {
@@ -977,13 +1113,60 @@ function SwapView({
     }
   }, [
     approvalSuccess,
+    approvalIntentFingerprint,
     approvalWrite.data,
     handledApprovalHash,
     handledSwapHash,
     onRefresh,
+    primaryPool?.id,
+    selectedPoolId,
     swapSuccess,
     swapWrite.data,
     walletQuery
+  ]);
+
+  useEffect(() => {
+    if (approvalRefresh?.status !== "awaiting-render") return;
+    if (approvalRefresh.intentFingerprint !== approvalIntentFingerprint) {
+      setApprovalRefresh((current) =>
+        current?.status === "awaiting-render"
+          ? {
+              ...current,
+              error: "Swap context changed while refreshing the selected market after approval; review and try again",
+              status: "error"
+            }
+          : current
+      );
+      return;
+    }
+    if (swapSnapshotIdentity(snapshot, primaryPool?.id ?? selectedPoolId) !== approvalRefresh.snapshotIdentity) return;
+    if (!swapMarketReady) {
+      setApprovalRefresh((current) =>
+        current?.status === "awaiting-render"
+          ? {
+              ...current,
+              error: `Selected market is unsafe after approval refresh: ${swapMarketError ?? "market unavailable"}`,
+              status: "error"
+            }
+          : current
+      );
+      return;
+    }
+
+    setApprovalRefresh((current) =>
+      current?.status === "awaiting-render"
+        ? { ...current, refreshedContextFingerprint: swapContextFingerprint, status: "ready" }
+        : current
+    );
+  }, [
+    approvalIntentFingerprint,
+    approvalRefresh,
+    primaryPool?.id,
+    selectedPoolId,
+    snapshot,
+    swapContextFingerprint,
+    swapMarketError,
+    swapMarketReady
   ]);
 
   const handleApprove = async () => {
@@ -1077,10 +1260,17 @@ function SwapView({
 
         <PoolSelect
           id="swap-pool"
-          label="Token pair (best V2.2 route)"
+          label="Selected market (Best V2.2 route)"
           onChange={onSelectedPoolChange}
           pools={poolOptions}
           selectedPoolId={selectedPoolId}
+        />
+
+        <SwapMarketRecovery
+          error={swapMarketError}
+          onRefresh={onRefresh}
+          pool={primaryPool}
+          readiness={selectedPool}
         />
 
         <label className="field-label" htmlFor="swap-amount">
@@ -1164,6 +1354,12 @@ function SwapView({
               })}
             </span>
           </button>
+          {approvalRefreshRetryRequired ? (
+            <button className="secondary-button wide" data-testid="swap-approval-refresh-button" onClick={retryApprovalRefresh} type="button">
+              <RefreshCw size={18} />
+              <span>Refresh after approval</span>
+            </button>
+          ) : null}
         </div>
 
         <SwapStateRows
@@ -1188,9 +1384,44 @@ function SwapView({
         quote={quote}
         priceImpactLabel={priceImpactLabel}
         routeSteps={routeSteps}
+        selectedPool={selectedPool}
+        swapMarketError={swapMarketError}
+        swapMarketReady={swapMarketReady}
         tokenIn={tokenIn}
         tokenOut={tokenOut}
       />
+    </div>
+  );
+}
+
+function SwapMarketRecovery({
+  error,
+  onRefresh,
+  pool,
+  readiness
+}: {
+  error: string | null;
+  onRefresh: SnapshotRefetch;
+  pool: PoolRow | null;
+  readiness: SelectedPoolDescriptor;
+}) {
+  if (readiness.ready) return null;
+
+  const emptyPool = readiness.blockers.some((blocker) => blocker.code === "empty-pool");
+
+  return (
+    <div className="state-row warning" data-testid="swap-market-recovery" role="status">
+      <AlertTriangle size={16} />
+      <span>{error ?? "Selected market is not safe for swaps"}</span>
+      {emptyPool && pool !== null ? (
+        <a className="secondary-button" href={`#/liquidity/add/${encodeURIComponent(pool.id)}`}>
+          Create position
+        </a>
+      ) : (
+        <button className="secondary-button" onClick={() => void onRefresh()} type="button">
+          Refresh market data
+        </button>
+      )}
     </div>
   );
 }
@@ -1202,6 +1433,9 @@ function SwapDetailsCard({
   quote,
   priceImpactLabel,
   routeSteps,
+  selectedPool,
+  swapMarketError,
+  swapMarketReady,
   tokenIn,
   tokenOut
 }: {
@@ -1211,6 +1445,9 @@ function SwapDetailsCard({
   quote: SerializedExactInQuote | undefined;
   priceImpactLabel: string;
   routeSteps: RouteStepView[];
+  selectedPool: SelectedPoolDescriptor;
+  swapMarketError: string | null;
+  swapMarketReady: boolean;
   tokenIn: TokenMetadata | null;
   tokenOut: TokenMetadata | null;
 }) {
@@ -1218,7 +1455,10 @@ function SwapDetailsCard({
     <section className="info-panel">
       <div className="panel-heading">
         <span>Route</span>
-        <StatusBadge state={quote ? "ready" : primaryPool ? "loading" : "empty"} label={quote ? "best V2.2 route" : primaryPool ? "waiting" : "no market"} />
+        <StatusBadge
+          state={!swapMarketReady ? "unavailable" : quote ? "ready" : primaryPool ? "loading" : "empty"}
+          label={!swapMarketReady ? swapMarketError ?? "unavailable" : quote ? "Best V2.2 route" : primaryPool ? "waiting" : "no market"}
+        />
       </div>
 
       <div className="quote-grid">
@@ -1245,10 +1485,27 @@ function SwapDetailsCard({
           ))}
         </div>
       ) : (
-        <EmptyState state={primaryPool ? "loading" : "empty"} />
+        swapMarketReady ? <EmptyState state={primaryPool ? "loading" : "empty"} /> : <p className="state-row warning">{swapMarketError}</p>
       )}
 
       <dl className="contract-list">
+        <div>
+          <dt>Routing mode</dt>
+          <dd>Best V2.2 route</dd>
+        </div>
+        <div>
+          <dt>Selected market</dt>
+          <dd
+            data-reserve-x={selectedPool.reserveX?.toString() ?? "unavailable"}
+            data-testid="swap-selected-market-identity"
+            data-token-x={selectedPool.tokenXAddress ?? "unavailable"}
+            data-token-y={selectedPool.tokenYAddress ?? "unavailable"}
+          >
+            {selectedPool.pair ? (
+              <><code className="approval-address">{selectedPool.pair}</code> · bin step {selectedPool.binStep ?? "unknown"}</>
+            ) : "unavailable"}
+          </dd>
+        </div>
         <div>
           <dt>Input</dt>
           <dd>{tokenSymbol(tokenIn)}</dd>
@@ -1385,6 +1642,38 @@ function runtimeIsReady(snapshot: AppSnapshot | undefined, expectedChainId: numb
   return snapshot?.runtime.status === "ready" && snapshot.runtime.chainId === expectedChainId;
 }
 
+function swapSnapshotIdentity(snapshot: AppSnapshot | undefined, poolId: string): string {
+  const pool = snapshot?.indexer.pools.find(
+    (candidate) => candidate.id.toLowerCase() === poolId.toLowerCase() || candidate.address.toLowerCase() === poolId.toLowerCase()
+  );
+
+  return JSON.stringify({
+    indexerBlockHash: snapshot?.indexer.blockHash ?? null,
+    indexerBlockNumber: snapshot?.indexer.blockNumber ?? null,
+    indexerHasErrors: snapshot?.indexer.hasIndexingErrors ?? null,
+    indexerPoolPagination: snapshot?.indexer.pagination.pools ?? null,
+    indexerStatus: snapshot?.indexer.status ?? null,
+    pool: pool
+      ? {
+          activeId: pool.activeId,
+          address: pool.address,
+          binStep: pool.binStep,
+          id: pool.id,
+          reserveX: pool.reserveX,
+          reserveY: pool.reserveY,
+          tokenX: pool.tokenX,
+          tokenXAddress: pool.tokenXAddress,
+          tokenY: pool.tokenY,
+          tokenYAddress: pool.tokenYAddress,
+          updatedAtBlock: pool.updatedAtBlock
+        }
+      : null,
+    runtimeBlockNumber: snapshot?.runtime.blockNumber ?? null,
+    runtimeChainId: snapshot?.runtime.chainId ?? null,
+    runtimeStatus: snapshot?.runtime.status ?? null
+  });
+}
+
 function runtimeChainLabel(expectedChainId: number, actualChainId: number | null): string {
   if (actualChainId === null || actualChainId === expectedChainId) return `Chain ${expectedChainId}`;
   return `Expected ${expectedChainId}, RPC ${actualChainId}`;
@@ -1426,6 +1715,10 @@ function swapMarketReadinessError(pool: SelectedPoolDescriptor, rpcReady: boolea
         ["rpc-chain-mismatch", "rpc-error", "rpc-loading"].includes(blocker.code)
       )?.message ?? "RPC is unavailable"
     );
+  }
+
+  if (!pool.ready) {
+    return poolDescriptorError(pool) ?? "Selected pool is not safe for swaps";
   }
 
   if (pool.tokenXAddress === null || pool.tokenYAddress === null || pool.tokenX === null || pool.tokenY === null) {
