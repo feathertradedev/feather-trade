@@ -8,6 +8,7 @@ import {
   LB_ROUTER,
   LOCALNET_INDEXER_URL,
   SECOND_WNATIVE_USDC_PAIR,
+  WNATIVE,
   WNATIVE_USDC_PAIR,
   type InstalledMockRpc,
   type MockRpcOptions
@@ -103,6 +104,58 @@ test("wallet-read-error state fails closed and renders an actionable error", asy
   await expect(page.getByTestId("swap-approve-button")).toBeDisabled();
 });
 
+test("empty selected pool renders position recovery and force-clicks make zero downstream calls", async ({ page }) => {
+  const rpc = await installMockRpc(page, {
+    allowance: 0n,
+    balance: 5n * ONE_TOKEN,
+    includePairs: true,
+    pairReserveX: 0n,
+    pairReserveY: 0n
+  });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
+  await page.goto("/#/swap");
+  await connectWallet(page);
+
+  const recovery = page.getByTestId("swap-market-recovery");
+  await expect(recovery).toContainText("Selected pool has no swap liquidity yet");
+  await expect(recovery.getByRole("link", { name: "Create position" })).toHaveAttribute(
+    "href",
+    `#/liquidity/add/${WNATIVE_USDC_PAIR.toLowerCase()}`
+  );
+  await assertSwapBlockedBeforeDownstream(page, rpc);
+});
+
+test("malformed selected pool fails closed before quote, simulation, or wallet submission", async ({ page }) => {
+  const rpc = await installMockRpc(page, {
+    allowance: 0n,
+    balance: 5n * ONE_TOKEN,
+    includePairs: true,
+    pairBinStep: "0"
+  });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
+  await page.goto("/#/swap");
+  await connectWallet(page);
+
+  await expect(page.getByTestId("swap-market-recovery")).toContainText("Selected pool binStep is not a valid integer");
+  await expect(page.getByTestId("swap-market-recovery").getByRole("button", { name: "Refresh market data" })).toBeVisible();
+  await assertSwapBlockedBeforeDownstream(page, rpc);
+});
+
+test("unsafe selected-pool source fails closed before quote, simulation, or wallet submission", async ({ page }) => {
+  const rpc = await installMockRpc(page, {
+    allowance: 0n,
+    balance: 5n * ONE_TOKEN,
+    includePairs: true,
+    indexerHasErrors: true
+  });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
+  await page.goto("/#/swap");
+  await connectWallet(page);
+
+  await expect(page.getByTestId("swap-market-recovery")).toContainText("Indexer reports indexing errors");
+  await assertSwapBlockedBeforeDownstream(page, rpc);
+});
+
 test("insufficient-balance state blocks approval and swap submission", async ({ page }) => {
   await installMockRpc(page, { allowance: 0n, balance: 0n });
   await installMockWallet(page);
@@ -131,6 +184,130 @@ test("approval-needed state enables approval but guards swap until allowance exi
   assertTransactionMatchesSimulation((await readMockWallet(page)).sentTransactions[0], rpc, "approve");
 });
 
+test("approval confirmation invalidates the reviewed quote until fresh wallet, market, and quote reads complete", async ({ page }) => {
+  const rpc = await setupConnectedSwap(page, {
+    allowance: 0n,
+    allowanceAfterReceipt: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    includePairs: true,
+    indexerDelayMsAfterReceipt: 900,
+    pairReserveXAfterReceipt: 80n * ONE_TOKEN,
+    quoteRate: 999n,
+    quoteRateAfterReceipt: 900n
+  });
+  const output = page.locator("#swap-output");
+  await expect.poll(() => output.inputValue()).not.toBe("0");
+  const preApprovalOutput = await output.inputValue();
+  const quoteCallsBeforeApproval = rpc.snapshot().ethCalls.filter((call) => call.functionName === "findBestPathFromAmountIn").length;
+  const selectedMarket = page.getByTestId("swap-selected-market-identity");
+  const preApprovalReserve = await selectedMarket.getAttribute("data-reserve-x");
+
+  await page.getByTestId("swap-approve-button").click();
+  await expect(page.getByText("Approval confirmed")).toBeVisible({ timeout: 12_000 });
+  await page.waitForTimeout(250);
+  await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
+  await expect(selectedMarket).toHaveAttribute("data-reserve-x", preApprovalReserve ?? "");
+  expect(rpc.snapshot().ethCalls.filter((call) => call.functionName === "findBestPathFromAmountIn")).toHaveLength(
+    quoteCallsBeforeApproval
+  );
+  await bypassDisabledButtonAndClick(page, "swap-submit-button");
+  await expect(page.getByTestId("swap-failure-state")).toContainText(
+    "Refreshing balance, allowance, and quote after approval"
+  );
+
+  expect(simulatedFunctions(rpc)).not.toContain("swapExactTokensForTokens");
+  expect((await readMockWallet(page)).sentTransactions).toHaveLength(1);
+
+  await expect(selectedMarket).toHaveAttribute("data-reserve-x", (80n * ONE_TOKEN).toString(), { timeout: 12_000 });
+  await expect.poll(() => output.inputValue(), { timeout: 12_000 }).not.toBe(preApprovalOutput);
+  await expect(page.getByTestId("swap-allowance-value")).toContainText("5");
+  await expect(page.getByTestId("swap-submit-button")).toBeEnabled();
+  expect(rpc.snapshot().ethCalls.filter((call) => call.functionName === "findBestPathFromAmountIn").length).toBeGreaterThanOrEqual(2);
+
+  const postApprovalOutput = await output.inputValue();
+  const postApprovalQuoteCalls = rpc.snapshot().ethCalls.filter((call) => call.functionName === "findBestPathFromAmountIn").length;
+  rpc.update({
+    blockNumber: 43n,
+    indexerBlockNumber: 43n,
+    indexerDelayMs: 0,
+    pairReserveX: 70n * ONE_TOKEN,
+    quoteRate: 850n
+  });
+  await page.getByTestId("snapshot-refresh-button").click();
+
+  await expect(selectedMarket).toHaveAttribute("data-reserve-x", (70n * ONE_TOKEN).toString());
+  await expect.poll(() => output.inputValue()).not.toBe(postApprovalOutput);
+  await expect(page.getByTestId("swap-submit-button")).toBeEnabled();
+  expect(rpc.snapshot().ethCalls.filter((call) => call.functionName === "findBestPathFromAmountIn").length).toBeGreaterThan(
+    postApprovalQuoteCalls
+  );
+});
+
+test("a stale same-hash approval refresh cannot overwrite a newer intent generation", async ({ page }) => {
+  const rpc = await setupConnectedSwap(page, {
+    allowance: 0n,
+    allowanceAfterReceipt: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    includePairs: true,
+    indexerDelayMsAfterReceipt: 900
+  });
+
+  await page.getByTestId("swap-approve-button").click();
+  await expect(page.getByText("Approval confirmed")).toBeVisible({ timeout: 12_000 });
+  await page.locator("#swap-slippage").fill("0.6");
+  await expect(page.getByTestId("swap-approval-refresh-button")).toBeVisible();
+
+  rpc.update({ indexerDelayMs: 0 });
+  await page.getByTestId("swap-approval-refresh-button").click();
+  await expect(page.getByTestId("swap-submit-button")).toBeEnabled({ timeout: 12_000 });
+  await page.waitForTimeout(1_100);
+
+  await expect(page.getByTestId("swap-submit-button")).toBeEnabled();
+  await expect(page.getByTestId("swap-approval-refresh-button")).toHaveCount(0);
+  await expect(page.getByTestId("swap-failure-state")).not.toContainText("Swap context changed while refreshing");
+});
+
+test("post-approval snapshot refresh rejects a malformed token identity at an otherwise unchanged market", async ({ page }) => {
+  const rpc = await setupConnectedSwap(page, {
+    allowance: 0n,
+    allowanceAfterReceipt: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    includePairs: true,
+    indexerDelayMsAfterReceipt: 700,
+    pairTokenXAfterReceipt: "malformed-token-address"
+  });
+  const selectedMarket = page.getByTestId("swap-selected-market-identity");
+  const quoteCallsBeforeApproval = rpc.snapshot().ethCalls.filter((call) => call.functionName === "findBestPathFromAmountIn").length;
+  const walletReadsBeforeApproval = rpc.snapshot().ethCalls.filter((call) => ["allowance", "balanceOf"].includes(call.functionName)).length;
+
+  await expect(selectedMarket).toHaveAttribute("data-token-x", WNATIVE);
+  await page.getByTestId("swap-approve-button").click();
+  await expect(page.getByText("Approval confirmed")).toBeVisible({ timeout: 12_000 });
+  await page.waitForTimeout(200);
+  await expect(selectedMarket).toHaveAttribute("data-token-x", WNATIVE);
+  await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
+
+  await expect(page.getByTestId("swap-market-recovery")).toContainText(
+    "Selected pool tokenXAddress is not a valid address",
+    { timeout: 12_000 }
+  );
+  await expect(selectedMarket).toHaveAttribute("data-token-x", "unavailable");
+  await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
+  await expect(page.getByTestId("swap-approve-button")).toBeDisabled();
+  await bypassDisabledButtonAndClick(page, "swap-submit-button");
+  await bypassDisabledButtonAndClick(page, "swap-approve-button");
+  await waitForForcedClickEffects(page);
+
+  expect(rpc.snapshot().ethCalls.filter((call) => call.functionName === "findBestPathFromAmountIn")).toHaveLength(
+    quoteCallsBeforeApproval
+  );
+  expect(rpc.snapshot().ethCalls.filter((call) => ["allowance", "balanceOf"].includes(call.functionName))).toHaveLength(
+    walletReadsBeforeApproval
+  );
+  expect(simulatedFunctions(rpc).filter((name) => name === "swapExactTokensForTokens")).toEqual([]);
+  expect((await readMockWallet(page)).sentTransactions).toHaveLength(1);
+});
+
 test("wallet switch control requests the active localnet chain", async ({ page }) => {
   await installMockRpc(page);
   await installMockWallet(page, { chainId: ROBINHOOD_TESTNET_CHAIN_ID });
@@ -154,6 +331,7 @@ test("ready wallet state simulates and submits a guarded swap transaction", asyn
   await expect(page.getByTestId("swap-allowance-value")).toContainText("5");
   await expect(page.getByTestId("swap-submit-button")).toContainText("Swap");
   await expect(page.getByTestId("swap-submit-button")).toBeEnabled();
+  await expect(page.getByTestId("swap-selected-market-identity")).toContainText(`${WNATIVE_USDC_PAIR} · bin step 10`);
 
   await page.getByTestId("swap-submit-button").click();
   await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
@@ -1714,6 +1892,25 @@ async function assertRemoveBlockedBeforeWallet(
   await waitForForcedClickEffects(page);
 
   expect(simulatedFunctions(rpc)).not.toContain("removeLiquidity");
+  const wallet = await readMockWallet(page);
+  expect(wallet.calls).not.toContain("eth_sendTransaction");
+  expect(wallet.sentTransactions).toEqual([]);
+}
+
+async function assertSwapBlockedBeforeDownstream(
+  page: Parameters<typeof installMockRpc>[0],
+  rpc: InstalledMockRpc
+): Promise<void> {
+  await expect(page.getByTestId("swap-approve-button")).toBeDisabled();
+  await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
+  await bypassDisabledButtonAndClick(page, "swap-approve-button");
+  await bypassDisabledButtonAndClick(page, "swap-submit-button");
+  await waitForForcedClickEffects(page);
+
+  const calls = rpc.snapshot().ethCalls.map((call) => call.functionName);
+  expect(calls).not.toContain("findBestPathFromAmountIn");
+  expect(simulatedFunctions(rpc)).not.toContain("approve");
+  expect(simulatedFunctions(rpc)).not.toContain("swapExactTokensForTokens");
   const wallet = await readMockWallet(page);
   expect(wallet.calls).not.toContain("eth_sendTransaction");
   expect(wallet.sentTransactions).toEqual([]);
