@@ -73,6 +73,7 @@ export interface MockRpcOptions {
   indexerHasErrors?: boolean;
   indexerMode?: "ready" | "error";
   lbApproved?: boolean;
+  lbApprovedAfterReceipt?: boolean;
   livePositionBalance?: bigint;
   nativeBalance?: bigint;
   omitActivePoolBin?: boolean;
@@ -443,6 +444,7 @@ async function handleRpc(request: RpcRequest, options: MockRpcOptions, state: Mo
           if (options.clearPositionsAfterReceipt === true) options.includePositions = false;
           if (options.allowanceAfterReceipt !== undefined) options.allowance = options.allowanceAfterReceipt;
           if (options.indexerDelayMsAfterReceipt !== undefined) options.indexerDelayMs = options.indexerDelayMsAfterReceipt;
+          if (options.lbApprovedAfterReceipt !== undefined) options.lbApproved = options.lbApprovedAfterReceipt;
           if (options.pairReserveXAfterReceipt !== undefined) options.pairReserveX = options.pairReserveXAfterReceipt;
           if (options.pairTokenXAfterReceipt !== undefined) options.pairTokenX = options.pairTokenXAfterReceipt;
           if (options.quoteDelayMsAfterReceipt !== undefined) options.quoteDelayMs = options.quoteDelayMsAfterReceipt;

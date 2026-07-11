@@ -11,6 +11,7 @@
     "test:pagination": "node scripts/test-graphql-pagination.mjs",
     "test:pair-attestation": "node scripts/test-pair-attestation.mjs",
     "test:liquidity-review": "node scripts/test-liquidity-review.mjs",
+    "test:lb-operator-approval": "node scripts/test-lb-operator-approval.mjs",
     "test:pool-selection": "node scripts/test-pool-selection.mjs",
     "test:positions": "node scripts/test-position-burn-plan.mjs",
     "test:safety": "node scripts/test-transaction-safety.mjs",

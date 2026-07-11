@@ -100,6 +100,13 @@ import {
   poolRowToPairClaim,
   type PairAttestation
 } from "./pair-attestation";
+import {
+  classifyLbOperatorApproval,
+  observationMatchesGrant,
+  type LbOperatorApprovalGrant,
+  type LbOperatorApprovalObservation
+} from "./lb-operator-approval";
+import { LbOperatorApprovalDisclosure } from "./lb-operator-approval-disclosure";
 import { buildPositionBurnPlan, type PositionBurnLiveBalanceRow, type PositionBurnPlanResult } from "./position-burn-plan";
 import {
   BLOCKING_PRICE_IMPACT_BPS,
@@ -2397,6 +2404,19 @@ function ApprovalDetails({
   );
 }
 
+function rememberLbApprovalGrant(
+  grants: readonly LbOperatorApprovalGrant[],
+  next: LbOperatorApprovalGrant
+): LbOperatorApprovalGrant[] {
+  const key = (grant: LbOperatorApprovalGrant) => [
+    grant.account.toLowerCase(),
+    grant.chainId.toString(),
+    grant.pair.toLowerCase(),
+    grant.operator.toLowerCase()
+  ].join("|");
+  return grants.some((grant) => key(grant) === key(next)) ? [...grants] : [...grants, next];
+}
+
 function TokenIdentity({ networkName, testId, token }: { networkName: string; testId: string; token: TokenMetadata | null }) {
   const [logoFailed, setLogoFailed] = useState(false);
   useEffect(() => setLogoFailed(false), [token?.address]);
@@ -3314,6 +3334,12 @@ function LiquidityView({
   const removeReceipt = useWaitForTransactionReceipt({ hash: removeWrite.data });
   const transactionJournal = useTransactionJournal();
   const publicClient = useMemo(() => createDexPublicClient(registry.chain, registry.endpoints.rpcUrl), [registry]);
+  const [lbApprovalObservation, setLbApprovalObservation] = useState<LbOperatorApprovalObservation | null>(null);
+  const [observedApprovedLbGrants, setObservedApprovedLbGrants] = useState<LbOperatorApprovalGrant[]>([]);
+  const latestLbApprovalObservationRef = useRef<LbOperatorApprovalObservation | null>(lbApprovalObservation);
+  const latestObservedApprovedLbGrantsRef = useRef<readonly LbOperatorApprovalGrant[]>(observedApprovedLbGrants);
+  latestLbApprovalObservationRef.current = lbApprovalObservation;
+  latestObservedApprovedLbGrantsRef.current = observedApprovedLbGrants;
 
   useEffect(() => {
     if (initialSection === null) return;
@@ -3519,7 +3545,7 @@ function LiquidityView({
   const rangeSliderMin = Math.min(-MAX_LIQUIDITY_BINS, lowerDelta ?? 0, (upperDelta ?? 0) - MAX_LIQUIDITY_BINS + 1);
   const rangeSliderMax = Math.max(MAX_LIQUIDITY_BINS, upperDelta ?? 0, (lowerDelta ?? 0) + MAX_LIQUIDITY_BINS - 1);
   const walletQuery = useQuery({
-    queryKey: ["liquidityWallet", registry.chainId, account.address, pool?.pair, pool?.tokenX, pool?.tokenY],
+    queryKey: ["liquidityWallet", registry.chainId, account.address, pool?.pair, pool?.tokenX, pool?.tokenY, registry.contracts.lbRouter],
     queryFn: async () => {
       if (!account.address || !pool) {
         throw new Error("Liquidity wallet reads are not available");
@@ -3560,6 +3586,10 @@ function LiquidityView({
       ]);
 
       return {
+        approvalAccount: account.address,
+        approvalChainId: registry.chainId,
+        approvalOperator: registry.contracts.lbRouter,
+        approvalPair: pool.pair,
         balanceX: balanceX.toString(),
         balanceY: balanceY.toString(),
         allowanceX: allowanceX.toString(),
@@ -3572,9 +3602,102 @@ function LiquidityView({
     refetchInterval:
       rpcReady && connected && pool !== null && (selectedPool.ready || removeSelectedPool.ready)
         ? 10_000
-        : false
+        : false,
+    retry: false
   });
   const walletData = walletQuery.data && !walletQuery.isError ? walletQuery.data : null;
+  const currentLbApprovalGrant = useMemo<LbOperatorApprovalGrant | null>(() =>
+    account.address && pool
+      ? {
+          account: account.address,
+          chainId: registry.chainId,
+          operator: registry.contracts.lbRouter,
+          pair: pool.pair
+        }
+      : null,
+    [account.address, pool?.pair, registry.chainId, registry.contracts.lbRouter]
+  );
+  useEffect(() => {
+    if (!walletQuery.isError || currentLbApprovalGrant === null) return;
+    setLbApprovalObservation((current) =>
+      observationMatchesGrant(current, currentLbApprovalGrant) ? null : current
+    );
+    setGasReview(null);
+  }, [currentLbApprovalGrant, walletQuery.isError]);
+  useEffect(() => {
+    if (walletData === null) return;
+    const observation: LbOperatorApprovalObservation = {
+      account: walletData.approvalAccount,
+      approved: walletData.lbApproved,
+      chainId: walletData.approvalChainId,
+      operator: walletData.approvalOperator,
+      pair: walletData.approvalPair
+    };
+    if (!observationMatchesGrant(observation, currentLbApprovalGrant)) return;
+    const previousObservation = latestLbApprovalObservationRef.current;
+    const hasExactPriorGrant = latestObservedApprovedLbGrantsRef.current.some((grant) =>
+      observationMatchesGrant({ ...grant, approved: true }, observation)
+    );
+    const previousIsExact = observationMatchesGrant(previousObservation, observation);
+    const externallyRevoked =
+      !observation.approved &&
+      (
+        (previousIsExact && previousObservation.approved) ||
+        (!previousIsExact && hasExactPriorGrant)
+      );
+    if (externallyRevoked) {
+      setLiquiditySimulationError(null);
+      setGasReview(null);
+      setGasReviewError(null);
+      setRemoveQuoteReviewRequired("LB operator approval was revoked by an external on-chain change. Re-approve this exact pair and router before withdrawing.");
+    }
+    setLbApprovalObservation((current) =>
+      observationMatchesGrant(current, observation) && current.approved === observation.approved
+        ? current
+        : observation
+    );
+    if (observation.approved) {
+      setObservedApprovedLbGrants((current) => rememberLbApprovalGrant(current, observation));
+    }
+  }, [
+    currentLbApprovalGrant,
+    walletQuery.dataUpdatedAt,
+    walletData?.approvalAccount,
+    walletData?.approvalChainId,
+    walletData?.approvalOperator,
+    walletData?.approvalPair,
+    walletData?.lbApproved
+  ]);
+  const lbApprovalState = classifyLbOperatorApproval({
+    approvedGrants: observedApprovedLbGrants,
+    current: currentLbApprovalGrant,
+    observation: lbApprovalObservation
+  });
+  const liveLbApproved = lbApprovalState === "approved";
+  useEffect(() => {
+    if (!liveLbApproved) return;
+    setRemoveQuoteReviewRequired((current) => current?.startsWith("LB operator") ? null : current);
+  }, [liveLbApproved]);
+  const recordLiveLbApproval = (approved: boolean): LbOperatorApprovalObservation => {
+    if (currentLbApprovalGrant === null) throw new Error("Exact LB pair/operator approval context is unavailable");
+    const observation = { ...currentLbApprovalGrant, approved };
+    setLbApprovalObservation(observation);
+    if (approved) {
+      setObservedApprovedLbGrants((current) => rememberLbApprovalGrant(current, currentLbApprovalGrant));
+    }
+    return observation;
+  };
+  const readLiveLbApproval = async (): Promise<boolean> => {
+    if (currentLbApprovalGrant === null) throw new Error("Exact LB pair/operator approval context is unavailable");
+    const approved = await publicClient.readContract({
+      address: currentLbApprovalGrant.pair,
+      abi: lbPairAbi,
+      functionName: "isApprovedForAll",
+      args: [currentLbApprovalGrant.account, currentLbApprovalGrant.operator]
+    });
+    recordLiveLbApproval(approved);
+    return approved;
+  };
   const walletReadsReady = walletData !== null;
   const walletBalanceX = walletData ? BigInt(walletData.balanceX) : null;
   const walletBalanceY = walletData ? BigInt(walletData.balanceY) : null;
@@ -3645,7 +3768,7 @@ function LiquidityView({
     activeWalletChainId?.toString() ?? "",
     registry.contracts.lbRouter,
     selectedPositionsKey,
-    walletData?.lbApproved === false ? "approval-required" : "approval-not-required"
+    liveLbApproved ? "approval-not-required" : "approval-required"
   ].join("|");
   const lbApprovalFormFingerprint = [
     account.address ?? "",
@@ -3961,7 +4084,7 @@ function LiquidityView({
     removeInputError === null &&
     liquidityExitAttestationQuery.data !== undefined &&
     liquidityExitAttestationQuery.error === null &&
-    walletData?.lbApproved === true &&
+    liveLbApproved &&
     !removeBurnPlan.blocked &&
     liquiditySimulationError === null &&
     !liquiditySimulationPending &&
@@ -3998,7 +4121,8 @@ function LiquidityView({
     connected &&
     !onWrongChain &&
     hasSelectedPositions &&
-    walletData?.lbApproved === false &&
+    !liveLbApproved &&
+    lbApprovalState !== "unavailable" &&
     removeInputError === null &&
     liquidityExitAttestationQuery.data !== undefined &&
     liquidityExitAttestationQuery.error === null &&
@@ -4142,6 +4266,10 @@ function LiquidityView({
     }
 
     if (approveLbSuccess && approveLbWrite.data && approveLbWrite.data !== handledLbApprovalHash) {
+      if (currentLbApprovalGrant !== null) {
+        setLbApprovalObservation({ ...currentLbApprovalGrant, approved: true });
+        setObservedApprovedLbGrants((current) => rememberLbApprovalGrant(current, currentLbApprovalGrant));
+      }
       void walletQuery.refetch();
       setHandledLbApprovalHash(approveLbWrite.data);
     }
@@ -4171,6 +4299,7 @@ function LiquidityView({
     approveXWrite.data,
     approveYSuccess,
     approveYWrite.data,
+    currentLbApprovalGrant,
     handledAddHash,
     handledApproveXHash,
     handledApproveYHash,
@@ -4426,6 +4555,7 @@ function LiquidityView({
     approveLbWrite.reset();
     setSubmittedLbApprovalReceiptContext(null);
     setGasReviewError(null);
+    setRemoveQuoteReviewRequired(null);
     const operationIsCurrent = () =>
       liquidityOperationGenerationRef.current === submittedOperationGeneration &&
       approveLbSubmitInFlightRef.current === submittedOperationGeneration;
@@ -4435,6 +4565,16 @@ function LiquidityView({
         await attestLiquidityPair("remove-liquidity");
       } catch (error) {
         setLiquiditySimulationError(getWriteError(error));
+        return;
+      }
+      try {
+        if (await readLiveLbApproval()) {
+          setLiquiditySimulationError(null);
+          setGasReview(null);
+          return;
+        }
+      } catch (error) {
+        setLiquiditySimulationError(`Live LB operator approval preflight failed: ${getWriteError(error) ?? "approval state unavailable"}`);
         return;
       }
       setLiquiditySimulationError(null);
@@ -4513,6 +4653,17 @@ function LiquidityView({
         return;
       }
 
+      try {
+        if (await readLiveLbApproval()) {
+          setLiquiditySimulationError(null);
+          setGasReview(null);
+          return;
+        }
+      } catch (error) {
+        setLiquiditySimulationError(`Live LB operator approval recheck failed: ${getWriteError(error) ?? "approval state unavailable"}`);
+        return;
+      }
+
       if (!operationIsCurrent()) return;
       const gasReviewIsCurrent = () =>
         operationIsCurrent() &&
@@ -4563,13 +4714,21 @@ function LiquidityView({
           }),
           preWalletGuard: async () => {
             await attestLiquidityPair("remove-liquidity");
+            if (await readLiveLbApproval()) {
+              throw new PairAttestationError("context-changed", "LB operator access is already approved; the redundant approval was not opened in the wallet");
+            }
             if (!gasReviewIsCurrent()) throw new PairAttestationError("context-changed", "Withdrawal context changed during final pair attestation");
           },
           send: () => approveLbWrite.writeContractAsync(simulated.request)
         });
         submitted = hash !== null;
       } catch (error) {
-        if (!isUserRejectedSubmission(error)) setLiquiditySimulationError(getWriteError(error) ?? "Transaction journal blocked LB approval submission");
+        if (error instanceof PairAttestationError && error.message.includes("already approved")) {
+          setLiquiditySimulationError(null);
+          setGasReview(null);
+        } else if (!isUserRejectedSubmission(error)) {
+          setLiquiditySimulationError(getWriteError(error) ?? "Transaction journal blocked LB approval submission");
+        }
         // The wagmi mutation retains the rejection for the originating mounted session.
       }
     } finally {
@@ -4785,6 +4944,17 @@ function LiquidityView({
         setLiquiditySimulationError(getWriteError(error));
         return;
       }
+      try {
+        if (!(await readLiveLbApproval())) {
+          setLiquiditySimulationError(null);
+          setGasReview(null);
+          setRemoveQuoteReviewRequired("LB operator access was revoked or does not match this exact pair and router. Approve the current pair-wide operator before retrying; no remove simulation or wallet request was sent.");
+          return;
+        }
+      } catch (error) {
+        setLiquiditySimulationError(`Live LB operator approval preflight failed: ${getWriteError(error) ?? "approval state unavailable"}`);
+        return;
+      }
       setLiquiditySimulationPending(true);
       let freshPlan: PositionBurnPlanResult;
       let freshBurnSnapshot: LiveBurnSnapshot;
@@ -4955,6 +5125,17 @@ function LiquidityView({
         setLiquiditySimulationError(`Simulation failed: ${getWriteError(error) ?? "Transaction simulation failed"}`);
         return;
       }
+      try {
+        if (!(await readLiveLbApproval())) {
+          setLiquiditySimulationError(null);
+          setGasReview(null);
+          setRemoveQuoteReviewRequired("LB operator access changed during review. Re-approve this exact pair and router before retrying; no wallet request was sent.");
+          return;
+        }
+      } catch (error) {
+        setLiquiditySimulationError(`Live LB operator approval recheck failed: ${getWriteError(error) ?? "approval state unavailable"}`);
+        return;
+      }
       if (!operationIsCurrent()) return;
       if (latestRemoveExecutionContextFingerprint.current !== submittedExecutionContextFingerprint) {
         setLiquiditySimulationError("Remove execution context changed during live reads or simulation; review the current inputs and try again");
@@ -5033,13 +5214,22 @@ function LiquidityView({
           reviewed: reviewedTransactionIntent(submittedContext, { poolId: pool.pair, recipient: account.address, refundRecipient: null, settingsFingerprint: removeReviewFingerprint }),
           preWalletGuard: async () => {
             await attestLiquidityPair("remove-liquidity");
+            if (!(await readLiveLbApproval())) {
+              throw new PairAttestationError("context-changed", "LB operator access was revoked before wallet confirmation");
+            }
             if (!gasReviewIsCurrent()) throw new PairAttestationError("context-changed", "Withdrawal context changed during final pair attestation");
           },
           send: () => removeWrite.sendTransactionAsync(transaction)
         });
         submitted = hash !== null;
       } catch (error) {
-        if (!isUserRejectedSubmission(error)) setLiquiditySimulationError(getWriteError(error) ?? "Transaction journal blocked withdrawal submission");
+        if (error instanceof PairAttestationError && error.message.includes("LB operator access was revoked")) {
+          setLiquiditySimulationError(null);
+          setGasReview(null);
+          setRemoveQuoteReviewRequired("LB operator access was revoked before wallet confirmation. Re-approve this exact pair and router; no wallet request was sent.");
+        } else if (!isUserRejectedSubmission(error)) {
+          setLiquiditySimulationError(getWriteError(error) ?? "Transaction journal blocked withdrawal submission");
+        }
         // The wagmi mutation retains the rejection for the originating mounted session.
       }
     } finally {
@@ -5397,15 +5587,14 @@ function LiquidityView({
         <TokenIdentity token={tokenX} networkName={registry.chain.name} testId="withdraw-token-x-identity" />
         <TokenIdentity token={tokenY} networkName={registry.chain.name} testId="withdraw-token-y-identity" />
 
-        <ApprovalDetails
-          amount={null}
-          asset={`LB pair ${pool?.pair ?? "not selected"}`}
-          currentState={walletData ? (walletData.lbApproved ? "Approved" : "Not approved") : "unavailable"}
-          id="remove-lb-approval-details"
-          requested={`Operator access for ${selectedBinSummary}`}
-          scope="All LB token IDs for this pair"
-          spender={registry.contracts.lbRouter}
-          token={null}
+        <LbOperatorApprovalDisclosure
+          account={account.address ?? null}
+          approvedGrants={observedApprovedLbGrants}
+          chainId={registry.chainId}
+          networkName={registry.chain.name}
+          observation={lbApprovalObservation}
+          operator={registry.contracts.lbRouter}
+          pair={pool?.pair ?? null}
         />
 
         <div className="action-stack">
@@ -5415,15 +5604,15 @@ function LiquidityView({
             type="button"
             aria-describedby="remove-lb-approval-details"
             disabled={!canApproveLb}
-            title={`Approve all LB positions to ${registry.contracts.lbRouter}`}
+            title={`Approve every LB token ID in pair ${pool?.pair ?? "not selected"} for operator ${registry.contracts.lbRouter}`}
             onClick={handleApproveLb}
           >
             {liquiditySimulationPending || approveLbWrite.isPending || approveLbReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <CheckCircle2 size={18} />}
-            <span>{walletData?.lbApproved ? "LB approved" : "Approve LB tokens"}</span>
+            <span>{liveLbApproved ? "Pair-wide LB operator approved" : "Approve pair-wide LB operator"}</span>
           </button>
           <button className="primary-button wide" data-testid="liquidity-remove-button" type="button" disabled={!removeReady} onClick={handleRemoveLiquidity}>
             {liquiditySimulationPending || removeWrite.isPending || removeReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <Droplets size={18} />}
-            <span>{removeButtonLabel({ poolReady: removePoolReady, connected, fullExit, onWrongChain, invalidInput: removeInputError !== null, hasPosition: hasSelectedPositions, needsApproval: walletData?.lbApproved === false, insufficientGas: liquiditySimulationError?.startsWith("Insufficient ETH for gas") === true })}</span>
+            <span>{removeButtonLabel({ poolReady: removePoolReady, connected, fullExit, onWrongChain, invalidInput: removeInputError !== null, hasPosition: hasSelectedPositions, needsApproval: !liveLbApproved, insufficientGas: liquiditySimulationError?.startsWith("Insufficient ETH for gas") === true })}</span>
           </button>
         </div>
 
