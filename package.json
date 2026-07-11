@@ -76,6 +76,7 @@
     "web:test:pool-selection": "pnpm --filter @robinhood-lb/web test:pool-selection",
     "web:test:positions": "pnpm --filter @robinhood-lb/web test:positions",
     "web:test:safety": "pnpm --filter @robinhood-lb/web test:safety",
+    "web:test:transaction-journal": "pnpm --filter @robinhood-lb/web test:transaction-journal",
     "web:typecheck": "pnpm --filter @robinhood-lb/web typecheck",
     "web:fixture:public": "node scripts/web/create-public-config-fixture.cjs",
     "web:test:public-config": "node scripts/web/test-public-config.cjs",

@@ -12,6 +12,7 @@
     "test:pool-selection": "node scripts/test-pool-selection.mjs",
     "test:positions": "node scripts/test-position-burn-plan.mjs",
     "test:safety": "node scripts/test-transaction-safety.mjs",
+    "test:transaction-journal": "node scripts/test-transaction-journal.mjs",
     "typecheck": "tsc -b --pretty false"
   },
   "dependencies": {

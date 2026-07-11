@@ -180,6 +180,19 @@ test("actual UI submits approve, swap, add, LB approval, and remove transactions
   const partialArgs = partialRemove.args as readonly unknown[];
   expect((await readTokenBalance(pool.tokenX)) - tokenXBeforePartial).toBeGreaterThanOrEqual(partialArgs[3] as bigint);
   expect((await readTokenBalance(pool.tokenY)) - tokenYBeforePartial).toBeGreaterThanOrEqual(partialArgs[4] as bigint);
+  const journalBeforeReload = await page.evaluate(() => {
+    const raw = window.localStorage.getItem("feather.transaction-journal.v1");
+    return raw === null ? [] : (JSON.parse(raw) as { records: Array<{ reviewed: { intent: string } }> }).records;
+  });
+  expect(journalBeforeReload.map((record) => record.reviewed.intent)).toEqual([
+    "approval",
+    "swap",
+    "approval",
+    "approval",
+    "add-liquidity",
+    "approval",
+    "remove-liquidity"
+  ]);
 
   await page.reload();
   if (await page.getByTestId("wallet-connect-button").isVisible()) await connectWallet(page);

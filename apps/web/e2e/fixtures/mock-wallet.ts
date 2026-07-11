@@ -18,7 +18,9 @@ export interface MockWalletOptions {
   primaryProvider?: { name: string; rdns: string; uuid: string };
   rejectTransactions?: boolean;
   switchMode?: "ready" | "add-required" | "add-rejected" | "switch-rejected";
+  transactionDelayMs?: number;
   transactionHash?: `0x${string}`;
+  transactionMode?: "ready" | "ambiguous";
 }
 
 export interface MockWalletSnapshot {
@@ -33,7 +35,7 @@ export interface MockWalletSnapshot {
 
 export async function installMockWallet(page: Page, options: MockWalletOptions = {}): Promise<void> {
   await page.addInitScript(
-    ({ account, additionalProviders, allowTransactions, chainId, connectMode, primaryProvider, rejectTransactions, switchMode, transactionHash }) => {
+    ({ account, additionalProviders, allowTransactions, chainId, connectMode, primaryProvider, rejectTransactions, switchMode, transactionDelayMs, transactionHash, transactionMode }) => {
       type Listener = (...args: unknown[]) => void;
       type ProviderState = Window["__mockWalletState"];
 
@@ -125,11 +127,13 @@ export async function installMockWallet(page: Page, options: MockWalletOptions =
             case "eth_sendTransaction":
               state.sentTransactions.push(params?.[0] ?? null);
               if (!allowTransactions) throw new Error("Mock wallet should not receive guarded transactions");
+              if (transactionDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, transactionDelayMs));
               if (state.rejectTransactions) {
                 const rejection = new Error("User rejected the transaction request") as Error & { code: number };
                 rejection.code = 4001;
                 throw rejection;
               }
+              if (transactionMode === "ambiguous") throw rpcError("Transport closed after possible broadcast", -32_603);
               return transactionHash;
             default:
               throw new Error(`Unhandled mock wallet method: ${method}`);
@@ -222,7 +226,9 @@ export async function installMockWallet(page: Page, options: MockWalletOptions =
       primaryProvider: options.primaryProvider ?? { name: "Mock MetaMask", rdns: "io.metamask", uuid: "robinhood-lb-mock-wallet" },
       rejectTransactions: options.rejectTransactions ?? false,
       switchMode: options.switchMode ?? "ready",
-      transactionHash: options.transactionHash ?? "0x1111111111111111111111111111111111111111111111111111111111111111"
+      transactionDelayMs: options.transactionDelayMs ?? 0,
+      transactionHash: options.transactionHash ?? "0x1111111111111111111111111111111111111111111111111111111111111111",
+      transactionMode: options.transactionMode ?? "ready"
     }
   );
 }

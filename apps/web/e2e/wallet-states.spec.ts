@@ -299,7 +299,8 @@ test("account change resets executable state and receipt banners but preserves t
   await expect(page.locator("#swap-amount")).toHaveValue("1.0");
   await expect(page.getByText("Receipt state will appear here")).toBeVisible();
   await expect(page.getByText("Swap confirmed")).toHaveCount(0);
-  await expect(page.getByTestId("submitted-transaction-journal").locator("[data-transaction-hash]")).toHaveCount(1);
+  await expect(page.getByTestId("submitted-transaction-journal")).toHaveCount(0);
+  expect(await persistedTransactionJournalCount(page)).toBe(1);
 });
 
 test("disconnect, reconnect, chain, and environment changes clear prior-owner drafts", async ({ page }) => {
@@ -351,7 +352,8 @@ test("LP owner change reissues owner queries and clears LP drafts and terminal b
   await expect(page.getByTestId("liquidity-amount-x")).toHaveValue("0.01");
   await expect(page.getByText("Token approval confirmed")).toHaveCount(0);
   await expect.poll(() => rpc.snapshot().graphRequests.some((request) => request.variables?.owner?.toLowerCase() === nextOwner)).toBe(true);
-  await expect(page.getByTestId("submitted-transaction-journal").locator("[data-transaction-hash]")).toHaveCount(1);
+  await expect(page.getByTestId("submitted-transaction-journal")).toHaveCount(0);
+  expect(await persistedTransactionJournalCount(page)).toBe(1);
 });
 
 test("wrong-chain wallet state disables approvals and submit handlers", async ({ page }) => {
@@ -658,6 +660,82 @@ test("ready wallet state simulates and submits a guarded swap transaction", asyn
 
   expect(simulatedFunctions(rpc)).toContain("swapExactTokensForTokens");
   assertTransactionMatchesSimulation((await readMockWallet(page)).sentTransactions[0], rpc, "swapExactTokensForTokens");
+});
+
+test("wallet prompts longer than the reconciliation interval retain their durable pre-broadcast intent", async ({ page }) => {
+  await installMockRpc(page, { allowance: 5n * ONE_TOKEN, balance: 5n * ONE_TOKEN });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID, transactionDelayMs: 3_500 });
+  await page.goto("/#/swap");
+  await connectWallet(page);
+  await expect(page.getByTestId("swap-submit-button")).toBeEnabled();
+
+  await clickReviewedAction(page, "swap-submit-button");
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+  await expect(page.getByTestId("submitted-transaction-journal").locator("[data-transaction-hash]"), { timeout: 8_000 }).toHaveCount(1);
+  expect(await persistedTransactionJournalCount(page)).toBe(1);
+});
+
+test("ambiguous wallet transport blocks blind retry while preserving a hashless intent", async ({ page }) => {
+  await installMockRpc(page, { allowance: 5n * ONE_TOKEN, balance: 5n * ONE_TOKEN });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID, transactionMode: "ambiguous" });
+  await page.goto("/#/swap");
+  await connectWallet(page);
+
+  await clickReviewedAction(page, "swap-submit-button");
+  await expect(page.getByTestId("swap-failure-state")).toContainText(/possible broadcast/i);
+  expect((await readMockWallet(page)).sentTransactions).toHaveLength(1);
+  await expect(page.getByTestId("submitted-transaction-journal")).toContainText(/unknown-submission|reconciling/);
+
+  await page.locator("#swap-amount").fill("1.1");
+  await page.locator("#swap-amount").fill("1.0");
+  await clickReviewedAction(page, "swap-submit-button");
+  await expect(page.getByTestId("swap-failure-state")).toContainText(/still unresolved/i);
+  expect((await readMockWallet(page)).sentTransactions).toHaveLength(1);
+});
+
+test("unavailable durable storage blocks wallet handoff and surfaces a controlled journal error", async ({ page }) => {
+  await page.addInitScript(() => {
+    const original = Storage.prototype.setItem;
+    Storage.prototype.setItem = function (key, value) {
+      if (key === "feather.transaction-journal.v1") throw new DOMException("Mock quota unavailable", "QuotaExceededError");
+      return original.call(this, key, value);
+    };
+  });
+  await installMockRpc(page, { allowance: 5n * ONE_TOKEN, balance: 5n * ONE_TOKEN });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
+  await page.goto("/#/swap");
+  await connectWallet(page);
+
+  await clickReviewedAction(page, "swap-submit-button");
+  await expect(page.getByTestId("swap-failure-state")).toContainText(/quota|storage|journal/i);
+  expect((await readMockWallet(page)).sentTransactions).toHaveLength(0);
+});
+
+test("two same-origin tabs serialize identical intents before either wallet can double-submit", async ({ page, context }) => {
+  await installMockRpc(page, { allowance: 5n * ONE_TOKEN, balance: 5n * ONE_TOKEN });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID, transactionDelayMs: 4_000 });
+  await page.goto("/#/swap");
+  await connectWallet(page);
+
+  await clickReviewedAction(page, "swap-submit-button");
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+
+  const secondPage = await context.newPage();
+  await installMockRpc(secondPage, { allowance: 5n * ONE_TOKEN, balance: 5n * ONE_TOKEN });
+  await installMockWallet(secondPage, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
+  await secondPage.goto("/#/swap");
+  await expect.poll(async () =>
+    await secondPage.getByTestId("wallet-account-button").isVisible() ||
+    await secondPage.getByTestId("wallet-connect-button").isEnabled()).toBe(true);
+  if (!await secondPage.getByTestId("wallet-account-button").isVisible()) {
+    await secondPage.getByTestId("wallet-connect-button").click();
+  }
+  await expect(secondPage.getByTestId("wallet-account-button")).toContainText("0xf39F...2266");
+  await clickReviewedAction(secondPage, "swap-submit-button");
+
+  await expect(secondPage.getByTestId("swap-failure-state")).toContainText(/still unresolved/i);
+  expect((await readMockWallet(secondPage)).sentTransactions).toHaveLength(0);
+  await expect(page.getByTestId("submitted-transaction-journal").locator("[data-transaction-hash]"), { timeout: 8_000 }).toHaveCount(1);
 });
 
 test("best multi-hop route remains executable when it differs from the selected indexed pool", async ({ page }) => {
@@ -1539,6 +1617,20 @@ test("withdrawal reverted receipt is explicit and never reports success", async 
   await expect(page.getByText("Liquidity removed")).toHaveCount(0);
 });
 
+test("successful withdrawal remains visible when its own receipt refresh removes the spent position", async ({ page }) => {
+  await setupConnectedLiquidity(page, {
+    clearPositionsAfterReceipt: true,
+    includePositions: true,
+    lbApproved: true
+  });
+  await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled();
+  await clickReviewedAction(page, "liquidity-remove-button");
+
+  await expect(page.getByText("Liquidity removed")).toBeVisible({ timeout: 12_000 });
+  await expect(page.getByRole("group", { name: "Positions" }).locator('input[type="checkbox"]')).toHaveCount(0);
+  await expect(page.getByText("Liquidity removed")).toBeVisible();
+});
+
 test("one-sided ranges submit direct add-liquidity transactions with the unused side zeroed", async ({ page }) => {
   const rpc = await setupConnectedLiquidity(page, {
     allowance: 5n * ONE_TOKEN,
@@ -2026,10 +2118,19 @@ test("same-pool partial-to-full route prefill cannot reuse the partial receipt",
   await expect(page.getByText("Liquidity removed")).toBeVisible();
 
   await page.evaluate((pair) => {
+    const root = document.documentElement;
+    root.dataset.staleRemoveReceiptPaint = "false";
+    const observer = new MutationObserver(() => {
+      if (window.location.hash.includes("/full/") && document.body.textContent?.includes("Liquidity removed")) {
+        root.dataset.staleRemoveReceiptPaint = "true";
+      }
+    });
+    observer.observe(document.body, { attributes: true, childList: true, characterData: true, subtree: true });
     window.location.hash = `#/liquidity/full/${pair}`;
   }, WNATIVE_USDC_PAIR.toLowerCase());
   await expect(page.locator("#remove-percent")).toHaveValue("100");
   await expect(page.getByText("Liquidity removed")).toHaveCount(0);
+  await expect(page.locator("html")).toHaveAttribute("data-stale-remove-receipt-paint", "false");
 });
 
 test("portfolio exits fail closed when the exact analytics bin set is missing from the indexer", async ({ page }) => {
@@ -2291,6 +2392,15 @@ function decodeSubmittedTransaction(transaction: unknown) {
   return decodeFunctionData({
     abi: TRANSACTION_ABI,
     data: submitted.data as Hex
+  });
+}
+
+async function persistedTransactionJournalCount(page: import("@playwright/test").Page): Promise<number> {
+  return page.evaluate(() => {
+    const raw = window.localStorage.getItem("feather.transaction-journal.v1");
+    if (raw === null) return 0;
+    const parsed = JSON.parse(raw) as { records?: unknown[] };
+    return Array.isArray(parsed.records) ? parsed.records.length : 0;
   });
 }
 

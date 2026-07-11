@@ -46,6 +46,7 @@ export interface MockRpcOptions {
   blockHash?: Hex;
   blockNumber?: bigint;
   chainId?: number;
+  clearPositionsAfterReceipt?: boolean;
   dashboardPoolLimit?: number;
   estimatedGas?: bigint;
   gasEstimateMode?: "ready" | "error";
@@ -401,6 +402,8 @@ async function handleRpc(request: RpcRequest, options: MockRpcOptions, state: Mo
         return rpcResult(request, numberToHex(options.chainId ?? LOCALNET_CHAIN_ID));
       case "eth_blockNumber":
         return rpcResult(request, numberToHex(options.blockNumber ?? DEFAULT_BLOCK_NUMBER));
+      case "eth_getTransactionCount":
+        return rpcResult(request, "0x0");
       case "eth_getBlockByNumber":
         return rpcResult(request, {
           hash: options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222",
@@ -415,6 +418,7 @@ async function handleRpc(request: RpcRequest, options: MockRpcOptions, state: Mo
         return rpcResult(request, numberToHex(options.gasPrice ?? 1_000_000_000n));
       case "eth_getTransactionReceipt":
         if ((options.receiptStatus ?? "success") === "success") {
+          if (options.clearPositionsAfterReceipt === true) options.includePositions = false;
           if (options.allowanceAfterReceipt !== undefined) options.allowance = options.allowanceAfterReceipt;
           if (options.indexerDelayMsAfterReceipt !== undefined) options.indexerDelayMs = options.indexerDelayMsAfterReceipt;
           if (options.pairReserveXAfterReceipt !== undefined) options.pairReserveX = options.pairReserveXAfterReceipt;
