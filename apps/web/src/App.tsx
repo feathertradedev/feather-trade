@@ -3421,7 +3421,7 @@ function LiquidityView({
   const addReverted = submittedAddReceiptContext === addExecutionFingerprint && (addReceipt.data?.status === "reverted" || isRevertedReceiptError(addReceipt.error));
   const removeReverted = removeReceipt.data?.status === "reverted" || isRevertedReceiptError(removeReceipt.error);
   const removeReceiptMatchesCurrentIntent =
-    liquidityReceiptPhase === "remove" && submittedRemoveReceiptContext === removeReviewFingerprint;
+    liquidityReceiptPhase === "remove" && submittedRemoveReceiptContext === liquidityLifecycleKey;
   const currentRemoveSuccess = removeReceiptMatchesCurrentIntent && removeSuccess;
   const currentRemoveReverted = removeReceiptMatchesCurrentIntent && removeReverted;
   const currentLbApprovalSuccess = liquidityReceiptPhase === "lb-approval" && approveLbSuccess;
@@ -4364,7 +4364,7 @@ function LiquidityView({
       });
       if (!gasApproved || !gasReviewIsCurrent()) return;
       setLiquidityReceiptPhase("remove");
-      setSubmittedRemoveReceiptContext(removeReviewFingerprint);
+      setSubmittedRemoveReceiptContext(liquidityLifecycleKey);
       const submittedContext = {
         account: account.address,
         calldataFingerprint: keccak256(transaction.data),

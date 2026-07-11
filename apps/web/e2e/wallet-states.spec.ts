@@ -1617,6 +1617,20 @@ test("withdrawal reverted receipt is explicit and never reports success", async 
   await expect(page.getByText("Liquidity removed")).toHaveCount(0);
 });
 
+test("successful withdrawal remains visible when its own receipt refresh removes the spent position", async ({ page }) => {
+  await setupConnectedLiquidity(page, {
+    clearPositionsAfterReceipt: true,
+    includePositions: true,
+    lbApproved: true
+  });
+  await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled();
+  await clickReviewedAction(page, "liquidity-remove-button");
+
+  await expect(page.getByText("Liquidity removed")).toBeVisible({ timeout: 12_000 });
+  await expect(page.getByRole("group", { name: "Positions" }).locator('input[type="checkbox"]')).toHaveCount(0);
+  await expect(page.getByText("Liquidity removed")).toBeVisible();
+});
+
 test("one-sided ranges submit direct add-liquidity transactions with the unused side zeroed", async ({ page }) => {
   const rpc = await setupConnectedLiquidity(page, {
     allowance: 5n * ONE_TOKEN,
@@ -2104,10 +2118,19 @@ test("same-pool partial-to-full route prefill cannot reuse the partial receipt",
   await expect(page.getByText("Liquidity removed")).toBeVisible();
 
   await page.evaluate((pair) => {
+    const root = document.documentElement;
+    root.dataset.staleRemoveReceiptPaint = "false";
+    const observer = new MutationObserver(() => {
+      if (window.location.hash.includes("/full/") && document.body.textContent?.includes("Liquidity removed")) {
+        root.dataset.staleRemoveReceiptPaint = "true";
+      }
+    });
+    observer.observe(document.body, { attributes: true, childList: true, characterData: true, subtree: true });
     window.location.hash = `#/liquidity/full/${pair}`;
   }, WNATIVE_USDC_PAIR.toLowerCase());
   await expect(page.locator("#remove-percent")).toHaveValue("100");
   await expect(page.getByText("Liquidity removed")).toHaveCount(0);
+  await expect(page.locator("html")).toHaveAttribute("data-stale-remove-receipt-paint", "false");
 });
 
 test("portfolio exits fail closed when the exact analytics bin set is missing from the indexer", async ({ page }) => {

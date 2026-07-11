@@ -46,6 +46,7 @@ export interface MockRpcOptions {
   blockHash?: Hex;
   blockNumber?: bigint;
   chainId?: number;
+  clearPositionsAfterReceipt?: boolean;
   dashboardPoolLimit?: number;
   estimatedGas?: bigint;
   gasEstimateMode?: "ready" | "error";
@@ -417,6 +418,7 @@ async function handleRpc(request: RpcRequest, options: MockRpcOptions, state: Mo
         return rpcResult(request, numberToHex(options.gasPrice ?? 1_000_000_000n));
       case "eth_getTransactionReceipt":
         if ((options.receiptStatus ?? "success") === "success") {
+          if (options.clearPositionsAfterReceipt === true) options.includePositions = false;
           if (options.allowanceAfterReceipt !== undefined) options.allowance = options.allowanceAfterReceipt;
           if (options.indexerDelayMsAfterReceipt !== undefined) options.indexerDelayMs = options.indexerDelayMsAfterReceipt;
           if (options.pairReserveXAfterReceipt !== undefined) options.pairReserveX = options.pairReserveXAfterReceipt;
