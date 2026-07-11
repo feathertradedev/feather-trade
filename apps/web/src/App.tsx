@@ -122,6 +122,14 @@ import { SUPPORTED_WALLET_RDNS, walletFailure, walletSessionIdentity, type Walle
 import { TransactionJournalProvider, useTransactionJournal, type TransactionJournalApi } from "./transaction-journal-react";
 import { isUserRejectedSubmission, type ReviewedTransactionIntent } from "./transaction-journal";
 import {
+  getPinnedBlockIdentity,
+  loadPinnedAddLiquidityReview,
+  reconcileAddLiquidityReceipt,
+  samePinnedLiquidityReview,
+  type AddLiquidityReceiptReconciliation,
+  type PinnedAddLiquidityReview
+} from "./liquidity-review";
+import {
   assertExecutableTokenAction,
   deterministicTokenFallback,
   poolChoiceIdentityLabel,
@@ -200,6 +208,17 @@ interface ExactGasReview {
   gasPrice: bigint;
   requiredWei: bigint;
   transactionValue: bigint;
+}
+
+interface LiquidityAddReviewState {
+  executionFingerprint: string;
+  review: PinnedAddLiquidityReview;
+}
+
+interface SubmittedLiquidityAddReview extends LiquidityAddReviewState {
+  chainId: number;
+  environment: EnvironmentKey;
+  submittedAt: number;
 }
 
 const GAS_BUFFER_BPS = 12_500n;
@@ -1232,7 +1251,7 @@ function SwapView({
   const priceImpactLabel = priceImpactBps !== null ? formatBps(priceImpactBps) : "n/a";
   const quoteFreshnessLabel = formatQuoteFreshness(quoteUpdatedAt, safetyNow);
   const approvalReceiptMatchesCurrentIntent = submittedApprovalReceiptContext === approvalIntentFingerprint;
-  const swapReceiptMatchesCurrentIntent = submittedSwapReceiptContext === swapContextFingerprint;
+  const swapReceiptMatchesCurrentIntent = submittedSwapReceiptContext === approvalIntentFingerprint;
   const approvalSuccess = approvalReceiptMatchesCurrentIntent && approvalReceipt.data?.status === "success";
   const approvalReverted = approvalReceiptMatchesCurrentIntent && (approvalReceipt.data?.status === "reverted" || isRevertedReceiptError(approvalReceipt.error));
   const swapSuccess = swapReceiptMatchesCurrentIntent && swapReceipt.data?.status === "success";
@@ -1711,7 +1730,7 @@ function SwapView({
       value: 0n
     };
     try {
-      setSubmittedSwapReceiptContext(simulatedContextFingerprint);
+      setSubmittedSwapReceiptContext(approvalIntentFingerprint);
       await submitJournaledTransaction({
         isCurrent: gasReviewIsCurrent,
         journal: transactionJournal,
@@ -2694,9 +2713,154 @@ function GasReview({ review }: { review: ExactGasReview | null }) {
   return (
     <div className="state-row warning" data-testid="gas-review" role="status">
       <CircleDollarSign size={16} />
-      <span>Gas review for {review.action}: limit {review.gasLimit.toString()} × {formatUnits(review.gasPrice, 9)} gwei + 25% gas buffer{review.transactionValue > 0n ? ` + ${formatUnits(review.transactionValue, 18)} ETH value` : ""} = {formatUnits(review.requiredWei, 18)} ETH required. Submit again to re-estimate and open the wallet.</span>
+      <span>Non-guaranteed gas estimate for {review.action}: limit {review.gasLimit.toString()} × {formatUnits(review.gasPrice, 9)} gwei + 25% gas buffer{review.transactionValue > 0n ? ` + ${formatUnits(review.transactionValue, 18)} ETH value` : ""} = {formatUnits(review.requiredWei, 18)} ETH required. Submit again to re-estimate and open the wallet.</span>
     </div>
   );
+}
+
+function LiquidityAddReviewPanel({
+  reviewJson,
+  tokenX,
+  tokenY
+}: {
+  reviewJson: string | null;
+  tokenX: TokenMetadata | null;
+  tokenY: TokenMetadata | null;
+}) {
+  if (reviewJson === null) return null;
+  const reviewState = deserializeBigintState<LiquidityAddReviewState>(reviewJson);
+  const { math, parameters, simulation, block } = reviewState.review;
+  const positionX = simulation.amountXAdded - math.compositionFeeX;
+  const positionY = simulation.amountYAdded - math.compositionFeeY;
+  return (
+    <div className="review-card" data-testid="liquidity-add-review" role="status">
+      <div className="panel-heading">
+        <span>Pinned liquidity review</span>
+        <StatusBadge state="ready" label={`block ${block.number.toString()}`} />
+      </div>
+      <div className="quote-grid">
+        <MiniMetric data-testid="liquidity-review-added-x" label={`${tokenSymbol(tokenX)} added (fee included)`} value={formatTokenAmount(simulation.amountXAdded.toString(), tokenX)} />
+        <MiniMetric data-testid="liquidity-review-added-y" label={`${tokenSymbol(tokenY)} added (fee included)`} value={formatTokenAmount(simulation.amountYAdded.toString(), tokenY)} />
+        <MiniMetric data-testid="liquidity-review-position-x" label={`${tokenSymbol(tokenX)} after composition fee`} value={formatTokenAmount(positionX.toString(), tokenX)} />
+        <MiniMetric data-testid="liquidity-review-position-y" label={`${tokenSymbol(tokenY)} after composition fee`} value={formatTokenAmount(positionY.toString(), tokenY)} />
+        <MiniMetric label={`${tokenSymbol(tokenX)} deposited to bins`} value={formatTokenAmount((simulation.amountXAdded - math.protocolFeeX).toString(), tokenX)} />
+        <MiniMetric label={`${tokenSymbol(tokenY)} deposited to bins`} value={formatTokenAmount((simulation.amountYAdded - math.protocolFeeY).toString(), tokenY)} />
+        <MiniMetric data-testid="liquidity-review-refund-x" label={`${tokenSymbol(tokenX)} refund`} value={formatTokenAmount(simulation.amountXLeft.toString(), tokenX)} />
+        <MiniMetric data-testid="liquidity-review-refund-y" label={`${tokenSymbol(tokenY)} refund`} value={formatTokenAmount(simulation.amountYLeft.toString(), tokenY)} />
+        <MiniMetric data-testid="liquidity-review-fee-x" label={`${tokenSymbol(tokenX)} composition fee estimate`} value={formatTokenAmount(math.compositionFeeX.toString(), tokenX)} />
+        <MiniMetric data-testid="liquidity-review-fee-y" label={`${tokenSymbol(tokenY)} composition fee estimate`} value={formatTokenAmount(math.compositionFeeY.toString(), tokenY)} />
+        <MiniMetric label={`${tokenSymbol(tokenX)} protocol fee estimate`} value={formatTokenAmount(math.protocolFeeX.toString(), tokenX)} />
+        <MiniMetric label={`${tokenSymbol(tokenY)} protocol fee estimate`} value={formatTokenAmount(math.protocolFeeY.toString(), tokenY)} />
+        <MiniMetric label={`${tokenSymbol(tokenX)} minimum`} value={formatTokenAmount(parameters.amountXMin.toString(), tokenX)} />
+        <MiniMetric label={`${tokenSymbol(tokenY)} minimum`} value={formatTokenAmount(parameters.amountYMin.toString(), tokenY)} />
+        <MiniMetric label="Position recipient" value={formatCompactAddress(parameters.to)} />
+        <MiniMetric label="Refund recipient" value={formatCompactAddress(parameters.refundTo)} />
+        <MiniMetric label="Projected bins" value={simulation.depositIds.length.toString()} />
+        <MiniMetric label="Projected LB shares" value={simulation.liquidityMinted.reduce((total: bigint, shares: bigint) => total + shares, 0n).toString()} />
+        <MiniMetric label="Pinned timestamp" value={block.timestamp.toString()} />
+        <MiniMetric label="Pinned block hash" value={formatCompactAddress(block.hash)} />
+      </div>
+      <section className="approval-disclosure" data-testid="liquidity-review-exact-destination" aria-label="Exact liquidity destination and deadline">
+        <strong>Exact destination and expiry</strong>
+        <dl>
+          <div><dt>Position recipient</dt><dd><code className="approval-address">{parameters.to}</code></dd></div>
+          <div><dt>Refund recipient</dt><dd><code className="approval-address">{parameters.refundTo}</code></dd></div>
+          <div><dt>Unix deadline</dt><dd>{parameters.deadline.toString()}</dd></div>
+          <div><dt>Native value</dt><dd>0 ETH · ERC-20 addLiquidity</dd></div>
+        </dl>
+      </section>
+      <details className="review-details" data-testid="liquidity-review-bin-shares">
+        <summary>Projected per-bin claims</summary>
+        <div className="quote-grid">
+          {math.bins.map((bin, index) => (
+            <MiniMetric
+              key={`${bin.binId.toString()}-${index}`}
+              label={`Bin ${bin.binId.toString()} shares`}
+              value={`${bin.mintedShares.toString()} · fee ${formatUnits(bin.totalFeeRate, 16)}%`}
+            />
+          ))}
+        </div>
+      </details>
+      <div className="state-row warning" data-testid="liquidity-review-limitations">
+        <AlertTriangle size={16} />
+        <span>Composition and protocol fees are pinned estimates, not guarantees. Token minima protect total amounts added, including composition fees; they do not protect fee size or LB shares. Any block, timestamp, volatility, active-bin, recipient, range, amount, or calldata change requires another review.</span>
+      </div>
+      <div className="state-row" data-testid="liquidity-review-native-scope">
+        <CircleDollarSign size={16} />
+        <span>This path deposits ERC-20 tokens only. Wrapped native assets remain ERC-20; ETH is used only for gas. Native add-liquidity reconciliation is unavailable until the dedicated native flow lands.</span>
+      </div>
+    </div>
+  );
+}
+
+function LiquidityReceiptReview({
+  error,
+  hash,
+  reconciliationJson,
+  tokenX,
+  tokenY
+}: {
+  error: unknown;
+  hash: Address | null;
+  reconciliationJson: string | null;
+  tokenX: TokenMetadata | null;
+  tokenY: TokenMetadata | null;
+}) {
+  if (hash === null) return null;
+  if (error !== null && error !== undefined) {
+    return <div className="state-row failure" data-testid="liquidity-receipt-review-error"><AlertTriangle size={16} /><span>Canonical receipt accounting failed closed: {getWriteError(error)}</span></div>;
+  }
+  if (reconciliationJson === null) {
+    return <div className="state-row" data-testid="liquidity-receipt-review-loading"><LoaderCircle className="spin" size={16} /><span>Reconciling canonical receipt {formatCompactAddress(hash)}</span></div>;
+  }
+  const reconciliation = deserializeBigintState<AddLiquidityReceiptReconciliation>(reconciliationJson);
+  return (
+    <div className="review-card" data-testid="liquidity-receipt-review">
+      <div className="panel-heading"><span>Canonical receipt accounting</span><StatusBadge state={reconciliation.estimateMatchedActual ? "ready" : "partial"} label={reconciliation.estimateMatchedActual ? "estimate matched" : "execution drift"} /></div>
+      <div className="quote-grid">
+        <MiniMetric label={`${tokenSymbol(tokenX)} actually added`} value={formatTokenAmount(reconciliation.actualAddedX.toString(), tokenX)} />
+        <MiniMetric label={`${tokenSymbol(tokenY)} actually added`} value={formatTokenAmount(reconciliation.actualAddedY.toString(), tokenY)} />
+        <MiniMetric label={`${tokenSymbol(tokenX)} actual composition fee`} value={formatTokenAmount(reconciliation.compositionFeeX.toString(), tokenX)} />
+        <MiniMetric label={`${tokenSymbol(tokenY)} actual composition fee`} value={formatTokenAmount(reconciliation.compositionFeeY.toString(), tokenY)} />
+        <MiniMetric label={`${tokenSymbol(tokenX)} actual protocol fee`} value={formatTokenAmount(reconciliation.protocolFeeX.toString(), tokenX)} />
+        <MiniMetric label={`${tokenSymbol(tokenY)} actual protocol fee`} value={formatTokenAmount(reconciliation.protocolFeeY.toString(), tokenY)} />
+        <MiniMetric label={`${tokenSymbol(tokenX)} actual refund`} value={reconciliation.refundedX === null ? "unavailable" : formatTokenAmount(reconciliation.refundedX.toString(), tokenX)} />
+        <MiniMetric label={`${tokenSymbol(tokenY)} actual refund`} value={reconciliation.refundedY === null ? "unavailable" : formatTokenAmount(reconciliation.refundedY.toString(), tokenY)} />
+        <MiniMetric label={`${tokenSymbol(tokenX)} wallet delta`} value={reconciliation.eventObservedNetSpendX === null ? "unavailable from events" : `-${formatTokenAmount(reconciliation.eventObservedNetSpendX.toString(), tokenX)}`} />
+        <MiniMetric label={`${tokenSymbol(tokenY)} wallet delta`} value={reconciliation.eventObservedNetSpendY === null ? "unavailable from events" : `-${formatTokenAmount(reconciliation.eventObservedNetSpendY.toString(), tokenY)}`} />
+        <MiniMetric label="Actual minted bins" value={reconciliation.mintedIds.join(", ")} />
+        <MiniMetric label="Actual LB shares" value={reconciliation.mintedShares.reduce((total, shares) => total + shares, 0n).toString()} />
+        <MiniMetric label="Actual gas used" value={reconciliation.actualGasUsed.toString()} />
+        <MiniMetric label="Actual gas cost" value={`${formatUnits(reconciliation.actualGasCostWei, 18)} ETH`} />
+      </div>
+      <details className="review-details" data-testid="liquidity-receipt-bin-shares">
+        <summary>Actual per-bin claims</summary>
+        <div className="quote-grid">
+          {reconciliation.mintedIds.map((id, index) => <MiniMetric key={`${id.toString()}-${index}`} label={`Bin ${id.toString()} shares`} value={reconciliation.mintedShares[index]?.toString() ?? "unavailable"} />)}
+        </div>
+      </details>
+      {reconciliation.estimateDifferences.length > 0 ? (
+        <div className="state-row warning" data-testid="liquidity-receipt-drift"><AlertTriangle size={16} /><span>Estimate versus actual: {reconciliation.estimateDifferences.join("; ")}.</span></div>
+      ) : null}
+      <div className="state-row"><CheckCircle2 size={16} /><span>Actual fees, deposited amounts, residual transfers, bin IDs, and shares come from the canonical replacement-aware receipt. Wallet delta is shown only when standard direct Transfer evidence reconciles exactly; otherwise it remains unavailable.</span></div>
+    </div>
+  );
+}
+
+function serializeBigintState(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  return JSON.stringify(value, (_key, candidate) => typeof candidate === "bigint" ? { __featherBigint: candidate.toString() } : candidate);
+}
+
+function deserializeBigintState<T>(value: string): T {
+  return JSON.parse(value, (_key, candidate) =>
+    candidate !== null &&
+    typeof candidate === "object" &&
+    Object.keys(candidate).length === 1 &&
+    typeof candidate.__featherBigint === "string"
+      ? BigInt(candidate.__featherBigint)
+      : candidate
+  ) as T;
 }
 
 function PairAttestationReview({
@@ -3107,6 +3271,9 @@ function LiquidityView({
   const [liquiditySimulationPending, setLiquiditySimulationPending] = useState(false);
   const [gasReviewError, setGasReviewError] = useState<string | null>(null);
   const [gasReview, setGasReview] = useState<ExactGasReview | null>(null);
+  const [liquidityAddReview, setLiquidityAddReview] = useState<LiquidityAddReviewState | null>(null);
+  const [submittedLiquidityAddReview, setSubmittedLiquidityAddReview] = useState<SubmittedLiquidityAddReview | null>(null);
+  const [liquidityReviewNotice, setLiquidityReviewNotice] = useState<string | null>(null);
   const [removeQuoteReviewRequired, setRemoveQuoteReviewRequired] = useState<string | null>(null);
   const [selectedPositionIds, setSelectedPositionIds] = useState<string[]>([]);
   const [removePercentInput, setRemovePercentInput] = useState("100");
@@ -3123,6 +3290,7 @@ function LiquidityView({
   const approveYSubmitInFlightRef = useRef<number | null>(null);
   const approveLbSubmitInFlightRef = useRef<number | null>(null);
   const addSubmitInFlightRef = useRef<number | null>(null);
+  const latestLiquidityAddReviewRef = useRef<LiquidityAddReviewState | null>(null);
   const removeSubmitInFlightRef = useRef<number | null>(null);
   const [handledApproveXHash, setHandledApproveXHash] = useState<Address | null>(null);
   const [handledApproveYHash, setHandledApproveYHash] = useState<Address | null>(null);
@@ -3212,9 +3380,9 @@ function LiquidityView({
     refetchInterval: rpcReady && primaryPool !== null ? 10_000 : false,
     retry: false
   });
-  const attestLiquidityPair = async (operation: "add-liquidity" | "remove-liquidity") => {
+  const attestLiquidityPair = async (operation: "add-liquidity" | "remove-liquidity", blockNumber?: bigint) => {
     if (primaryPool === null) throw new PairAttestationError("unindexed-pair", "Selected pair is not present in the current indexer snapshot");
-    return attestPairForWrite(publicClient, registry, poolRowToPairClaim(primaryPool, operation));
+    return attestPairForWrite(publicClient, registry, poolRowToPairClaim(primaryPool, operation), blockNumber);
   };
   const activeBin =
     selectedPool.activeId ??
@@ -3278,6 +3446,76 @@ function LiquidityView({
   ].join("|");
   const latestAddExecutionFingerprint = useRef(addExecutionFingerprint);
   latestAddExecutionFingerprint.current = addExecutionFingerprint;
+  latestLiquidityAddReviewRef.current = liquidityAddReview;
+  useEffect(() => {
+    if (liquidityAddReview !== null && liquidityAddReview.executionFingerprint !== addExecutionFingerprint) {
+      latestLiquidityAddReviewRef.current = null;
+      setLiquidityAddReview(null);
+      setGasReview(null);
+      setGasReviewError(null);
+    }
+  }, [addExecutionFingerprint, liquidityAddReview]);
+  const canonicalAddRecord = useMemo(() => {
+    if (
+      submittedLiquidityAddReview === null ||
+      account.address === undefined ||
+      pool === null ||
+      submittedLiquidityAddReview.chainId !== registry.chainId ||
+      submittedLiquidityAddReview.environment !== environmentKey ||
+      !isAddressEqual(submittedLiquidityAddReview.review.pair, pool.pair) ||
+      !isAddressEqual(submittedLiquidityAddReview.review.router, registry.contracts.lbRouter)
+    ) return null;
+    const exactCalldataFingerprint = keccak256(encodeFunctionData({
+      abi: lbRouterAbi,
+      functionName: "addLiquidity",
+      args: [submittedLiquidityAddReview.review.parameters]
+    }));
+    return transactionJournal.records
+      .filter((record) =>
+        record.reviewed.intent === "add-liquidity" &&
+        record.reviewed.calldataFingerprint.toLowerCase() === exactCalldataFingerprint.toLowerCase() &&
+        record.reviewed.executionFingerprint === submittedLiquidityAddReview.executionFingerprint &&
+        record.reviewed.poolId !== null &&
+        isAddressEqual(record.reviewed.poolId as Address, submittedLiquidityAddReview.review.pair) &&
+        isAddressEqual(record.reviewed.account, account.address!) &&
+        record.createdAt >= submittedLiquidityAddReview.submittedAt &&
+        record.status === "canonical" &&
+        record.activeHash !== null &&
+        record.canonicalReceipt?.status === "success" &&
+        record.canonicalReceipt.hash.toLowerCase() === record.activeHash.toLowerCase() &&
+        record.replacementCompatibility !== "incompatible"
+      )
+      .sort((left, right) => right.createdAt - left.createdAt)[0] ?? null;
+  }, [account.address, environmentKey, pool, registry.chainId, registry.contracts.lbRouter, submittedLiquidityAddReview, transactionJournal.records]);
+  const canonicalAddHash = canonicalAddRecord?.canonicalReceipt?.hash ?? null;
+  const addReceiptReconciliationQuery = useQuery<AddLiquidityReceiptReconciliation>({
+    queryKey: ["canonicalAddLiquidityReceipt", registry.chainId, canonicalAddHash],
+    queryFn: async () => {
+      if (canonicalAddHash === null || submittedLiquidityAddReview === null || account.address === undefined) {
+        throw new Error("Canonical add-liquidity receipt is unavailable");
+      }
+      const receipt = await publicClient.getTransactionReceipt({ hash: canonicalAddHash });
+      if (receipt.status !== "success" || receipt.blockHash.toLowerCase() !== canonicalAddRecord?.canonicalReceipt?.blockHash.toLowerCase()) {
+        throw new Error("Canonical add-liquidity receipt changed during reconciliation");
+      }
+      const parameters = submittedLiquidityAddReview.review.parameters;
+      return reconcileAddLiquidityReceipt({
+        account: account.address,
+        effectiveGasPrice: receipt.effectiveGasPrice,
+        expectedReview: submittedLiquidityAddReview.review,
+        gasUsed: receipt.gasUsed,
+        logs: receipt.logs,
+        pair: submittedLiquidityAddReview.review.pair,
+        recipient: parameters.to,
+        refundRecipient: parameters.refundTo,
+        router: registry.contracts.lbRouter,
+        tokenX: parameters.tokenX,
+        tokenY: parameters.tokenY
+      });
+    },
+    enabled: canonicalAddHash !== null && submittedLiquidityAddReview !== null && account.address !== undefined,
+    retry: false
+  });
   const rangeSliderMin = Math.min(-MAX_LIQUIDITY_BINS, lowerDelta ?? 0, (upperDelta ?? 0) - MAX_LIQUIDITY_BINS + 1);
   const rangeSliderMax = Math.max(MAX_LIQUIDITY_BINS, upperDelta ?? 0, (lowerDelta ?? 0) + MAX_LIQUIDITY_BINS - 1);
   const walletQuery = useQuery({
@@ -3698,6 +3936,18 @@ function LiquidityView({
     liquidityAttestationQuery.error === null &&
     !addWrite.isPending &&
     !addReceipt.isLoading;
+  const addButtonLabel = liquidityButtonLabel({
+    poolReady: addPoolReady,
+    connected,
+    onWrongChain,
+    walletReadsReady,
+    walletReadErrored: walletQuery.isError,
+    invalidInput: addInputError !== null,
+    needsApproval: needsXApproval || needsYApproval,
+    insufficientBalance: insufficientX || insufficientY,
+    insufficientGas: liquiditySimulationError?.startsWith("Insufficient ETH for gas") === true,
+    ready: distributionResult.distribution !== null
+  });
   const removeReady =
     removePoolReady &&
     connected &&
@@ -3862,6 +4112,7 @@ function LiquidityView({
     setLiquiditySimulationError(null);
     setGasReviewError(null);
     setGasReview(null);
+    setLiquidityReviewNotice(null);
     setRemoveQuoteReviewRequired(null);
   }, [
     account.address,
@@ -4334,8 +4585,10 @@ function LiquidityView({
 
     const submittedOperationGeneration = liquidityOperationGenerationRef.current;
     const submittedExecutionFingerprint = addExecutionFingerprint;
-    const args = [
-      {
+    const previousReview = latestLiquidityAddReviewRef.current?.executionFingerprint === submittedExecutionFingerprint
+      ? latestLiquidityAddReviewRef.current.review
+      : null;
+    const parameters = previousReview?.parameters ?? {
         tokenX: pool.tokenX,
         tokenY: pool.tokenY,
         binStep: BigInt(pool.binStep),
@@ -4351,73 +4604,90 @@ function LiquidityView({
         to: account.address,
         refundTo: account.address,
         deadline: deadlineFromNow(deadlineMinutes)
-      }
-    ] as const;
+      };
     addSubmitInFlightRef.current = submittedOperationGeneration;
     addWrite.reset();
     setSubmittedAddReceiptContext(null);
     setGasReviewError(null);
+    setLiquidityReviewNotice(null);
     const operationIsCurrent = () =>
       liquidityOperationGenerationRef.current === submittedOperationGeneration &&
       addSubmitInFlightRef.current === submittedOperationGeneration;
     let submitted = false;
     try {
       try {
-        await attestLiquidityPair("add-liquidity");
-      } catch (error) {
-        setLiquiditySimulationError(getWriteError(error));
-        return;
-      }
-      try {
         assertExecutableTokenAction([tokenX, tokenY], "add-liquidity");
       } catch (error) {
         setLiquiditySimulationError(getWriteError(error));
         return;
       }
-      const simulated = await runPreSubmitSimulation(
-        () =>
-          publicClient.simulateContract({
+      const exactReview = await runPreSubmitSimulation(
+        async () => {
+          const block = await getPinnedBlockIdentity(publicClient);
+          await attestLiquidityPair("add-liquidity", block.number);
+          if (
+            previousReview !== null &&
+            previousReview.block.number === block.number &&
+            previousReview.block.hash.toLowerCase() === block.hash.toLowerCase() &&
+            previousReview.block.timestamp === block.timestamp
+          ) {
+            return previousReview;
+          }
+          return loadPinnedAddLiquidityReview(publicClient, {
             account: account.address,
-            address: registry.contracts.lbRouter,
-            abi: lbRouterAbi,
-            functionName: "addLiquidity",
-            args
-          }),
+            block,
+            pair: pool.pair,
+            parameters,
+            router: registry.contracts.lbRouter
+          });
+        },
         setLiquiditySimulationError,
         setLiquiditySimulationPending,
         operationIsCurrent
       );
 
-      if (!simulated) return;
+      if (!exactReview) return;
       if (liquidityOperationGenerationRef.current !== submittedOperationGeneration) return;
       if (latestAddExecutionFingerprint.current !== submittedExecutionFingerprint) {
         setLiquiditySimulationError("Liquidity execution context, safety settings, strategy, range, or composition changed during simulation; review the projected bins and try again");
         return;
       }
+      const reviewUnchanged = samePinnedLiquidityReview(previousReview, exactReview);
+      const nextReviewState = { executionFingerprint: submittedExecutionFingerprint, review: exactReview };
+      latestLiquidityAddReviewRef.current = nextReviewState;
+      setLiquidityAddReview(nextReviewState);
+      const pinnedExecutionFingerprint = [
+        submittedExecutionFingerprint,
+        exactReview.block.number.toString(),
+        exactReview.block.hash,
+        exactReview.block.timestamp.toString()
+      ].join("|");
       const gasReviewIsCurrent = () =>
         operationIsCurrent() &&
-        latestAddExecutionFingerprint.current === submittedExecutionFingerprint;
+        latestAddExecutionFingerprint.current === submittedExecutionFingerprint &&
+        latestLiquidityAddReviewRef.current?.review.block.hash.toLowerCase() === exactReview.block.hash.toLowerCase();
       const gasApproved = await reviewExactGas({
         action: "add liquidity",
         currentReview: gasReview,
-        estimateGas: () => publicClient.estimateContractGas(simulated.request),
-        executionFingerprint: submittedExecutionFingerprint,
+        estimateGas: () => publicClient.estimateContractGas({
+          account: account.address,
+          address: registry.contracts.lbRouter,
+          abi: lbRouterAbi,
+          functionName: "addLiquidity",
+          args: [parameters],
+          blockNumber: exactReview.block.number
+        }),
+        executionFingerprint: pinnedExecutionFingerprint,
         getBalance: () => publicClient.getBalance({ address: account.address }),
         getGasPrice: () => publicClient.getGasPrice(),
         isCurrent: gasReviewIsCurrent,
         setError: setGasReviewError,
         setReview: setGasReview
       });
-      if (!gasApproved || !gasReviewIsCurrent()) return;
-      try {
-        await attestLiquidityPair("add-liquidity");
-      } catch (error) {
-        setLiquiditySimulationError(getWriteError(error));
-        return;
-      }
+      if (!reviewUnchanged || !gasApproved || !gasReviewIsCurrent()) return;
       const submittedContext = {
         account: account.address,
-        calldataFingerprint: keccak256(encodeFunctionData({ abi: lbRouterAbi, functionName: "addLiquidity", args })),
+        calldataFingerprint: keccak256(encodeFunctionData({ abi: lbRouterAbi, functionName: "addLiquidity", args: [parameters] })),
         chainId: activeWalletChainId,
         deploymentEpoch: deploymentEpoch(registry),
         environment: environmentKey,
@@ -4431,19 +4701,49 @@ function LiquidityView({
       };
       try {
         setSubmittedAddReceiptContext(submittedExecutionFingerprint);
+        const submittedAt = Date.now();
+        setSubmittedLiquidityAddReview({
+          ...nextReviewState,
+          chainId: registry.chainId,
+          environment: environmentKey,
+          submittedAt
+        });
         const hash = await submitJournaledTransaction({
           isCurrent: gasReviewIsCurrent,
           journal: transactionJournal,
           reviewed: reviewedTransactionIntent(submittedContext, { poolId: pool.pair, recipient: account.address, refundRecipient: account.address, settingsFingerprint: addRetrySettingsFingerprint }),
           preWalletGuard: async () => {
-            await attestLiquidityPair("add-liquidity");
+            const finalBlock = await getPinnedBlockIdentity(publicClient);
+            if (
+              finalBlock.number !== exactReview.block.number ||
+              finalBlock.hash.toLowerCase() !== exactReview.block.hash.toLowerCase() ||
+              finalBlock.timestamp !== exactReview.block.timestamp
+            ) {
+              throw new PairAttestationError("context-changed", "Pinned liquidity block advanced; review the updated fees, refunds, and shares before opening the wallet");
+            }
+            await attestLiquidityPair("add-liquidity", finalBlock.number);
             if (!gasReviewIsCurrent()) throw new PairAttestationError("context-changed", "Liquidity context changed during final pair attestation");
           },
-          send: () => addWrite.writeContractAsync(simulated.request)
+          send: () => addWrite.writeContractAsync({
+            account: account.address,
+            address: registry.contracts.lbRouter,
+            abi: lbRouterAbi,
+            functionName: "addLiquidity",
+            args: [parameters]
+          })
         });
         submitted = hash !== null;
       } catch (error) {
-        if (!isUserRejectedSubmission(error)) setLiquiditySimulationError(getWriteError(error) ?? "Transaction journal blocked add-liquidity submission");
+        if (error instanceof PairAttestationError && error.code === "context-changed") {
+          latestLiquidityAddReviewRef.current = null;
+          setLiquidityAddReview(null);
+          setGasReview(null);
+          setGasReviewError(null);
+          setLiquiditySimulationError(null);
+          setLiquidityReviewNotice(`${error.message}. Review again; no wallet request was sent.`);
+        } else if (!isUserRejectedSubmission(error)) {
+          setLiquiditySimulationError(getWriteError(error) ?? "Transaction journal blocked add-liquidity submission");
+        }
         // The wagmi mutation retains the rejection for the originating mounted session.
       }
     } finally {
@@ -4859,6 +5159,18 @@ function LiquidityView({
 
         <GasReview review={gasReview} />
 
+        {liquidityReviewNotice ? <div className="state-row warning" data-testid="liquidity-review-notice"><AlertTriangle size={16} /><span>{liquidityReviewNotice}</span></div> : null}
+
+        <LiquidityAddReviewPanel reviewJson={serializeBigintState(liquidityAddReview)} tokenX={tokenX} tokenY={tokenY} />
+
+        <LiquidityReceiptReview
+          error={addReceiptReconciliationQuery.error}
+          hash={canonicalAddHash}
+          reconciliationJson={serializeBigintState(addReceiptReconciliationQuery.data)}
+          tokenX={tokenX}
+          tokenY={tokenY}
+        />
+
         <PairAttestationReview
           attestation={liquidityAttestationQuery.data ?? null}
           error={liquidityAttestationQuery.error}
@@ -4987,7 +5299,7 @@ function LiquidityView({
           </button>
           <button className="primary-button wide" data-testid="liquidity-add-button" type="button" disabled={!addReady} onClick={handleAddLiquidity}>
             {liquiditySimulationPending || addWrite.isPending || addReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <Droplets size={18} />}
-            <span>{liquidityButtonLabel({ poolReady: addPoolReady, connected, onWrongChain, walletReadsReady, walletReadErrored: walletQuery.isError, invalidInput: addInputError !== null, needsApproval: needsXApproval || needsYApproval, insufficientBalance: insufficientX || insufficientY, insufficientGas: liquiditySimulationError?.startsWith("Insufficient ETH for gas") === true, ready: distributionResult.distribution !== null })}</span>
+            <span>{addButtonLabel === "Add liquidity" ? (liquidityAddReview?.executionFingerprint === addExecutionFingerprint ? "Confirm add liquidity" : "Review add liquidity") : addButtonLabel}</span>
           </button>
         </div>
 
