@@ -13,6 +13,7 @@
     "test:positions": "node scripts/test-position-burn-plan.mjs",
     "test:safety": "node scripts/test-transaction-safety.mjs",
     "test:transaction-journal": "node scripts/test-transaction-journal.mjs",
+    "test:token-safety": "node scripts/test-token-safety.mjs",
     "typecheck": "tsc -b --pretty false"
   },
   "dependencies": {

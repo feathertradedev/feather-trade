@@ -2,6 +2,7 @@ import { encodeFunctionData, type Address, type Hex, type PublicClient } from "v
 
 import { lbRouterAbi } from "./abi.js";
 import type { DexRegistry, LocalnetDexRegistry } from "./registry.js";
+import { assertTokenActionAllowed } from "./tokens.js";
 
 export const DISTRIBUTION_PRECISION = 1_000_000_000_000_000_000n;
 export const MAX_LIQUIDITY_BINS = 69;
@@ -114,6 +115,7 @@ export async function getSwapOutQuote(
   amountIn: bigint
 ): Promise<SwapOutQuote> {
   const pool = registry.seededPools.wnativeUsdc;
+  assertTokenActionAllowed(registry.tokens, [pool.tokenX, pool.tokenY], "swap");
   const [amountInLeft, amountOut, fee] = await client.readContract({
     address: registry.contracts.lbRouter,
     abi: lbRouterAbi,
@@ -133,9 +135,10 @@ export async function getSwapOutQuote(
 }
 
 export function buildAddLiquidityTransaction(
-  registry: Pick<DexRegistry, "contracts">,
+  registry: Pick<DexRegistry, "contracts" | "tokens">,
   input: AddLiquidityCalldataInput
 ): BuiltTransaction {
+  assertTokenActionAllowed(registry.tokens, [input.tokenX, input.tokenY], "add-liquidity");
   const deltaIds = input.deltaIds ?? [0n];
   const distributionX = input.distributionX ?? [DISTRIBUTION_PRECISION];
   const distributionY = input.distributionY ?? [DISTRIBUTION_PRECISION];
@@ -217,9 +220,10 @@ export function buildSeededWnativeUsdcAddLiquidityTransaction(
 }
 
 export function buildRemoveLiquidityTransaction(
-  registry: Pick<DexRegistry, "contracts">,
+  registry: Pick<DexRegistry, "contracts" | "tokens">,
   input: RemoveLiquidityCalldataInput
 ): BuiltTransaction {
+  assertTokenActionAllowed(registry.tokens, [input.tokenX, input.tokenY], "remove-liquidity");
   if (input.ids.length === 0 || input.ids.length !== input.amounts.length) {
     throw new Error("Remove liquidity ids and amounts must be non-empty and have matching lengths");
   }

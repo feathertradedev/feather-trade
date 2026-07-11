@@ -12,6 +12,7 @@ import { privateKeyToAccount } from "viem/accounts";
 
 import {
   createDexPublicClient,
+  findTokenBySymbol,
   getBestExactInQuote,
   getQuoteAmountOut,
   lbRouterAbi,
@@ -33,7 +34,10 @@ const rpcUrl = process.env.LOCALNET_RPC_URL ?? registry.endpoints.rpcUrl;
 const publicClient = createDexPublicClient(registry.chain, rpcUrl);
 const account = privateKeyToAccount((process.env.LOCALNET_PRIVATE_KEY ?? DEFAULT_PRIVATE_KEY) as `0x${string}`);
 
-const amountIn = parseUnits(process.env.SDK_EXAMPLE_EXPECTED_REVERT_AMOUNT_IN ?? "0.001", registry.tokens.WNATIVE.decimals);
+const wnative = findTokenBySymbol(registry.tokens, "WNATIVE");
+const usdc = findTokenBySymbol(registry.tokens, "USDC");
+if (wnative === null || usdc === null) throw new Error("Required localnet token identity is unavailable or ambiguous");
+const amountIn = parseUnits(process.env.SDK_EXAMPLE_EXPECTED_REVERT_AMOUNT_IN ?? "0.001", wnative.decimals);
 const expiredDeadline = BigInt(process.env.SDK_EXAMPLE_EXPECTED_REVERT_DEADLINE ?? "1");
 const pool = registry.seededPools.wnativeUsdc;
 const quote = await getBestExactInQuote(publicClient, registry, pool.tokenX, pool.tokenY, amountIn);
@@ -64,10 +68,10 @@ console.log(
       manifestPath,
       chainId: registry.chainId,
       account: account.address,
-      tokenIn: registry.tokens.WNATIVE.symbol,
-      tokenOut: registry.tokens.USDC.symbol,
+      tokenIn: wnative.symbol,
+      tokenOut: usdc.symbol,
       amountIn: amountIn.toString(),
-      amountInFormatted: formatUnits(amountIn, registry.tokens.WNATIVE.decimals),
+      amountInFormatted: formatUnits(amountIn, wnative.decimals),
       quotedAmountOut: amountOut.toString(),
       expectedError: "LBRouter__DeadlineExceeded",
       simulationError,

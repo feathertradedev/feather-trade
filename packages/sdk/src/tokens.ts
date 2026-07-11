@@ -21,6 +21,7 @@ export type TokenAddressRef = "tokens.wnative" | "tokens.usdc" | "tokens.usdt" |
 export type TokenRiskFlag = "fee-on-transfer" | "rebasing" | "blacklistable" | "upgradeable" | "suspicious";
 export type TokenAction = "swap" | "add-liquidity" | "remove-liquidity";
 export type TokenReviewStatus = "standard" | "restricted" | "blocked";
+export type TokenApprovalBehavior = "standard-bool" | "returns-false" | "no-return" | "zero-reset-required";
 
 export interface TokenRiskPolicy {
   disabledActions: readonly TokenAction[];
@@ -30,6 +31,7 @@ export interface TokenRiskPolicy {
 }
 
 export interface TokenListEntry {
+  approvalBehavior: TokenApprovalBehavior;
   address?: Address;
   addressRef?: TokenAddressRef;
   decimals: number;
@@ -52,6 +54,7 @@ export interface TokenListDefinition {
 
 export interface TokenMetadata {
   address: Address;
+  approvalBehavior: TokenApprovalBehavior;
   chainId: number;
   decimals: number;
   id: string;
@@ -66,7 +69,6 @@ export type TokenMetadataMap = Record<string, TokenMetadata>;
 
 export interface TokenListMapOptions {
   chainId?: number;
-  key?: "address" | "symbol";
   resolveAddressRef?: (addressRef: TokenAddressRef) => Address;
 }
 
@@ -100,21 +102,90 @@ export function robinhoodTokenListFromManifest(manifest: RobinhoodDeploymentMani
 }
 
 export function tokenListToMetadataMap(tokenList: TokenListDefinition, options: TokenListMapOptions = {}): TokenMetadataMap {
-  const keyType = options.key ?? "symbol";
   const chainId = options.chainId ?? tokenList.chainId;
   const tokens = tokenList.tokens.map((entry) => tokenEntryToMetadata(entry, chainId, options.resolveAddressRef));
 
-  return Object.fromEntries(
-    tokens.map((token) => [keyType === "address" ? token.address.toLowerCase() : token.symbol.toUpperCase(), token])
-  );
+  const addresses = new Set<string>();
+  const ids = new Set<string>();
+  for (const token of tokens) {
+    const address = token.address.toLowerCase();
+    if (addresses.has(address)) throw new Error(`Duplicate token address ${token.address}`);
+    if (ids.has(token.id)) throw new Error(`Duplicate token id ${token.id}`);
+    addresses.add(address);
+    ids.add(token.id);
+  }
+
+  return Object.fromEntries(tokens.map((token) => [token.address.toLowerCase(), token]));
 }
 
 export function findTokenMetadata(tokens: TokenMetadataMap, address: Address | string): TokenMetadata | null {
   return Object.values(tokens).find((token) => sameTokenAddress(token.address, address)) ?? null;
 }
 
+export function findTokenBySymbol(tokens: TokenMetadataMap, symbol: string): TokenMetadata | null {
+  const matches = Object.values(tokens).filter((token) => token.symbol.toLowerCase() === symbol.trim().toLowerCase());
+  return matches.length === 1 ? matches[0] ?? null : null;
+}
+
 export function tokenAllowsAction(token: TokenMetadata, action: TokenAction): boolean {
-  return token.risk.reviewStatus !== "blocked" && !token.risk.disabledActions.includes(action);
+  return tokenActionBlocker(token, action) === null;
+}
+
+export function tokenActionBlocker(token: TokenMetadata, action: TokenAction): string | null {
+  if (token.risk.reviewStatus === "blocked") {
+    return `${token.symbol} at ${token.address} is blocked by the Feather token policy${token.risk.notes ? `: ${token.risk.notes}` : ""}`;
+  }
+  if (token.risk.disabledActions.includes(action)) {
+    return `${token.symbol} at ${token.address} is disabled for ${action}${token.risk.notes ? `: ${token.risk.notes}` : ""}`;
+  }
+  if (action !== "remove-liquidity" && !tokenSupportsExecutableApproval(token)) {
+    return `${token.symbol} at ${token.address} uses unsupported approval behavior ${token.approvalBehavior}`;
+  }
+  return null;
+}
+
+export function assertTokenActionAllowed(
+  tokens: TokenMetadataMap,
+  addresses: readonly (Address | string)[],
+  action: TokenAction
+): void {
+  for (const address of addresses) {
+    const token = findTokenMetadata(tokens, address);
+    if (token === null) throw new Error(`Token ${address} is not in the configured Feather token allowlist`);
+    const blocker = tokenActionBlocker(token, action);
+    if (blocker !== null) throw new Error(blocker);
+  }
+}
+
+export function tokenSupportsExecutableApproval(token: Pick<TokenMetadata, "approvalBehavior">): boolean {
+  return token.approvalBehavior === "standard-bool";
+}
+
+export function tokenApprovalCapabilityLabel(token: Pick<TokenMetadata, "approvalBehavior">): string {
+  switch (token.approvalBehavior) {
+    case "standard-bool":
+      return "Standard ERC-20 approval";
+    case "returns-false":
+      return "Excluded: approval may return false";
+    case "no-return":
+      return "Excluded: approval has no return value";
+    case "zero-reset-required":
+      return "Excluded: approval requires a zero reset";
+  }
+}
+
+export function searchTokenMetadata(tokens: TokenMetadataMap, query: string): TokenMetadata[] {
+  const normalized = query.trim().toLowerCase();
+  return Object.values(tokens)
+    .filter((token) =>
+      normalized.length === 0 ||
+      [token.name, token.symbol, token.address].some((value) => value.toLowerCase().includes(normalized))
+    )
+    .sort((left, right) =>
+      left.symbol.localeCompare(right.symbol) ||
+      left.name.localeCompare(right.name) ||
+      left.address.toLowerCase().localeCompare(right.address.toLowerCase())
+    );
 }
 
 export function tokenHasRiskFlag(token: TokenMetadata, flag: TokenRiskFlag): boolean {
@@ -130,8 +201,15 @@ function tokenEntryToMetadata(
   chainId: number,
   resolveAddressRef?: (addressRef: TokenAddressRef) => Address
 ): TokenMetadata {
+  if (!isTokenApprovalBehavior(entry.approvalBehavior)) {
+    throw new Error(`Token ${entry.id} is missing a valid explicit approval behavior`);
+  }
+  if (!Number.isSafeInteger(entry.decimals) || entry.decimals < 0 || entry.decimals > 255) {
+    throw new Error(`Token ${entry.id} decimals must be an integer from 0 to 255`);
+  }
   return {
     address: resolveTokenAddress(entry, resolveAddressRef),
+    approvalBehavior: entry.approvalBehavior,
     chainId,
     decimals: entry.decimals,
     id: entry.id,
@@ -141,6 +219,10 @@ function tokenEntryToMetadata(
     symbol: entry.symbol,
     tags: entry.tags
   };
+}
+
+function isTokenApprovalBehavior(value: unknown): value is TokenApprovalBehavior {
+  return value === "standard-bool" || value === "returns-false" || value === "no-return" || value === "zero-reset-required";
 }
 
 function normalizeTokenRiskPolicy(risk?: TokenRiskPolicy): TokenRiskPolicy {
