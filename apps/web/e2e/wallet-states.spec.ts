@@ -274,7 +274,7 @@ test("exact buffered gas insufficiency blocks LP submission without dead-ending 
   rpc.update({ nativeBalance: 10_000_000_000_000_000n });
   await page.getByTestId("liquidity-add-button").click();
   await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
-  expect(simulatedFunctions(rpc).filter((name) => name === "addLiquidity")).toHaveLength(2);
+  expect(simulatedFunctions(rpc).filter((name) => name === "addLiquidity")).toHaveLength(1);
 });
 
 test("an exact low-cost gas review permits a balance below the former fixed reserve", async ({ page }) => {
@@ -1862,7 +1862,7 @@ test("one-sided ranges submit direct add-liquidity transactions with the unused 
   expect(belowParams.amountXMin).toBe(0n);
   expect(belowParams.amountY).toBeGreaterThan(0n);
   expect(belowParams.distributionX.every((weight) => weight === 0n)).toBe(true);
-  expect(simulatedFunctions(rpc).filter((name) => name === "addLiquidity")).toHaveLength(4);
+  expect(simulatedFunctions(rpc).filter((name) => name === "addLiquidity")).toHaveLength(2);
   expect(simulatedFunctions(rpc)).not.toContain("swapExactTokensForTokens");
 });
 
@@ -2014,7 +2014,7 @@ test("replacement add survives completion of the invalidated wallet-chain genera
   await clickReviewedAction(page, "liquidity-add-button");
 
   await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
-  expect(simulatedFunctions(rpc).filter((name) => name === "addLiquidity")).toHaveLength(3);
+  expect(simulatedFunctions(rpc).filter((name) => name === "addLiquidity")).toHaveLength(2);
 });
 
 test("maximum-bin strategy fails closed when exact transaction simulation exceeds the gas envelope", async ({ page }) => {
@@ -2031,6 +2031,29 @@ test("maximum-bin strategy fails closed when exact transaction simulation exceed
   await expect(page.getByText(/Simulation failed/).first()).toBeVisible();
   expect(simulatedFunctions(rpc).filter((name) => name === "addLiquidity")).toHaveLength(1);
   expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
+test("maximum-bin pinned review batches its RPC burst and reuses immutable state", async ({ page }) => {
+  const rpc = await setupConnectedLiquidity(page, {
+    allowance: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    lbApproved: true
+  });
+  await page.locator("#range-lower").fill("-34");
+  await page.locator("#range-upper").fill("34");
+  const requestBaseline = rpc.snapshot().rpcHttpRequests;
+  await page.getByTestId("liquidity-add-button").click();
+  await expect(page.getByTestId("liquidity-add-review")).toBeVisible();
+  await expect(page.getByTestId("gas-review")).toBeVisible();
+  const firstReview = rpc.snapshot();
+  expect(firstReview.methods.filter((method) => method === "eth_call").length).toBeGreaterThanOrEqual(207);
+  expect(firstReview.rpcHttpRequests - requestBaseline).toBeLessThanOrEqual(20);
+
+  const pinnedPriceReadBaseline = firstReview.ethCalls.filter((call) => call.functionName === "getPriceFromId").length;
+  await page.getByTestId("liquidity-add-button").click();
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+  const secondReview = rpc.snapshot();
+  expect(secondReview.ethCalls.filter((call) => call.functionName === "getPriceFromId")).toHaveLength(pinnedPriceReadBaseline);
 });
 
 test("burn outputs recompute for selection, percentage, slippage, live pool state, and balance changes", async ({ page }, testInfo) => {

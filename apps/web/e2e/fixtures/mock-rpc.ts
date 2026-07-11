@@ -2,6 +2,7 @@ import type { Page } from "@playwright/test";
 import { decodeFunctionData, encodeFunctionResult, numberToHex, type Address, type Hex } from "viem";
 
 import { erc20Abi, lbFactoryAbi, lbPairAbi, lbQuoterAbi, lbRouterAbi } from "../../../../packages/sdk/src/abi";
+import { LB_Q128, quoteAddLiquidityMath } from "../../../../packages/sdk/src/liquidity-review";
 
 export const LOCALNET_RPC_URL = "http://127.0.0.1:8545";
 export const LOCALNET_INDEXER_URL = "http://127.0.0.1:8000/subgraphs/name/robinhood-lb/localnet";
@@ -117,6 +118,7 @@ export interface MockRpcSnapshot {
   graphQueries: string[];
   graphRequests: Array<{ query: string; variables: GraphRequest["variables"] }>;
   methods: string[];
+  rpcHttpRequests: number;
 }
 
 export interface InstalledMockRpc {
@@ -155,7 +157,8 @@ export async function installMockRpc(page: Page, options: MockRpcOptions = {}): 
     gasEstimatesCompleted: 0,
     graphQueries: [],
     graphRequests: [],
-    methods: []
+    methods: [],
+    rpcHttpRequests: 0
   };
 
   await page.route(`${LOCALNET_RPC_URL}/`, async (route) => {
@@ -164,6 +167,8 @@ export async function installMockRpc(page: Page, options: MockRpcOptions = {}): 
       await route.fulfill({ headers: corsHeaders(), status: 204 });
       return;
     }
+
+    state.rpcHttpRequests += 1;
 
     const payload = JSON.parse(request.postData() ?? "null") as RpcRequest | RpcRequest[];
     const response = Array.isArray(payload)
@@ -224,7 +229,8 @@ export async function installMockRpc(page: Page, options: MockRpcOptions = {}): 
       gasEstimatesCompleted: state.gasEstimatesCompleted,
       graphQueries: [...state.graphQueries],
       graphRequests: state.graphRequests.map((request) => ({ query: request.query, variables: request.variables ? { ...request.variables } : undefined })),
-      methods: [...state.methods]
+      methods: [...state.methods],
+      rpcHttpRequests: state.rpcHttpRequests
     }),
     update: (nextOptions) => Object.assign(currentOptions, nextOptions)
   };
@@ -420,7 +426,10 @@ async function handleRpc(request: RpcRequest, options: MockRpcOptions, state: Mo
       case "eth_getBlockByNumber":
         return rpcResult(request, {
           hash: options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222",
-          number: request.params?.[0] ?? numberToHex(options.blockNumber ?? DEFAULT_BLOCK_NUMBER)
+          number: typeof request.params?.[0] === "string" && request.params[0].startsWith("0x")
+            ? request.params[0]
+            : numberToHex(options.blockNumber ?? DEFAULT_BLOCK_NUMBER),
+          timestamp: numberToHex(1_720_000_000n)
         });
       case "eth_estimateGas":
         if (options.gasEstimateDelayMs !== undefined) await delay(options.gasEstimateDelayMs);
@@ -568,6 +577,26 @@ async function handleEthCall(
     return encodeFunctionResult({ abi: lbPairAbi, functionName, result: ACTIVE_ID });
   }
 
+  if (functionName === "getPriceFromId") {
+    return encodeFunctionResult({ abi: lbPairAbi, functionName, result: LB_Q128 });
+  }
+
+  if (functionName === "getStaticFeeParameters") {
+    return encodeFunctionResult({
+      abi: lbPairAbi,
+      functionName,
+      result: [1, 10, 20, 5_000, 0, 0, 100_000]
+    });
+  }
+
+  if (functionName === "getVariableFeeParameters") {
+    return encodeFunctionResult({
+      abi: lbPairAbi,
+      functionName,
+      result: [0, 0, ACTIVE_ID, 1_720_000_000]
+    });
+  }
+
   if (functionName === "findBestPathFromAmountIn") {
     if (options.quoteDelayMs !== undefined) await delay(options.quoteDelayMs);
     if (options.quoteMode === "error") throw new Error("Mock quote failed");
@@ -669,12 +698,58 @@ async function handleEthCall(
 
   if (functionName === "addLiquidity") {
     if (options.simulationMode === "error") throw new Error("Mock add-liquidity simulation failed");
-    const params = decoded.args[0] as { amountX: bigint; amountY: bigint };
+    const params = decoded.args[0] as {
+      amountX: bigint;
+      amountY: bigint;
+      binStep: bigint;
+      deltaIds: readonly bigint[];
+      distributionX: readonly bigint[];
+      distributionY: readonly bigint[];
+    };
+    const quote = quoteAddLiquidityMath({
+      activeId: BigInt(ACTIVE_ID),
+      amountXReceived: params.amountX,
+      amountYReceived: params.amountY,
+      binStep: params.binStep,
+      blockTimestamp: 1_720_000_000n,
+      deltaIds: params.deltaIds,
+      distributionX: params.distributionX,
+      distributionY: params.distributionY,
+      bins: params.deltaIds.map((deltaId) => ({
+        binId: BigInt(ACTIVE_ID) + deltaId,
+        priceQ128: LB_Q128,
+        reserveX: options.binReserveX ?? 4n * DEFAULT_POSITION_LIQUIDITY,
+        reserveY: options.binReserveY ?? 2n * DEFAULT_POSITION_LIQUIDITY,
+        totalSupply: options.binTotalSupply ?? options.positionLiquidity ?? DEFAULT_POSITION_LIQUIDITY
+      })),
+      staticFees: {
+        baseFactor: 1n,
+        filterPeriod: 10n,
+        decayPeriod: 20n,
+        reductionFactor: 5_000n,
+        variableFeeControl: 0n,
+        protocolShare: 0n,
+        maxVolatilityAccumulator: 100_000n
+      },
+      variableFees: {
+        volatilityAccumulator: 0n,
+        volatilityReference: 0n,
+        idReference: BigInt(ACTIVE_ID),
+        timeOfLastUpdate: 1_720_000_000n
+      }
+    });
 
     return encodeFunctionResult({
       abi: lbRouterAbi,
       functionName,
-      result: [params.amountX, params.amountY, 0n, 0n, [BigInt(ACTIVE_ID)], [options.positionLiquidity ?? DEFAULT_POSITION_LIQUIDITY]]
+      result: [
+        quote.amountXAdded,
+        quote.amountYAdded,
+        quote.amountXLeft,
+        quote.amountYLeft,
+        quote.bins.map((bin) => bin.binId),
+        quote.bins.map((bin) => bin.mintedShares)
+      ]
     });
   }
 

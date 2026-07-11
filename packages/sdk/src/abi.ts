@@ -163,6 +163,16 @@ export const lbQuoterAbi = [
 
 export const erc20Abi = [
   {
+    type: "event",
+    name: "Transfer",
+    anonymous: false,
+    inputs: [
+      { name: "from", type: "address", indexed: true },
+      { name: "to", type: "address", indexed: true },
+      { name: "value", type: "uint256", indexed: false }
+    ]
+  },
+  {
     type: "function",
     name: "allowance",
     stateMutability: "view",
@@ -207,6 +217,40 @@ export const erc20Abi = [
 
 export const lbPairAbi = [
   {
+    type: "event",
+    name: "CompositionFees",
+    anonymous: false,
+    inputs: [
+      { name: "sender", type: "address", indexed: true },
+      { name: "id", type: "uint24", indexed: false },
+      { name: "totalFees", type: "bytes32", indexed: false },
+      { name: "protocolFees", type: "bytes32", indexed: false }
+    ]
+  },
+  {
+    type: "event",
+    name: "DepositedToBins",
+    anonymous: false,
+    inputs: [
+      { name: "sender", type: "address", indexed: true },
+      { name: "to", type: "address", indexed: true },
+      { name: "ids", type: "uint256[]", indexed: false },
+      { name: "amounts", type: "bytes32[]", indexed: false }
+    ]
+  },
+  {
+    type: "event",
+    name: "TransferBatch",
+    anonymous: false,
+    inputs: [
+      { name: "sender", type: "address", indexed: true },
+      { name: "from", type: "address", indexed: true },
+      { name: "to", type: "address", indexed: true },
+      { name: "ids", type: "uint256[]", indexed: false },
+      { name: "amounts", type: "uint256[]", indexed: false }
+    ]
+  },
+  {
     type: "function",
     name: "implementation",
     stateMutability: "view",
@@ -247,6 +291,40 @@ export const lbPairAbi = [
     stateMutability: "view",
     inputs: [],
     outputs: [{ name: "binStep", type: "uint16" }]
+  },
+  {
+    type: "function",
+    name: "getPriceFromId",
+    stateMutability: "view",
+    inputs: [{ name: "id", type: "uint24" }],
+    outputs: [{ name: "price", type: "uint256" }]
+  },
+  {
+    type: "function",
+    name: "getStaticFeeParameters",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [
+      { name: "baseFactor", type: "uint16" },
+      { name: "filterPeriod", type: "uint16" },
+      { name: "decayPeriod", type: "uint16" },
+      { name: "reductionFactor", type: "uint16" },
+      { name: "variableFeeControl", type: "uint24" },
+      { name: "protocolShare", type: "uint16" },
+      { name: "maxVolatilityAccumulator", type: "uint24" }
+    ]
+  },
+  {
+    type: "function",
+    name: "getVariableFeeParameters",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [
+      { name: "volatilityAccumulator", type: "uint24" },
+      { name: "volatilityReference", type: "uint24" },
+      { name: "idReference", type: "uint24" },
+      { name: "timeOfLastUpdate", type: "uint40" }
+    ]
   },
   {
     type: "function",

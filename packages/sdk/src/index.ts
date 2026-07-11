@@ -3,6 +3,7 @@ export * from "./chains.js";
 export * from "./client.js";
 export * from "./endpoints.js";
 export * from "./liquidity.js";
+export * from "./liquidity-review.js";
 export * from "./manifest.js";
 export * from "./registry.js";
 export * from "./routing-policy.js";

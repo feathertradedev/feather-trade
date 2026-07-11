@@ -5,6 +5,6 @@ export function createDexPublicClient(chain: Chain, rpcUrl?: string): PublicClie
 
   return createPublicClient({
     chain,
-    transport: http(rpcUrl ?? fallbackRpcUrl)
+    transport: http(rpcUrl ?? fallbackRpcUrl, { batch: { batchSize: 256, wait: 0 } })
   });
 }

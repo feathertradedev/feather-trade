@@ -323,11 +323,12 @@ export function evaluatePairEvidence(registry: DexRegistry, claim: PairClaim, ev
 export async function attestPairForWrite(
   publicClient: PublicClient,
   registry: DexRegistry,
-  claim: PairClaim
+  claim: PairClaim,
+  requestedBlockNumber?: bigint
 ): Promise<PairAttestation> {
   try {
     const chainId = await publicClient.getChainId();
-    const blockNumber = await publicClient.getBlockNumber();
+    const blockNumber = requestedBlockNumber ?? await publicClient.getBlockNumber();
     const [
       factoryCode,
       routerCode,

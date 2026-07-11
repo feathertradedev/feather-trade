@@ -163,6 +163,8 @@ test("actual UI submits approve, swap, add, LB approval, and remove transactions
   await clickReviewedAction(page, "liquidity-approve-lb-button");
   await expect.poll(async () => (await readUnlockedRpcWallet(page)).transactionHashes.length).toBe(6);
   await expect(page.getByText("LB approval confirmed")).toBeVisible();
+  await expect(page.getByTestId("liquidity-receipt-review")).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByTestId("liquidity-receipt-review")).toContainText("Actual gas cost");
 
   const tokenXBeforePartial = await readTokenBalance(pool.tokenX);
   const tokenYBeforePartial = await readTokenBalance(pool.tokenY);
@@ -241,7 +243,6 @@ test("actual UI submits approve, swap, add, LB approval, and remove transactions
     { functionName: "approve", to: pool.tokenY.toLowerCase() },
     { functionName: "approve", to: pool.tokenY.toLowerCase() },
     { functionName: "addLiquidity", to: manifest.contracts.lbRouter.toLowerCase() },
-    { functionName: "addLiquidity", to: manifest.contracts.lbRouter.toLowerCase() },
     { functionName: "approveForAll", to: pool.pair.toLowerCase() },
     { functionName: "approveForAll", to: pool.pair.toLowerCase() },
     { functionName: "removeLiquidity", to: manifest.contracts.lbRouter.toLowerCase() },
@@ -314,10 +315,8 @@ test("actual UI deposits one-sided liquidity above and below the active bin with
     "approve",
     "approve",
     "addLiquidity",
-    "addLiquidity",
     "approve",
     "approve",
-    "addLiquidity",
     "addLiquidity"
   ]);
   expect(rpcControl.simulations.map((simulation) => simulation.functionName)).not.toContain("swapExactTokensForTokens");
@@ -440,6 +439,11 @@ async function installChainBackedIndexerBridge(page: Page): Promise<void> {
         _meta: { block: { number: Number(block.number), hash: block.hash }, hasIndexingErrors: false },
         factory: { pairCount: "1" }
       };
+    } else if (query.includes("PairById")) {
+      const requestedPair = typeof (body.variables as { id?: string } | undefined)?.id === "string"
+        ? (body.variables as { id: string }).id.toLowerCase()
+        : "";
+      data = { pair: requestedPair === pool.pair.toLowerCase() ? await pairGraphRow(block.number) : null };
     } else if (query.includes("OwnerPairPositions")) {
       const requestedOwner = body.variables?.owner?.toLowerCase();
       const requestedPair = body.variables?.pair?.toLowerCase();
@@ -451,7 +455,7 @@ async function installChainBackedIndexerBridge(page: Page): Promise<void> {
             : []
       };
     } else if (query.includes("PairsPage")) {
-      data = { pairs: [] };
+      data = { pairs: [await pairGraphRow(block.number)] };
     } else if (query.includes("SwapsPage")) {
       data = { swaps: [] };
     } else if (query.includes("LiquidityEventsPage")) {
@@ -467,6 +471,34 @@ async function installChainBackedIndexerBridge(page: Page): Promise<void> {
   });
 }
 
+async function pairGraphRow(blockNumber: bigint): Promise<Record<string, unknown>> {
+  const [activeId, hooksParameters] = await Promise.all([
+    client.readContract({ address: pool.pair, abi: lbPairAbi, functionName: "getActiveId" }),
+    client.readContract({ address: pool.pair, abi: lbPairAbi, functionName: "getLBHooksParameters" })
+  ]);
+  const reserves = await client.readContract({ address: pool.pair, abi: lbPairAbi, functionName: "getBin", args: [activeId] });
+  return {
+    activeId: activeId.toString(),
+    address: pool.pair,
+    binStep: pool.binStep.toString(),
+    depositCount: "1",
+    factory: { id: manifest.contracts.lbFactory.toLowerCase() },
+    hooksParameters,
+    id: pool.pair.toLowerCase(),
+    ignoredForRouting: false,
+    reserveX: reserves[0].toString(),
+    reserveY: reserves[1].toString(),
+    swapCount: "1",
+    tokenX: { address: pool.tokenX },
+    tokenY: { address: pool.tokenY },
+    totalFeesX: "0",
+    totalFeesY: "0",
+    totalVolumeX: "0",
+    totalVolumeY: "0",
+    updatedAtBlock: blockNumber.toString()
+  };
+}
+
 function positionGraphRow(liquidity: bigint, blockNumber: bigint): Record<string, unknown> {
   return {
     bin: { binId: pool.activeId.toString() },
@@ -480,17 +512,38 @@ function positionGraphRow(liquidity: bigint, blockNumber: bigint): Record<string
 
 async function connectWallet(page: Page): Promise<void> {
   const connectButton = page.getByTestId("wallet-connect-button");
+  const accountButton = page.getByTestId("wallet-account-button");
   if (await connectButton.isVisible({ timeout: 1_000 }).catch(() => false)) {
-    await connectButton.click();
+    await page.waitForTimeout(250);
+    if (!await accountButton.isVisible().catch(() => false) && await connectButton.isVisible().catch(() => false)) {
+      await expect(connectButton).toBeEnabled();
+      await connectButton.click();
+    }
   }
-  await expect(page.getByTestId("wallet-account-button")).toContainText(
+  await expect(accountButton).toContainText(
     new RegExp(`${browserAccount.slice(0, 6)}\\.\\.\\.${browserAccount.slice(-4)}`, "i")
   );
 }
 
 async function clickReviewedAction(page: Page, testId: string): Promise<void> {
+  const expectedAction = new Map<string, RegExp>([
+    ["swap-approve-button", /gas estimate for WNATIVE approval:/],
+    ["swap-submit-button", /gas estimate for swap:/],
+    ["liquidity-approve-x-button", /gas estimate for WNATIVE approval:/],
+    ["liquidity-approve-y-button", /gas estimate for USDC approval:/],
+    ["liquidity-add-button", /gas estimate for add liquidity:/],
+    ["liquidity-approve-lb-button", /gas estimate for LB operator approval:/],
+    ["liquidity-remove-button", /gas estimate for (?:liquidity withdrawal|full liquidity exit):/]
+  ]).get(testId);
+  if (expectedAction === undefined) throw new Error(`No reviewed-action expectation is defined for ${testId}`);
+
   await page.getByTestId(testId).click();
-  await expect(page.getByTestId("gas-review")).toBeVisible();
+  await expect(page.getByTestId("gas-review")).toContainText(expectedAction);
+  if (testId === "liquidity-add-button") {
+    await expect(page.getByTestId("liquidity-add-review")).toBeVisible();
+    await expect(page.getByTestId("liquidity-review-exact-destination")).toContainText("Unix deadline");
+    await expect(page.getByTestId("liquidity-review-limitations")).toContainText("not guarantees");
+  }
   await page.getByTestId(testId).click();
 }
 

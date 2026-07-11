@@ -84,6 +84,7 @@ export default defineConfig(({ mode }) => {
         "@robinhood-lb/sdk/client": resolve(sdkSrc, "client.ts"),
         "@robinhood-lb/sdk/endpoints": resolve(sdkSrc, "endpoints.ts"),
         "@robinhood-lb/sdk/liquidity": resolve(sdkSrc, "liquidity.ts"),
+        "@robinhood-lb/sdk/liquidity-review": resolve(sdkSrc, "liquidity-review.ts"),
         "@robinhood-lb/sdk/manifest": resolve(sdkSrc, "manifest.ts"),
         "@robinhood-lb/sdk/registry": resolve(sdkSrc, "registry.ts"),
         "@robinhood-lb/sdk/swap": resolve(sdkSrc, "swap.ts"),
