@@ -27,6 +27,7 @@ import {
   deadlineFromNow,
   estimatePriceImpactBps,
   getBestExactInQuote,
+  getSelectedPairExactInQuote,
   getQuoteAmountOut,
   getTotalFeeBps,
   quoteToRouteSteps,
@@ -1124,6 +1125,7 @@ function SwapView({
   onRefresh: SnapshotRefetch;
 }) {
   const [amount, setAmount] = useState("1.0");
+  const [routeMode, setRouteMode] = useState<"exact-selected" | "best">("exact-selected");
   const [swapForY, setSwapForY] = useState(true);
   const [slippageInput, setSlippageInput] = useState("0.5");
   const [deadlineInput, setDeadlineInput] = useState("20");
@@ -1199,6 +1201,7 @@ function SwapView({
     registryChainId: registry.chainId,
     reserveX: selectedPool.reserveX?.toString() ?? null,
     reserveY: selectedPool.reserveY?.toString() ?? null,
+    routeMode,
     rpcChainId: snapshot?.runtime.chainId ?? null,
     slippageBps: slippageBps?.toString() ?? null,
     tokenIn: tokenInAddress,
@@ -1253,8 +1256,27 @@ function SwapView({
       if (!swapMarketReady || tokenInAddress === null || tokenOutAddress === null || parsedAmount === null) {
         throw new Error("Swap quote is not available");
       }
-
-      const quote = await getBestExactInQuote(publicClient, registry, tokenInAddress, tokenOutAddress, parsedAmount);
+      let quote: ExactInQuote;
+      if (routeMode === "best") {
+        quote = await getBestExactInQuote(publicClient, registry, tokenInAddress, tokenOutAddress, parsedAmount);
+      } else {
+        const { binStep, pair, tokenXAddress, tokenYAddress } = selectedPool;
+        if (pair === null || binStep === null || tokenXAddress === null || tokenYAddress === null) {
+          throw new Error("Exact selected-pool identity is unavailable");
+        }
+        quote = await getSelectedPairExactInQuote(publicClient, registry, {
+            amountIn: parsedAmount,
+            binStep: BigInt(binStep),
+            ...(snapshot?.runtime.blockNumber === null || snapshot?.runtime.blockNumber === undefined
+              ? {}
+              : { blockNumber: BigInt(snapshot.runtime.blockNumber) }),
+            pair,
+            tokenIn: tokenInAddress,
+            tokenOut: tokenOutAddress,
+            tokenX: tokenXAddress,
+            tokenY: tokenYAddress
+          });
+      }
 
       return {
         approvalHash: approvalConfirmation?.hash ?? null,
@@ -1868,12 +1890,25 @@ function SwapView({
       <section className="tool-panel">
         <div className="panel-heading">
           <span>Swap</span>
-          <StatusBadge state={swapMarketReady ? "ready" : "unavailable"} label={swapMarketReady ? "best route" : swapMarketError ?? "unavailable"} />
+          <StatusBadge state={swapMarketReady ? "ready" : "unavailable"} label={swapMarketReady ? routeMode === "exact-selected" ? "exact pool" : "best route" : swapMarketError ?? "unavailable"} />
         </div>
+
+        <fieldset className="routing-mode-control">
+          <legend>Routing choice</legend>
+          <div className="segmented" role="group" aria-label="Swap routing choice">
+            <button aria-pressed={routeMode === "exact-selected"} className={routeMode === "exact-selected" ? "segment active" : "segment"} onClick={() => setRouteMode("exact-selected")} type="button">
+              Exact selected pool
+            </button>
+            <button aria-pressed={routeMode === "best"} className={routeMode === "best" ? "segment active" : "segment"} onClick={() => setRouteMode("best")} type="button">
+              Best route
+            </button>
+          </div>
+          <p>{routeMode === "exact-selected" ? "Quote and submit only through the selected pair and bin step." : "Search the supported direct and one-intermediary V2.2 routes for the best output."}</p>
+        </fieldset>
 
         <PoolSelect
           id="swap-pool"
-          label="Selected market (Best V2.2 route)"
+          label="Selected market"
           onChange={onSelectedPoolChange}
           pools={poolOptions}
           selectedPoolId={selectedPoolId}
@@ -2024,6 +2059,7 @@ function SwapView({
         primaryPool={primaryPool}
         quote={quote}
         priceImpactLabel={priceImpactLabel}
+        routeMode={routeMode}
         routeSteps={routeSteps}
         selectedPool={selectedPool}
         swapMarketError={swapMarketError}
@@ -2073,6 +2109,7 @@ function SwapDetailsCard({
   primaryPool,
   quote,
   priceImpactLabel,
+  routeMode,
   routeSteps,
   selectedPool,
   swapMarketError,
@@ -2085,6 +2122,7 @@ function SwapDetailsCard({
   primaryPool: PoolRow | null;
   quote: SerializedExactInQuote | undefined;
   priceImpactLabel: string;
+  routeMode: "exact-selected" | "best";
   routeSteps: RouteStepView[];
   selectedPool: SelectedPoolDescriptor;
   swapMarketError: string | null;
@@ -2098,7 +2136,7 @@ function SwapDetailsCard({
         <span>Route</span>
         <StatusBadge
           state={!swapMarketReady ? "unavailable" : quote ? "ready" : primaryPool ? "loading" : "empty"}
-          label={!swapMarketReady ? swapMarketError ?? "unavailable" : quote ? "Best V2.2 route" : primaryPool ? "waiting" : "no market"}
+          label={!swapMarketReady ? swapMarketError ?? "unavailable" : quote ? routeMode === "exact-selected" ? "Exact selected pool" : "Best V2.2 route" : primaryPool ? "waiting" : "no market"}
         />
       </div>
 
@@ -2132,7 +2170,7 @@ function SwapDetailsCard({
       <dl className="contract-list">
         <div>
           <dt>Routing mode</dt>
-          <dd>Best V2.2 route</dd>
+          <dd>{routeMode === "exact-selected" ? "Exact selected pool" : "Best route"}</dd>
         </div>
         <div>
           <dt>Selected market</dt>

@@ -49,6 +49,7 @@ export interface SwapExecutionContext {
   registryChainId: number;
   reserveX: string | null;
   reserveY: string | null;
+  routeMode: "exact-selected" | "best";
   rpcChainId: number | null;
   slippageBps: string | null;
   tokenIn: string | null;
@@ -175,6 +176,7 @@ export function swapExecutionContextFingerprint(context: SwapExecutionContext): 
     context.activeId,
     context.reserveX,
     context.reserveY,
+    context.routeMode,
     context.updatedAtBlock,
     normalizeContextAddress(context.tokenIn),
     normalizeContextAddress(context.tokenOut),
