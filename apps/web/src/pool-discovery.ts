@@ -113,7 +113,11 @@ export function safeReturnHref(value: string | null | undefined): string | null 
   if (parsed.segments.length === 1) return discoveryHref(state);
   const poolId = decodeRoutePart(parsed.segments[1]);
   if (poolId === null) return null;
-  return poolDetailHref(poolId, state);
+  try {
+    return poolDetailHref(poolId, state);
+  } catch {
+    return null;
+  }
 }
 
 export function buildOwnerLiquidityIndex(
@@ -222,7 +226,7 @@ function encodeRoutePart(value: string): string {
 function decodeRoutePart(value: string): string | null {
   try {
     const decoded = decodeURIComponent(value);
-    if (decoded.length === 0 || decoded === "." || decoded === ".." || /[\/\u0000-\u001f]/.test(decoded)) return null;
+    if (decoded.length === 0 || decoded === "." || decoded === ".." || /[%\/\u0000-\u001f]/.test(decoded)) return null;
     return decoded;
   } catch {
     return null;

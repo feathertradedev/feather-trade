@@ -128,3 +128,11 @@ test("historical zero-only positions are excluded from My liquidity", async ({ p
   await expect(page.getByTestId("owner-pool-filter-status")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "My liquidity" })).toHaveAttribute("aria-pressed", "true");
 });
+
+test("double-encoded malformed return routes fail closed without crashing actions", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "chromium");
+  await installMockRpc(page, { includePairs: true });
+  await page.goto(`/#/swap/${WNATIVE_USDC_PAIR.toLowerCase()}?returnTo=%23%2Fpools%2F%25252e%25252e`);
+  await expect(page.getByTestId("swap-submit-button")).toBeVisible();
+  await expect(page.getByTestId("pool-action-back")).toHaveCount(0);
+});
