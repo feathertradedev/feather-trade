@@ -214,6 +214,15 @@ import {
   type PoolCreationReview,
   type PoolCreationMode
 } from "./pool-creation";
+import {
+  DEFAULT_POOL_DISCOVERY_STATE,
+  buildOwnerLiquidityIndex,
+  discoveryHref,
+  filterPoolPage,
+  parsePoolDiscoveryState,
+  poolDetailHref,
+  type PoolDiscoveryState
+} from "./pool-discovery";
 
 const queryClient = new QueryClient();
 const SNAPSHOT_REFRESH_INTERVAL_MS = 10_000;
@@ -3466,9 +3475,6 @@ function PairAttestationReview({
   );
 }
 
-type PoolCategory = "all" | "active" | "stables";
-type PoolSort = "swaps" | "deposits" | "updated";
-
 function PoolsView({
   environmentKey,
   onConfirmedPool,
@@ -3486,47 +3492,48 @@ function PoolsView({
   snapshot: AppSnapshot | undefined;
   snapshotState: LoadState;
 }) {
+  const registry = registries[environmentKey];
+  const account = useAccount();
   const poolState = isPartialPagination(snapshot?.indexer.pagination.pools) ? "partial" : pools.length > 0 ? "ready" : snapshotState;
-  const [query, setQuery] = useState("");
-  const [category, setCategory] = useState<PoolCategory>("all");
-  const [sort, setSort] = useState<PoolSort>("swaps");
-  const [page, setPage] = useState(0);
+  const [discoveryState, setDiscoveryState] = useState<PoolDiscoveryState>(() =>
+    typeof window === "undefined" ? { ...DEFAULT_POOL_DISCOVERY_STATE } : parsePoolDiscoveryState(window.location.hash)
+  );
   const [creationOpen, setCreationOpen] = useState(false);
   const pageSize = 10;
-  const filteredPools = useMemo(() => {
-    const normalizedQuery = query.trim().toLowerCase();
-    return pools
-      .filter((pool) => {
-        if (category === "active" && !poolHasSwapLiquidity(pool)) return false;
-        if (
-          category === "stables" &&
-          !(pool.tokenX?.tags.includes("stablecoin") && pool.tokenY?.tags.includes("stablecoin"))
-        ) {
-          return false;
-        }
-        if (normalizedQuery.length === 0) return true;
-
-        return [
-          tokenSymbol(pool.tokenX),
-          pool.tokenX?.name,
-          pool.tokenXAddress,
-          tokenSymbol(pool.tokenY),
-          pool.tokenY?.name,
-          pool.tokenYAddress,
-          pool.address,
-          pool.id
-        ]
-          .join(" ")
-          .toLowerCase()
-          .includes(normalizedQuery);
+  const ownerEndpoint = analyticsEndpointForRegistry(registry);
+  const ownerPortfolioQuery = useQuery({
+    queryKey: ["poolDiscoveryOwner", environmentKey, account.address, ownerEndpoint],
+    queryFn: () => {
+      if (!account.address || ownerEndpoint === null) throw new Error("Wallet analytics are unavailable");
+      return loadWalletPortfolio(ownerEndpoint, account.address);
+    },
+    enabled: discoveryState.hasLiquidity && account.address !== undefined && ownerEndpoint !== null,
+    refetchInterval: discoveryState.hasLiquidity ? SNAPSHOT_REFRESH_INTERVAL_MS : false,
+    refetchOnWindowFocus: "always",
+    retry: false
+  });
+  const ownerLiquidity = ownerPortfolioQuery.data
+    ? buildOwnerLiquidityIndex(ownerPortfolioQuery.data.positions, {
+        capped: ownerPortfolioQuery.data.pageInfo.hasNextPage,
+        failed: ownerPortfolioQuery.data.pageInfo.partial
       })
-      .sort((left, right) => comparePoolMetric(right, left, sort));
-  }, [category, pools, query, sort]);
-  const pageCount = Math.max(1, Math.ceil(filteredPools.length / pageSize));
-  const safePage = Math.min(page, pageCount - 1);
-  const visiblePools = filteredPools.slice(safePage * pageSize, (safePage + 1) * pageSize);
+    : null;
+  const filteredPage = useMemo(
+    () => filterPoolPage(pools, discoveryState, ownerLiquidity, pageSize),
+    [discoveryState, ownerLiquidity, pools]
+  );
 
-  useEffect(() => setPage(0), [category, query, sort]);
+  useEffect(() => {
+    const read = () => setDiscoveryState(parsePoolDiscoveryState(window.location.hash));
+    window.addEventListener("hashchange", read);
+    return () => window.removeEventListener("hashchange", read);
+  }, []);
+
+  const updateDiscovery = (next: Partial<PoolDiscoveryState>, resetPage = true) => {
+    const state = { ...discoveryState, ...next, page: resetPage ? 0 : next.page ?? discoveryState.page };
+    setDiscoveryState(state);
+    window.location.hash = discoveryHref(state);
+  };
 
   return (
     <div className="view-grid">
@@ -3564,26 +3571,39 @@ function PoolsView({
             <span className="field-label">Search</span>
             <input
               aria-label="Search pools"
-              onChange={(event) => setQuery(event.target.value)}
+              onChange={(event) => updateDiscovery({ query: event.target.value })}
               placeholder="Pair, token, or address"
-              value={query}
+              value={discoveryState.query}
             />
           </label>
           <div className="pool-filter-chips" role="group" aria-label="Pool category">
             {(["all", "active", "stables"] as const).map((value) => (
               <button
-                className={category === value ? "filter-chip active" : "filter-chip"}
+                className={discoveryState.category === value ? "filter-chip active" : "filter-chip"}
                 key={value}
-                onClick={() => setCategory(value)}
+                onClick={() => updateDiscovery({ category: value })}
                 type="button"
               >
                 {value === "all" ? "All DLMM" : value === "active" ? "Active" : "Stables"}
               </button>
             ))}
+            <button
+              aria-pressed={discoveryState.hasLiquidity}
+              className={discoveryState.hasLiquidity ? "filter-chip active" : "filter-chip"}
+              disabled={!account.address}
+              onClick={() => updateDiscovery({ hasLiquidity: !discoveryState.hasLiquidity })}
+              type="button"
+            >
+              My liquidity
+            </button>
           </div>
           <label>
             <span className="field-label">Sort</span>
-            <select aria-label="Sort pools" onChange={(event) => setSort(event.target.value as PoolSort)} value={sort}>
+            <select
+              aria-label="Sort pools"
+              onChange={(event) => updateDiscovery({ sort: event.target.value as PoolDiscoveryState["sort"] })}
+              value={discoveryState.sort}
+            >
               <option value="swaps">Swap count</option>
               <option value="deposits">Deposit count</option>
               <option value="updated">Recently updated</option>
@@ -3600,9 +3620,9 @@ function PoolsView({
                 <span>Lifetime fees</span>
                 <span>Action</span>
               </div>
-              {visiblePools.map((pool) => (
+              {filteredPage.rows.map((pool) => (
                 <div className="table-row" key={pool.id}>
-                  <a className="pair-name" href={`#/pools/${encodeURIComponent(pool.id)}`}>
+                  <a className="pair-name" href={poolDetailHref(pool.id, discoveryState)}>
                     {tokenSymbol(pool.tokenX)} / {tokenSymbol(pool.tokenY)}
                     <small>DLMM · bin step {pool.binStep} · {formatCompactAddress(pool.address)}</small>
                     <small>{pool.tokenX?.name ?? "Unknown token"} · {pool.tokenXAddress} · chain {pool.tokenX?.chainId ?? "?"} · review {pool.tokenX?.risk.reviewStatus ?? "unlisted"}</small>
@@ -3617,17 +3637,26 @@ function PoolsView({
                   <span>
                     {formatTokenAmount(pool.feesX, pool.tokenX)} / {formatTokenAmount(pool.feesY, pool.tokenY)}
                   </span>
-                  <a className="secondary-button" href={`#/pools/${encodeURIComponent(pool.id)}`}>
+                  <a className="secondary-button" href={poolDetailHref(pool.id, discoveryState)}>
                     View
                   </a>
                 </div>
               ))}
             </div>
-            {visiblePools.length === 0 ? <p className="inline-empty">No pools match these filters.</p> : null}
+            {filteredPage.rows.length === 0 ? <p className="inline-empty">No pools match these filters.</p> : null}
+            {discoveryState.hasLiquidity && filteredPage.ownerStatus !== "ready" ? (
+              <p className="state-row warning" data-testid="owner-pool-filter-status">
+                {filteredPage.ownerStatus === "partial"
+                  ? "Wallet liquidity results are partial; only verified loaded pools are shown."
+                  : account.address
+                    ? "Wallet liquidity analytics are unavailable."
+                    : "Connect a wallet to filter pools by your liquidity."}
+              </p>
+            ) : null}
             <div className="pagination-controls" aria-label="Pool pages">
-              <button disabled={safePage === 0} onClick={() => setPage((value) => Math.max(0, value - 1))} type="button">Previous</button>
-              <span>Page {safePage + 1} of {pageCount} · {filteredPools.length} pools</span>
-              <button disabled={safePage + 1 >= pageCount} onClick={() => setPage((value) => Math.min(pageCount - 1, value + 1))} type="button">Next</button>
+              <button disabled={filteredPage.page === 0} onClick={() => updateDiscovery({ page: Math.max(0, filteredPage.page - 1) }, false)} type="button">Previous</button>
+              <span>Page {filteredPage.page + 1} of {filteredPage.pageCount} · {filteredPage.filteredCount} pools</span>
+              <button disabled={filteredPage.page + 1 >= filteredPage.pageCount} onClick={() => updateDiscovery({ page: Math.min(filteredPage.pageCount - 1, filteredPage.page + 1) }, false)} type="button">Next</button>
             </div>
           </>
         ) : (
@@ -4889,18 +4918,6 @@ function withActiveBin(bins: BinRow[], activeId: string | null): BinRow[] {
 
   return [...bins, { id: `active-${activeId}`, binId: activeId, reserveX: "0", reserveY: "0", totalSupply: "0", updatedAtBlock: "0" }]
     .sort((left, right) => Number(left.binId) - Number(right.binId));
-}
-
-function comparePoolMetric(left: PoolRow, right: PoolRow, sort: PoolSort): number {
-  const leftValue = poolMetric(left, sort);
-  const rightValue = poolMetric(right, sort);
-  return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : left.id.localeCompare(right.id);
-}
-
-function poolMetric(pool: PoolRow, sort: PoolSort): bigint {
-  if (sort === "deposits") return BigInt(pool.depositCount);
-  if (sort === "updated") return BigInt(pool.updatedAtBlock);
-  return BigInt(pool.swapCount);
 }
 
 function LiquidityView({
@@ -9391,8 +9408,9 @@ function useHashRoute(): [
   string | null,
   "add" | "partial" | "full" | null
 ] {
+  const routeParts = () => window.location.hash.replace("#/", "").split("?", 1)[0].split("/");
   const readRoute = () => {
-    const [next] = window.location.hash.replace("#/", "").split("/");
+    const [next] = routeParts();
     if (next === "" && (window.location.hash === "" || window.location.hash === "#/")) return "home";
     return routes.some((route) => route.key === next) ? (next as RouteKey) : "swap";
   };
@@ -9405,20 +9423,20 @@ function useHashRoute(): [
     }
   };
   const readPoolDetailId = () => {
-    const [route, encodedPoolId] = window.location.hash.replace("#/", "").split("/");
+    const [route, encodedPoolId] = routeParts();
     return route === "pools" ? decodeRoutePart(encodedPoolId) : null;
   };
   const readPositionDetailId = () => {
-    const [route, encodedId] = window.location.hash.replace("#/", "").split("/");
+    const [route, encodedId] = routeParts();
     return route === "positions" ? decodeRoutePart(encodedId) : null;
   };
   const readLiquiditySection = (): "add" | "withdraw" | null => {
-    const [route, section] = window.location.hash.replace("#/", "").split("/");
+    const [route, section] = routeParts();
     if (route !== "liquidity") return null;
     return section === "add" ? "add" : section === "withdraw" || section === "partial" || section === "full" ? "withdraw" : null;
   };
   const readActionPoolId = () => {
-    const [route, sectionOrPool, liquidityPool] = window.location.hash.replace("#/", "").split("/");
+    const [route, sectionOrPool, liquidityPool] = routeParts();
     const knownSection = sectionOrPool === "add" || sectionOrPool === "withdraw" || sectionOrPool === "partial" || sectionOrPool === "full";
     const encodedPoolId = route === "swap"
       ? sectionOrPool
@@ -9428,7 +9446,7 @@ function useHashRoute(): [
     return decodeRoutePart(encodedPoolId);
   };
   const readPortfolioAction = (): "add" | "partial" | "full" | null => {
-    const [route, action] = window.location.hash.replace("#/", "").split("/");
+    const [route, action] = routeParts();
     return route === "liquidity" && (action === "add" || action === "partial" || action === "full") ? action : null;
   };
   const [routeKey, setRouteKeyState] = useState<RouteKey>(readRoute);

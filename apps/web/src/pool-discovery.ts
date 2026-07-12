@@ -17,7 +17,7 @@ export interface DiscoverableToken {
   address?: Address;
   name?: string;
   symbol?: string;
-  tags?: string[];
+  tags?: readonly string[];
 }
 
 export interface DiscoverablePool {
