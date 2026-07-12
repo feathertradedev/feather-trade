@@ -19,6 +19,7 @@ import {
   recoverAwaitingWalletIntents,
   deferTransactionMonitoring,
   selectTransactionRecordsForMonitoring,
+  transactionFamilyRetryBlocked,
   transactionRetryBlocked,
   type ReviewedTransactionIntent,
   type TransactionJournalObservation,
@@ -89,16 +90,20 @@ export function TransactionJournalProvider({ children }: { children: ReactNode }
       throw new Error("Transaction journal blocked a reviewed intent whose chain or deployment identity is stale");
     }
     const client = createDexPublicClient(registry.chain, registry.endpoints.rpcUrl);
-    const [expectedNonce, submissionBlock] = await Promise.all([
-      client.getTransactionCount({ address: reviewed.account, blockTag: "pending" }),
-      client.getBlockNumber()
-    ]);
     return withJournalLock(async () => {
       const current = mergeTransactionJournals(stateRef.current, loadTransactionJournal(window.localStorage));
-      if (transactionRetryBlocked(current, reviewed)) {
+      if (transactionRetryBlocked(current, reviewed) || transactionFamilyRetryBlocked(current, reviewed)) {
         throw new Error("A matching transaction intent is still unresolved; retry is blocked until reconciliation completes");
       }
-      const next = beginTransactionIntent(current, reviewed, { expectedNonce: BigInt(expectedNonce), submissionBlock });
+      const [expectedNonce, submissionBlock] = await Promise.all([
+        client.getTransactionCount({ address: reviewed.account, blockTag: "pending" }),
+        client.getBlockNumber()
+      ]);
+      const rechecked = mergeTransactionJournals(stateRef.current, loadTransactionJournal(window.localStorage));
+      if (transactionRetryBlocked(rechecked, reviewed) || transactionFamilyRetryBlocked(rechecked, reviewed)) {
+        throw new Error("A conflicting transaction intent was recorded while wallet state was checked; retry is blocked until reconciliation completes");
+      }
+      const next = beginTransactionIntent(rechecked, reviewed, { expectedNonce: BigInt(expectedNonce), submissionBlock });
       const record = next.records[next.records.length - 1];
       if (!record) throw new Error("Transaction intent was not retained by the durable journal");
       const persisted = persistTransactionJournal(window.localStorage, next);
@@ -133,7 +138,7 @@ export function TransactionJournalProvider({ children }: { children: ReactNode }
   }, [commit]);
 
   const retryBlocked = useCallback((reviewed: ReviewedTransactionIntent) =>
-    !ready || transactionRetryBlocked(stateRef.current, reviewed), [ready]);
+    !ready || transactionRetryBlocked(stateRef.current, reviewed) || transactionFamilyRetryBlocked(stateRef.current, reviewed), [ready]);
 
   useEffect(() => {
     const mergeFromStorage = (event: StorageEvent) => {

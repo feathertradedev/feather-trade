@@ -281,8 +281,6 @@ export function applyTransactionObservation(
     updatedAt: observation.now
   };
 
-  if (record.status === "reverted") return record;
-
   if (
     (observation.receiptLookup === "unavailable" || observation.canonicalBlockLookup === "unavailable") &&
     ["confirming", "canonical", "reverted", "replaced", "orphaned"].includes(record.status)
@@ -338,7 +336,7 @@ export function applyTransactionObservation(
 
   if (
     observation.receiptLookup === "missing" &&
-    (record.canonicalReceipt !== null || record.status === "canonical" || record.status === "confirming")
+    (record.canonicalReceipt !== null || record.status === "canonical" || record.status === "confirming" || record.status === "reverted")
   ) {
     return {
       ...base,
@@ -388,7 +386,7 @@ function applyReceiptObservation(
 ): TransactionJournalRecord {
   const receipt = observation.receipt;
   if (receipt === null || record.activeHash === null || !sameHex(receipt.hash, record.activeHash)) {
-    if (record.canonicalReceipt !== null || record.status === "canonical" || record.status === "confirming") {
+    if (record.canonicalReceipt !== null || record.status === "canonical" || record.status === "confirming" || record.status === "reverted") {
       return {
         ...record,
         confirmations: 0,
@@ -410,12 +408,12 @@ function applyReceiptObservation(
       status: "orphaned"
     };
   }
-  if (receipt.status === "reverted") {
-    return { ...record, canonicalReceipt: receipt, confirmations: 0, rejectionReason: "Transaction reverted", status: "reverted" };
-  }
   const head = parseStoredBigInt(observation.headBlockNumber);
   const receiptBlock = BigInt(receipt.blockNumber);
   const confirmations = head === null || head < receiptBlock ? 0 : Number(head - receiptBlock + 1n);
+  if (receipt.status === "reverted") {
+    return { ...record, canonicalReceipt: receipt, confirmations, rejectionReason: "Transaction reverted", status: "reverted" };
+  }
   return {
     ...record,
     canonicalReceipt: receipt,
@@ -445,9 +443,35 @@ export function transactionRetryBlocked(state: TransactionJournalState, reviewed
   return state.records.some((record) =>
     transactionScopeKey(record.reviewed) === scope &&
     transactionRetryKey(record.reviewed) === retryKey &&
-    !["canonical", "reverted", "rejected", "aborted"].includes(record.status) &&
+    !["canonical", "rejected", "aborted"].includes(record.status) &&
+    !(record.status === "reverted" && record.confirmations >= TRANSACTION_JOURNAL_MONITOR_CONFIRMATIONS) &&
     !(record.status === "replaced" && record.replacementCompatibility === "incompatible" && record.replacementFinalized)
   );
+}
+
+export function transactionFamilyRetryBlocked(
+  state: TransactionJournalState,
+  reviewed: ReviewedTransactionIntent
+): boolean {
+  if (reviewed.intent !== "remove-liquidity") return false;
+  const scope = transactionScopeKey(reviewed);
+  return state.records.some((record) =>
+    record.reviewed.intent === "remove-liquidity" &&
+    transactionScopeKey(record.reviewed) === scope &&
+    record.reviewed.poolId?.toLowerCase() === reviewed.poolId?.toLowerCase() &&
+    record.reviewed.target.toLowerCase() === reviewed.target.toLowerCase() &&
+    transactionRecordBlocksIntentFamily(record)
+  );
+}
+
+export function transactionRecordBlocksIntentFamily(record: TransactionJournalRecord): boolean {
+  if (["rejected", "aborted"].includes(record.status)) return false;
+  if (record.status === "canonical") return record.confirmations < TRANSACTION_JOURNAL_MONITOR_CONFIRMATIONS;
+  if (record.status === "reverted") return record.confirmations < TRANSACTION_JOURNAL_MONITOR_CONFIRMATIONS;
+  if (record.status === "replaced" && record.replacementCompatibility === "incompatible") {
+    return !record.replacementFinalized || record.confirmations < TRANSACTION_JOURNAL_MONITOR_CONFIRMATIONS;
+  }
+  return true;
 }
 
 function transactionRetryKey(reviewed: ReviewedTransactionIntent): string {
@@ -478,7 +502,8 @@ export function recordsForScope(state: TransactionJournalState, scope: Transacti
 }
 
 export function transactionNeedsMonitoring(record: TransactionJournalRecord): boolean {
-  if (["rejected", "aborted", "reverted"].includes(record.status)) return false;
+  if (["rejected", "aborted"].includes(record.status)) return false;
+  if (record.status === "reverted" && record.confirmations >= TRANSACTION_JOURNAL_MONITOR_CONFIRMATIONS) return false;
   if (record.status === "canonical" && record.confirmations >= TRANSACTION_JOURNAL_MONITOR_CONFIRMATIONS) return false;
   if (
     record.status === "replaced" &&
@@ -836,7 +861,11 @@ function isJournalRecord(value: unknown): value is TransactionJournalRecord {
   if (valid.status === "canonical" && valid.confirmations < TRANSACTION_JOURNAL_CONFIRMATIONS) return false;
   if (valid.status === "confirming" && (valid.confirmations <= 0 || valid.confirmations >= TRANSACTION_JOURNAL_CONFIRMATIONS)) return false;
   if (valid.status === "reverted") {
-    if (valid.activeHash === null || valid.canonicalReceipt?.status !== "reverted" || !sameHex(valid.canonicalReceipt.hash, valid.activeHash)) return false;
+    if (
+      valid.activeHash === null ||
+      valid.canonicalReceipt?.status !== "reverted" ||
+      !sameHex(valid.canonicalReceipt.hash, valid.activeHash)
+    ) return false;
   }
   if (valid.status === "submitted" && valid.activeHash === null) return false;
   if (["awaiting-wallet", "unknown-submission"].includes(valid.status) && valid.activeHash !== null) return false;

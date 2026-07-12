@@ -107,6 +107,17 @@ import {
   type LbOperatorApprovalObservation
 } from "./lb-operator-approval";
 import { LbOperatorApprovalDisclosure } from "./lb-operator-approval-disclosure";
+import {
+  classifyFullExitJournalRecord,
+  createFullExitStateSnapshot,
+  createFullExitWorkflowKey,
+  encodeFullExitBatchSettings,
+  fullExitStateFingerprint,
+  parseFullExitBatchSettings,
+  planFullExitBatches,
+  type FullExitLiveBin
+} from "./full-exit-batching";
+import { fullExitBatchPolicy } from "./full-exit-policy";
 import { buildPositionBurnPlan, type PositionBurnLiveBalanceRow, type PositionBurnPlanResult } from "./position-burn-plan";
 import {
   BLOCKING_PRICE_IMPACT_BPS,
@@ -127,7 +138,14 @@ import {
 import { wagmiConfig } from "./wagmi";
 import { SUPPORTED_WALLET_RDNS, walletFailure, walletSessionIdentity, type WalletFailure } from "./wallet-lifecycle";
 import { TransactionJournalProvider, useTransactionJournal, type TransactionJournalApi } from "./transaction-journal-react";
-import { isUserRejectedSubmission, type ReviewedTransactionIntent } from "./transaction-journal";
+import {
+  TRANSACTION_JOURNAL_MONITOR_CONFIRMATIONS,
+  isUserRejectedSubmission,
+  loadTransactionJournal,
+  transactionRecordBlocksIntentFamily,
+  type ReviewedTransactionIntent,
+  type TransactionJournalRecord
+} from "./transaction-journal";
 import {
   getPinnedBlockIdentity,
   loadPinnedAddLiquidityReview,
@@ -148,6 +166,35 @@ import {
 const queryClient = new QueryClient();
 const SNAPSHOT_REFRESH_INTERVAL_MS = 10_000;
 const SWAP_QUOTE_REFRESH_INTERVAL_MS = 10_000;
+
+interface FullExitUiState {
+  batchOrdinal: number;
+  completedBatches: number;
+  estimatedTransactionsRemaining: number | null;
+  message: string;
+  remainingBins: number | null;
+  status: "idle" | "planning" | "awaiting-review" | "submitted" | "awaiting-finality" | "complete" | "blocked";
+  workflowKey: string;
+}
+
+interface FullExitBatchReviewState {
+  batchOrdinal: number;
+  batchSettings: string;
+  binStates: LiveBurnBinState[];
+  completedBatches: number;
+  estimatedTransactionsRemaining: number;
+  estimatedGas: bigint;
+  executionContextFingerprint: string;
+  executionFingerprint: string;
+  liveBins: FullExitLiveBin[];
+  positions: PositionRow[];
+  remainingBins: number;
+  sourceBlockHash: string;
+  sourceBlockNumber: bigint;
+  stateFingerprint: string;
+  transaction: ReturnType<typeof buildRemoveLiquidityTransaction>;
+  workflowKey: string;
+}
 
 interface SerializedExactInQuote {
   route: Address[];
@@ -241,6 +288,52 @@ function deploymentEpoch(registry: DexRegistry): string {
     registry.contracts.lbRouter
   ].join("|");
 }
+
+function sliceBurnPlan(plan: PositionBurnPlanResult, bins: readonly FullExitLiveBin[]): PositionBurnPlanResult {
+  const included = new Set(bins.map((bin) => bin.binId.toString()));
+  const items = plan.items.filter((item) => included.has(item.binId.toString()));
+  return {
+    amounts: items.map((item) => item.amount),
+    blocked: false,
+    blockers: [],
+    ids: items.map((item) => item.binId),
+    items,
+    warnings: [...plan.warnings]
+  };
+}
+
+function fullExitSettingsForRecord(record: TransactionJournalRecord) {
+  try {
+    return parseFullExitBatchSettings(record.reviewed.settingsFingerprint);
+  } catch {
+    return null;
+  }
+}
+
+function fullExitJournalDisposition(record: TransactionJournalRecord) {
+  return classifyFullExitJournalRecord({
+    confirmations: record.confirmations,
+    receiptStatus: record.canonicalReceipt?.status ?? null,
+    replacementCompatibility: record.replacementCompatibility,
+    replacementFinalized: record.replacementFinalized,
+    status: record.status
+  }, TRANSACTION_JOURNAL_MONITOR_CONFIRMATIONS);
+}
+
+function fullExitReviewedLiveStateFingerprint(
+  bins: readonly FullExitLiveBin[],
+  binStates: readonly LiveBurnBinState[]
+): string {
+  const stateByBin = new Map(binStates.map((state) => [BigInt(state.binId).toString(), state]));
+  return JSON.stringify([...bins]
+    .sort((left, right) => left.binId < right.binId ? -1 : left.binId > right.binId ? 1 : 0)
+    .map((bin) => {
+      const state = stateByBin.get(bin.binId.toString());
+      if (!state) throw new Error(`Full-exit quote state is missing for bin ${bin.binId.toString()}`);
+      return [bin.binId.toString(), bin.liveBalance.toString(), state.reserveX, state.reserveY, state.totalSupply];
+    }));
+}
+
 
 function reviewedTransactionIntent(
   input: {
@@ -3295,10 +3388,16 @@ function LiquidityView({
   const [submittedLiquidityAddReview, setSubmittedLiquidityAddReview] = useState<SubmittedLiquidityAddReview | null>(null);
   const [liquidityReviewNotice, setLiquidityReviewNotice] = useState<string | null>(null);
   const [removeQuoteReviewRequired, setRemoveQuoteReviewRequired] = useState<string | null>(null);
+  const [fullExitUi, setFullExitUi] = useState<FullExitUiState | null>(null);
+  const [fullExitBatchReview, setFullExitBatchReview] = useState<FullExitBatchReviewState | null>(null);
+  const latestFullExitBatchReviewRef = useRef<FullExitBatchReviewState | null>(fullExitBatchReview);
+  latestFullExitBatchReviewRef.current = fullExitBatchReview;
   const [selectedPositionIds, setSelectedPositionIds] = useState<string[]>([]);
   const [removePercentInput, setRemovePercentInput] = useState("100");
+  const [explicitFullExitRequested, setExplicitFullExitRequested] = useState(false);
   const [liquidityReceiptPhase, setLiquidityReceiptPhase] = useState<"idle" | "lb-approval" | "remove">("idle");
   const [submittedRemoveReceiptContext, setSubmittedRemoveReceiptContext] = useState<string | null>(null);
+  const [submittedFullExitHash, setSubmittedFullExitHash] = useState<Address | null>(null);
   const [submittedApproveXReceiptContext, setSubmittedApproveXReceiptContext] = useState<string | null>(null);
   const [submittedApproveYReceiptContext, setSubmittedApproveYReceiptContext] = useState<string | null>(null);
   const [submittedLbApprovalReceiptContext, setSubmittedLbApprovalReceiptContext] = useState<string | null>(null);
@@ -3959,7 +4058,57 @@ function LiquidityView({
         ? "in range"
         : "out of range";
   const removePercentValue = removePercentBps === null ? 0 : Number(removePercentBps) / 100;
-  const fullExit = removePercentBps === 10_000n && selectedCoversAllWalletBins;
+  const currentFullExitWorkflowKey = account.address && pool
+    ? createFullExitWorkflowKey({
+        account: account.address,
+        chainId: registry.chainId,
+        deploymentEpoch: deploymentEpoch(registry),
+        environment: environmentKey,
+        pair: pool.pair,
+        recipient: account.address,
+        router: registry.contracts.lbRouter
+      })
+    : null;
+  const currentFullExitRecords = currentFullExitWorkflowKey === null
+    ? []
+    : transactionJournal.records.filter((record) =>
+        fullExitSettingsForRecord(record)?.workflowKey === currentFullExitWorkflowKey
+      );
+  const currentRemoveFamilyConflict = account.address && pool
+    ? transactionJournal.records.find((record) =>
+        record.reviewed.intent === "remove-liquidity" &&
+        record.reviewed.account.toLowerCase() === account.address!.toLowerCase() &&
+        record.reviewed.chainId === registry.chainId &&
+        record.reviewed.environment === environmentKey &&
+        record.reviewed.deploymentEpoch === deploymentEpoch(registry) &&
+        record.reviewed.poolId?.toLowerCase() === pool.pair.toLowerCase() &&
+        record.reviewed.target.toLowerCase() === registry.contracts.lbRouter.toLowerCase() &&
+        transactionRecordBlocksIntentFamily(record)
+      ) ?? null
+    : null;
+  const fullExitHasHistory = currentFullExitRecords.length > 0;
+  const fullExit = removePercentBps === 10_000n && selectedCoversAllWalletBins && (
+    explicitFullExitRequested ||
+    portfolioAction === "full"
+  );
+  useEffect(() => {
+    if (fullExitUi === null || fullExitUi.status === "complete" || fullExitUi.workflowKey !== currentFullExitWorkflowKey) return;
+    const finalized = currentFullExitRecords
+      .filter((record) => fullExitJournalDisposition(record).countsCompletedBatch)
+      .sort((left, right) => right.createdAt - left.createdAt);
+    const latest = finalized[0];
+    if (!latest) return;
+    const settings = fullExitSettingsForRecord(latest);
+    if (!settings || settings.batchOrdinal < fullExitUi.batchOrdinal) return;
+    const completedBatches = new Set(finalized.map((record) => fullExitSettingsForRecord(record)?.batchOrdinal).filter((value) => value !== undefined)).size;
+    if (fullExitUi.status === "idle" && fullExitUi.completedBatches === completedBatches) return;
+    setFullExitUi((current) => current === null ? null : {
+      ...current,
+      completedBatches,
+      message: `Batch ${settings.batchOrdinal} reached ${TRANSACTION_JOURNAL_MONITOR_CONFIRMATIONS}-confirmation finality. Resume explicitly to re-enumerate all live owner bins before the next transaction or completion check.`,
+      status: "idle"
+    });
+  }, [currentFullExitRecords, currentFullExitWorkflowKey, fullExitUi]);
   const removeBurnPlanIssue = positionBurnSubmissionError(removeBurnPlan);
   const addInputError =
     distributionResult.error ??
@@ -3997,6 +4146,8 @@ function LiquidityView({
         ? "Slippage exceeds 10% safety limit"
         : deadlineMinutes === null
           ? "Enter a deadline from 1 to 120 minutes"
+          : currentRemoveFamilyConflict !== null
+            ? `A prior withdrawal is ${currentRemoveFamilyConflict.status} at ${currentRemoveFamilyConflict.confirmations}/${TRANSACTION_JOURNAL_MONITOR_CONFIRMATIONS} confirmations; no sibling partial or full exit may start before finality`
           : removeDataFreshnessIssue ??
             (!removeSelectedPool.ready
               ? poolDescriptorError(removeSelectedPool)
@@ -4175,7 +4326,11 @@ function LiquidityView({
   useEffect(() => {
     setLiquidityReceiptPhase("idle");
     setSubmittedRemoveReceiptContext(null);
-  }, [account.address, activeWalletChainId, environmentKey, initialSection, pool?.pair, portfolioAction, selectedPoolId]);
+    setSubmittedFullExitHash(null);
+    setFullExitUi((current) => current !== null && current.workflowKey === currentFullExitWorkflowKey ? current : null);
+    setFullExitBatchReview((current) => current !== null && current.workflowKey === currentFullExitWorkflowKey ? current : null);
+    setExplicitFullExitRequested(portfolioAction === "full");
+  }, [account.address, activeWalletChainId, currentFullExitWorkflowKey, environmentKey, initialSection, pool?.pair, portfolioAction, selectedPoolId]);
 
   useEffect(() => {
     if (approveLbSubmitInFlightRef.current === null) return;
@@ -4207,6 +4362,7 @@ function LiquidityView({
     if ((portfolioAction === "partial" || portfolioAction === "full") && walletPositions.length > 0 && portfolioPrefillKeyRef.current !== prefillKey) {
       portfolioPrefillKeyRef.current = prefillKey;
       intentionalEmptySelectionRef.current = false;
+      setExplicitFullExitRequested(portfolioAction === "full");
       setRemovePercentInput(portfolioAction === "partial" ? "50" : "100");
       setSelectedPositionIds(walletPositions.map((position) => position.id));
       return;
@@ -4238,6 +4394,7 @@ function LiquidityView({
     setGasReview(null);
     setLiquidityReviewNotice(null);
     setRemoveQuoteReviewRequired(null);
+    setFullExitBatchReview(null);
   }, [
     account.address,
     amountXInput,
@@ -4287,6 +4444,13 @@ function LiquidityView({
       void walletPositionsQuery.refetch();
       void selectedBurnSnapshotQuery.refetch();
       onRefresh();
+      if (submittedFullExitHash === removeWrite.data) {
+        setFullExitUi((current) => current === null ? null : {
+          ...current,
+          message: `Batch ${current.batchOrdinal} mined successfully but is not final. Wait for ${TRANSACTION_JOURNAL_MONITOR_CONFIRMATIONS} confirmations, then resume to re-enumerate live bins.`,
+          status: "awaiting-finality"
+        });
+      }
       setHandledRemoveHash(removeWrite.data);
     }
 
@@ -4308,6 +4472,7 @@ function LiquidityView({
     onRefresh,
     removeSuccess,
     removeWrite.data,
+    submittedFullExitHash,
     selectedBurnSnapshotQuery,
     walletPositionsQuery,
     walletQuery
@@ -4912,7 +5077,449 @@ function LiquidityView({
     }
   };
 
+  const handleFullExitBatch = async (workflowKeyOverride: string | null = null) => {
+    if (
+      removeSubmitInFlightRef.current !== null ||
+      !pool ||
+      !account.address ||
+      slippageBps === null ||
+      deadlineMinutes === null ||
+      activeWalletChainId !== registry.chainId
+    ) return;
+    const workflowKey = workflowKeyOverride ?? currentFullExitWorkflowKey;
+    if (workflowKey === null) return;
+    const expectedWorkflowKey = createFullExitWorkflowKey({
+      account: account.address,
+      chainId: registry.chainId,
+      deploymentEpoch: deploymentEpoch(registry),
+      environment: environmentKey,
+      pair: pool.pair,
+      recipient: account.address,
+      router: registry.contracts.lbRouter
+    });
+    if (workflowKey !== expectedWorkflowKey) {
+      setLiquiditySimulationError("The resumable full-exit identity does not match the current owner, chain, deployment, pair, and router");
+      return;
+    }
+    if (!navigator.locks) {
+      setLiquiditySimulationError("This browser cannot provide the exclusive lock required for safe full-exit batching");
+      return;
+    }
+
+    const submittedOperationGeneration = liquidityOperationGenerationRef.current;
+    const submittedExecutionContextFingerprint = removeExecutionContextFingerprint;
+    removeSubmitInFlightRef.current = submittedOperationGeneration;
+    const operationIsCurrent = () =>
+      liquidityOperationGenerationRef.current === submittedOperationGeneration &&
+      removeSubmitInFlightRef.current === submittedOperationGeneration;
+    removeWrite.reset();
+    setLiquidityReceiptPhase("idle");
+    setSubmittedRemoveReceiptContext(null);
+    setSubmittedFullExitHash(null);
+    setLiquiditySimulationError(null);
+    setGasReviewError(null);
+    setRemoveQuoteReviewRequired(null);
+    setLiquiditySimulationPending(true);
+    setFullExitUi({
+      batchOrdinal: 1,
+      completedBatches: 0,
+      estimatedTransactionsRemaining: null,
+      message: "Re-enumerating every owner bin at a complete pinned indexer block before planning the next transaction.",
+      remainingBins: null,
+      status: "planning",
+      workflowKey
+    });
+    let submitted = false;
+    try {
+      await navigator.locks.request(`feather.full-exit:${workflowKey}`, { ifAvailable: true, mode: "exclusive" }, async (lock) => {
+        if (lock === null) throw new Error("Another tab is already planning or submitting this exact full exit");
+        const durableJournal = loadTransactionJournal(window.localStorage);
+        const familyRecords = durableJournal.records.filter((record) =>
+          record.reviewed.intent === "remove-liquidity" &&
+          record.reviewed.account.toLowerCase() === account.address!.toLowerCase() &&
+          record.reviewed.chainId === registry.chainId &&
+          record.reviewed.environment === environmentKey &&
+          record.reviewed.deploymentEpoch === deploymentEpoch(registry) &&
+          record.reviewed.poolId?.toLowerCase() === pool.pair.toLowerCase() &&
+          record.reviewed.target.toLowerCase() === registry.contracts.lbRouter.toLowerCase()
+        );
+        const conflictingRecord = familyRecords.find(transactionRecordBlocksIntentFamily) ?? null;
+        if (conflictingRecord !== null) {
+          const settings = fullExitSettingsForRecord(conflictingRecord);
+          setFullExitUi({
+            batchOrdinal: settings?.batchOrdinal ?? 1,
+            completedBatches: familyRecords.filter((record) => {
+              const recordSettings = fullExitSettingsForRecord(record);
+              return recordSettings?.workflowKey === workflowKey && fullExitJournalDisposition(record).countsCompletedBatch;
+            }).length,
+            estimatedTransactionsRemaining: null,
+            message: `Prior remove transaction is ${conflictingRecord.status} with ${conflictingRecord.confirmations}/${TRANSACTION_JOURNAL_MONITOR_CONFIRMATIONS} confirmations. Reconciliation and finality must finish before replanning.`,
+            remainingBins: null,
+            status: "awaiting-finality",
+            workflowKey
+          });
+          throw new Error("A prior withdrawal for this owner and pair is not yet finalized; resume remains blocked until journal reconciliation reaches 12 confirmations");
+        }
+        const workflowRecords = familyRecords.filter((record) => fullExitSettingsForRecord(record)?.workflowKey === workflowKey);
+        const completedBatches = new Set(workflowRecords
+          .filter((record) => fullExitJournalDisposition(record).countsCompletedBatch)
+          .map((record) => fullExitSettingsForRecord(record)!.batchOrdinal)).size;
+        const batchOrdinal = completedBatches + 1;
+
+        const submitPreparedBatch = async (prepared: FullExitBatchReviewState) => {
+          const gasReviewIsCurrent = () =>
+            operationIsCurrent() &&
+            latestRemoveExecutionContextFingerprint.current === prepared.executionContextFingerprint &&
+            latestFullExitBatchReviewRef.current?.executionFingerprint === prepared.executionFingerprint;
+          const gasApproved = await reviewExactGas({
+            action: "full liquidity exit",
+            currentReview: gasReview,
+            estimateGas: () => publicClient.estimateGas({
+              account: account.address!,
+              to: prepared.transaction.to,
+              data: prepared.transaction.data,
+              value: prepared.transaction.value
+            }),
+            executionFingerprint: prepared.executionFingerprint,
+            getBalance: () => publicClient.getBalance({ address: account.address! }),
+            getGasPrice: () => publicClient.getGasPrice(),
+            isCurrent: gasReviewIsCurrent,
+            setError: setGasReviewError,
+            setReview: setGasReview,
+            transactionValue: prepared.transaction.value
+          });
+          if (!gasApproved || !gasReviewIsCurrent()) return;
+          const assertPreparedLiveState = async () => {
+            if (await readRpcBlockHash(prepared.sourceBlockNumber) !== prepared.sourceBlockHash) {
+              throw new Error("The reviewed full-exit state block was reorganized; discard this review and re-enumerate");
+            }
+            const latest = await readSelectedBurnSnapshot(prepared.positions);
+            const balanceByBin = new Map(latest.balances.map((row) => [BigInt(row.binId).toString(), BigInt(row.balance ?? 0)]));
+            const latestBins = prepared.liveBins.map((bin) => ({ binId: bin.binId, liveBalance: balanceByBin.get(bin.binId.toString()) ?? 0n }));
+            const latestStates = latest.binStates.filter((state) => latestBins.some((bin) => bin.binId === BigInt(state.binId)));
+            if (
+              fullExitReviewedLiveStateFingerprint(latestBins, latestStates) !==
+              fullExitReviewedLiveStateFingerprint(prepared.liveBins, prepared.binStates)
+            ) {
+              throw new Error("Reviewed full-exit balances or quote state changed; re-enumerate and review the exact batch again");
+            }
+          };
+          await assertPreparedLiveState();
+          if (!(await readLiveLbApproval())) throw new Error("LB operator access was revoked before the full-exit wallet request");
+          await publicClient.call({ account: account.address!, to: prepared.transaction.to, data: prepared.transaction.data, value: prepared.transaction.value });
+          await attestLiquidityPair("remove-liquidity");
+          setLiquidityReceiptPhase("remove");
+          setSubmittedRemoveReceiptContext(liquidityLifecycleKey);
+          const submittedContext = {
+            account: account.address!,
+            calldataFingerprint: keccak256(prepared.transaction.data),
+            chainId: activeWalletChainId,
+            deploymentEpoch: deploymentEpoch(registry),
+            environment: environmentKey,
+            executionFingerprint: prepared.executionFingerprint,
+            intent: "remove-liquidity" as const,
+            providerId: account.connector?.id ?? "unknown",
+            providerUid: account.connector?.uid ?? "unknown",
+            submittedAt: Date.now(),
+            target: prepared.transaction.to,
+            value: prepared.transaction.value
+          };
+          const hash = await submitJournaledTransaction({
+            isCurrent: gasReviewIsCurrent,
+            journal: transactionJournal,
+            reviewed: reviewedTransactionIntent(submittedContext, {
+              poolId: pool.pair,
+              recipient: account.address!,
+              refundRecipient: null,
+              settingsFingerprint: prepared.batchSettings
+            }),
+            preWalletGuard: async () => {
+              await assertPreparedLiveState();
+              if (!(await readLiveLbApproval())) throw new PairAttestationError("context-changed", "LB operator access was revoked before wallet confirmation");
+              await publicClient.call({ account: account.address!, to: prepared.transaction.to, data: prepared.transaction.data, value: prepared.transaction.value });
+              await attestLiquidityPair("remove-liquidity");
+              if (!gasReviewIsCurrent()) throw new PairAttestationError("context-changed", "Full-exit context changed before wallet confirmation");
+            },
+            send: () => removeWrite.sendTransactionAsync(prepared.transaction)
+          });
+          submitted = hash !== null;
+          if (submitted) {
+            setSubmittedFullExitHash(hash);
+            latestFullExitBatchReviewRef.current = null;
+            setFullExitBatchReview(null);
+            setFullExitUi({
+              batchOrdinal: prepared.batchOrdinal,
+              completedBatches: prepared.completedBatches,
+              estimatedTransactionsRemaining: prepared.estimatedTransactionsRemaining,
+              message: `Batch ${prepared.batchOrdinal} submitted for ${prepared.liveBins.length} bins. This is not a completed full exit; wait for 12-confirmation finality, then explicitly resume to re-enumerate every remaining owner bin.`,
+              remainingBins: prepared.remainingBins,
+              status: "submitted",
+              workflowKey
+            });
+          }
+        };
+
+        if (
+          fullExitBatchReview !== null &&
+          fullExitBatchReview.workflowKey === workflowKey &&
+          fullExitBatchReview.batchOrdinal === batchOrdinal &&
+          fullExitBatchReview.executionContextFingerprint === submittedExecutionContextFingerprint
+        ) {
+          try {
+            await submitPreparedBatch(fullExitBatchReview);
+            return;
+          } catch (error) {
+            if (!/Reviewed full-exit balances or quote state changed/i.test(getWriteError(error) ?? "")) throw error;
+            latestFullExitBatchReviewRef.current = null;
+            setFullExitBatchReview(null);
+            setGasReview(null);
+            setFullExitUi({
+              batchOrdinal,
+              completedBatches,
+              estimatedTransactionsRemaining: null,
+              message: "Live balances or quote state changed after review. Re-enumerating now; a new exact gas review is required before any wallet request.",
+              remainingBins: null,
+              status: "planning",
+              workflowKey
+            });
+          }
+        }
+
+        try {
+          await attestLiquidityPair("remove-liquidity");
+        } catch (error) {
+          throw new Error(`Full-exit pair attestation failed: ${getWriteError(error) ?? "pair identity unavailable"}`);
+        }
+        const snapshotResult = await onRefresh();
+        if (snapshotResult.isError || snapshotResult.error || !snapshotResult.data) {
+          throw snapshotResult.error ?? new Error("exact full-exit snapshot unavailable");
+        }
+        const freshSnapshot = snapshotResult.data;
+        const freshnessError = indexerSubmissionFreshnessError(freshSnapshot);
+        if (freshnessError !== null) throw new Error(freshnessError);
+        if (
+          freshSnapshot.runtime.blockNumber === null ||
+          freshSnapshot.indexer.blockNumber === null ||
+          freshSnapshot.indexer.blockHash === null ||
+          BigInt(freshSnapshot.runtime.blockNumber) < BigInt(freshSnapshot.indexer.blockNumber)
+        ) throw new Error("Full exit requires a complete indexer block that does not exceed the observed RPC head");
+        const pinnedBlockNumber = BigInt(freshSnapshot.indexer.blockNumber);
+        const pinnedBlockHash = freshSnapshot.indexer.blockHash.toLowerCase();
+        if (await readRpcBlockHash(pinnedBlockNumber) !== pinnedBlockHash) {
+          throw new Error("Full exit requires the pinned indexer block hash to remain canonical on RPC");
+        }
+        const freshPositionsPage = await loadPaginatedPositionsForOwnerPairAtBlock(
+          registry,
+          account.address!,
+          pool.pair,
+          pinnedBlockNumber
+        );
+        const positionDataError = ownerPositionPaginationError(freshPositionsPage, false);
+        if (positionDataError !== null) throw new Error(positionDataError);
+        const finalizedPriorBatch = workflowRecords.some((record) => fullExitJournalDisposition(record).countsCompletedBatch);
+        let burnSnapshot: LiveBurnSnapshot | null = null;
+        let livePositivePositions: PositionRow[] = [];
+        if (freshPositionsPage.rows.length > 0) {
+          burnSnapshot = await readSelectedBurnSnapshot(freshPositionsPage.rows, pinnedBlockNumber);
+          const balanceByBin = new Map(burnSnapshot.balances.map((row) => [BigInt(row.binId).toString(), BigInt(row.balance ?? 0)]));
+          livePositivePositions = freshPositionsPage.rows.filter((position) => (balanceByBin.get(BigInt(position.binId).toString()) ?? 0n) > 0n);
+        }
+        if (livePositivePositions.length === 0) {
+          if (!finalizedPriorBatch) throw new Error("No positive owner bins were found, but there is no finalized full-exit batch to verify");
+          if (await readRpcBlockHash(pinnedBlockNumber) !== pinnedBlockHash) {
+            throw new Error("The zero-position verification block was reorganized; retry after reconciliation");
+          }
+          setLiquiditySimulationPending(false);
+          setFullExitUi({
+            batchOrdinal,
+            completedBatches,
+            estimatedTransactionsRemaining: 0,
+            message: `Full exit verified complete: zero positive owner bins at canonical block ${pinnedBlockNumber.toString()} (${formatCompactAddress(pinnedBlockHash)}).`,
+            remainingBins: 0,
+            status: "complete",
+            workflowKey
+          });
+          return;
+        }
+        if (burnSnapshot === null) throw new Error("Pinned live owner-bin state is unavailable");
+        const livePositiveIds = new Set(livePositivePositions.map((position) => BigInt(position.binId).toString()));
+        burnSnapshot = {
+          ...burnSnapshot,
+          balances: burnSnapshot.balances.filter((row) => livePositiveIds.has(BigInt(row.binId).toString())),
+          binStates: burnSnapshot.binStates.filter((row) => livePositiveIds.has(BigInt(row.binId).toString()))
+        };
+        const freshPlan = buildPositionBurnPlan({
+          burnBps: 10_000n,
+          freshness: {
+            indexerStale: false,
+            liveReadError: false,
+            liveReadLoading: false,
+            positionDataCapped: false,
+            positionDataPartial: false
+          },
+          liveBalancesByBin: burnSnapshot.balances,
+          selectedPositions: livePositivePositions
+        });
+        if (freshPlan.blocked) throw new Error(positionBurnSubmissionError(freshPlan) ?? "Exact live full-exit burn plan is blocked");
+        const observedHeadBlockNumber = await readRpcHeadBlockNumber();
+        const stateSnapshot = createFullExitStateSnapshot({
+          bins: freshPlan.items.map((item) => ({ binId: item.binId, liveBalance: item.liveBalance })),
+          blockHash: pinnedBlockHash,
+          blockNumber: pinnedBlockNumber,
+          observedHeadBlockNumber,
+          workflowKey
+        });
+        const stateFingerprint = fullExitStateFingerprint(stateSnapshot);
+        const pinnedBlock = await publicClient.getBlock({ blockNumber: pinnedBlockNumber });
+        const policy = fullExitBatchPolicy(environmentKey);
+        const reviewedDeadline = deadlineFromNow(deadlineMinutes);
+        const plan = await planFullExitBatches({
+          bins: stateSnapshot.bins,
+          limits: {
+            blockGasLimit: pinnedBlock.gasLimit,
+            maxBlockGasBps: policy.maxBlockGasBps,
+            maxCalldataBytes: policy.maxCalldataBytes,
+            maxCandidateBins: policy.maxCandidateBins,
+            maxProbeCount: policy.maxProbeCount
+          },
+          stateFingerprint,
+          probe: async ({ bins }) => {
+            const candidatePlan = sliceBurnPlan(freshPlan, bins);
+            const quoteView = buildBurnQuoteView(candidatePlan, burnSnapshot.binStates, slippageBps);
+            if (quoteView.error !== null || quoteView.minimums === null) {
+              return { diagnostic: quoteView.error ?? "burn minimums unavailable", status: "semantic-failure" as const };
+            }
+            const candidate = buildRemoveLiquidityTransaction(registry, {
+              tokenX: pool.tokenX,
+              tokenY: pool.tokenY,
+              binStep: pool.binStep,
+              minimums: quoteView.minimums,
+              ids: candidatePlan.ids,
+              amounts: candidatePlan.amounts,
+              to: account.address!,
+              deadline: reviewedDeadline
+            });
+            const calldataBytes = Math.max(0, (candidate.data.length - 2) / 2);
+            try {
+              await publicClient.call({ account: account.address!, blockNumber: pinnedBlockNumber, to: candidate.to, data: candidate.data, value: candidate.value });
+            } catch (error) {
+              const diagnostic = getWriteError(error) ?? "exact candidate simulation failed";
+              return /(?:out of gas|gas limit|intrinsic gas|calldata|payload|batch exceeds|transaction too large|request entity too large)/i.test(diagnostic)
+                ? { diagnostic, status: "capacity" as const }
+                : { diagnostic, status: "semantic-failure" as const };
+            }
+            try {
+              const estimatedGas = await publicClient.estimateGas({ account: account.address!, blockNumber: pinnedBlockNumber, to: candidate.to, data: candidate.data, value: candidate.value });
+              return { calldataBytes, estimatedGas, status: "success" as const };
+            } catch (error) {
+              const diagnostic = getWriteError(error) ?? "exact candidate gas estimate unavailable";
+              return /(?:out of gas|gas limit|intrinsic gas|calldata|payload|batch exceeds|transaction too large|request entity too large)/i.test(diagnostic)
+                ? { diagnostic, status: "capacity" as const }
+                : { diagnostic, status: "unavailable" as const };
+            }
+          }
+        });
+        const firstBatch = plan.batches[0];
+        if (!firstBatch) throw new Error("Full-exit planner returned no safe transaction for positive live bins");
+        if (await readRpcBlockHash(pinnedBlockNumber) !== pinnedBlockHash) {
+          throw new Error("The pinned full-exit planning block was reorganized; re-enumerate before reviewing a batch");
+        }
+        const batchPlan = sliceBurnPlan(freshPlan, firstBatch.bins);
+        const batchQuote = buildBurnQuoteView(batchPlan, burnSnapshot.binStates, slippageBps);
+        if (batchQuote.error !== null || batchQuote.minimums === null || batchQuote.quote === null) {
+          throw new Error(`Full-exit batch quote failed: ${batchQuote.error ?? "minimums unavailable"}`);
+        }
+        const transaction = buildRemoveLiquidityTransaction(registry, {
+          tokenX: pool.tokenX,
+          tokenY: pool.tokenY,
+          binStep: pool.binStep,
+          minimums: batchQuote.minimums,
+          ids: batchPlan.ids,
+          amounts: batchPlan.amounts,
+          to: account.address!,
+          deadline: reviewedDeadline
+        });
+        const batchSettings = encodeFullExitBatchSettings({
+          batchOrdinal,
+          bins: firstBatch.bins,
+          stateFingerprint,
+          workflowKey
+        });
+        const batchReviewFingerprint = JSON.stringify([
+          workflowKey,
+          stateFingerprint,
+          batchSettings,
+          keccak256(transaction.data),
+          transaction.value.toString()
+        ]);
+        const firstBatchIds = new Set(firstBatch.bins.map((bin) => bin.binId.toString()));
+        const prepared: FullExitBatchReviewState = {
+          batchOrdinal,
+          batchSettings,
+          binStates: burnSnapshot.binStates.filter((state) => firstBatchIds.has(BigInt(state.binId).toString())),
+          completedBatches,
+          estimatedTransactionsRemaining: plan.batches.length,
+          estimatedGas: firstBatch.estimatedGas,
+          executionContextFingerprint: submittedExecutionContextFingerprint,
+          executionFingerprint: batchReviewFingerprint,
+          liveBins: firstBatch.bins.map((bin) => ({ ...bin })),
+          positions: livePositivePositions.filter((position) => firstBatchIds.has(BigInt(position.binId).toString())),
+          remainingBins: stateSnapshot.bins.length,
+          sourceBlockHash: pinnedBlockHash,
+          sourceBlockNumber: pinnedBlockNumber,
+          stateFingerprint,
+          transaction,
+          workflowKey
+        };
+        latestFullExitBatchReviewRef.current = prepared;
+        setFullExitBatchReview(prepared);
+        setFullExitUi({
+          batchOrdinal,
+          completedBatches,
+          estimatedTransactionsRemaining: plan.batches.length,
+          message: `Safe serial plan: ${stateSnapshot.bins.length} live bins require ${plan.batches.length} non-atomic transaction${plan.batches.length === 1 ? "" : "s"}. Batch ${batchOrdinal} burns ${firstBatch.bins.length} bins; each later batch requires fresh enumeration, finality, and explicit review.`,
+          remainingBins: stateSnapshot.bins.length,
+          status: "awaiting-review",
+          workflowKey
+        });
+        await submitPreparedBatch(prepared);
+      });
+    } catch (error) {
+      const errorMessage = getWriteError(error) ?? "Full-exit batch planning or submission failed";
+      const approvalRevoked = /LB operator access was revoked/i.test(errorMessage);
+      if (approvalRevoked) {
+        latestFullExitBatchReviewRef.current = null;
+        setFullExitBatchReview(null);
+        setGasReview(null);
+        setGasReviewError(null);
+        setLiquiditySimulationError(null);
+        setRemoveQuoteReviewRequired("LB operator access was revoked during full-exit review. Re-approve this exact pair and router; no full-exit wallet request was sent.");
+      } else if (!isUserRejectedSubmission(error)) {
+        latestFullExitBatchReviewRef.current = null;
+        setFullExitBatchReview(null);
+        setGasReview(null);
+        setLiquiditySimulationError(errorMessage);
+      }
+      setFullExitUi((current) => current === null || current.status === "awaiting-finality" ? current : {
+        ...current,
+        message: approvalRevoked
+          ? "Pair-wide LB operator access was revoked. Re-approve before replanning this batch."
+          : errorMessage,
+        status: "blocked"
+      });
+    } finally {
+      if (!submitted && removeSubmitInFlightRef.current === submittedOperationGeneration) {
+        removeSubmitInFlightRef.current = null;
+      }
+      setLiquiditySimulationPending(false);
+    }
+  };
+
   const handleRemoveLiquidity = async () => {
+    if (fullExit) {
+      await handleFullExitBatch();
+      return;
+    }
     if (removeSubmitInFlightRef.current !== null) return;
     if (
       !removeReady ||
@@ -4933,6 +5540,7 @@ function LiquidityView({
     removeWrite.reset();
     setLiquidityReceiptPhase("idle");
     setSubmittedRemoveReceiptContext(null);
+    setSubmittedFullExitHash(null);
     setLiquiditySimulationError(null);
     setGasReviewError(null);
     setRemoveQuoteReviewRequired(null);
@@ -5243,9 +5851,11 @@ function LiquidityView({
   const clearSubmittedRemoveReceipt = () => {
     setLiquidityReceiptPhase((currentPhase) => currentPhase === "remove" ? "idle" : currentPhase);
     setSubmittedRemoveReceiptContext(null);
+    setSubmittedFullExitHash(null);
   };
-  const updateRemovePercentInput = (value: string) => {
+  const updateRemovePercentInput = (value: string, requestFullExit = false) => {
     clearSubmittedRemoveReceipt();
+    setExplicitFullExitRequested(requestFullExit);
     setRemovePercentInput(value);
   };
   const toggleSelectedPosition = (positionId: string) => {
@@ -5545,21 +6155,39 @@ function LiquidityView({
         </div>
         <BurnPlanWarnings plan={removeBurnPlan} />
 
+        {currentFullExitWorkflowKey !== null && (fullExitHasHistory || fullExitUi?.workflowKey === currentFullExitWorkflowKey) ? (
+          <section className={`snapshot-message ${fullExitUi?.status === "complete" ? "ready" : "warning"}`} data-testid="full-exit-workflow-status" role="status">
+            <strong>{fullExitUi?.status === "complete" ? "Full exit verified" : "Resumable serial full exit"}</strong>
+            <span>{fullExitUi?.message ?? "A durable full-exit batch exists for this exact owner, chain, deployment, pair, and router. Resume performs a fresh uncapped exact-block enumeration; journal history is never treated as proof that balances are gone."}</span>
+            {fullExitUi?.status !== "complete" ? (
+              <button
+                className="secondary-button"
+                data-testid="resume-full-exit-button"
+                disabled={liquiditySimulationPending || removeWrite.isPending || removeReceipt.isLoading}
+                onClick={() => void handleFullExitBatch(currentFullExitWorkflowKey)}
+                type="button"
+              >
+                {currentRemoveFamilyConflict !== null ? "Check finality before resume" : "Resume full exit"}
+              </button>
+            ) : null}
+          </section>
+        ) : null}
+
         <div className="withdraw-percent-controls">
           <label htmlFor="remove-percent-slider">
             <span>Burn percentage</span>
-            <input id="remove-percent-slider" max="100" min="0.01" step="0.01" type="range" value={removePercentValue} onChange={(event) => updateRemovePercentInput(event.target.value)} />
+            <input id="remove-percent-slider" max="100" min="0.01" step="0.01" type="range" value={removePercentValue} onChange={(event) => updateRemovePercentInput(event.target.value, event.target.value === "100")} />
           </label>
           <div className="withdraw-quick-actions" aria-label="Withdrawal percentage presets" role="group">
             {[25, 50, 75, 100].map((percent) => (
-              <button aria-pressed={removePercentValue === percent} key={percent} onClick={() => updateRemovePercentInput(String(percent))} type="button">
+              <button aria-pressed={removePercentValue === percent} key={percent} onClick={() => updateRemovePercentInput(String(percent), percent === 100)} type="button">
                 {percent === 100 ? "Max" : `${percent}%`}
               </button>
             ))}
           </div>
           <label htmlFor="remove-percent">
             <span>Exact %</span>
-            <input id="remove-percent" inputMode="decimal" value={removePercentInput} onChange={(event) => updateRemovePercentInput(event.target.value)} />
+            <input id="remove-percent" inputMode="decimal" value={removePercentInput} onChange={(event) => updateRemovePercentInput(event.target.value, parsePercentToBps(event.target.value) === 10_000n)} />
           </label>
         </div>
 
@@ -5576,6 +6204,7 @@ function LiquidityView({
           <span>{selectedRangeStatus}; same-block claims at {selectedBurnSnapshotQuery.data ? `block ${selectedBurnSnapshotQuery.data.blockNumber.toString()}` : "a pending head"}.</span>
           <span>Expected receipts include proportional principal and accrued fee growth. There is no separate fee claim or rent refund.</span>
           <span>Minimum receipts apply {slippageInput}% slippage protection before wallet confirmation.</span>
+          {fullExitUi?.workflowKey === currentFullExitWorkflowKey ? <span>{fullExitUi.message}</span> : null}
         </section>
 
         <PairAttestationReview
@@ -5621,7 +6250,11 @@ function LiquidityView({
           inputError={removeInputError}
           insufficientBalance={false}
           pendingHash={liquidityReceiptPhase === "remove" ? removeWrite.data : liquidityReceiptPhase === "lb-approval" ? approveLbWrite.data : undefined}
-          successText={currentRemoveSuccess ? "Liquidity removed" : currentLbApprovalSuccess ? "LB approval confirmed" : null}
+          successText={currentRemoveSuccess
+            ? submittedFullExitHash !== null && submittedFullExitHash === removeWrite.data
+              ? "Full-exit batch mined; the full exit is not complete until 12-confirmation finality and a fresh zero-bin verification"
+              : "Liquidity removed"
+            : currentLbApprovalSuccess ? "LB approval confirmed" : null}
           revertedText={currentRemoveReverted ? "Remove liquidity reverted" : currentLbApprovalReverted ? "LB approval reverted" : null}
         />
 

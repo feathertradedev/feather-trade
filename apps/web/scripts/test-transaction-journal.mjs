@@ -36,6 +36,8 @@ try {
     recoverAwaitingWalletIntents,
     recordsForScope,
     selectTransactionRecordsForMonitoring,
+    transactionFamilyRetryBlocked,
+    transactionRecordBlocksIntentFamily,
     transactionRetryBlocked,
     transactionNeedsMonitoring,
     updateObservedTransaction
@@ -189,7 +191,53 @@ try {
     })
   );
   assert.equal(reverted.status, "reverted");
+  assert.equal(reverted.confirmations, 1);
+  assert(transactionNeedsMonitoring(reverted), "a shallow reverted receipt remains reorg-monitored");
+  assert(transactionRetryBlocked({ ...state, records: [reverted] }, reverted.reviewed), "a shallow revert must remain retry-blocking");
+  assert(transactionRecordBlocksIntentFamily(reverted));
   assert.notEqual(reverted.status, "canonical");
+  const finalizedRevert = applyTransactionObservation(
+    reverted,
+    observation({
+      canonicalBlockHash: BLOCK_A,
+      headBlockNumber: "111",
+      receipt: { blockHash: BLOCK_A, blockNumber: "100", hash: HASH_A, status: "reverted" }
+    })
+  );
+  assert.equal(finalizedRevert.confirmations, 12);
+  assert(!transactionNeedsMonitoring(finalizedRevert));
+  assert(!transactionRetryBlocked({ ...state, records: [finalizedRevert] }, finalizedRevert.reviewed));
+  assert(!transactionRecordBlocksIntentFamily(finalizedRevert));
+  const orphanedRevert = applyTransactionObservation(
+    reverted,
+    observation({ canonicalBlockHash: null, receipt: null, transaction: null })
+  );
+  assert.equal(orphanedRevert.status, "orphaned", "a reverted receipt must be demoted when its canonical evidence disappears");
+  assert(transactionRecordBlocksIntentFamily(orphanedRevert));
+  const noncanonicalRevert = applyTransactionObservation(
+    reverted,
+    observation({
+      canonicalBlockHash: BLOCK_B,
+      receipt: { blockHash: BLOCK_A, blockNumber: "100", hash: HASH_A, status: "reverted" }
+    })
+  );
+  assert.equal(noncanonicalRevert.status, "orphaned", "a reverted receipt must be demoted when its block hash is no longer canonical");
+  const unavailableRevert = applyTransactionObservation(
+    reverted,
+    observation({ canonicalBlockHash: null, canonicalBlockLookup: "unavailable", receiptLookup: "unavailable", transactionLookup: "unavailable" })
+  );
+  assert.equal(unavailableRevert.status, "reverted", "unavailable lookups preserve prior reverted evidence");
+  assert.equal(unavailableRevert.canonicalReceipt?.hash, HASH_A);
+  const successfulReinclusion = applyTransactionObservation(
+    orphanedRevert,
+    observation({
+      canonicalBlockHash: BLOCK_B,
+      headBlockNumber: "113",
+      receipt: { blockHash: BLOCK_B, blockNumber: "102", hash: HASH_A, status: "success" },
+      transaction: tx({ blockHash: BLOCK_B, blockNumber: "102" })
+    })
+  );
+  assert.equal(successfulReinclusion.status, "canonical", "a reorged revert may re-enter canon as a successful matching transaction");
 
   const replacement = applyTransactionObservation(
     state.records[0],
@@ -210,6 +258,18 @@ try {
   assert.match(incompatibleReplacement.rejectionReason, /not executed/);
   assert.notEqual(incompatibleReplacement.status, "canonical");
   assert(transactionRetryBlocked({ ...state, records: [incompatibleReplacement] }, incompatibleReplacement.reviewed));
+
+  const removeReviewed = reviewed("remove-liquidity", { poolId: "pool-1" });
+  const otherRemoveReviewed = reviewed("remove-liquidity", {
+    executionFingerprint: "different-batch",
+    poolId: "pool-1",
+    settingsFingerprint: "full-exit-batch:v1:{different}"
+  });
+  const removePending = beginTransactionIntent(emptyTransactionJournal(), removeReviewed, { expectedNonce: 8n, submissionBlock: 100n }, now, "remove-pending");
+  assert(transactionFamilyRetryBlocked(removePending, otherRemoveReviewed), "volatile settings must not permit a sibling remove for the same owner and pair");
+  assert(!transactionFamilyRetryBlocked(removePending, { ...otherRemoveReviewed, poolId: "pool-2" }), "a different pair is an independent intent family");
+  const rejectedRemove = recordRejectedSubmission(removePending, "remove-pending", 0, "rejected", now + 1);
+  assert(!transactionFamilyRetryBlocked(rejectedRemove, otherRemoveReviewed));
   const finalizedCancellation = applyTransactionObservation(
     state.records[0],
     observation({
@@ -363,6 +423,12 @@ try {
   assert.deepEqual(hydrated.records, state.records, "reload must preserve pending hashes, nonce, reviewed intent, and lifecycle");
   assert.equal(hydrated.revision, state.revision, "hydration must not invent a journal revision");
   assert(Object.isFrozen(hydrated.records[0].reviewed));
+  const legacyReverted = { ...reverted, confirmations: 0 };
+  memory.set(TRANSACTION_JOURNAL_STORAGE_KEY, JSON.stringify({ version: 1, revision: 1, records: [legacyReverted] }));
+  const hydratedLegacyRevert = loadTransactionJournal(storage).records[0];
+  assert.equal(hydratedLegacyRevert?.status, "reverted", "v1 reverted records with zero confirmations remain hydratable");
+  assert(transactionNeedsMonitoring(hydratedLegacyRevert));
+  assert(transactionRecordBlocksIntentFamily(hydratedLegacyRevert));
   memory.set(TRANSACTION_JOURNAL_STORAGE_KEY, "{broken");
   assert.deepEqual(loadTransactionJournal(storage).records, []);
   memory.set(TRANSACTION_JOURNAL_STORAGE_KEY, JSON.stringify({ version: 999, revision: 0, records: [] }));

@@ -54,6 +54,7 @@ export interface MockRpcOptions {
   estimatedGas?: bigint;
   gasEstimateMode?: "ready" | "error";
   gasEstimateDelayMs?: number;
+  gasLimit?: bigint;
   gasPrice?: bigint;
   factoryAddress?: Address;
   factoryLookupIgnored?: boolean;
@@ -68,6 +69,7 @@ export interface MockRpcOptions {
   includePairs?: boolean;
   includePositions?: boolean;
   indexerBlockNumber?: bigint;
+  indexerBlockHash?: Hex;
   indexerDelayMs?: number;
   indexerDelayMsAfterReceipt?: number;
   indexerHasErrors?: boolean;
@@ -75,6 +77,8 @@ export interface MockRpcOptions {
   lbApproved?: boolean;
   lbApprovedAfterReceipt?: boolean;
   livePositionBalance?: bigint;
+  maxRemoveLiquidityBinsForEstimate?: number;
+  maxRemoveLiquidityBinsForSimulation?: number;
   nativeBalance?: bigint;
   omitActivePoolBin?: boolean;
   ownerPositionCount?: number;
@@ -107,6 +111,7 @@ export interface MockRpcOptions {
   quoteUseAlternateDirectPool?: boolean;
   quoteVersion?: number;
   receiptStatus?: "success" | "reverted";
+  receiptBlockNumber?: bigint;
   simulationDelayMs?: number;
   simulationMode?: "success" | "error";
   walletReadMode?: "ready" | "error";
@@ -300,7 +305,7 @@ function mockGraphResponse(body: GraphRequest, options: MockRpcOptions): Record<
       data: {
         _meta: {
           block: {
-            hash: options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222",
+            hash: options.indexerBlockHash ?? options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222",
             number: Number(options.indexerBlockNumber ?? DEFAULT_BLOCK_NUMBER)
           },
           hasIndexingErrors: options.indexerHasErrors ?? false
@@ -426,6 +431,7 @@ async function handleRpc(request: RpcRequest, options: MockRpcOptions, state: Mo
         return rpcResult(request, "0x0");
       case "eth_getBlockByNumber":
         return rpcResult(request, {
+          gasLimit: numberToHex(options.gasLimit ?? 30_000_000n),
           hash: options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222",
           number: typeof request.params?.[0] === "string" && request.params[0].startsWith("0x")
             ? request.params[0]
@@ -436,6 +442,10 @@ async function handleRpc(request: RpcRequest, options: MockRpcOptions, state: Mo
         if (options.gasEstimateDelayMs !== undefined) await delay(options.gasEstimateDelayMs);
         state.gasEstimatesCompleted += 1;
         if (options.gasEstimateMode === "error") return rpcError(request, -32_000, "Mock gas estimation failed");
+        if (
+          options.maxRemoveLiquidityBinsForEstimate !== undefined &&
+          removeLiquidityBinCount((request.params?.[0] as RpcCall | undefined)?.data) > options.maxRemoveLiquidityBinsForEstimate
+        ) return rpcError(request, -32_000, "Mock remove-liquidity batch exceeds the gas-safe bin bound");
         return rpcResult(request, numberToHex(options.estimatedGas ?? 500_000n));
       case "eth_gasPrice":
         return rpcResult(request, numberToHex(options.gasPrice ?? 1_000_000_000n));
@@ -450,9 +460,9 @@ async function handleRpc(request: RpcRequest, options: MockRpcOptions, state: Mo
           if (options.quoteDelayMsAfterReceipt !== undefined) options.quoteDelayMs = options.quoteDelayMsAfterReceipt;
           if (options.quoteRateAfterReceipt !== undefined) options.quoteRate = options.quoteRateAfterReceipt;
         }
-        return rpcResult(request, transactionReceipt(options.blockNumber ?? DEFAULT_BLOCK_NUMBER, options.receiptStatus ?? "success"));
+        return rpcResult(request, transactionReceipt(options.receiptBlockNumber ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER, options.receiptStatus ?? "success"));
       case "eth_getTransactionByHash":
-        return rpcResult(request, transactionByHash(options.blockNumber ?? DEFAULT_BLOCK_NUMBER, state));
+        return rpcResult(request, transactionByHash(options.receiptBlockNumber ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER, state));
       case "eth_getBalance":
         return rpcResult(request, numberToHex(options.nativeBalance ?? DEFAULT_BALANCE));
       case "eth_getCode": {
@@ -757,6 +767,12 @@ async function handleEthCall(
 
   if (functionName === "removeLiquidity") {
     if (options.simulationMode === "error") throw new Error("Mock remove-liquidity simulation failed");
+    const args = decoded.args as readonly unknown[];
+    if (
+      options.maxRemoveLiquidityBinsForSimulation !== undefined &&
+      Array.isArray(args[5]) &&
+      args[5].length > options.maxRemoveLiquidityBinsForSimulation
+    ) throw new Error("Mock remove-liquidity batch exceeds the simulation-safe bin bound");
 
     return encodeFunctionResult({
       abi: lbRouterAbi,
@@ -766,6 +782,18 @@ async function handleEthCall(
   }
 
   throw new Error(`Unhandled mock eth_call function: ${functionName}`);
+}
+
+function removeLiquidityBinCount(data: Hex | undefined): number {
+  if (!data || data === "0x") return 0;
+  try {
+    const decoded = decodeFunctionData({ abi: lbRouterAbi, data });
+    if (decoded.functionName !== "removeLiquidity") return 0;
+    const args = decoded.args as readonly unknown[];
+    return Array.isArray(args[5]) ? args[5].length : 0;
+  } catch {
+    return 0;
+  }
 }
 
 function quotePairForLeg(tokenIn: Address, tokenOut: Address, alternateDirect: boolean): Address {

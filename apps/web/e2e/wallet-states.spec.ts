@@ -1734,6 +1734,24 @@ test("external revocation after remove review blocks the wallet and requires a n
   expect((await readMockWallet(page)).sentTransactions).toEqual([]);
 });
 
+test("full-exit revocation during final review returns directly to pair-wide reapproval", async ({ page }) => {
+  const rpc = await setupConnectedLiquidity(page, {
+    allowance: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    lbApproved: true
+  });
+  await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "Max" }).click();
+  await page.getByTestId("liquidity-remove-button").click();
+  await expect(page.getByTestId("gas-review")).toContainText("full liquidity exit");
+
+  rpc.update({ lbApproved: false });
+  await page.getByTestId("liquidity-remove-button").click();
+
+  await expect(page.getByText(/revoked during full-exit review/).first()).toBeVisible();
+  await expect(page.getByTestId("liquidity-approve-lb-button")).toBeEnabled();
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
 test("external revocation in the final remove guard aborts the reviewed wallet handoff", async ({ page }) => {
   const rpc = await setupConnectedLiquidity(page, { lbApproved: true, pairCodeDelayMs: 300 });
   const removeButton = page.getByTestId("liquidity-remove-button");
@@ -2452,6 +2470,13 @@ test("portfolio partial and full exits preserve all-bin intent and full exit sub
   await expect(page.getByText("Liquidity removed")).toBeVisible();
   await page.locator("#remove-percent").fill("40");
   await expect(page.getByText("Liquidity removed")).toHaveCount(0);
+  rpc.update({ blockNumber: 53n, indexerBlockNumber: 53n, receiptBlockNumber: 42n });
+  await expect.poll(() => page.evaluate(() => {
+    const raw = window.localStorage.getItem("feather.transaction-journal.v1");
+    if (raw === null) return 0;
+    const records = (JSON.parse(raw) as { records: Array<{ confirmations: number; reviewed: { intent: string } }> }).records;
+    return records.findLast((record) => record.reviewed.intent === "remove-liquidity")?.confirmations ?? 0;
+  }), { timeout: 12_000 }).toBeGreaterThanOrEqual(12);
   rpc.update({ simulationMode: "error" });
   await page.getByTestId("liquidity-remove-button").click();
   await expect(page.getByText(/Simulation failed/).first()).toBeVisible();
@@ -2476,22 +2501,48 @@ test("portfolio partial and full exits preserve all-bin intent and full exit sub
   await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled();
   await clickReviewedAction(page, "liquidity-remove-button");
   await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(2);
-  await expect(page.getByText("Liquidity removed")).toBeVisible();
+  await expect(page.getByText(/Full-exit batch mined; the full exit is not complete/)).toBeVisible();
+  await expect(page.getByText("Liquidity removed")).toHaveCount(0);
+  await expect(page.getByTestId("full-exit-workflow-status")).toContainText("Batch 1 reached 12-confirmation finality");
 
   const submitted = decodeSubmittedTransaction((await readMockWallet(page)).sentTransactions[1]);
   expect(submitted.functionName).toBe("removeLiquidity");
   const args = submitted.args as readonly unknown[];
   expect(args[5]).toHaveLength(3);
   expect(args[6]).toHaveLength(3);
-  expect((args[6] as bigint[]).every((amount, index) => amount === (partialArgs[6] as bigint[])[index] * 2n)).toBe(true);
+  expect((args[6] as bigint[]).every((amount) => amount > 0n)).toBe(true);
   assertTransactionMatchesSimulation((await readMockWallet(page)).sentTransactions[1], rpc, "removeLiquidity");
   const pinnedOwnerQuery = rpc.snapshot().graphQueries.find((query) => query.includes("OwnerPairPositionsAtBlock"));
   expect(pinnedOwnerQuery).toContain("block: { number: $blockNumber }");
 });
 
-test("full exit requires an exact indexer and RPC head even inside the normal stale threshold", async ({ page }) => {
+test("a later partial receipt never mutates or impersonates durable full-exit progress", async ({ page }) => {
+  const rpc = await setupConnectedLiquidity(page, {
+    allowance: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    lbApproved: true
+  });
+  await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "Max" }).click();
+  await clickReviewedAction(page, "liquidity-remove-button");
+  await expect(page.getByText(/Full-exit batch mined/)).toBeVisible();
+  rpc.update({ blockNumber: 53n, indexerBlockNumber: 53n, receiptBlockNumber: 42n });
+  await expect.poll(() => page.evaluate(() => {
+    const raw = window.localStorage.getItem("feather.transaction-journal.v1");
+    if (raw === null) return 0;
+    return (JSON.parse(raw) as { records: Array<{ confirmations: number; reviewed: { intent: string } }> }).records
+      .findLast((record) => record.reviewed.intent === "remove-liquidity")?.confirmations ?? 0;
+  }), { timeout: 12_000 }).toBeGreaterThanOrEqual(12);
+
+  await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "50%" }).click();
+  await clickReviewedAction(page, "liquidity-remove-button");
+
+  await expect(page.getByText("Liquidity removed")).toBeVisible();
+  await expect(page.getByText(/Full-exit batch mined; the full exit is not complete/)).toHaveCount(0);
+  await expect(page.getByTestId("full-exit-workflow-status")).toContainText("Batch 1 reached 12-confirmation finality");
+});
+
+test("full exit accepts a complete canonical indexer block behind a continuously advancing RPC head", async ({ page }) => {
   const rpc = await installMockRpc(page, {
-    analyticsAsOfBlock: 42n,
     blockNumber: 42n,
     includePairs: true,
     includePositions: true,
@@ -2501,15 +2552,34 @@ test("full exit requires an exact indexer and RPC head even inside the normal st
   await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/liquidity");
   await connectWallet(page);
+  await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "Max" }).click();
   await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled();
   await page.getByTestId("liquidity-remove-button").click();
 
-  await expect(page.getByText(/Full exit requires the indexer and RPC to reconcile at the exact same block/).first()).toBeVisible();
-  expect(simulatedFunctions(rpc)).not.toContain("removeLiquidity");
+  await expect(page.getByTestId("gas-review")).toContainText("full liquidity exit");
+  expect(simulatedFunctions(rpc)).toContain("removeLiquidity");
   expect((await readMockWallet(page)).sentTransactions).toEqual([]);
 });
 
-test("full exit rejects a newly enumerated exact-head bin that was not reviewed", async ({ page }) => {
+for (const [name, options, message] of [
+  ["indexer ahead of RPC", { blockNumber: 41n, indexerBlockNumber: 42n }, /does not exceed the observed RPC head/],
+  ["indexer hash differs from RPC", { blockNumber: 42n, indexerBlockHash: `0x${"3".repeat(64)}` }, /block hash to remain canonical/]
+] as const) {
+  test(`full exit blocks when the pinned indexer state is unsafe: ${name}`, async ({ page }) => {
+    const rpc = await installMockRpc(page, { includePairs: true, includePositions: true, lbApproved: true, ...options });
+    await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
+    await page.goto("/#/liquidity");
+    await connectWallet(page);
+    await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "Max" }).click();
+    await page.getByTestId("liquidity-remove-button").click();
+
+    await expect(page.getByText(message).first()).toBeVisible();
+    expect(simulatedFunctions(rpc)).not.toContain("removeLiquidity");
+    expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+  });
+}
+
+test("full exit replans around a newly enumerated exact-head bin instead of silently skipping it", async ({ page }) => {
   const rpc = await installMockRpc(page, {
     analyticsBinCount: 1,
     includePairs: true,
@@ -2520,28 +2590,33 @@ test("full exit rejects a newly enumerated exact-head bin that was not reviewed"
   await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/liquidity");
   await connectWallet(page);
+  await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "Max" }).click();
   await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled();
   rpc.update({ ownerPositionCount: 2 });
-  await page.getByTestId("liquidity-remove-button").click();
-
-  await expect(page.getByText(/exact-head owner position set changed/).first()).toBeVisible();
-  expect(simulatedFunctions(rpc)).not.toContain("removeLiquidity");
-  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+  await clickReviewedAction(page, "liquidity-remove-button");
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+  const submitted = decodeSubmittedTransaction((await readMockWallet(page)).sentTransactions[0]);
+  expect(submitted.functionName).toBe("removeLiquidity");
+  expect((submitted.args as readonly unknown[])[5]).toHaveLength(2);
 });
 
-test("full exit aborts when the RPC head advances during final simulation", async ({ page }) => {
+test("full exit planning tolerates continuous head advance while preserving its canonical pinned block", async ({ page }) => {
   const rpc = await setupConnectedLiquidity(page, {
     allowance: 5n * ONE_TOKEN,
     balance: 5n * ONE_TOKEN,
     lbApproved: true,
     simulationDelayMs: 600
   });
+  await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "Max" }).click();
   await page.getByTestId("liquidity-remove-button").click();
   await expect.poll(() => simulatedFunctions(rpc).filter((name) => name === "removeLiquidity")).toHaveLength(1);
   rpc.update({ blockNumber: 43n });
 
-  await expect(page.getByText(/chain advanced during full-exit validation/).first()).toBeVisible();
+  await expect(page.getByTestId("gas-review")).toContainText(/full liquidity exit/);
+  await expect(page.getByText(/chain advanced during full-exit validation/)).toHaveCount(0);
   expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+  await page.getByTestId("liquidity-remove-button").click();
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
 });
 
 test("full exit aborts when its exact-head block hash is reorganized", async ({ page }) => {
@@ -2551,11 +2626,12 @@ test("full exit aborts when its exact-head block hash is reorganized", async ({ 
     lbApproved: true,
     simulationDelayMs: 600
   });
+  await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "Max" }).click();
   await page.getByTestId("liquidity-remove-button").click();
   await expect.poll(() => simulatedFunctions(rpc).filter((name) => name === "removeLiquidity")).toHaveLength(1);
   rpc.update({ blockHash: "0x3333333333333333333333333333333333333333333333333333333333333333" });
 
-  await expect(page.getByText(/validation block was reorganized/).first()).toBeVisible();
+  await expect(page.getByText(/block was reorganized/).first()).toBeVisible();
   expect((await readMockWallet(page)).sentTransactions).toEqual([]);
 });
 
