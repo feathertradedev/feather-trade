@@ -2129,10 +2129,10 @@ test("strategy and synchronized range controls enforce the 69-bin product envelo
   await expect(page.locator("#range-upper")).toHaveValue("1");
   await expect(page.locator("#range-lower-bin")).toHaveValue("8388607");
   await expect(page.locator("#range-upper-bin")).toHaveValue("8388609");
-  await expect(page.getByLabel("Min USDC per WNATIVE")).toHaveValue("500000000000");
-  await expect(page.getByLabel("Max USDC per WNATIVE")).toHaveValue("2000000000000");
-  await expect(page.getByTestId("liquidity-min-price-inverse")).toContainText("0.0000000000005 WNATIVE per USDC");
-  await expect(page.getByTestId("liquidity-max-price-inverse")).toContainText("0.000000000002 WNATIVE per USDC");
+  await expect(page.getByLabel("Min USDC per WNATIVE")).toHaveValue("0.5");
+  await expect(page.getByLabel("Max USDC per WNATIVE")).toHaveValue("2");
+  await expect(page.getByTestId("liquidity-min-price-inverse")).toContainText("0.5 WNATIVE per USDC");
+  await expect(page.getByTestId("liquidity-max-price-inverse")).toContainText("2 WNATIVE per USDC");
   await page.getByTestId("liquidity-strategy-curve").click();
   await expect(page.getByTestId("liquidity-strategy-curve")).toHaveAttribute("aria-pressed", "true");
   await expect(page.getByTestId("liquidity-composition-guidance")).toContainText("does not silently swap");
@@ -2195,7 +2195,7 @@ test("extreme prices render exactly while active-bin movement preserves absolute
       [String(upperBin)]: maximumQ128
     }
   });
-  const priceOptions = { baseDecimals: 18, quoteDecimals: 6 };
+  const priceOptions = { baseDecimals: 18, quoteDecimals: 18 };
   const forwardMinimum = formatExactPriceFraction(normalizeQ128Price(1n, priceOptions));
   const forwardMaximum = formatExactPriceFraction(normalizeQ128Price(maximumQ128, priceOptions));
   const inverseMinimum = formatExactPriceFraction(normalizeQ128Price(maximumQ128, { ...priceOptions, inverse: true }));

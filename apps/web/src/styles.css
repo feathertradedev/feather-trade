@@ -2300,7 +2300,7 @@ a {
 
 .range-presets label {
   display: grid;
-  grid-template-columns: minmax(72px, 1fr) 72px auto;
+  grid-template-columns: minmax(0, 1fr) 72px;
   gap: 8px;
   align-items: center;
 }
@@ -2312,6 +2312,8 @@ a {
 }
 
 .range-presets button {
+  grid-column: 1 / -1;
+  width: 100%;
   min-height: 38px;
   padding: 7px 10px;
 }
