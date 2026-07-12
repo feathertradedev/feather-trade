@@ -391,6 +391,39 @@ export const lbPairAbi = [
 
 export const lbFactoryAbi = [
   {
+    type: "event",
+    name: "LBPairCreated",
+    anonymous: false,
+    inputs: [
+      { indexed: true, name: "tokenX", type: "address" },
+      { indexed: true, name: "tokenY", type: "address" },
+      { indexed: true, name: "binStep", type: "uint256" },
+      { indexed: false, name: "LBPair", type: "address" },
+      { indexed: false, name: "pid", type: "uint256" }
+    ]
+  },
+  {
+    type: "function",
+    name: "getOpenBinSteps",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "openBinSteps", type: "uint256[]" }]
+  },
+  {
+    type: "function",
+    name: "getNumberOfQuoteAssets",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "numberOfQuoteAssets", type: "uint256" }]
+  },
+  {
+    type: "function",
+    name: "getQuoteAssetAtIndex",
+    stateMutability: "view",
+    inputs: [{ name: "index", type: "uint256" }],
+    outputs: [{ name: "asset", type: "address" }]
+  },
+  {
     type: "function",
     name: "isQuoteAsset",
     stateMutability: "view",
