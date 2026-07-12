@@ -2517,6 +2517,8 @@ test("portfolio stays owner-scoped and its deep link survives reload", async ({ 
 });
 
 test("portfolio partial and full exits preserve all-bin intent and full exit submits the receipt-tracked burn", async ({ page }) => {
+  const expectedIds = [8_388_608n, 8_388_609n, 8_388_610n];
+  const expectedRemainingAmounts = [ONE_TOKEN, ONE_TOKEN, ONE_TOKEN];
   const rpc = await installMockRpc(page, {
     analyticsBinCount: 3,
     includePairs: true,
@@ -2541,7 +2543,13 @@ test("portfolio partial and full exits preserve all-bin intent and full exit sub
   await expect(page.getByText("Liquidity removed")).toBeVisible();
   await page.locator("#remove-percent").fill("40");
   await expect(page.getByText("Liquidity removed")).toHaveCount(0);
-  rpc.update({ blockNumber: 53n, indexerBlockNumber: 53n, receiptBlockNumber: 42n });
+  rpc.update({
+    blockNumber: 53n,
+    indexerBlockNumber: 53n,
+    livePositionBalance: ONE_TOKEN,
+    positionLiquidity: ONE_TOKEN,
+    receiptBlockNumber: 42n
+  });
   await expect.poll(() => page.evaluate(() => {
     const raw = window.localStorage.getItem("feather.transaction-journal.v1");
     if (raw === null) return 0;
@@ -2550,6 +2558,9 @@ test("portfolio partial and full exits preserve all-bin intent and full exit sub
   }), { timeout: 12_000 }).toBeGreaterThanOrEqual(12);
   rpc.update({ simulationMode: "error" });
   await page.getByTestId("liquidity-remove-button").click();
+  await expect(page.locator(".mini-metric").filter({ hasText: "Indexed Liquidity" }).locator("strong")).toHaveText("3");
+  await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled();
+  await page.getByTestId("liquidity-remove-button").click();
   await expect(page.getByText(/Simulation failed/).first()).toBeVisible();
   await expect(page.getByText("Liquidity removed")).toHaveCount(0);
   expect((await readMockWallet(page)).sentTransactions).toHaveLength(1);
@@ -2557,8 +2568,8 @@ test("portfolio partial and full exits preserve all-bin intent and full exit sub
   const partialSubmitted = decodeSubmittedTransaction((await readMockWallet(page)).sentTransactions[0]);
   expect(partialSubmitted.functionName).toBe("removeLiquidity");
   const partialArgs = partialSubmitted.args as readonly unknown[];
-  expect(partialArgs[5]).toHaveLength(3);
-  expect(partialArgs[6]).toHaveLength(3);
+  expect(partialArgs[5]).toEqual(expectedIds);
+  expect(partialArgs[6]).toEqual(expectedRemainingAmounts);
   assertTransactionMatchesSimulation((await readMockWallet(page)).sentTransactions[0], rpc, "removeLiquidity");
 
   await page.goto("/#/positions");
@@ -2579,9 +2590,8 @@ test("portfolio partial and full exits preserve all-bin intent and full exit sub
   const submitted = decodeSubmittedTransaction((await readMockWallet(page)).sentTransactions[1]);
   expect(submitted.functionName).toBe("removeLiquidity");
   const args = submitted.args as readonly unknown[];
-  expect(args[5]).toHaveLength(3);
-  expect(args[6]).toHaveLength(3);
-  expect((args[6] as bigint[]).every((amount) => amount > 0n)).toBe(true);
+  expect(args[5]).toEqual(expectedIds);
+  expect(args[6]).toEqual(expectedRemainingAmounts);
   assertTransactionMatchesSimulation((await readMockWallet(page)).sentTransactions[1], rpc, "removeLiquidity");
   const pinnedOwnerQuery = rpc.snapshot().graphQueries.find((query) => query.includes("OwnerPairPositionsAtBlock"));
   expect(pinnedOwnerQuery).toContain("block: { number: $blockNumber }");
