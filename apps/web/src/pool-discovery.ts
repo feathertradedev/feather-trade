@@ -1,7 +1,7 @@
 import { isAddress, type Address } from "viem";
 
 export type PoolCategory = "all" | "active" | "stables";
-export type PoolSort = "swaps" | "deposits" | "updated";
+export type PoolSort = "swaps" | "deposits" | "updated" | "tvl" | "volume24h" | "lpFees24h" | "feeToTvl";
 export type PoolAction = "swap" | "add" | "withdraw";
 
 export interface PoolDiscoveryState {
@@ -17,7 +17,7 @@ export interface DiscoverableToken {
   address?: Address;
   name?: string;
   symbol?: string;
-  tags?: string[];
+  tags?: readonly string[];
 }
 
 export interface DiscoverablePool {
@@ -38,6 +38,7 @@ export interface DiscoverablePool {
 
 export interface OwnerPositionLike {
   pair: string;
+  bins?: readonly { liquidity: string }[];
 }
 
 export interface PaginationLike {
@@ -75,7 +76,7 @@ export function parsePoolDiscoveryState(hash: string): PoolDiscoveryState {
   return {
     query: (params.get("q") ?? "").trim(),
     category: category === "active" || category === "stables" ? category : "all",
-    sort: sort === "deposits" || sort === "updated" ? sort : "swaps",
+    sort: sort === "deposits" || sort === "updated" || sort === "tvl" || sort === "volume24h" || sort === "lpFees24h" || sort === "feeToTvl" ? sort : "swaps",
     page: page !== null && /^[1-9]\d*$/.test(page) && Number.isSafeInteger(Number(page)) ? Number(page) - 1 : 0,
     hasLiquidity: params.get("mine") === "1"
   };
@@ -112,7 +113,11 @@ export function safeReturnHref(value: string | null | undefined): string | null 
   if (parsed.segments.length === 1) return discoveryHref(state);
   const poolId = decodeRoutePart(parsed.segments[1]);
   if (poolId === null) return null;
-  return poolDetailHref(poolId, state);
+  try {
+    return poolDetailHref(poolId, state);
+  } catch {
+    return null;
+  }
 }
 
 export function buildOwnerLiquidityIndex(
@@ -120,7 +125,13 @@ export function buildOwnerLiquidityIndex(
   pageInfo: PaginationLike
 ): OwnerLiquidityIndex {
   return {
-    pairs: new Set(positions.map((position) => canonicalAddress(position.pair))),
+    pairs: new Set(positions.flatMap((position) => {
+      const hasCurrentLiquidity = position.bins === undefined || position.bins.some((bin) => {
+        if (!/^\d+$/.test(bin.liquidity)) throw new Error(`Invalid owner liquidity: ${bin.liquidity}`);
+        return BigInt(bin.liquidity) > 0n;
+      });
+      return hasCurrentLiquidity ? [canonicalAddress(position.pair)] : [];
+    })),
     partial: pageInfo.capped || pageInfo.failed
   };
 }
@@ -129,7 +140,8 @@ export function filterPoolPage<T extends DiscoverablePool>(
   pools: readonly T[],
   state: PoolDiscoveryState,
   ownerLiquidity: OwnerLiquidityIndex | null,
-  pageSize = 10
+  pageSize = 10,
+  sorter?: (left: T, right: T, sort: PoolSort) => number | null
 ): FilteredPoolPage<T> {
   if (!Number.isSafeInteger(pageSize) || pageSize <= 0) throw new Error("pageSize must be a positive safe integer");
   const normalizedQuery = state.query.trim().toLowerCase();
@@ -158,7 +170,7 @@ export function filterPoolPage<T extends DiscoverablePool>(
         pool.id
       ].join(" ").toLowerCase().includes(normalizedQuery);
     })
-    .sort((left, right) => comparePools(left, right, state.sort));
+    .sort((left, right) => sorter?.(left, right, state.sort) ?? comparePools(left, right, state.sort));
   const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
   const page = Math.min(Math.max(0, state.page), pageCount - 1);
   return {
@@ -214,7 +226,7 @@ function encodeRoutePart(value: string): string {
 function decodeRoutePart(value: string): string | null {
   try {
     const decoded = decodeURIComponent(value);
-    if (decoded.length === 0 || decoded === "." || decoded === ".." || /[\/\u0000-\u001f]/.test(decoded)) return null;
+    if (decoded.length === 0 || decoded === "." || decoded === ".." || /[%\/\u0000-\u001f]/.test(decoded)) return null;
     return decoded;
   } catch {
     return null;
@@ -231,6 +243,9 @@ function poolHasSwapLiquidity(pool: DiscoverablePool): boolean {
 }
 
 function comparePools(left: DiscoverablePool, right: DiscoverablePool, sort: PoolSort): number {
+  if (sort === "tvl" || sort === "volume24h" || sort === "lpFees24h" || sort === "feeToTvl") {
+    return canonicalAddress(left.address).localeCompare(canonicalAddress(right.address));
+  }
   const leftMetric = sort === "deposits" ? left.depositCount : sort === "updated" ? left.updatedAtBlock : left.swapCount;
   const rightMetric = sort === "deposits" ? right.depositCount : sort === "updated" ? right.updatedAtBlock : right.swapCount;
   const metricOrder = compareDecimalStrings(rightMetric, leftMetric);

@@ -43,12 +43,15 @@ const ZERO_HOOKS = `0x${"0".repeat(64)}` as Hex;
 export interface MockRpcOptions {
   activeId?: number;
   analyticsIncludeOtherOwner?: boolean;
+  analyticsMetricTokenMismatch?: boolean;
   analyticsBinCount?: number;
+  analyticsCandleGap?: boolean;
   analyticsAsOfBlock?: bigint;
   analyticsMode?: "ready" | "error";
   analyticsOutOfRange?: boolean;
   analyticsPartialHistory?: boolean;
   analyticsTransferred?: boolean;
+  analyticsZeroLiquidity?: boolean;
   allowance?: bigint;
   allowanceAfterReceipt?: bigint;
   balance?: bigint;
@@ -191,11 +194,16 @@ interface RpcCall {
 interface GraphRequest {
   query?: string;
   variables?: {
+    after?: string | null;
+    asOfTimestamp?: number;
     first?: number;
+    fromTimestamp?: number;
     id?: string;
+    interval?: "HOUR" | "DAY";
     owner?: string;
     pair?: string;
     skip?: number;
+    toTimestamp?: number;
   };
 }
 
@@ -272,8 +280,14 @@ export async function installMockRpc(page: Page, options: MockRpcOptions = {}): 
     const body = JSON.parse(request.postData() ?? "{}") as GraphRequest;
     state.graphQueries.push(body.query ?? "");
     state.graphRequests.push({ query: body.query ?? "", variables: body.variables });
+    let response: Record<string, unknown>;
+    try {
+      response = mockAnalyticsResponse(body, currentOptions);
+    } catch (error) {
+      response = { errors: [{ message: error instanceof Error ? error.message : "Mock analytics response failed" }] };
+    }
     await route.fulfill({
-      body: JSON.stringify(mockAnalyticsResponse(body, currentOptions)),
+      body: JSON.stringify(response),
       contentType: "application/json",
       headers: corsHeaders(),
       status: 200
@@ -295,15 +309,69 @@ export async function installMockRpc(page: Page, options: MockRpcOptions = {}): 
 
 function mockAnalyticsResponse(body: GraphRequest, options: MockRpcOptions): Record<string, unknown> {
   if (options.analyticsMode === "error") return { errors: [{ message: "Mock analytics failed" }] };
-  const owner = body.variables?.owner ?? DEFAULT_ACCOUNT;
+  const query = body.query ?? "";
   const partial = options.analyticsPartialHistory === true;
+  const analyticsStatus = partial ? "PARTIAL" : "READY";
+  if (query.includes("WebPoolMetrics")) {
+    const pairMetadata = allPairMetadata(options);
+    const dashboardPairMetadata = [pairMetadata[0]!, pairMetadata.at(-1)!, ...pairMetadata.slice(1, -1)];
+    const nodes = dashboardPairMetadata.slice(0, options.poolCount ?? 1).map((metadata, index) => ({
+      pair: metadata.pair.toLowerCase(),
+      tokenX: (options.analyticsMetricTokenMismatch ? USDT : metadata.tokenX).toLowerCase(),
+      tokenY: metadata.tokenY.toLowerCase(),
+      tvlUsdE18: partial ? null : String((500_000n - BigInt(index) * 10_000n) * 10n ** 18n),
+      volume24hUsdE18: String((120_000n - BigInt(index) * 1_000n) * 10n ** 18n),
+      fees24hUsdE18: String((240n - BigInt(index)) * 10n ** 18n),
+      feeToTvlE18: partial ? null : "480000000000000",
+      priceUsdE18: "2500000000000000000",
+      asOfBlock: String(options.analyticsAsOfBlock ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER),
+      asOfTimestamp: 1_720_000_000,
+      status: analyticsStatus,
+      missingPriceTokens: partial ? [metadata.tokenX.toLowerCase()] : []
+    })).sort((left, right) => left.pair.localeCompare(right.pair));
+    return { data: { poolMetrics: { nodes, pageInfo: { endCursor: null, hasNextPage: false, partial } } } };
+  }
+  if (query.includes("WebPairCandles")) {
+    const pair = body.variables?.pair ?? WNATIVE_USDC_PAIR.toLowerCase();
+    const from = body.variables?.fromTimestamp ?? 1_719_913_600;
+    const to = body.variables?.toTimestamp ?? from + 23 * 3_600;
+    const interval = body.variables?.interval ?? "HOUR";
+    const seconds = interval === "DAY" ? 86_400 : 3_600;
+    const nodes = Array.from({ length: Math.floor((to - from) / seconds) + 1 }, (_, index) => {
+      const open = 2_400_000_000_000_000_000n + BigInt(index) * 2_000_000_000_000_000n;
+      const close = open + 1_000_000_000_000_000n;
+      return {
+        pair,
+        interval,
+        startTimestamp: from + index * seconds,
+        endTimestamp: from + (index + 1) * seconds,
+        openUsdE18: partial && index === 0 ? null : open.toString(),
+        highUsdE18: partial && index === 0 ? null : (close + 2_000_000_000_000_000n).toString(),
+        lowUsdE18: partial && index === 0 ? null : (open - 2_000_000_000_000_000n).toString(),
+        closeUsdE18: partial && index === 0 ? null : close.toString(),
+        volumeUsdE18: String((10_000n + BigInt(index) * 100n) * 10n ** 18n),
+        feesUsdE18: String((20n + BigInt(index)) * 10n ** 18n),
+        tvlUsdE18: String(500_000n * 10n ** 18n),
+        swapCount: 20 + index,
+        status: partial && index === 0 ? "PARTIAL" : "READY",
+        missingPriceTokens: partial && index === 0 ? [WNATIVE.toLowerCase()] : [],
+        firstBlock: String(100 + index),
+        lastBlock: String(100 + index)
+      };
+    }).filter((_, index) => options.analyticsCandleGap !== true || index !== 1);
+    return { data: { pairCandles: { nodes, pageInfo: { endCursor: null, hasNextPage: false, partial } } } };
+  }
+  if (query.includes("WebAnalyticsHealth")) {
+    return { data: { analyticsHealth: mockAnalyticsHealth(options, partial) } };
+  }
+  const owner = body.variables?.owner ?? DEFAULT_ACCOUNT;
   const binId = options.analyticsOutOfRange === true ? activeIdFor(options) + 10 : activeIdFor(options);
   const transferred = options.analyticsTransferred === true;
   const analyticsBins = transferred
     ? []
     : Array.from({ length: options.analyticsBinCount ?? 1 }, (_, index) => ({
         binId: String(binId + index),
-        liquidity: String(options.positionLiquidity ?? DEFAULT_POSITION_LIQUIDITY),
+        liquidity: options.analyticsZeroLiquidity === true ? "0" : String(options.positionLiquidity ?? DEFAULT_POSITION_LIQUIDITY),
         amountX: "50000000000000000000",
         amountY: "70000000000000000000",
         costBasisUsdE18: partial ? null : "100000000000000000000",
@@ -341,6 +409,28 @@ function mockAnalyticsResponse(body: GraphRequest, options: MockRpcOptions): Rec
       },
       walletPositions: { nodes, pageInfo: { endCursor: null, hasNextPage: false, partial } }
     }
+  };
+}
+
+function mockAnalyticsHealth(options: MockRpcOptions, partial: boolean): Record<string, unknown> {
+  return {
+    status: partial ? "PARTIAL" : "READY",
+    headBlock: String(options.analyticsAsOfBlock ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER),
+    headHash: options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222",
+    headTimestamp: 1_720_000_000,
+    canonicalBlockCount: 42,
+    reorgCount: 0,
+    partialEventCount: partial ? 1 : 0,
+    missingPriceTokens: partial ? [WNATIVE.toLowerCase()] : [],
+    fresh: !partial,
+    headLagSeconds: partial ? 120 : 0,
+    maxHeadLagSeconds: 60,
+    backfillStatus: partial ? "partial" : "complete",
+    backfillCursor: null,
+    backfillError: null,
+    coverageStartTimestamp: "1719913600",
+    coverageThroughTimestamp: "1720000000",
+    prices: [{ token: WNATIVE.toLowerCase(), source: "mock", feedId: "wnative-usd", status: partial ? "missing" : "available", observedAt: 1_720_000_000, ageSeconds: 0 }]
   };
 }
 

@@ -58,6 +58,9 @@ try {
   assert.equal(safeReturnHref("https://evil.example/#/pools"), null);
   assert.equal(safeReturnHref("#/swap/anything"), null);
   assert.equal(safeReturnHref("#/pools/%2e%2e"), null);
+  assert.equal(safeReturnHref("#/pools/%252e%252e"), null);
+  assert.equal(safeReturnHref("#/pools/%2525ZZ"), null);
+  assert.equal(returnHrefFromAction("#/swap/pool?returnTo=%23%2Fpools%2F%25252e%25252e"), null);
 
   const ownerPage = await loadPaginatedPositionsForOwner({ endpoints: { indexerUrl: endpoint } }, owner.toUpperCase().replace("0X", "0x"));
   assert.equal(ownerPage.rows.length, 500);
@@ -66,6 +69,15 @@ try {
   const ownerIndex = buildOwnerLiquidityIndex(ownerPage.rows, ownerPage.pageInfo);
   assert.equal(ownerIndex.partial, true);
   assert.deepEqual([...ownerIndex.pairs].sort(), [pairA, pairB]);
+  const currentOwnerIndex = buildOwnerLiquidityIndex([
+    { pair: pairA, bins: [{ liquidity: "0" }, { liquidity: "000" }] },
+    { pair: pairB, bins: [{ liquidity: "1" }] }
+  ], { capped: false, failed: false });
+  assert.deepEqual([...currentOwnerIndex.pairs], [pairB]);
+  assert.throws(
+    () => buildOwnerLiquidityIndex([{ pair: pairA, bins: [{ liquidity: "-1" }] }], { capped: false, failed: false }),
+    /Invalid owner liquidity/
+  );
 
   const pools = [
     pool(pairA, tokenX, tokenY, "25", "10"),

@@ -1432,16 +1432,18 @@ test("pool discovery deep-links to real indexed bins and preselects liquidity ac
 
   await expect(page).toHaveURL(/#\/pools\//);
   await expect(page.getByText("Live liquidity bins")).toBeVisible();
-  await expect(page.locator(".pool-bin-chart .pool-bin")).toHaveCount(7);
-  await expect(page.locator(".pool-bin-chart .pool-bin.active")).toHaveCount(1);
+  await expect(page.locator(".pool-bin-chart .pool-bin-stack")).toHaveCount(7);
+  await expect(page.locator(".pool-bin-chart .pool-bin-stack.active")).toHaveCount(1);
+  await expect(page.getByTestId("pool-bin-distribution-table").locator("tbody tr")).toHaveCount(7);
   await expect.poll(() => rpc.snapshot().graphQueries.some((query) => query.includes("PairBinWindow"))).toBe(true);
   await expect.poll(() => rpc.snapshot().graphQueries.some((query) => query.includes("OwnerPairPositions"))).toBe(true);
 
   await page.reload();
-  await expect(page.locator(".pool-bin-chart .pool-bin")).toHaveCount(7);
+  await expect(page.locator(".pool-bin-chart .pool-bin-stack")).toHaveCount(7);
 
   await page.getByRole("link", { name: "Withdraw" }).click();
-  await expect(page).toHaveURL(/#\/liquidity\/withdraw\/0x/i);
+  await expect(page).toHaveURL(/#\/liquidity\/withdraw\/0x.+\?returnTo=/i);
+  await expect(page.getByTestId("pool-action-back")).toHaveAttribute("href", /#\/pools\/.+q=WNATIVE/);
   await expect(page.locator("#liquidity-withdraw")).toBeInViewport();
 
   await page.goBack();
@@ -1465,7 +1467,9 @@ test("pool detail keeps an empty active-bin marker and reports capped wallet pos
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR.toLowerCase()}`);
   await connectWallet(page);
 
-  await expect(page.locator(".pool-bin-chart .pool-bin.active")).toHaveCount(1);
+  await expect(page.locator(".pool-bin-chart .pool-bin-stack.active")).toHaveCount(1);
+  await expect(page.locator(".pool-bin-chart .pool-bin-stack.active")).toHaveAttribute("aria-label", /active bin/);
+  await expect(page.getByTestId("pool-bin-distribution-table").locator("tbody tr").filter({ hasText: "Active" })).toHaveCount(1);
   await expect(page.locator(".table-panel").filter({ hasText: "Your bins" }).locator(".status-badge")).toContainText("partial");
   await expect(page.getByText("The owner/pair position query is partial; destructive actions remain blocked.")).toBeVisible();
 });
@@ -1477,7 +1481,8 @@ test("pool and action deep links resolve outside the dashboard page and survive 
   await expect(page.getByText("Live liquidity bins")).toBeVisible();
   await expect(page.getByText(/bin step 11/)).toBeVisible();
   await page.getByRole("link", { name: "Withdraw" }).click();
-  await expect(page).toHaveURL(new RegExp(`#/liquidity/withdraw/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}$`, "i"));
+  await expect(page).toHaveURL(new RegExp(`#/liquidity/withdraw/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}\\?returnTo=`, "i"));
+  await expect(page.getByTestId("pool-action-back")).toHaveAttribute("href", new RegExp(`#/pools/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}`, "i"));
 
   await page.reload();
   await expect(page.locator("#liquidity-pair")).toHaveValue(SECOND_WNATIVE_USDC_PAIR.toLowerCase());
@@ -3197,15 +3202,26 @@ test("a later partial receipt never mutates or impersonates durable full-exit pr
   await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "Max" }).click();
   await clickReviewedAction(page, "liquidity-remove-button");
   await expect(page.getByText(/Full-exit batch mined/)).toBeVisible();
-  rpc.update({ blockNumber: 53n, indexerBlockNumber: 53n, receiptBlockNumber: 42n });
+  rpc.update({
+    blockNumber: 53n,
+    indexerBlockNumber: 53n,
+    livePositionBalance: 2n * ONE_TOKEN,
+    positionLiquidity: 2n * ONE_TOKEN,
+    receiptBlockNumber: 42n
+  });
   await expect.poll(() => page.evaluate(() => {
     const raw = window.localStorage.getItem("feather.transaction-journal.v1");
     if (raw === null) return 0;
     return (JSON.parse(raw) as { records: Array<{ confirmations: number; reviewed: { intent: string } }> }).records
       .findLast((record) => record.reviewed.intent === "remove-liquidity")?.confirmations ?? 0;
   }), { timeout: 12_000 }).toBeGreaterThanOrEqual(12);
+  await expect(page.getByTestId("full-exit-workflow-status")).toContainText("Batch 1 reached 12-confirmation finality");
+  await expect(page.locator(".mini-metric").filter({ hasText: "Live Balance" }).locator("strong")).toHaveText("2", { timeout: 12_000 });
+  await expect(page.locator(".mini-metric").filter({ hasText: "Index Freshness" }).locator("strong")).toHaveText("block 53", { timeout: 12_000 });
 
   await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "50%" }).click();
+  await expect(page.locator("#remove-percent")).toHaveValue("50");
+  await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled();
   await clickReviewedAction(page, "liquidity-remove-button");
 
   await expect(page.getByText("Liquidity removed")).toBeVisible();
