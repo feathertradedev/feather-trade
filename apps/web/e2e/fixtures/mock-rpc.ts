@@ -743,7 +743,7 @@ async function handleEthCall(
       distributionY: params.distributionY,
       bins: params.deltaIds.map((deltaId) => ({
         binId: BigInt(activeIdFor(options)) + deltaId,
-        priceQ128: LB_Q128,
+        priceQ128: options.priceQ128ByBin?.[(BigInt(activeIdFor(options)) + deltaId).toString()] ?? LB_Q128,
         reserveX: options.binReserveX ?? 4n * DEFAULT_POSITION_LIQUIDITY,
         reserveY: options.binReserveY ?? 2n * DEFAULT_POSITION_LIQUIDITY,
         totalSupply: options.binTotalSupply ?? options.positionLiquidity ?? DEFAULT_POSITION_LIQUIDITY

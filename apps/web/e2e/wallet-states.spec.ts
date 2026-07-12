@@ -2205,8 +2205,8 @@ test("extreme prices render exactly while active-bin movement preserves absolute
 
   await expect(minimumInput).toHaveValue(forwardMinimum);
   await expect(maximumInput).toHaveValue(forwardMaximum);
-  await expect(page.getByTestId("liquidity-min-price-inverse")).toContainText(`Inverse min ${inverseMinimum} WNATIVE per USDC`);
-  await expect(page.getByTestId("liquidity-max-price-inverse")).toContainText(`Inverse max ${inverseMaximum} WNATIVE per USDC`);
+  await expect(page.getByTestId("liquidity-min-price-inverse").locator("output")).toHaveText(`${inverseMinimum} WNATIVE per USDC`);
+  await expect(page.getByTestId("liquidity-max-price-inverse").locator("output")).toHaveText(`${inverseMaximum} WNATIVE per USDC`);
   for (const value of [forwardMinimum, forwardMaximum, inverseMinimum, inverseMaximum]) {
     expect(value).not.toMatch(/^0(?:\.0*)?$/);
   }
