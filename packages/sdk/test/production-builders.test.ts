@@ -18,6 +18,8 @@ import {
   buildAddLiquidityTransaction,
   buildExactInCandidatePaths,
   buildExactInSwapTransaction,
+  buildExactNativeForTokensSwapTransaction,
+  buildExactTokensForNativeSwapTransaction,
   buildLiquidityDistribution,
   buildProtectedBurnMinimums,
   buildRemoveLiquidityTransaction,
@@ -299,6 +301,170 @@ test("builds exact-in swap calldata from a non-localnet registry with slippage a
   );
   assert.throws(() => deadlineFromNow(0.5, 1_700_000_000), /integer from 1 to 120/);
   assert.throws(() => deadlineFromNow(121, 1_700_000_000), /integer from 1 to 120/);
+});
+
+test("builds canonical exact native-input and native-output swap calldata with exact value", () => {
+  const registry = fixtureRegistry(readManifestFixture());
+  const deadline = 1_700_001_200n;
+  const nativeAmountIn = 1_000_000_000_000_000_000n;
+  const tokenAmountOut = 2_000_000n;
+  const nativeInQuote: ExactInQuote = {
+    route: [addresses.weth, addresses.usdc],
+    pairs: [addresses.pair],
+    binSteps: [25n],
+    versions: [LB_ROUTER_VERSION_V2_2],
+    amounts: [nativeAmountIn, tokenAmountOut],
+    virtualAmountsWithoutSlippage: [nativeAmountIn, 2_010_000n],
+    fees: [1_000_000_000_000_000n]
+  };
+  const nativeIn = buildExactNativeForTokensSwapTransaction(
+    registry,
+    addresses.weth,
+    nativeInQuote,
+    nativeAmountIn,
+    1_990_000n,
+    addresses.recipient,
+    deadline
+  );
+  const decodedNativeIn = decodeFunctionData({ abi: lbRouterAbi, data: nativeIn.data });
+
+  assert.equal(nativeIn.to, addresses.router);
+  assert.equal(nativeIn.value, nativeAmountIn);
+  assert.equal(decodedNativeIn.functionName, "swapExactNATIVEForTokens");
+  assert.deepEqual(decodedNativeIn.args, [
+    1_990_000n,
+    {
+      pairBinSteps: [25n],
+      versions: [LB_ROUTER_VERSION_V2_2],
+      tokenPath: [addresses.weth, addresses.usdc]
+    },
+    addresses.recipient,
+    deadline
+  ]);
+
+  const tokenAmountIn = 2_000_000n;
+  const nativeAmountOut = 990_000_000_000_000_000n;
+  const nativeOutQuote: ExactInQuote = {
+    route: [addresses.usdc, addresses.weth],
+    pairs: [addresses.pair],
+    binSteps: [25n],
+    versions: [LB_ROUTER_VERSION_V2_2],
+    amounts: [tokenAmountIn, nativeAmountOut],
+    virtualAmountsWithoutSlippage: [tokenAmountIn, 1_000_000_000_000_000_000n],
+    fees: [1_000_000_000_000_000n]
+  };
+  const nativeOut = buildExactTokensForNativeSwapTransaction(
+    registry,
+    addresses.weth,
+    nativeOutQuote,
+    tokenAmountIn,
+    985_000_000_000_000_000n,
+    addresses.recipient,
+    deadline
+  );
+  const decodedNativeOut = decodeFunctionData({ abi: lbRouterAbi, data: nativeOut.data });
+
+  assert.equal(nativeOut.to, addresses.router);
+  assert.equal(nativeOut.value, 0n);
+  assert.equal(decodedNativeOut.functionName, "swapExactTokensForNATIVE");
+  assert.deepEqual(decodedNativeOut.args, [
+    tokenAmountIn,
+    985_000_000_000_000_000n,
+    {
+      pairBinSteps: [25n],
+      versions: [LB_ROUTER_VERSION_V2_2],
+      tokenPath: [addresses.usdc, addresses.weth]
+    },
+    addresses.recipient,
+    deadline
+  ]);
+});
+
+test("native exact-input builders fail closed on wrapper, value, path, minimum, deadline, and recipient drift", () => {
+  const registry = fixtureRegistry(readManifestFixture());
+  const quote: ExactInQuote = {
+    route: [addresses.weth, addresses.usdc],
+    pairs: [addresses.pair],
+    binSteps: [25n],
+    versions: [LB_ROUTER_VERSION_V2_2],
+    amounts: [1_000n, 900n],
+    virtualAmountsWithoutSlippage: [1_000n, 910n],
+    fees: [1n]
+  };
+  const buildNativeIn = (candidate: ExactInQuote, overrides: {
+    amountIn?: bigint;
+    amountOutMin?: bigint;
+    deadline?: bigint;
+    recipient?: Address;
+    wrappedNative?: Address;
+  } = {}) => buildExactNativeForTokensSwapTransaction(
+    registry,
+    overrides.wrappedNative ?? addresses.weth,
+    candidate,
+    overrides.amountIn ?? 1_000n,
+    overrides.amountOutMin ?? 890n,
+    overrides.recipient ?? addresses.recipient,
+    overrides.deadline ?? 2n
+  );
+
+  assert.throws(() => buildNativeIn(quote, { amountIn: 999n }), /amount does not match the quote input/);
+  assert.throws(() => buildNativeIn(quote, { amountOutMin: 0n }), /minimum output must be positive/);
+  assert.throws(() => buildNativeIn(quote, { amountOutMin: 901n }), /no greater than the quoted output/);
+  assert.throws(() => buildNativeIn(quote, { deadline: 0n }), /deadline must be greater than zero/);
+  assert.throws(() => buildNativeIn(quote, { recipient: zeroAddress }), /recipient must be nonzero/);
+  assert.throws(() => buildNativeIn(quote, { wrappedNative: zeroAddress }), /identity must be nonzero/);
+  assert.throws(() => buildNativeIn(quote, { wrappedNative: addresses.usdc }), /registered wrapped-native token/);
+  assert.throws(
+    () => buildNativeIn({ ...quote, route: [addresses.usdc, addresses.weth] }),
+    /route must start with the router wrapped-native token/
+  );
+  assert.throws(
+    () => buildNativeIn({ ...quote, versions: [2] }),
+    /Only V2\.2 swap route versions/
+  );
+  assert.throws(
+    () => buildNativeIn({ ...quote, pairs: [] }),
+    /arrays do not match the route hop count/
+  );
+  assert.throws(
+    () => buildNativeIn({
+      ...quote,
+      route: [addresses.weth, addresses.usdc, addresses.weth],
+      pairs: [addresses.pair, addresses.router],
+      binSteps: [25n, 10n],
+      versions: [LB_ROUTER_VERSION_V2_2, LB_ROUTER_VERSION_V2_2],
+      amounts: [1_000n, 950n, 900n],
+      virtualAmountsWithoutSlippage: [1_000n, 960n, 910n],
+      fees: [1n, 1n]
+    }),
+    /only at its native endpoint/
+  );
+
+  const nativeOutQuote: ExactInQuote = { ...quote, route: [addresses.usdc, addresses.weth] };
+  assert.throws(
+    () => buildExactTokensForNativeSwapTransaction(
+      registry,
+      addresses.weth,
+      quote,
+      1_000n,
+      890n,
+      addresses.recipient,
+      2n
+    ),
+    /route must end with the router wrapped-native token/
+  );
+  assert.throws(
+    () => buildExactTokensForNativeSwapTransaction(
+      registry,
+      addresses.weth,
+      nativeOutQuote,
+      999n,
+      890n,
+      addresses.recipient,
+      2n
+    ),
+    /amount does not match the quote input/
+  );
 });
 
 test("accepts structurally complete multi-hop V2.2 swap routes", () => {
