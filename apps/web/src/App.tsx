@@ -23,7 +23,10 @@ import { createDexPublicClient } from "@robinhood-lb/sdk/client";
 import {
   applyBurnQuoteSlippage,
   applyLiquiditySlippageMin,
+  buildAddLiquidityNativeTransaction,
+  buildAddLiquidityTransaction,
   buildLiquidityDistribution,
+  buildRemoveLiquidityNativeTransaction,
   buildRemoveLiquidityTransaction,
   MAX_LIQUIDITY_BINS,
   quoteLiquidityBurn,
@@ -35,6 +38,9 @@ import type { DexRegistry, LocalnetDexRegistry } from "@robinhood-lb/sdk/registr
 import {
   assertQuoteMatchesExactInRequest,
   buildExactInSwapPath,
+  buildExactInSwapTransaction,
+  buildExactNativeForTokensSwapTransaction,
+  buildExactTokensForNativeSwapTransaction,
   calculateAmountOutMin,
   deadlineFromNow,
   estimatePriceImpactBps,
@@ -61,7 +67,7 @@ import {
   Wallet
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ComponentType } from "react";
-import { encodeFunctionData, isAddress, isAddressEqual, keccak256, zeroAddress, type Address, type Chain, type Hex, type PublicClient, formatUnits } from "viem";
+import { decodeEventLog, encodeFunctionData, isAddress, isAddressEqual, keccak256, zeroAddress, type Address, type Chain, type Hex, type PublicClient, formatUnits } from "viem";
 import {
   useAccount,
   useChainId,
@@ -148,11 +154,15 @@ import {
   burnQuoteExecutionFingerprint,
   evaluateTransactionSafety,
   idSlippageInputError,
+  liquidityAddAssetFingerprint,
+  nativeSwapSubmissionFingerprint,
   parseDeadlineMinutes,
   parseIdSlippage,
   quoteIsStale,
+  reconcileNativeSwapReceipt,
   swapExecutionContextFingerprint,
   type BurnQuoteExecutionBinding,
+  type NativeSwapSubmissionBinding,
   type SwapExecutionContext
 } from "./transaction-safety";
 import { wagmiConfig } from "./wagmi";
@@ -170,8 +180,12 @@ import {
   getPinnedBlockIdentity,
   loadPinnedAddLiquidityReview,
   reconcileAddLiquidityReceipt,
+  reconcileNativeAddLiquidityReceipt,
+  reconcileNativeRemoveLiquidityReceipt,
   samePinnedLiquidityReview,
   type AddLiquidityReceiptReconciliation,
+  type NativeAddLiquidityReceiptReconciliation,
+  type NativeRemoveLiquidityReceiptReconciliation,
   type PinnedAddLiquidityReview
 } from "./liquidity-review";
 import {
@@ -179,6 +193,7 @@ import {
   deterministicTokenFallback,
   poolChoiceIdentityLabel,
   maxAmountInput,
+  safeMaxAmount,
   parseTokenAmount,
   tokenAmountErrorMessage
 } from "./token-safety";
@@ -226,15 +241,20 @@ interface FullExitUiState {
 }
 
 interface FullExitBatchReviewState {
+  assetMode: "erc20" | "native";
   batchOrdinal: number;
   batchSettings: string;
   binStates: LiveBurnBinState[];
   completedBatches: number;
   estimatedTransactionsRemaining: number;
   estimatedGas: bigint;
+  expectedAmountX: bigint;
+  expectedAmountY: bigint;
   executionContextFingerprint: string;
   executionFingerprint: string;
   liveBins: FullExitLiveBin[];
+  minimumAmountX: bigint;
+  minimumAmountY: bigint;
   positions: PositionRow[];
   remainingBins: number;
   sourceBlockHash: string;
@@ -321,6 +341,25 @@ interface SubmittedLiquidityAddReview extends LiquidityAddReviewState {
   chainId: number;
   environment: EnvironmentKey;
   submittedAt: number;
+}
+
+interface SubmittedNativeRemoveReview {
+  account: Address;
+  amounts: bigint[];
+  chainId: number;
+  environment: EnvironmentKey;
+  executionFingerprint: string;
+  expectedAmountX: bigint;
+  expectedAmountY: bigint;
+  ids: bigint[];
+  minimumAmountX: bigint;
+  minimumAmountY: bigint;
+  nativeSide: "x" | "y";
+  pair: Address;
+  submittedAt: number;
+  tokenX: Address;
+  tokenY: Address;
+  transaction: { data: Hex; to: Address; value: bigint };
 }
 
 interface ConfirmedPoolOverlay {
@@ -469,19 +508,29 @@ async function submitJournaledTransaction(input: {
       throw error;
     }
   }
+  let hash: Address;
   try {
-    const hash = await input.send();
-    try {
-      await input.journal.submitted(handle, hash);
-    } catch {
-      throw new Error(`Wallet returned ${formatCompactAddress(hash)}, but durable hash persistence failed; retry remains blocked in this session`);
-    }
-    return hash;
+    hash = await input.send();
   } catch (error) {
-    if (!(error instanceof Error && error.message.includes("durable hash persistence failed"))) {
-      await input.journal.fail(handle, error);
-    }
-    throw error;
+    await input.journal.fail(handle, error);
+    if (isUserRejectedSubmission(error)) throw error;
+    throw new AmbiguousWalletSubmissionError(error);
+  }
+  try {
+    await input.journal.submitted(handle, hash);
+  } catch {
+    throw new Error(`Wallet returned ${formatCompactAddress(hash)}, but durable hash persistence failed; retry remains blocked in this session`);
+  }
+  return hash;
+}
+
+class AmbiguousWalletSubmissionError extends Error {
+  readonly cause: unknown;
+
+  constructor(cause: unknown) {
+    super("Wallet transport failed after submission handoff; a possible broadcast has no returned transaction hash. Retry remains blocked while the durable journal reconciles it.");
+    this.name = "AmbiguousWalletSubmissionError";
+    this.cause = cause;
   }
 }
 
@@ -1196,6 +1245,23 @@ function poolHasSwapLiquidity(pool: PoolRow): boolean {
   }
 }
 
+interface NativeSwapReceiptReview {
+  direction: "native-in" | "native-out";
+  gasCost: string;
+  nativeAmount: string;
+  tokenAmount: string;
+  hash: Address;
+}
+
+interface SubmittedNativeSwapReceiptContext extends Omit<NativeSwapSubmissionBinding, "account" | "calldataFingerprint" | "hash" | "target" | "token"> {
+  account: Address;
+  calldataFingerprint: Hex;
+  data: Hex;
+  hash: Address;
+  target: Address;
+  token: Address;
+}
+
 function SwapView({
   environmentKey,
   onSelectedPoolChange,
@@ -1216,6 +1282,7 @@ function SwapView({
   const [amount, setAmount] = useState("1.0");
   const [routeMode, setRouteMode] = useState<"exact-selected" | "best">("exact-selected");
   const [swapForY, setSwapForY] = useState(true);
+  const [useNativeWrapper, setUseNativeWrapper] = useState(false);
   const [slippageInput, setSlippageInput] = useState("0.5");
   const [deadlineInput, setDeadlineInput] = useState("20");
   const [safetyNow, setSafetyNow] = useState(() => Date.now());
@@ -1231,17 +1298,24 @@ function SwapView({
   const swapOperationGeneration = useRef(0);
   const approvalSubmitInFlight = useRef(false);
   const swapSubmitInFlight = useRef(false);
+  const nativeSwapMaxProbeRef = useRef(false);
+  const nativeSwapMaxBindingRef = useRef<{ context: string; value: bigint } | null>(null);
+  const latestSwapGasObservationRef = useRef<{ balance: bigint; context: string; reserve: bigint } | null>(null);
+  const [nativeSwapMaxPending, setNativeSwapMaxPending] = useState(false);
   const [handledApprovalHash, setHandledApprovalHash] = useState<Address | null>(null);
   const [handledSwapHash, setHandledSwapHash] = useState<Address | null>(null);
   const [submittedApprovalReceiptContext, setSubmittedApprovalReceiptContext] = useState<string | null>(null);
   const [submittedSwapReceiptContext, setSubmittedSwapReceiptContext] = useState<string | null>(null);
+  const [nativeReceiptReview, setNativeReceiptReview] = useState<NativeSwapReceiptReview | null>(null);
+  const [nativeReceiptError, setNativeReceiptError] = useState<string | null>(null);
+  const [submittedNativeSwapReceiptContext, setSubmittedNativeSwapReceiptContext] = useState<SubmittedNativeSwapReceiptContext | null>(null);
   const transactionJournal = useTransactionJournal();
   const registry = registries[environmentKey];
   const localnetRegistry = isLocalnetRegistry(registry) ? registry : null;
   const account = useAccount();
   const activeWalletChainId = useChainId();
   const approvalWrite = useWriteContract();
-  const swapWrite = useWriteContract();
+  const swapWrite = useSendTransaction();
   const approvalReceipt = useWaitForTransactionReceipt({ hash: approvalWrite.data });
   const swapReceipt = useWaitForTransactionReceipt({ hash: swapWrite.data });
 
@@ -1258,6 +1332,17 @@ function SwapView({
   const tokenOut = swapForY ? tokenY : tokenX;
   const tokenInAddress = swapForY ? selectedPool.tokenXAddress : selectedPool.tokenYAddress;
   const tokenOutAddress = swapForY ? selectedPool.tokenYAddress : selectedPool.tokenXAddress;
+  const wrappedNativeToken = Object.values(registry.tokens).find((token) =>
+    token.tags.includes("wrapped-native") && tokenAllowsAction(token, "swap")
+  ) ?? null;
+  const selectedPoolHasWrapper = wrappedNativeToken !== null &&
+    (tokenX !== null && isAddressEqual(tokenX.address, wrappedNativeToken.address) || tokenY !== null && isAddressEqual(tokenY.address, wrappedNativeToken.address));
+  const nativeInput = useNativeWrapper && wrappedNativeToken !== null && tokenInAddress !== null && isAddressEqual(tokenInAddress, wrappedNativeToken.address);
+  const nativeOutput = useNativeWrapper && wrappedNativeToken !== null && tokenOutAddress !== null && isAddressEqual(tokenOutAddress, wrappedNativeToken.address);
+  const inputAssetMode = nativeInput ? "native" as const : "erc20" as const;
+  const outputAssetMode = nativeOutput ? "native" as const : "erc20" as const;
+  const inputSymbol = nativeInput ? "ETH" : tokenSymbol(tokenIn);
+  const outputSymbol = nativeOutput ? "ETH" : tokenSymbol(tokenOut);
   const parsedAmountResult = parseTokenAmount(amount, tokenIn?.decimals ?? 18);
   const parsedAmount = parsedAmountResult.amount;
   const slippageBps = parseSlippageToBps(slippageInput);
@@ -1291,6 +1376,8 @@ function SwapView({
     reserveX: selectedPool.reserveX?.toString() ?? null,
     reserveY: selectedPool.reserveY?.toString() ?? null,
     routeMode,
+    inputAssetMode,
+    outputAssetMode,
     rpcChainId: snapshot?.runtime.chainId ?? null,
     slippageBps: slippageBps?.toString() ?? null,
     tokenIn: tokenInAddress,
@@ -1300,6 +1387,7 @@ function SwapView({
     walletChainId: activeWalletChainId
   };
   const swapContextFingerprint = swapExecutionContextFingerprint(swapExecutionContext);
+  const swapMaxContextFingerprint = swapExecutionContextFingerprint({ ...swapExecutionContext, amountIn: null });
   const swapOperationContext = useRef(swapContextFingerprint);
   if (swapOperationContext.current !== swapContextFingerprint) {
     swapOperationContext.current = swapContextFingerprint;
@@ -1380,13 +1468,22 @@ function SwapView({
     retry: false
   });
   const walletQuery = useQuery({
-    queryKey: ["swapWallet", registry.chainId, tokenInAddress, account.address, approvalConfirmationKey],
+    queryKey: ["swapWallet", registry.chainId, tokenInAddress, inputAssetMode, account.address, approvalConfirmationKey],
     queryFn: async () => {
       if (tokenInAddress === null || !account.address) {
         throw new Error("Wallet reads are not available");
       }
 
-      const [balance, allowance, nativeBalance] = await Promise.all([
+      const nativeBalance = await publicClient.getBalance({ address: account.address });
+      if (nativeInput) {
+        return {
+          approvalHash: approvalConfirmation?.hash ?? null,
+          balance: nativeBalance.toString(),
+          allowance: ((1n << 256n) - 1n).toString(),
+          nativeBalance: nativeBalance.toString()
+        };
+      }
+      const [balance, allowance] = await Promise.all([
         publicClient.readContract({
           address: tokenInAddress,
           abi: erc20Abi,
@@ -1398,8 +1495,7 @@ function SwapView({
           abi: erc20Abi,
           functionName: "allowance",
           args: [account.address, registry.contracts.lbRouter]
-        }),
-        publicClient.getBalance({ address: account.address })
+        })
       ]);
 
       return {
@@ -1463,9 +1559,9 @@ function SwapView({
   const walletReadsReady = walletReadsMatchApproval && walletBalance !== null && walletAllowance !== null && nativeBalance !== null;
   const walletError = walletQuery.error ? `Wallet read failed: ${getWriteError(walletQuery.error) ?? "balance and allowance unavailable"}` : null;
   const walletReadsPending = connected && swapMarketReady && tokenInAddress !== null && !walletReadsReady && walletError === null;
-  const needsApproval = parsedAmount !== null && walletAllowance !== null && walletAllowance < parsedAmount;
+  const needsApproval = !nativeInput && parsedAmount !== null && walletAllowance !== null && walletAllowance < parsedAmount;
   const insufficientBalance = parsedAmount !== null && walletBalance !== null && walletBalance < parsedAmount;
-  const expectedOutLabel = amountOut !== null ? formatTokenAmount(amountOut.toString(), tokenOut) : "n/a";
+  const expectedOutLabel = amountOut !== null ? nativeOutput ? `${formatUnits(amountOut, 18)} ETH` : formatTokenAmount(amountOut.toString(), tokenOut) : "n/a";
   const feeLabel = exactQuote ? formatBps(getTotalFeeBps(exactQuote)) : "n/a";
   const priceImpactLabel = priceImpactBps !== null ? formatBps(priceImpactBps) : "n/a";
   const quoteFreshnessLabel = formatQuoteFreshness(quoteUpdatedAt, safetyNow);
@@ -1695,6 +1791,122 @@ function SwapView({
     walletQuery
   ]);
 
+  const nativeReceiptIdentity = swapReceipt.data
+    ? [swapReceipt.data.transactionHash, swapReceipt.data.blockHash, swapReceipt.data.blockNumber.toString(), swapReceipt.data.status].join(":")
+    : null;
+  const submittedNativeSwapFingerprint = submittedNativeSwapReceiptContext === null
+    ? null
+    : nativeSwapSubmissionFingerprint(submittedNativeSwapReceiptContext);
+  const activeSwapJournalRecord = submittedNativeSwapReceiptContext === null
+    ? null
+    : transactionJournal.records.find((record) =>
+        record.reviewed.intent === "swap" &&
+        (
+          record.activeHash?.toLowerCase() === submittedNativeSwapReceiptContext.hash.toLowerCase() ||
+          record.hashes.some((candidate) => candidate.hash.toLowerCase() === submittedNativeSwapReceiptContext.hash.toLowerCase())
+        )
+      ) ?? null;
+  useEffect(() => {
+    if (submittedNativeSwapReceiptContext === null || !swapReceipt.data || activeSwapJournalRecord === null) return;
+    let cancelled = false;
+    const receipt = swapReceipt.data;
+    const submitted = submittedNativeSwapReceiptContext;
+    if (receipt.blockNumber === 0n) return;
+    void (async () => {
+      try {
+        if (receipt.transactionHash.toLowerCase() !== submitted.hash.toLowerCase()) throw new Error("Native swap receipt hash differs from the submitted context");
+        if (receipt.status !== "success") throw new Error("Native swap receipt did not succeed");
+        if (
+          !isAddressEqual(activeSwapJournalRecord.reviewed.account, submitted.account) ||
+          !isAddressEqual(activeSwapJournalRecord.reviewed.target, submitted.target) ||
+          activeSwapJournalRecord.reviewed.calldataFingerprint.toLowerCase() !== submitted.calldataFingerprint.toLowerCase() ||
+          activeSwapJournalRecord.reviewed.executionFingerprint !== submitted.executionFingerprint ||
+          activeSwapJournalRecord.reviewed.value.toString() !== submitted.transactionValue
+        ) throw new Error("Native swap journal context differs from the immutable submitted context");
+        const beforeBlockNumber = receipt.blockNumber - 1n;
+        const canonical = await publicClient.getBlock({ blockNumber: receipt.blockNumber });
+        if (canonical.hash?.toLowerCase() !== receipt.blockHash.toLowerCase()) throw new Error("Native swap receipt block is not canonical");
+        const canonicalTransaction = await publicClient.getTransaction({ hash: submitted.hash as Address });
+        if (
+          !isAddressEqual(canonicalTransaction.from, submitted.account) ||
+          canonicalTransaction.to === null ||
+          !isAddressEqual(canonicalTransaction.to, submitted.target) ||
+          canonicalTransaction.input.toLowerCase() !== submitted.data.toLowerCase() ||
+          keccak256(canonicalTransaction.input).toLowerCase() !== submitted.calldataFingerprint.toLowerCase() ||
+          canonicalTransaction.value.toString() !== submitted.transactionValue
+        ) throw new Error("Canonical native swap transaction differs from the immutable submitted context");
+        const [nativeBalanceBefore, nativeBalanceAfter, tokenBalanceBefore, tokenBalanceAfter] = await Promise.all([
+          publicClient.getBalance({ address: submitted.account as Address, blockNumber: beforeBlockNumber }),
+          publicClient.getBalance({ address: submitted.account as Address, blockNumber: receipt.blockNumber }),
+          publicClient.readContract({ address: submitted.token as Address, abi: erc20Abi, functionName: "balanceOf", args: [submitted.account as Address], blockNumber: beforeBlockNumber }),
+          publicClient.readContract({ address: submitted.token as Address, abi: erc20Abi, functionName: "balanceOf", args: [submitted.account as Address], blockNumber: receipt.blockNumber })
+        ]);
+        let loggedTokenAmount = 0n;
+        for (const log of receipt.logs) {
+          if (!isAddressEqual(log.address, submitted.token)) continue;
+          try {
+            const decoded = decodeEventLog({ abi: erc20Abi, data: log.data, topics: log.topics });
+            if (decoded.eventName !== "Transfer") continue;
+            const args = decoded.args as { from: Address; to: Address; value: bigint };
+            if (submitted.direction === "native-in" && isAddressEqual(args.to, submitted.account)) loggedTokenAmount += args.value;
+            if (submitted.direction === "native-out" && isAddressEqual(args.from, submitted.account)) loggedTokenAmount += args.value;
+          } catch {
+            // Non-Transfer logs from the token do not contribute to received/spent accounting.
+          }
+        }
+        const submittedAmountIn = BigInt(submitted.amountIn);
+        const submittedAmountOutMin = BigInt(submitted.amountOutMin);
+        const submittedValue = BigInt(submitted.transactionValue);
+        if (submitted.direction === "native-in" && loggedTokenAmount < submittedAmountOutMin) throw new Error("Native-input receipt transfer logs are below the reviewed minimum");
+        if (submitted.direction === "native-out" && loggedTokenAmount !== submittedAmountIn) throw new Error("Native-output receipt transfer logs differ from the reviewed input");
+        const accounting = reconcileNativeSwapReceipt({
+          amountIn: submittedAmountIn,
+          amountOutMin: submittedAmountOutMin,
+          direction: submitted.direction,
+          effectiveGasPrice: receipt.effectiveGasPrice,
+          gasUsed: receipt.gasUsed,
+          nativeBalanceAfter,
+          nativeBalanceBefore,
+          tokenBalanceAfter,
+          tokenBalanceBefore,
+          transactionValue: submittedValue
+        });
+        const postRead = await publicClient.getBlock({ blockNumber: receipt.blockNumber });
+        if (postRead.hash?.toLowerCase() !== receipt.blockHash.toLowerCase()) throw new Error("Native swap receipt block reorganized during accounting");
+        if (!cancelled) {
+          setNativeReceiptReview({
+            direction: accounting.direction,
+            gasCost: accounting.gasCost.toString(),
+            nativeAmount: accounting.nativeAmount.toString(),
+            tokenAmount: accounting.tokenAmount.toString(),
+            hash: submitted.hash as Address
+          });
+          setNativeReceiptError(null);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          const message = getWriteError(error) ?? "unknown accounting error";
+          setNativeReceiptReview(null);
+          setNativeReceiptError(`Native swap receipt reconciliation failed closed: ${message}`);
+          if (/differs from the (?:immutable )?submitted context|journal context differs/i.test(message)) {
+            setSubmittedNativeSwapReceiptContext(null);
+          }
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [activeSwapJournalRecord, nativeReceiptIdentity, submittedNativeSwapFingerprint]);
+
+  useEffect(() => {
+    if (activeSwapJournalRecord?.status === "orphaned" || activeSwapJournalRecord?.replacementCompatibility === "incompatible") {
+      setNativeReceiptReview(null);
+      setNativeReceiptError(activeSwapJournalRecord.status === "orphaned"
+        ? "Native swap receipt was reorganized; canonical accounting was removed and retry remains journal-blocked"
+        : "Native swap replacement differs from the submitted calldata or value; canonical accounting was cleared");
+      setSubmittedNativeSwapReceiptContext(null);
+    }
+  }, [activeSwapJournalRecord?.replacementCompatibility, activeSwapJournalRecord?.status]);
+
   useEffect(() => {
     if (approvalRefresh?.status !== "awaiting-render") return;
     if (approvalRefresh.intentFingerprint !== approvalIntentFingerprint) {
@@ -1857,10 +2069,14 @@ function SwapView({
 
   const handleSwap = async () => {
     if (swapSubmitInFlight.current || !canSwap || !account.address || !exactQuote || parsedAmount === null || amountOutMin === null || deadlineMinutes === null) return;
+    const nativeMaxProbe = nativeSwapMaxProbeRef.current;
     swapSubmitInFlight.current = true;
     swapWrite.reset();
     setSubmittedSwapReceiptContext(null);
     setGasReviewError(null);
+    setNativeReceiptReview(null);
+    setNativeReceiptError(null);
+    setSubmittedNativeSwapReceiptContext(null);
     try {
 
     try {
@@ -1881,22 +2097,17 @@ function SwapView({
     const simulatedQuoteIdentity = swapQuoteIdentity;
     const operationGeneration = swapOperationGeneration.current;
     const deadline = deadlineFromNow(deadlineMinutes);
-    const args = [
-      parsedAmount,
-      amountOutMin,
-      buildExactInSwapPath(exactQuote),
-      account.address,
-      deadline
-    ] as const;
+    if ((nativeInput || nativeOutput) && wrappedNativeToken === null) {
+      setSwapSimulationError("Router wrapped-native identity is unavailable");
+      return;
+    }
+    const transaction = nativeInput
+      ? buildExactNativeForTokensSwapTransaction(registry, wrappedNativeToken!.address, exactQuote, parsedAmount, amountOutMin, account.address, deadline)
+      : nativeOutput
+        ? buildExactTokensForNativeSwapTransaction(registry, wrappedNativeToken!.address, exactQuote, parsedAmount, amountOutMin, account.address, deadline)
+        : buildExactInSwapTransaction(registry, exactQuote, parsedAmount, amountOutMin, account.address, deadline);
     const simulated = await runPreSubmitSimulation(
-      () =>
-        publicClient.simulateContract({
-          account: account.address,
-          address: registry.contracts.lbRouter,
-          abi: lbRouterAbi,
-          functionName: "swapExactTokensForTokens",
-          args
-        }),
+      () => publicClient.call({ account: account.address, ...transaction }),
       setSwapSimulationError,
       setSwapSimulationPending
     );
@@ -1916,17 +2127,41 @@ function SwapView({
       latestSwapContextFingerprint.current === simulatedContextFingerprint &&
       latestSwapQuoteIdentity.current === simulatedQuoteIdentity &&
       !quoteIsStale(quoteUpdatedAt, Date.now());
+    const gasObservation: { value: { balance: bigint; review: ExactGasReview } | null } = { value: null };
     const gasApproved = await reviewExactGas({
       action: "swap",
       currentReview: gasReview,
-      estimateGas: () => publicClient.estimateContractGas(simulated.request),
+      estimateGas: () => publicClient.estimateGas({ account: account.address, ...transaction }),
       executionFingerprint: simulatedContextFingerprint,
       getBalance: () => publicClient.getBalance({ address: account.address }),
       getGasPrice: () => publicClient.getGasPrice(),
       isCurrent: gasReviewIsCurrent,
       setError: setGasReviewError,
-      setReview: setGasReview
+      setReview: setGasReview,
+      onReview: (review, nativeBalance) => {
+        gasObservation.value = { balance: nativeBalance, review };
+        latestSwapGasObservationRef.current = { balance: nativeBalance, context: swapMaxContextFingerprint, reserve: review.bufferedWei };
+        if (!nativeMaxProbe) return;
+        const max = safeMaxAmount({ asset: "native", balance: nativeBalance, gasReserveWei: review.bufferedWei });
+        if (max === 0n) {
+          setGasReviewError("Native Max is unavailable because the wallet balance does not exceed the reviewed gas reserve");
+          return;
+        }
+        nativeSwapMaxBindingRef.current = { context: swapMaxContextFingerprint, value: max };
+        setAmount(maxAmountInput({ asset: "native", balance: nativeBalance, decimals: 18, gasReserveWei: review.bufferedWei }));
+      },
+      transactionValue: transaction.value
     });
+    if (nativeMaxProbe) return;
+    const finalGasObservation = gasObservation.value;
+    if (nativeInput && nativeSwapMaxBindingRef.current !== null && finalGasObservation !== null) {
+      const binding = nativeSwapMaxBindingRef.current;
+      const exactMax = safeMaxAmount({ asset: "native", balance: finalGasObservation.balance, gasReserveWei: finalGasObservation.review.bufferedWei });
+      if (binding.context !== swapMaxContextFingerprint || parsedAmount !== binding.value || parsedAmount !== exactMax) {
+        setGasReviewError("Native Max changed with the latest balance or buffered gas; press Max again before wallet confirmation");
+        return;
+      }
+    }
     if (!gasApproved || !gasReviewIsCurrent()) return;
     try {
       await attestCurrentSwapRoute();
@@ -1936,7 +2171,7 @@ function SwapView({
     }
     const submittedContext = {
       account: account.address,
-      calldataFingerprint: keccak256(encodeFunctionData({ abi: lbRouterAbi, functionName: "swapExactTokensForTokens", args })),
+      calldataFingerprint: keccak256(transaction.data),
       chainId: activeWalletChainId,
       deploymentEpoch: deploymentEpoch(registry),
       environment: environmentKey,
@@ -1946,11 +2181,11 @@ function SwapView({
       providerUid: account.connector?.uid ?? "unknown",
       submittedAt: Date.now(),
       target: registry.contracts.lbRouter,
-      value: 0n
+      value: transaction.value
     };
     try {
       setSubmittedSwapReceiptContext(approvalIntentFingerprint);
-      await submitJournaledTransaction({
+      const hash = await submitJournaledTransaction({
         isCurrent: gasReviewIsCurrent,
         journal: transactionJournal,
         reviewed: reviewedTransactionIntent(submittedContext, {
@@ -1963,15 +2198,61 @@ function SwapView({
           await attestCurrentSwapRoute();
           if (!gasReviewIsCurrent()) throw new PairAttestationError("context-changed", "Swap context changed during final pair attestation");
         },
-        send: () => swapWrite.writeContractAsync(simulated.request)
+        send: () => swapWrite.sendTransactionAsync(transaction)
       });
+      if (hash !== null && (nativeInput || nativeOutput)) {
+        const token = nativeInput ? tokenOutAddress : tokenInAddress;
+        if (token === null || simulatedQuoteIdentity === null) throw new Error("Submitted native swap context is incomplete");
+        setSubmittedNativeSwapReceiptContext({
+          account: account.address,
+          amountIn: parsedAmount.toString(),
+          amountOutMin: amountOutMin.toString(),
+          calldataFingerprint: keccak256(transaction.data),
+          data: transaction.data,
+          direction: nativeInput ? "native-in" : "native-out",
+          executionFingerprint: simulatedContextFingerprint,
+          hash,
+          inputAssetMode,
+          outputAssetMode,
+          quoteIdentity: simulatedQuoteIdentity,
+          target: transaction.to,
+          token,
+          transactionValue: transaction.value.toString()
+        });
+      }
     } catch (error) {
-      if (!isUserRejectedSubmission(error)) setSwapSimulationError(getWriteError(error) ?? "Transaction journal blocked swap submission");
+      if (!isUserRejectedSubmission(error)) {
+        setSwapSimulationError(getWriteError(error) ?? "Transaction journal blocked swap submission");
+      }
       // The wagmi mutation retains the rejection for the originating mounted session.
     }
     } finally {
       swapSubmitInFlight.current = false;
+      if (nativeMaxProbe) {
+        nativeSwapMaxProbeRef.current = false;
+        setNativeSwapMaxPending(false);
+      }
     }
+  };
+
+  const canReuseNativeSwapMaxObservation = nativeSwapMaxBindingRef.current?.context === swapMaxContextFingerprint && latestSwapGasObservationRef.current?.context === swapMaxContextFingerprint && parsedAmount !== null && parsedAmount > 0n;
+  const handleNativeSwapMax = () => {
+    if (!nativeInput || nativeSwapMaxPending) return;
+    const observation = latestSwapGasObservationRef.current;
+    if (gasReview?.action === "swap" && observation !== null && canReuseNativeSwapMaxObservation) {
+      const max = safeMaxAmount({ asset: "native", balance: observation.balance, gasReserveWei: observation.reserve });
+      if (max === 0n) {
+        setGasReviewError("Native Max is unavailable because the wallet balance does not exceed the reviewed gas reserve");
+        return;
+      }
+      setAmount(maxAmountInput({ asset: "native", balance: observation.balance, decimals: 18, gasReserveWei: observation.reserve }));
+      nativeSwapMaxBindingRef.current = { context: swapMaxContextFingerprint, value: max };
+      return;
+    }
+    if (!canSwap) return;
+    nativeSwapMaxProbeRef.current = true;
+    setNativeSwapMaxPending(true);
+    void handleSwap();
   };
 
   return (
@@ -2003,6 +2284,17 @@ function SwapView({
           selectedPoolId={selectedPoolId}
         />
 
+        {connected && selectedPoolHasWrapper && wrappedNativeToken ? (
+          <fieldset className="routing-mode-control" data-testid="swap-native-mode">
+            <legend>Wrapped-native asset mode</legend>
+            <div className="segmented" role="group" aria-label="Wrapped-native asset mode">
+              <button aria-pressed={useNativeWrapper} className={useNativeWrapper ? "segment active" : "segment"} onClick={() => { nativeSwapMaxBindingRef.current = null; setUseNativeWrapper(true); setApprovalConfirmation(null); setNativeReceiptReview(null); setNativeReceiptError(null); }} type="button">ETH · native</button>
+              <button aria-pressed={!useNativeWrapper} className={!useNativeWrapper ? "segment active" : "segment"} onClick={() => { nativeSwapMaxBindingRef.current = null; setUseNativeWrapper(false); setApprovalConfirmation(null); setNativeReceiptReview(null); setNativeReceiptError(null); }} type="button">{wrappedNativeToken.symbol} · ERC-20</button>
+            </div>
+            <p data-testid="swap-wrapper-disclosure">ETH uses router native calldata and transaction value. {wrappedNativeToken.symbol} remains ERC-20 {wrappedNativeToken.address} and requires allowance when sold. Native Max requires a current positive probe amount so Feather can review buffered gas before computing spendable ETH.</p>
+          </fieldset>
+        ) : null}
+
         <SwapMarketRecovery
           error={swapMarketError}
           onRefresh={onRefresh}
@@ -2024,25 +2316,27 @@ function SwapView({
           Sell
         </label>
         <div className="amount-box">
-          <input id="swap-amount" inputMode="decimal" onChange={(event) => setAmount(event.target.value)} value={amount} />
-          <span>{tokenSymbol(tokenIn)}</span>
+          <input id="swap-amount" inputMode="decimal" onChange={(event) => { nativeSwapMaxBindingRef.current = null; setAmount(event.target.value); }} value={amount} />
+          <span>{inputSymbol}</span>
           <button
             className="token-max-button"
             data-testid="swap-max-button"
-            disabled={walletBalance === null || tokenIn === null}
+            disabled={walletBalance === null || tokenIn === null || (nativeInput && ((!canSwap && !canReuseNativeSwapMaxObservation) || nativeSwapMaxPending))}
             onClick={() => {
-              if (walletBalance !== null && tokenIn !== null) setAmount(maxAmountInput({ asset: "token", balance: walletBalance, decimals: tokenIn.decimals }));
+              if (nativeInput) handleNativeSwapMax();
+              else if (walletBalance !== null && tokenIn !== null) setAmount(maxAmountInput({ asset: "token", balance: walletBalance, decimals: tokenIn.decimals }));
             }}
             type="button"
           >Max</button>
         </div>
-        <TokenIdentity token={tokenIn} networkName={registry.chain.name} testId="swap-token-in-identity" />
+        {nativeInput && (parsedAmount === null || parsedAmount <= 0n) ? <div className="state-row warning" data-testid="swap-native-max-guidance"><AlertTriangle size={16} /><span>Enter a valid positive ETH probe amount before using Native Max; no wallet request is opened for the gas probe.</span></div> : null}
+        {nativeInput ? <div className="state-row" data-testid="swap-token-in-identity">ETH native asset · router wrapper {wrappedNativeToken?.symbol} {wrappedNativeToken?.address}</div> : <TokenIdentity token={tokenIn} networkName={registry.chain.name} testId="swap-token-in-identity" />}
         <div className="balance-line">
           <span>Balance</span>
-          <strong data-testid="swap-balance-value">{walletQuery.data ? formatTokenAmount(walletQuery.data.balance, tokenIn) : connected ? "loading" : "connect wallet"}</strong>
+          <strong data-testid="swap-balance-value">{walletQuery.data ? nativeInput ? `${formatUnits(BigInt(walletQuery.data.balance), 18)} ETH` : formatTokenAmount(walletQuery.data.balance, tokenIn) : connected ? "loading" : "connect wallet"}</strong>
         </div>
 
-        <button className="flip-button" type="button" title="Flip tokens" onClick={() => setSwapForY((value) => !value)}>
+        <button className="flip-button" type="button" title="Flip tokens" onClick={() => { nativeSwapMaxBindingRef.current = null; setSwapForY((value) => !value); }}>
           <ArrowLeftRight size={18} />
         </button>
 
@@ -2051,9 +2345,9 @@ function SwapView({
         </label>
         <div className="amount-box output">
           <input id="swap-output" readOnly value={formatSwapOutput(quoteQuery.isFetching, amountOut, tokenOut)} />
-          <span>{tokenSymbol(tokenOut)}</span>
+          <span>{outputSymbol}</span>
         </div>
-        <TokenIdentity token={tokenOut} networkName={registry.chain.name} testId="swap-token-out-identity" />
+        {nativeOutput ? <div className="state-row" data-testid="swap-token-out-identity">ETH native asset · router wrapper {wrappedNativeToken?.symbol} {wrappedNativeToken?.address}</div> : <TokenIdentity token={tokenOut} networkName={registry.chain.name} testId="swap-token-out-identity" />}
 
         <div className="swap-settings">
           <label htmlFor="swap-slippage">
@@ -2067,15 +2361,15 @@ function SwapView({
         </div>
 
         <div className="quote-grid">
-          <MiniMetric label="Minimum received" value={amountOutMin !== null ? formatTokenAmount(amountOutMin.toString(), tokenOut) : "n/a"} />
+          <MiniMetric label="Minimum received" value={amountOutMin !== null ? nativeOutput ? `${formatUnits(amountOutMin, 18)} ETH` : formatTokenAmount(amountOutMin.toString(), tokenOut) : "n/a"} />
           <MiniMetric label="Quote freshness" value={quoteFreshnessLabel} />
-          <MiniMetric data-testid="swap-allowance-value" label="Allowance" value={walletQuery.data ? formatTokenAmount(walletQuery.data.allowance, tokenIn) : "n/a"} />
+          <MiniMetric data-testid="swap-allowance-value" label="Allowance" value={nativeInput ? "not required for ETH" : walletQuery.data ? formatTokenAmount(walletQuery.data.allowance, tokenIn) : "n/a"} />
           <MiniMetric data-testid="swap-native-balance" label="ETH for gas" value={nativeBalance !== null ? `${formatUnits(nativeBalance, 18)} ETH` : connected ? "loading" : "connect wallet"} />
         </div>
 
         <GasReview review={gasReview} />
 
-        <ApprovalDetails
+        {!nativeInput ? <ApprovalDetails
           asset={tokenSymbol(tokenIn)}
           amount={parsedAmount}
           currentState={walletQuery.data ? `${formatTokenAmount(walletQuery.data.allowance, tokenIn)} allowance${needsApproval ? " (approval needed)" : " (sufficient)"}` : "unavailable"}
@@ -2084,10 +2378,10 @@ function SwapView({
           scope="Exact token amount for this swap"
           spender={registry.contracts.lbRouter}
           token={tokenIn}
-        />
+        /> : <div className="state-row success" data-testid="swap-native-no-approval">ETH uses exact transaction value and never requests ERC-20 approval.</div>}
 
         <div className="action-stack">
-          <button
+          {!nativeInput ? <button
             className="secondary-button wide"
             data-testid="swap-approve-button"
             type="button"
@@ -2098,7 +2392,7 @@ function SwapView({
           >
             {approvalSimulationPending || approvalWrite.isPending || approvalReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <CheckCircle2 size={18} />}
             <span>{needsApproval ? `Approve ${tokenSymbol(tokenIn)}` : "Approved"}</span>
-          </button>
+          </button> : null}
           <button className="primary-button wide" data-testid="swap-submit-button" type="button" disabled={!canSwap} onClick={handleSwap}>
             {swapSimulationPending || swapWrite.isPending || swapReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <ArrowLeftRight size={18} />}
             <span>
@@ -2125,6 +2419,9 @@ function SwapView({
             </button>
           ) : null}
         </div>
+
+        {nativeReceiptReview ? <div className="review-card" data-testid="native-swap-receipt-review"><strong>Canonical native swap accounting</strong><p>{nativeReceiptReview.direction === "native-in" ? "ETH spent" : "ETH received"}: {formatUnits(BigInt(nativeReceiptReview.nativeAmount), 18)} ETH · token amount {nativeReceiptReview.tokenAmount} · gas {formatUnits(BigInt(nativeReceiptReview.gasCost), 18)} ETH</p></div> : null}
+        {nativeReceiptError ? <div className="state-row failure" data-testid="native-swap-receipt-error">{nativeReceiptError}</div> : null}
 
         <SwapStateRows
           amountError={inputError}
@@ -2918,6 +3215,7 @@ async function reviewExactGas(input: {
   getBalance: () => Promise<bigint>;
   getGasPrice: () => Promise<bigint>;
   isCurrent: () => boolean;
+  onReview?: (review: ExactGasReview, nativeBalance: bigint) => void;
   setError: (message: string | null) => void;
   setReview: (review: ExactGasReview | null) => void;
   transactionValue?: bigint;
@@ -2929,6 +3227,7 @@ async function reviewExactGas(input: {
     const transactionValue = input.transactionValue ?? 0n;
     const requiredWei = bufferedWei + transactionValue;
     const review = { action: input.action, bufferedWei, executionFingerprint: input.executionFingerprint, gasLimit, gasPrice, requiredWei, transactionValue };
+    input.onReview?.(review, nativeBalance);
     if (nativeBalance < requiredWei) {
       input.setReview(review);
       input.setError(`Insufficient ETH for gas and value: exact buffered requirement is ${formatUnits(requiredWei, 18)} ETH, but this wallet has ${formatUnits(nativeBalance, 18)} ETH`);
@@ -3014,7 +3313,7 @@ function LiquidityAddReviewPanel({
           <div><dt>Position recipient</dt><dd><code className="approval-address">{parameters.to}</code></dd></div>
           <div><dt>Refund recipient</dt><dd><code className="approval-address">{parameters.refundTo}</code></dd></div>
           <div><dt>Unix deadline</dt><dd>{parameters.deadline.toString()}</dd></div>
-          <div><dt>Native value</dt><dd>0 ETH · ERC-20 addLiquidity</dd></div>
+          <div><dt>Native value</dt><dd>{reviewState.review.assetMode === "native" ? `${formatUnits(reviewState.review.transaction.value, 18)} ETH · addLiquidityNATIVE` : "0 ETH · ERC-20 addLiquidity"}</dd></div>
         </dl>
       </section>
       <details className="review-details" data-testid="liquidity-review-bin-shares">
@@ -3035,7 +3334,7 @@ function LiquidityAddReviewPanel({
       </div>
       <div className="state-row" data-testid="liquidity-review-native-scope">
         <CircleDollarSign size={16} />
-        <span>This path deposits ERC-20 tokens only. Wrapped native assets remain ERC-20; ETH is used only for gas. Native add-liquidity reconciliation is unavailable until the dedicated native flow lands.</span>
+        <span>{reviewState.review.assetMode === "native" ? "ETH is wrapped by the router and sent to the pair. Any unused native-side amount is refunded as wrapped-native ERC-20, not ETH." : "This review uses ERC-20 addLiquidity with zero transaction value; ETH is used only for gas."}</span>
       </div>
     </div>
   );
@@ -3062,6 +3361,7 @@ function LiquidityReceiptReview({
     return <div className="state-row" data-testid="liquidity-receipt-review-loading"><LoaderCircle className="spin" size={16} /><span>Reconciling canonical receipt {formatCompactAddress(hash)}</span></div>;
   }
   const reconciliation = deserializeBigintState<AddLiquidityReceiptReconciliation>(reconciliationJson);
+  const nativeReconciliation = "nativeValueWei" in reconciliation ? reconciliation as NativeAddLiquidityReceiptReconciliation : null;
   return (
     <div className="review-card" data-testid="liquidity-receipt-review">
       <div className="panel-heading"><span>Canonical receipt accounting</span><StatusBadge state={reconciliation.estimateMatchedActual ? "ready" : "partial"} label={reconciliation.estimateMatchedActual ? "estimate matched" : "execution drift"} /></div>
@@ -3080,6 +3380,9 @@ function LiquidityReceiptReview({
         <MiniMetric label="Actual LB shares" value={reconciliation.mintedShares.reduce((total, shares) => total + shares, 0n).toString()} />
         <MiniMetric label="Actual gas used" value={reconciliation.actualGasUsed.toString()} />
         <MiniMetric label="Actual gas cost" value={`${formatUnits(reconciliation.actualGasCostWei, 18)} ETH`} />
+        {nativeReconciliation ? <MiniMetric label="Exact native value" value={`${formatUnits(nativeReconciliation.nativeValueWei, 18)} ETH`} /> : null}
+        {nativeReconciliation ? <MiniMetric label="Wrapped-native refund" value={formatTokenAmount(nativeReconciliation.wrapperRefund.toString(), tokenX?.tags.includes("wrapped-native") ? tokenX : tokenY)} /> : null}
+        {nativeReconciliation ? <MiniMetric label="LP balance deltas" value={nativeReconciliation.lpBalanceDeltas.map((row) => `${row.binId.toString()}:${row.delta.toString()}`).join(", ")} /> : null}
       </div>
       <details className="review-details" data-testid="liquidity-receipt-bin-shares">
         <summary>Actual per-bin claims</summary>
@@ -3091,6 +3394,36 @@ function LiquidityReceiptReview({
         <div className="state-row warning" data-testid="liquidity-receipt-drift"><AlertTriangle size={16} /><span>Estimate versus actual: {reconciliation.estimateDifferences.join("; ")}.</span></div>
       ) : null}
       <div className="state-row"><CheckCircle2 size={16} /><span>Actual fees, deposited amounts, residual transfers, bin IDs, and shares come from the canonical replacement-aware receipt. Wallet delta is shown only when standard direct Transfer evidence reconciles exactly; otherwise it remains unavailable.</span></div>
+    </div>
+  );
+}
+
+function NativeRemoveReceiptReview({
+  error,
+  hash,
+  reconciliation
+}: {
+  error: unknown;
+  hash: Address | null;
+  reconciliation: NativeRemoveLiquidityReceiptReconciliation | undefined;
+}) {
+  if (hash === null) return null;
+  if (error !== null && error !== undefined) {
+    return <div className="state-row failure" data-testid="remove-receipt-review-error"><AlertTriangle size={16} /><span>Canonical native withdrawal accounting failed closed: {getWriteError(error)}</span></div>;
+  }
+  if (reconciliation === undefined) {
+    return <div className="state-row" data-testid="remove-receipt-review-loading"><LoaderCircle className="spin" size={16} /><span>Reconciling canonical native withdrawal {formatCompactAddress(hash)}</span></div>;
+  }
+  return (
+    <div className="review-card" data-testid="remove-receipt-review">
+      <div className="panel-heading"><span>Canonical native withdrawal</span><StatusBadge state="ready" label="exactly reconciled" /></div>
+      <div className="quote-grid">
+        <MiniMetric label="ETH received" value={`${formatUnits(reconciliation.nativeAmount, 18)} ETH`} />
+        <MiniMetric label="Other token received" value={reconciliation.otherTokenAmount.toString()} />
+        <MiniMetric label="Actual gas cost" value={`${formatUnits(reconciliation.actualGasCostWei, 18)} ETH`} />
+        <MiniMetric label="Burned bins" value={reconciliation.burnedBalances.map((row) => `${row.binId.toString()}:${row.delta.toString()}`).join(", ")} />
+      </div>
+      <div className="state-row"><CheckCircle2 size={16} /><span>Gas-adjusted ETH, the other-token receipt, withdrawal events, burn events, and every per-bin LB decrease match the immutable reviewed transaction.</span></div>
     </div>
   );
 }
@@ -4607,6 +4940,8 @@ function LiquidityView({
   const [narrowPresetInput, setNarrowPresetInput] = useState("3");
   const [widePresetInput, setWidePresetInput] = useState("21");
   const [liquidityStrategy, setLiquidityStrategy] = useState<LiquidityStrategy>("spot");
+  const [liquidityAssetMode, setLiquidityAssetMode] = useState<"erc20" | "native">("erc20");
+  const [removeAssetMode, setRemoveAssetMode] = useState<"erc20" | "native">("erc20");
   const [slippageInput, setSlippageInput] = useState("0.5");
   const [idSlippageInput, setIdSlippageInput] = useState("2");
   const [deadlineInput, setDeadlineInput] = useState("20");
@@ -4616,6 +4951,8 @@ function LiquidityView({
   const [gasReview, setGasReview] = useState<ExactGasReview | null>(null);
   const [liquidityAddReview, setLiquidityAddReview] = useState<LiquidityAddReviewState | null>(null);
   const [submittedLiquidityAddReview, setSubmittedLiquidityAddReview] = useState<SubmittedLiquidityAddReview | null>(null);
+  const [submittedNativeRemoveReview, setSubmittedNativeRemoveReview] = useState<SubmittedNativeRemoveReview | null>(null);
+  const [nativeRemoveOrphanNotice, setNativeRemoveOrphanNotice] = useState<string | null>(null);
   const [liquidityReviewNotice, setLiquidityReviewNotice] = useState<string | null>(null);
   const [removeQuoteReviewRequired, setRemoveQuoteReviewRequired] = useState<string | null>(null);
   const [fullExitUi, setFullExitUi] = useState<FullExitUiState | null>(null);
@@ -4641,6 +4978,10 @@ function LiquidityView({
   const approveYSubmitInFlightRef = useRef<number | null>(null);
   const approveLbSubmitInFlightRef = useRef<number | null>(null);
   const addSubmitInFlightRef = useRef<number | null>(null);
+  const nativeAddMaxProbeRef = useRef<"x" | "y" | null>(null);
+  const nativeAddMaxBindingRef = useRef<{ context: string; side: "x" | "y"; value: bigint } | null>(null);
+  const latestAddGasObservationRef = useRef<{ balance: bigint; context: string; reserve: bigint } | null>(null);
+  const [nativeAddMaxPending, setNativeAddMaxPending] = useState(false);
   const latestLiquidityAddReviewRef = useRef<LiquidityAddReviewState | null>(null);
   const removeSubmitInFlightRef = useRef<number | null>(null);
   const [handledApproveXHash, setHandledApproveXHash] = useState<Address | null>(null);
@@ -4656,7 +4997,7 @@ function LiquidityView({
   const approveXWrite = useWriteContract();
   const approveYWrite = useWriteContract();
   const approveLbWrite = useWriteContract();
-  const addWrite = useWriteContract();
+  const addWrite = useSendTransaction();
   const removeWrite = useSendTransaction();
   const approveXReceipt = useWaitForTransactionReceipt({ hash: approveXWrite.data });
   const approveYReceipt = useWaitForTransactionReceipt({ hash: approveYWrite.data });
@@ -4696,6 +5037,30 @@ function LiquidityView({
   const pool = executionPoolFromDescriptor(selectedPool) ?? executionPoolFromDescriptor(removeSelectedPool);
   const tokenX = selectedPool.tokenX ?? removeSelectedPool.tokenX;
   const tokenY = selectedPool.tokenY ?? removeSelectedPool.tokenY;
+  const liquidityWrappedNativeCandidates = [tokenX, tokenY].filter((token): token is TokenMetadata =>
+    token !== null && token.tags.includes("wrapped-native") && tokenAllowsAction(token, "add-liquidity")
+  );
+  const liquidityWrappedNative = liquidityWrappedNativeCandidates.length === 1 ? liquidityWrappedNativeCandidates[0] : null;
+  const liquidityWrappedNativeSide: "x" | "y" | null =
+    liquidityWrappedNative === null || pool === null
+      ? null
+      : isAddressEqual(liquidityWrappedNative.address, pool.tokenX)
+        ? "x"
+        : isAddressEqual(liquidityWrappedNative.address, pool.tokenY)
+          ? "y"
+          : null;
+  const removeWrappedNativeCandidates = [tokenX, tokenY].filter((token): token is TokenMetadata =>
+    token !== null && token.tags.includes("wrapped-native") && tokenAllowsAction(token, "remove-liquidity")
+  );
+  const removeWrappedNative = removeWrappedNativeCandidates.length === 1 ? removeWrappedNativeCandidates[0] : null;
+  const removeWrappedNativeSide: "x" | "y" | null =
+    removeWrappedNative === null || pool === null
+      ? null
+      : isAddressEqual(removeWrappedNative.address, pool.tokenX)
+        ? "x"
+        : isAddressEqual(removeWrappedNative.address, pool.tokenY)
+          ? "y"
+          : null;
   const connected = account.status === "connected" && account.address !== undefined;
   const onWrongChain = connected && activeWalletChainId !== registry.chainId;
   const liquidityLifecycleKey = [
@@ -4849,6 +5214,23 @@ function LiquidityView({
   const liquidityMode = distributionResult.distribution?.mode ?? null;
   const amountX = liquidityMode === "token-y" ? 0n : parsedAmountX;
   const amountY = liquidityMode === "token-x" ? 0n : parsedAmountY;
+  const nativeSideAmount = liquidityWrappedNativeSide === "x" ? amountX : liquidityWrappedNativeSide === "y" ? amountY : null;
+  const nativeAdd = liquidityAssetMode === "native" && nativeSideAmount !== null && nativeSideAmount > 0n;
+  const effectiveAddAssetMode: "erc20" | "native" = nativeAdd ? "native" : "erc20";
+  const addTransactionValue = nativeAdd ? nativeSideAmount : 0n;
+  const addAssetFingerprint = liquidityAddAssetFingerprint({
+    assetMode: effectiveAddAssetMode,
+    selectedMode: liquidityAssetMode,
+    transactionValue: addTransactionValue.toString(),
+    wrappedNative: liquidityWrappedNative?.address ?? null,
+    wrappedNativeSide: liquidityWrappedNativeSide
+  });
+  const nativeRemove = removeAssetMode === "native" && removeWrappedNative !== null && removeWrappedNativeSide !== null;
+  const effectiveRemoveAssetMode: "erc20" | "native" = nativeRemove ? "native" : "erc20";
+  const buildExactRemoveTransaction = (input: Parameters<typeof buildRemoveLiquidityTransaction>[1]) =>
+    nativeRemove
+      ? buildRemoveLiquidityNativeTransaction(registry, input)
+      : buildRemoveLiquidityTransaction(registry, input);
   const rangeControlError =
     rangeEditError ??
     (rangePriceQuery.error ? `Range price read failed: ${getWriteError(rangePriceQuery.error) ?? "price unavailable"}` : null) ??
@@ -4949,7 +5331,32 @@ function LiquidityView({
     liquidityStrategy,
     distributionResult.distribution?.deltaIds.join(",") ?? "",
     distributionResult.distribution?.distributionX.join(",") ?? "",
-    distributionResult.distribution?.distributionY.join(",") ?? ""
+    distributionResult.distribution?.distributionY.join(",") ?? "",
+    addAssetFingerprint
+  ].join("|");
+  const addMaxContextFingerprint = [
+    environmentKey,
+    registry.chainId.toString(),
+    activeWalletChainId?.toString() ?? "",
+    registry.endpoints.rpcUrl,
+    registry.contracts.lbRouter,
+    account.address ?? "",
+    pool?.pair ?? "",
+    pool?.tokenX ?? "",
+    pool?.tokenY ?? "",
+    pool?.binStep.toString() ?? "",
+    activeBin?.toString() ?? "",
+    slippageBps?.toString() ?? "",
+    idSlippage?.toString() ?? "",
+    deadlineMinutes?.toString() ?? "",
+    liquidityStrategy,
+    distributionResult.distribution?.deltaIds.join(",") ?? "",
+    distributionResult.distribution?.distributionX.join(",") ?? "",
+    distributionResult.distribution?.distributionY.join(",") ?? "",
+    liquidityWrappedNativeSide === "x" ? amountY?.toString() ?? "" : amountX?.toString() ?? "",
+    liquidityAssetMode,
+    liquidityWrappedNative?.address ?? "",
+    liquidityWrappedNativeSide ?? ""
   ].join("|");
   const addRetrySettingsFingerprint = [
     environmentKey,
@@ -4964,7 +5371,8 @@ function LiquidityView({
     deadlineMinutes?.toString() ?? "",
     liquidityStrategy,
     lowerDelta?.toString() ?? "",
-    upperDelta?.toString() ?? ""
+    upperDelta?.toString() ?? "",
+    addAssetFingerprint
   ].join("|");
   const latestAddExecutionFingerprint = useRef(addExecutionFingerprint);
   latestAddExecutionFingerprint.current = addExecutionFingerprint;
@@ -4987,11 +5395,7 @@ function LiquidityView({
       !isAddressEqual(submittedLiquidityAddReview.review.pair, pool.pair) ||
       !isAddressEqual(submittedLiquidityAddReview.review.router, registry.contracts.lbRouter)
     ) return null;
-    const exactCalldataFingerprint = keccak256(encodeFunctionData({
-      abi: lbRouterAbi,
-      functionName: "addLiquidity",
-      args: [submittedLiquidityAddReview.review.parameters]
-    }));
+    const exactCalldataFingerprint = keccak256(submittedLiquidityAddReview.review.transaction.data);
     return transactionJournal.records
       .filter((record) =>
         record.reviewed.intent === "add-liquidity" &&
@@ -5010,17 +5414,84 @@ function LiquidityView({
       .sort((left, right) => right.createdAt - left.createdAt)[0] ?? null;
   }, [account.address, environmentKey, pool, registry.chainId, registry.contracts.lbRouter, submittedLiquidityAddReview, transactionJournal.records]);
   const canonicalAddHash = canonicalAddRecord?.canonicalReceipt?.hash ?? null;
-  const addReceiptReconciliationQuery = useQuery<AddLiquidityReceiptReconciliation>({
+  const activeAddJournalRecord = addWrite.data
+    ? transactionJournal.records.find((record) => record.reviewed.intent === "add-liquidity" && record.activeHash?.toLowerCase() === addWrite.data!.toLowerCase()) ?? null
+    : null;
+  useEffect(() => {
+    if (activeAddJournalRecord?.status === "orphaned") {
+      setLiquidityReviewNotice("Add-liquidity receipt was reorganized; canonical accounting was removed and retry remains journal-blocked.");
+    }
+  }, [activeAddJournalRecord?.status]);
+  const addReceiptReconciliationQuery = useQuery<AddLiquidityReceiptReconciliation | NativeAddLiquidityReceiptReconciliation>({
     queryKey: ["canonicalAddLiquidityReceipt", registry.chainId, canonicalAddHash],
     queryFn: async () => {
       if (canonicalAddHash === null || submittedLiquidityAddReview === null || account.address === undefined) {
         throw new Error("Canonical add-liquidity receipt is unavailable");
       }
+      const owner = account.address;
       const receipt = await publicClient.getTransactionReceipt({ hash: canonicalAddHash });
       if (receipt.status !== "success" || receipt.blockHash.toLowerCase() !== canonicalAddRecord?.canonicalReceipt?.blockHash.toLowerCase()) {
         throw new Error("Canonical add-liquidity receipt changed during reconciliation");
       }
       const parameters = submittedLiquidityAddReview.review.parameters;
+      if (submittedLiquidityAddReview.review.assetMode === "native") {
+        if (receipt.blockNumber === 0n || liquidityWrappedNative === null || liquidityWrappedNativeSide === null) {
+          throw new Error("Canonical native add-liquidity balance evidence is unavailable");
+        }
+        const beforeBlockNumber = receipt.blockNumber - 1n;
+        const otherToken = liquidityWrappedNativeSide === "x" ? parameters.tokenY : parameters.tokenX;
+        const transaction = await publicClient.getTransaction({ hash: canonicalAddHash });
+        if (
+          !isAddressEqual(transaction.from, owner) ||
+          transaction.to === null ||
+          !isAddressEqual(transaction.to, submittedLiquidityAddReview.review.transaction.to) ||
+          transaction.input.toLowerCase() !== submittedLiquidityAddReview.review.transaction.data.toLowerCase() ||
+          transaction.value !== submittedLiquidityAddReview.review.transaction.value
+        ) throw new Error("Canonical native add-liquidity transaction differs from the reviewed request");
+        const canonicalBefore = await publicClient.getBlock({ blockNumber: receipt.blockNumber });
+        if (canonicalBefore.hash?.toLowerCase() !== receipt.blockHash.toLowerCase()) throw new Error("Canonical native add-liquidity receipt block changed before balance reads");
+        const [nativeBalanceBefore, nativeBalanceAfter, wrapperBalanceBefore, wrapperBalanceAfter, otherTokenBalanceBefore, otherTokenBalanceAfter, ...lpValues] = await Promise.all([
+          publicClient.getBalance({ address: owner, blockNumber: beforeBlockNumber }),
+          publicClient.getBalance({ address: owner, blockNumber: receipt.blockNumber }),
+          publicClient.readContract({ address: liquidityWrappedNative.address, abi: erc20Abi, functionName: "balanceOf", args: [owner], blockNumber: beforeBlockNumber }),
+          publicClient.readContract({ address: liquidityWrappedNative.address, abi: erc20Abi, functionName: "balanceOf", args: [owner], blockNumber: receipt.blockNumber }),
+          publicClient.readContract({ address: otherToken, abi: erc20Abi, functionName: "balanceOf", args: [owner], blockNumber: beforeBlockNumber }),
+          publicClient.readContract({ address: otherToken, abi: erc20Abi, functionName: "balanceOf", args: [owner], blockNumber: receipt.blockNumber }),
+          ...submittedLiquidityAddReview.review.simulation.depositIds.flatMap((binId) => [
+            publicClient.readContract({ address: submittedLiquidityAddReview.review.pair, abi: lbPairAbi, functionName: "balanceOf", args: [owner, binId], blockNumber: beforeBlockNumber }),
+            publicClient.readContract({ address: submittedLiquidityAddReview.review.pair, abi: lbPairAbi, functionName: "balanceOf", args: [owner, binId], blockNumber: receipt.blockNumber })
+          ])
+        ]);
+        const canonicalAfter = await publicClient.getBlock({ blockNumber: receipt.blockNumber });
+        if (canonicalAfter.hash?.toLowerCase() !== receipt.blockHash.toLowerCase()) throw new Error("Canonical native add-liquidity receipt block reorganized during accounting");
+        return reconcileNativeAddLiquidityReceipt({
+          account: owner,
+          effectiveGasPrice: receipt.effectiveGasPrice,
+          expectedReview: submittedLiquidityAddReview.review,
+          gasUsed: receipt.gasUsed,
+          logs: receipt.logs,
+          lpBalances: submittedLiquidityAddReview.review.simulation.depositIds.map((binId, index) => {
+            const before = lpValues[index * 2];
+            const after = lpValues[index * 2 + 1];
+            if (before === undefined || after === undefined) throw new Error("Canonical LP balance evidence is incomplete");
+            return { after, before, binId };
+          }),
+          nativeBalanceAfter,
+          nativeBalanceBefore,
+          nativeSide: liquidityWrappedNativeSide,
+          otherTokenBalanceAfter,
+          otherTokenBalanceBefore,
+          pair: submittedLiquidityAddReview.review.pair,
+          recipient: parameters.to,
+          refundRecipient: parameters.refundTo,
+          router: registry.contracts.lbRouter,
+          tokenX: parameters.tokenX,
+          tokenY: parameters.tokenY,
+          transactionValue: submittedLiquidityAddReview.review.transaction.value,
+          wrapperBalanceAfter,
+          wrapperBalanceBefore
+        });
+      }
       return reconcileAddLiquidityReceipt({
         account: account.address,
         effectiveGasPrice: receipt.effectiveGasPrice,
@@ -5036,6 +5507,116 @@ function LiquidityView({
       });
     },
     enabled: canonicalAddHash !== null && submittedLiquidityAddReview !== null && account.address !== undefined,
+    retry: false
+  });
+  const canonicalNativeRemoveRecord = useMemo(() => {
+    if (
+      submittedNativeRemoveReview === null ||
+      submittedNativeRemoveReview.chainId !== registry.chainId ||
+      submittedNativeRemoveReview.environment !== environmentKey
+    ) return null;
+    const calldataFingerprint = keccak256(submittedNativeRemoveReview.transaction.data);
+    return transactionJournal.records
+      .filter((record) =>
+        record.reviewed.intent === "remove-liquidity" &&
+        record.reviewed.calldataFingerprint.toLowerCase() === calldataFingerprint.toLowerCase() &&
+        record.reviewed.executionFingerprint === submittedNativeRemoveReview.executionFingerprint &&
+        record.reviewed.chainId === submittedNativeRemoveReview.chainId &&
+        record.reviewed.environment === submittedNativeRemoveReview.environment &&
+        isAddressEqual(record.reviewed.target, submittedNativeRemoveReview.transaction.to) &&
+        record.reviewed.value === submittedNativeRemoveReview.transaction.value.toString() &&
+        isAddressEqual(record.reviewed.account, submittedNativeRemoveReview.account) &&
+        record.reviewed.poolId !== null && isAddressEqual(record.reviewed.poolId as Address, submittedNativeRemoveReview.pair) &&
+        record.createdAt >= submittedNativeRemoveReview.submittedAt &&
+        record.status === "canonical" &&
+        record.activeHash !== null &&
+        record.canonicalReceipt?.status === "success" &&
+        record.canonicalReceipt.hash.toLowerCase() === record.activeHash.toLowerCase() &&
+        record.replacementCompatibility !== "incompatible"
+      )
+      .sort((left, right) => right.createdAt - left.createdAt)[0] ?? null;
+  }, [environmentKey, registry.chainId, submittedNativeRemoveReview, transactionJournal.records]);
+  const canonicalNativeRemoveHash = canonicalNativeRemoveRecord?.canonicalReceipt?.hash ?? null;
+  const activeNativeRemoveRecord = useMemo(() => {
+    if (submittedNativeRemoveReview === null) return null;
+    const calldataFingerprint = keccak256(submittedNativeRemoveReview.transaction.data);
+    return transactionJournal.records
+      .filter((record) =>
+        record.reviewed.intent === "remove-liquidity" &&
+        record.reviewed.calldataFingerprint.toLowerCase() === calldataFingerprint.toLowerCase() &&
+        record.reviewed.executionFingerprint === submittedNativeRemoveReview.executionFingerprint
+      )
+      .sort((left, right) => right.createdAt - left.createdAt)[0] ?? null;
+  }, [submittedNativeRemoveReview, transactionJournal.records]);
+  useEffect(() => {
+    if (activeNativeRemoveRecord?.status !== "orphaned") return;
+    setSubmittedNativeRemoveReview(null);
+    setLiquidityReceiptPhase("idle");
+    setSubmittedRemoveReceiptContext(null);
+    setNativeRemoveOrphanNotice("Native withdrawal receipt was reorganized; canonical accounting was removed and retry remains journal-blocked.");
+  }, [activeNativeRemoveRecord?.status]);
+  const nativeRemoveReceiptReconciliationQuery = useQuery<NativeRemoveLiquidityReceiptReconciliation>({
+    queryKey: ["canonicalNativeRemoveLiquidityReceipt", registry.chainId, canonicalNativeRemoveHash],
+    queryFn: async () => {
+      if (canonicalNativeRemoveHash === null || submittedNativeRemoveReview === null) throw new Error("Canonical native removal receipt is unavailable");
+      const review = submittedNativeRemoveReview;
+      const receipt = await publicClient.getTransactionReceipt({ hash: canonicalNativeRemoveHash });
+      if (receipt.status !== "success" || receipt.blockNumber === 0n || receipt.blockHash.toLowerCase() !== canonicalNativeRemoveRecord?.canonicalReceipt?.blockHash.toLowerCase()) {
+        throw new Error("Canonical native removal receipt changed during reconciliation");
+      }
+      const transaction = await publicClient.getTransaction({ hash: canonicalNativeRemoveHash });
+      if (
+        !isAddressEqual(transaction.from, review.account) || transaction.to === null ||
+        !isAddressEqual(transaction.to, review.transaction.to) ||
+        transaction.input.toLowerCase() !== review.transaction.data.toLowerCase() ||
+        transaction.value !== review.transaction.value
+      ) throw new Error("Canonical native removal transaction differs from the reviewed request");
+      const receiptBlock = await publicClient.getBlock({ blockNumber: receipt.blockNumber });
+      if (receiptBlock.hash?.toLowerCase() !== receipt.blockHash.toLowerCase()) throw new Error("Canonical native removal block changed before balance reads");
+      const beforeBlockNumber = receipt.blockNumber - 1n;
+      const otherToken = review.nativeSide === "x" ? review.tokenY : review.tokenX;
+      const [nativeBalanceBefore, nativeBalanceAfter, otherTokenBalanceBefore, otherTokenBalanceAfter, ...lpValues] = await Promise.all([
+        publicClient.getBalance({ address: review.account, blockNumber: beforeBlockNumber }),
+        publicClient.getBalance({ address: review.account, blockNumber: receipt.blockNumber }),
+        publicClient.readContract({ address: otherToken, abi: erc20Abi, functionName: "balanceOf", args: [review.account], blockNumber: beforeBlockNumber }),
+        publicClient.readContract({ address: otherToken, abi: erc20Abi, functionName: "balanceOf", args: [review.account], blockNumber: receipt.blockNumber }),
+        ...review.ids.flatMap((binId) => [
+          publicClient.readContract({ address: review.pair, abi: lbPairAbi, functionName: "balanceOf", args: [review.account, binId], blockNumber: beforeBlockNumber }),
+          publicClient.readContract({ address: review.pair, abi: lbPairAbi, functionName: "balanceOf", args: [review.account, binId], blockNumber: receipt.blockNumber })
+        ])
+      ]);
+      const canonicalAfter = await publicClient.getBlock({ blockNumber: receipt.blockNumber });
+      if (canonicalAfter.hash?.toLowerCase() !== receipt.blockHash.toLowerCase()) throw new Error("Canonical native removal block reorganized during accounting");
+      return reconcileNativeRemoveLiquidityReceipt({
+        account: review.account,
+        burnAmounts: review.amounts,
+        effectiveGasPrice: receipt.effectiveGasPrice,
+        expectedAmountX: review.expectedAmountX,
+        expectedAmountY: review.expectedAmountY,
+        gasUsed: receipt.gasUsed,
+        ids: review.ids,
+        logs: receipt.logs,
+        lpBalances: review.ids.map((binId, index) => {
+          const before = lpValues[index * 2];
+          const after = lpValues[index * 2 + 1];
+          if (before === undefined || after === undefined) throw new Error("Canonical native removal LP evidence is incomplete");
+          return { after, before, binId };
+        }),
+        minimumAmountX: review.minimumAmountX,
+        minimumAmountY: review.minimumAmountY,
+        nativeBalanceAfter,
+        nativeBalanceBefore,
+        nativeSide: review.nativeSide,
+        otherTokenBalanceAfter,
+        otherTokenBalanceBefore,
+        pair: review.pair,
+        router: registry.contracts.lbRouter,
+        tokenX: review.tokenX,
+        tokenY: review.tokenY,
+        transactionValue: review.transaction.value
+      });
+    },
+    enabled: canonicalNativeRemoveHash !== null && submittedNativeRemoveReview !== null,
     retry: false
   });
   const rangeSliderMin = Math.min(-MAX_LIQUIDITY_BINS, lowerDelta ?? 0, (upperDelta ?? 0) - MAX_LIQUIDITY_BINS + 1);
@@ -5200,10 +5781,16 @@ function LiquidityView({
   const walletAllowanceX = walletData ? BigInt(walletData.allowanceX) : null;
   const walletAllowanceY = walletData ? BigInt(walletData.allowanceY) : null;
   const nativeBalance = walletData ? BigInt(walletData.nativeBalance) : null;
-  const needsXApproval = amountX !== null && amountX > 0n && walletAllowanceX !== null && walletAllowanceX < amountX;
-  const needsYApproval = amountY !== null && amountY > 0n && walletAllowanceY !== null && walletAllowanceY < amountY;
-  const insufficientX = amountX !== null && amountX > 0n && walletBalanceX !== null && walletBalanceX < amountX;
-  const insufficientY = amountY !== null && amountY > 0n && walletBalanceY !== null && walletBalanceY < amountY;
+  const nativeModeX = liquidityAssetMode === "native" && liquidityWrappedNativeSide === "x";
+  const nativeModeY = liquidityAssetMode === "native" && liquidityWrappedNativeSide === "y";
+  const nativeX = nativeAdd && liquidityWrappedNativeSide === "x";
+  const nativeY = nativeAdd && liquidityWrappedNativeSide === "y";
+  const spendableBalanceX = nativeX ? nativeBalance : walletBalanceX;
+  const spendableBalanceY = nativeY ? nativeBalance : walletBalanceY;
+  const needsXApproval = !nativeX && amountX !== null && amountX > 0n && walletAllowanceX !== null && walletAllowanceX < amountX;
+  const needsYApproval = !nativeY && amountY !== null && amountY > 0n && walletAllowanceY !== null && walletAllowanceY < amountY;
+  const insufficientX = amountX !== null && amountX > 0n && spendableBalanceX !== null && spendableBalanceX < amountX;
+  const insufficientY = amountY !== null && amountY > 0n && spendableBalanceY !== null && spendableBalanceY < amountY;
   const approveXExecutionFingerprint = [
     addExecutionFingerprint,
     "token-x",
@@ -5278,6 +5865,7 @@ function LiquidityView({
   latestLbApprovalExecutionFingerprint.current = lbApprovalExecutionFingerprint;
   const removeExecutionContextFingerprint = burnExecutionContextFingerprint({
     account: account.address ?? null,
+    assetMode: effectiveRemoveAssetMode,
     binStep: pool?.binStep ?? null,
     burnBps: removePercentBps?.toString() ?? null,
     deadlineMinutes,
@@ -5286,11 +5874,15 @@ function LiquidityView({
     pair: pool?.pair ?? null,
     registryChainId: registry.chainId,
     router: registry.contracts.lbRouter,
+    selectedAssetMode: removeAssetMode,
     selectedPositionsKey,
     slippageBps: slippageBps?.toString() ?? null,
     tokenX: pool?.tokenX ?? null,
     tokenY: pool?.tokenY ?? null,
-    walletChainId: activeWalletChainId
+    transactionValue: "0",
+    walletChainId: activeWalletChainId,
+    wrappedNative: removeWrappedNative?.address ?? null,
+    wrappedNativeSide: removeWrappedNativeSide
   });
   const latestRemoveExecutionContextFingerprint = useRef(removeExecutionContextFingerprint);
   latestRemoveExecutionContextFingerprint.current = removeExecutionContextFingerprint;
@@ -5559,6 +6151,8 @@ function LiquidityView({
   const approveYSuccess = submittedApproveYReceiptContext === approveYExecutionFingerprint && approveYReceipt.data?.status === "success";
   const approveLbSuccess = submittedLbApprovalReceiptContext === lbApprovalFormFingerprint && approveLbReceipt.data?.status === "success";
   const addSuccess = submittedAddReceiptContext === addExecutionFingerprint && addReceipt.data?.status === "success";
+  const nativeAddAccountingRequired = submittedLiquidityAddReview?.review.assetMode === "native" && submittedLiquidityAddReview.executionFingerprint === submittedAddReceiptContext;
+  const addSuccessReconciled = addSuccess && (!nativeAddAccountingRequired || addReceiptReconciliationQuery.data !== undefined);
   const removeSuccess = removeReceipt.data?.status === "success";
   const approveXReverted = submittedApproveXReceiptContext === approveXExecutionFingerprint && (approveXReceipt.data?.status === "reverted" || isRevertedReceiptError(approveXReceipt.error));
   const approveYReverted = submittedApproveYReceiptContext === approveYExecutionFingerprint && (approveYReceipt.data?.status === "reverted" || isRevertedReceiptError(approveYReceipt.error));
@@ -5567,7 +6161,9 @@ function LiquidityView({
   const removeReverted = removeReceipt.data?.status === "reverted" || isRevertedReceiptError(removeReceipt.error);
   const removeReceiptMatchesCurrentIntent =
     liquidityReceiptPhase === "remove" && submittedRemoveReceiptContext === liquidityLifecycleKey;
-  const currentRemoveSuccess = removeReceiptMatchesCurrentIntent && removeSuccess;
+  const nativeRemoveAccountingRequired = submittedNativeRemoveReview !== null && removeReceiptMatchesCurrentIntent;
+  const currentRemoveOrphaned = currentRemoveFamilyConflict?.status === "orphaned";
+  const currentRemoveSuccess = removeReceiptMatchesCurrentIntent && removeSuccess && !currentRemoveOrphaned && (!nativeRemoveAccountingRequired || nativeRemoveReceiptReconciliationQuery.data !== undefined);
   const currentRemoveReverted = removeReceiptMatchesCurrentIntent && removeReverted;
   const currentLbApprovalSuccess = liquidityReceiptPhase === "lb-approval" && approveLbSuccess;
   const currentLbApprovalReverted = liquidityReceiptPhase === "lb-approval" && approveLbReverted;
@@ -5635,7 +6231,7 @@ function LiquidityView({
     liquidityExitAttestationQuery.error === null &&
     liveLbApproved &&
     !removeBurnPlan.blocked &&
-    liquiditySimulationError === null &&
+    (liquiditySimulationError === null || liquiditySimulationError.startsWith("Simulation failed:")) &&
     !liquiditySimulationPending &&
     !removeWrite.isPending &&
     !removeReceipt.isLoading;
@@ -5724,6 +6320,8 @@ function LiquidityView({
   useEffect(() => {
     setLiquidityReceiptPhase("idle");
     setSubmittedRemoveReceiptContext(null);
+    setSubmittedNativeRemoveReview(null);
+    setNativeRemoveOrphanNotice(null);
     setSubmittedFullExitHash(null);
     setFullExitUi((current) => current !== null && current.workflowKey === currentFullExitWorkflowKey ? current : null);
     setFullExitBatchReview((current) => current !== null && current.workflowKey === currentFullExitWorkflowKey ? current : null);
@@ -6305,6 +6903,7 @@ function LiquidityView({
   const handleAddLiquidity = async () => {
     if (addSubmitInFlightRef.current !== null || !addReady || !pool || !account.address || amountX === null || amountY === null || slippageBps === null || idSlippage === null || deadlineMinutes === null || distributionResult.distribution === null || activeBin === null) return;
 
+    const nativeMaxProbeSide = nativeAddMaxProbeRef.current;
     const submittedOperationGeneration = liquidityOperationGenerationRef.current;
     const submittedExecutionFingerprint = addExecutionFingerprint;
     const previousReview = latestLiquidityAddReviewRef.current?.executionFingerprint === submittedExecutionFingerprint
@@ -6327,6 +6926,15 @@ function LiquidityView({
         refundTo: account.address,
         deadline: deadlineFromNow(deadlineMinutes)
       };
+    const builderParameters = {
+      ...parameters,
+      deltaIds: [...parameters.deltaIds],
+      distributionX: [...parameters.distributionX],
+      distributionY: [...parameters.distributionY]
+    };
+    const transaction = effectiveAddAssetMode === "native"
+      ? buildAddLiquidityNativeTransaction(registry, builderParameters)
+      : buildAddLiquidityTransaction(registry, builderParameters);
     addSubmitInFlightRef.current = submittedOperationGeneration;
     addWrite.reset();
     setSubmittedAddReceiptContext(null);
@@ -6357,10 +6965,12 @@ function LiquidityView({
           }
           return loadPinnedAddLiquidityReview(publicClient, {
             account: account.address,
+            assetMode: effectiveAddAssetMode,
             block,
             pair: pool.pair,
             parameters,
-            router: registry.contracts.lbRouter
+            router: registry.contracts.lbRouter,
+            transaction
           });
         },
         setLiquiditySimulationError,
@@ -6388,28 +6998,48 @@ function LiquidityView({
         operationIsCurrent() &&
         latestAddExecutionFingerprint.current === submittedExecutionFingerprint &&
         latestLiquidityAddReviewRef.current?.review.block.hash.toLowerCase() === exactReview.block.hash.toLowerCase();
+      const gasObservation: { value: { balance: bigint; review: ExactGasReview } | null } = { value: null };
       const gasApproved = await reviewExactGas({
         action: "add liquidity",
         currentReview: gasReview,
-        estimateGas: () => publicClient.estimateContractGas({
-          account: account.address,
-          address: registry.contracts.lbRouter,
-          abi: lbRouterAbi,
-          functionName: "addLiquidity",
-          args: [parameters],
-          blockNumber: exactReview.block.number
-        }),
+        estimateGas: () => publicClient.estimateGas({ account: account.address, blockNumber: exactReview.block.number, ...transaction }),
         executionFingerprint: pinnedExecutionFingerprint,
         getBalance: () => publicClient.getBalance({ address: account.address }),
         getGasPrice: () => publicClient.getGasPrice(),
         isCurrent: gasReviewIsCurrent,
         setError: setGasReviewError,
-        setReview: setGasReview
+        setReview: setGasReview,
+        onReview: (review, latestNativeBalance) => {
+          gasObservation.value = { balance: latestNativeBalance, review };
+          latestAddGasObservationRef.current = { balance: latestNativeBalance, context: addMaxContextFingerprint, reserve: review.bufferedWei };
+          if (nativeMaxProbeSide === null) return;
+          const max = safeMaxAmount({ asset: "native", balance: latestNativeBalance, gasReserveWei: review.bufferedWei });
+          if (max === 0n) {
+            setGasReviewError("Native Max is unavailable because the wallet balance does not exceed the reviewed gas reserve");
+            return;
+          }
+          const value = maxAmountInput({ asset: "native", balance: latestNativeBalance, decimals: 18, gasReserveWei: review.bufferedWei });
+          nativeAddMaxBindingRef.current = { context: addMaxContextFingerprint, side: nativeMaxProbeSide, value: max };
+          if (nativeMaxProbeSide === "x") setAmountXInput(value);
+          else setAmountYInput(value);
+        },
+        transactionValue: transaction.value
       });
+      if (nativeMaxProbeSide !== null) return;
+      const finalGasObservation = gasObservation.value;
+      if (effectiveAddAssetMode === "native" && nativeAddMaxBindingRef.current !== null && finalGasObservation !== null) {
+        const binding = nativeAddMaxBindingRef.current;
+        const submittedNativeAmount = binding.side === "x" ? amountX : amountY;
+        const exactMax = safeMaxAmount({ asset: "native", balance: finalGasObservation.balance, gasReserveWei: finalGasObservation.review.bufferedWei });
+        if (binding.side !== liquidityWrappedNativeSide || binding.context !== addMaxContextFingerprint || submittedNativeAmount !== binding.value || submittedNativeAmount !== exactMax) {
+          setGasReviewError("Native Max changed with the latest balance or buffered gas; press Max again before wallet confirmation");
+          return;
+        }
+      }
       if (!reviewUnchanged || !gasApproved || !gasReviewIsCurrent()) return;
       const submittedContext = {
         account: account.address,
-        calldataFingerprint: keccak256(encodeFunctionData({ abi: lbRouterAbi, functionName: "addLiquidity", args: [parameters] })),
+        calldataFingerprint: keccak256(transaction.data),
         chainId: activeWalletChainId,
         deploymentEpoch: deploymentEpoch(registry),
         environment: environmentKey,
@@ -6419,7 +7049,7 @@ function LiquidityView({
         providerUid: account.connector?.uid ?? "unknown",
         submittedAt: Date.now(),
         target: registry.contracts.lbRouter,
-        value: 0n
+        value: transaction.value
       };
       try {
         setSubmittedAddReceiptContext(submittedExecutionFingerprint);
@@ -6446,13 +7076,7 @@ function LiquidityView({
             await attestLiquidityPair("add-liquidity", finalBlock.number);
             if (!gasReviewIsCurrent()) throw new PairAttestationError("context-changed", "Liquidity context changed during final pair attestation");
           },
-          send: () => addWrite.writeContractAsync({
-            account: account.address,
-            address: registry.contracts.lbRouter,
-            abi: lbRouterAbi,
-            functionName: "addLiquidity",
-            args: [parameters]
-          })
+          send: () => addWrite.sendTransactionAsync({ account: account.address, ...transaction })
         });
         submitted = hash !== null;
       } catch (error) {
@@ -6472,7 +7096,39 @@ function LiquidityView({
       if (!submitted && addSubmitInFlightRef.current === submittedOperationGeneration) {
         addSubmitInFlightRef.current = null;
       }
+      if (nativeMaxProbeSide !== null) {
+        nativeAddMaxProbeRef.current = null;
+        setNativeAddMaxPending(false);
+      }
     }
+  };
+
+  const handleNativeAddMax = (side: "x" | "y") => {
+    if (nativeAddMaxPending || liquidityWrappedNativeSide !== side || nativeBalance === null) return;
+    const observation = latestAddGasObservationRef.current;
+    const binding = nativeAddMaxBindingRef.current;
+    const canReuseObservation = binding?.side === side && binding.context === addMaxContextFingerprint && observation?.context === addMaxContextFingerprint && nativeSideAmount !== null && nativeSideAmount > 0n;
+    if (gasReview?.action === "add liquidity" && observation !== null && canReuseObservation) {
+      const max = safeMaxAmount({ asset: "native", balance: observation.balance, gasReserveWei: observation.reserve });
+      if (max === 0n) {
+        setGasReviewError("Native Max is unavailable because the wallet balance does not exceed the reviewed gas reserve");
+        return;
+      }
+      const value = maxAmountInput({ asset: "native", balance: observation.balance, decimals: 18, gasReserveWei: observation.reserve });
+      nativeAddMaxBindingRef.current = { context: addMaxContextFingerprint, side, value: max };
+      if (side === "x") setAmountXInput(value);
+      else setAmountYInput(value);
+      return;
+    }
+    if (!nativeAdd || !addReady) return;
+    nativeAddMaxProbeRef.current = side;
+    setNativeAddMaxPending(true);
+    void handleAddLiquidity();
+  };
+  const canReuseNativeAddMaxObservation = (side: "x" | "y") => {
+    const binding = nativeAddMaxBindingRef.current;
+    const observation = latestAddGasObservationRef.current;
+    return binding?.side === side && binding.context === addMaxContextFingerprint && observation?.context === addMaxContextFingerprint && nativeSideAmount !== null && nativeSideAmount > 0n;
   };
 
   const handleFullExitBatch = async (workflowKeyOverride: string | null = null) => {
@@ -6514,6 +7170,7 @@ function LiquidityView({
     setLiquidityReceiptPhase("idle");
     setSubmittedRemoveReceiptContext(null);
     setSubmittedFullExitHash(null);
+    setNativeRemoveOrphanNotice(null);
     setLiquiditySimulationError(null);
     setGasReviewError(null);
     setRemoveQuoteReviewRequired(null);
@@ -6642,6 +7299,26 @@ function LiquidityView({
           });
           submitted = hash !== null;
           if (submitted) {
+            if (prepared.assetMode === "native" && removeWrappedNativeSide !== null) {
+              setSubmittedNativeRemoveReview({
+                account: account.address!,
+                amounts: prepared.liveBins.map((bin) => bin.liveBalance),
+                chainId: registry.chainId,
+                environment: environmentKey,
+                executionFingerprint: prepared.executionFingerprint,
+                expectedAmountX: prepared.expectedAmountX,
+                expectedAmountY: prepared.expectedAmountY,
+                ids: prepared.liveBins.map((bin) => bin.binId),
+                minimumAmountX: prepared.minimumAmountX,
+                minimumAmountY: prepared.minimumAmountY,
+                nativeSide: removeWrappedNativeSide,
+                pair: pool.pair,
+                submittedAt: submittedContext.submittedAt,
+                tokenX: pool.tokenX,
+                tokenY: pool.tokenY,
+                transaction: { ...prepared.transaction }
+              });
+            }
             setSubmittedFullExitHash(hash);
             latestFullExitBatchReviewRef.current = null;
             setFullExitBatchReview(null);
@@ -6787,7 +7464,7 @@ function LiquidityView({
             if (quoteView.error !== null || quoteView.minimums === null) {
               return { diagnostic: quoteView.error ?? "burn minimums unavailable", status: "semantic-failure" as const };
             }
-            const candidate = buildRemoveLiquidityTransaction(registry, {
+            const candidate = buildExactRemoveTransaction({
               tokenX: pool.tokenX,
               tokenY: pool.tokenY,
               binStep: pool.binStep,
@@ -6827,7 +7504,7 @@ function LiquidityView({
         if (batchQuote.error !== null || batchQuote.minimums === null || batchQuote.quote === null) {
           throw new Error(`Full-exit batch quote failed: ${batchQuote.error ?? "minimums unavailable"}`);
         }
-        const transaction = buildRemoveLiquidityTransaction(registry, {
+        const transaction = buildExactRemoveTransaction({
           tokenX: pool.tokenX,
           tokenY: pool.tokenY,
           binStep: pool.binStep,
@@ -6852,15 +7529,20 @@ function LiquidityView({
         ]);
         const firstBatchIds = new Set(firstBatch.bins.map((bin) => bin.binId.toString()));
         const prepared: FullExitBatchReviewState = {
+          assetMode: effectiveRemoveAssetMode,
           batchOrdinal,
           batchSettings,
           binStates: burnSnapshot.binStates.filter((state) => firstBatchIds.has(BigInt(state.binId).toString())),
           completedBatches,
           estimatedTransactionsRemaining: plan.batches.length,
           estimatedGas: firstBatch.estimatedGas,
+          expectedAmountX: batchQuote.quote.amountXOut,
+          expectedAmountY: batchQuote.quote.amountYOut,
           executionContextFingerprint: submittedExecutionContextFingerprint,
           executionFingerprint: batchReviewFingerprint,
           liveBins: firstBatch.bins.map((bin) => ({ ...bin })),
+          minimumAmountX: batchQuote.minimums.amountXMin,
+          minimumAmountY: batchQuote.minimums.amountYMin,
           positions: livePositivePositions.filter((position) => firstBatchIds.has(BigInt(position.binId).toString())),
           remainingBins: stateSnapshot.bins.length,
           sourceBlockHash: pinnedBlockHash,
@@ -6939,6 +7621,7 @@ function LiquidityView({
     setLiquidityReceiptPhase("idle");
     setSubmittedRemoveReceiptContext(null);
     setSubmittedFullExitHash(null);
+    setNativeRemoveOrphanNotice(null);
     setLiquiditySimulationError(null);
     setGasReviewError(null);
     setRemoveQuoteReviewRequired(null);
@@ -7109,7 +7792,7 @@ function LiquidityView({
         return;
       }
 
-      const transaction = buildRemoveLiquidityTransaction(registry, {
+      const transaction = buildExactRemoveTransaction({
         tokenX: pool.tokenX,
         tokenY: pool.tokenY,
         binStep: pool.binStep,
@@ -7228,6 +7911,26 @@ function LiquidityView({
           send: () => removeWrite.sendTransactionAsync(transaction)
         });
         submitted = hash !== null;
+        if (submitted && effectiveRemoveAssetMode === "native" && removeWrappedNativeSide !== null) {
+          setSubmittedNativeRemoveReview({
+            account: account.address,
+            amounts: [...freshPlan.amounts],
+            chainId: registry.chainId,
+            environment: environmentKey,
+            executionFingerprint: submittedExecutionContextFingerprint,
+            expectedAmountX: freshBurnQuote.quote.amountXOut,
+            expectedAmountY: freshBurnQuote.quote.amountYOut,
+            ids: [...freshPlan.ids],
+            minimumAmountX: freshBurnQuote.minimums.amountXMin,
+            minimumAmountY: freshBurnQuote.minimums.amountYMin,
+            nativeSide: removeWrappedNativeSide,
+            pair: pool.pair,
+            submittedAt: submittedContext.submittedAt,
+            tokenX: pool.tokenX,
+            tokenY: pool.tokenY,
+            transaction: { ...transaction }
+          });
+        }
       } catch (error) {
         if (error instanceof PairAttestationError && error.message.includes("LB operator access was revoked")) {
           setLiquiditySimulationError(null);
@@ -7250,6 +7953,7 @@ function LiquidityView({
     setLiquidityReceiptPhase((currentPhase) => currentPhase === "remove" ? "idle" : currentPhase);
     setSubmittedRemoveReceiptContext(null);
     setSubmittedFullExitHash(null);
+    setSubmittedNativeRemoveReview(null);
   };
   const updateRemovePercentInput = (value: string, requestFullExit = false) => {
     clearSubmittedRemoveReceipt();
@@ -7303,6 +8007,17 @@ function LiquidityView({
           selectedPoolId={selectedPoolId}
         />
 
+        {connected && liquidityWrappedNative !== null && liquidityWrappedNativeSide !== null ? (
+          <fieldset className="routing-mode-control" data-testid="liquidity-native-mode">
+            <legend>Wrapped-native deposit mode</legend>
+            <div className="segmented" role="group" aria-label="Wrapped-native deposit mode">
+              <button aria-pressed={liquidityAssetMode === "native"} className={liquidityAssetMode === "native" ? "segment active" : "segment"} onClick={() => { nativeAddMaxBindingRef.current = null; setLiquidityAssetMode("native"); }} type="button">ETH · native</button>
+              <button aria-pressed={liquidityAssetMode === "erc20"} className={liquidityAssetMode === "erc20" ? "segment active" : "segment"} onClick={() => { nativeAddMaxBindingRef.current = null; setLiquidityAssetMode("erc20"); }} type="button">{liquidityWrappedNative.symbol} · ERC-20</button>
+            </div>
+            <p data-testid="liquidity-wrapper-disclosure">ETH deposits use exact router transaction value and never approve {liquidityWrappedNative.symbol}. Unused native-side input is refunded as {liquidityWrappedNative.symbol} ERC-20 at {liquidityWrappedNative.address}. Native Max reserves a freshly reviewed 25%-buffered gas estimate and the final value is revalidated before wallet confirmation.</p>
+          </fieldset>
+        ) : null}
+
         <div className="liquidity-rows">
           <div className="amount-box compact">
             <input
@@ -7310,11 +8025,12 @@ function LiquidityView({
               disabled={liquidityMode === "token-y"}
               inputMode="decimal"
               value={liquidityMode === "token-y" ? "0" : amountXInput}
-              onChange={(event) => setAmountXInput(event.target.value)}
+              onChange={(event) => { nativeAddMaxBindingRef.current = null; setAmountXInput(event.target.value); }}
             />
-            <span>{tokenSymbol(tokenX)}</span>
-            <button className="token-max-button" data-testid="liquidity-max-x" disabled={walletBalanceX === null || tokenX === null || liquidityMode === "token-y"} onClick={() => {
-              if (walletBalanceX !== null && tokenX !== null) setAmountXInput(maxAmountInput({ asset: "token", balance: walletBalanceX, decimals: tokenX.decimals }));
+            <span>{nativeModeX ? "ETH" : tokenSymbol(tokenX)}</span>
+            <button className="token-max-button" data-testid="liquidity-max-x" disabled={nativeModeX ? ((!nativeAdd || !addReady) && !canReuseNativeAddMaxObservation("x")) || nativeAddMaxPending : walletBalanceX === null || tokenX === null || liquidityMode === "token-y"} onClick={() => {
+              if (nativeModeX) handleNativeAddMax("x");
+              else if (walletBalanceX !== null && tokenX !== null) { nativeAddMaxBindingRef.current = null; setAmountXInput(maxAmountInput({ asset: "token", balance: walletBalanceX, decimals: tokenX.decimals })); }
             }} type="button">Max</button>
           </div>
           <div className="amount-box compact">
@@ -7323,16 +8039,17 @@ function LiquidityView({
               disabled={liquidityMode === "token-x"}
               inputMode="decimal"
               value={liquidityMode === "token-x" ? "0" : amountYInput}
-              onChange={(event) => setAmountYInput(event.target.value)}
+              onChange={(event) => { nativeAddMaxBindingRef.current = null; setAmountYInput(event.target.value); }}
             />
-            <span>{tokenSymbol(tokenY)}</span>
-            <button className="token-max-button" data-testid="liquidity-max-y" disabled={walletBalanceY === null || tokenY === null || liquidityMode === "token-x"} onClick={() => {
-              if (walletBalanceY !== null && tokenY !== null) setAmountYInput(maxAmountInput({ asset: "token", balance: walletBalanceY, decimals: tokenY.decimals }));
+            <span>{nativeModeY ? "ETH" : tokenSymbol(tokenY)}</span>
+            <button className="token-max-button" data-testid="liquidity-max-y" disabled={nativeModeY ? ((!nativeAdd || !addReady) && !canReuseNativeAddMaxObservation("y")) || nativeAddMaxPending : walletBalanceY === null || tokenY === null || liquidityMode === "token-x"} onClick={() => {
+              if (nativeModeY) handleNativeAddMax("y");
+              else if (walletBalanceY !== null && tokenY !== null) { nativeAddMaxBindingRef.current = null; setAmountYInput(maxAmountInput({ asset: "token", balance: walletBalanceY, decimals: tokenY.decimals })); }
             }} type="button">Max</button>
           </div>
         </div>
-        <TokenIdentity token={tokenX} networkName={registry.chain.name} testId="liquidity-token-x-identity" />
-        <TokenIdentity token={tokenY} networkName={registry.chain.name} testId="liquidity-token-y-identity" />
+        {nativeModeX ? <div className="state-row" data-testid="liquidity-token-x-identity">ETH native asset · router wrapper {liquidityWrappedNative?.symbol} {liquidityWrappedNative?.address}</div> : <TokenIdentity token={tokenX} networkName={registry.chain.name} testId="liquidity-token-x-identity" />}
+        {nativeModeY ? <div className="state-row" data-testid="liquidity-token-y-identity">ETH native asset · router wrapper {liquidityWrappedNative?.symbol} {liquidityWrappedNative?.address}</div> : <TokenIdentity token={tokenY} networkName={registry.chain.name} testId="liquidity-token-y-identity" />}
         <div className="state-row" data-testid="liquidity-range-mode">
           <Droplets size={16} />
           <span>{liquidityModeDescription(liquidityMode, tokenSymbol(tokenX), tokenSymbol(tokenY))}</span>
@@ -7343,6 +8060,12 @@ function LiquidityView({
             <span>One-sided liquidity deposits one token directly into the selected bins. It does not perform a swap; use the Swap screen separately if you want to rebalance first.</span>
           </div>
         ) : null}
+        {liquidityAssetMode === "native" && !nativeAdd ? (
+          <div className="state-row" data-testid="liquidity-native-unused-range"><CircleDollarSign size={16} /><span>This range uses only the non-wrapper token. Submission remains ERC-20 addLiquidity with 0 ETH value.</span></div>
+        ) : null}
+        {liquidityAssetMode === "native" && liquidityWrappedNativeSide !== null && (nativeSideAmount === null || nativeSideAmount <= 0n) && ((liquidityWrappedNativeSide === "x" && liquidityMode !== "token-y") || (liquidityWrappedNativeSide === "y" && liquidityMode !== "token-x")) ? (
+          <div className="state-row warning" data-testid="liquidity-native-max-guidance"><AlertTriangle size={16} /><span>Enter a valid positive ETH probe amount before using Native Max; no wallet request is opened for the gas probe.</span></div>
+        ) : null}
         {liquidityMode === "balanced" ? (
           <div className="state-row" data-testid="liquidity-composition-guidance">
             <CircleDollarSign size={16} />
@@ -7350,9 +8073,9 @@ function LiquidityView({
           </div>
         ) : null}
         <div className="quote-grid">
-          <MiniMetric label={`${tokenSymbol(tokenX)} balance`} value={walletData ? formatTokenAmount(walletData.balanceX, tokenX) : connected ? "loading" : "connect"} />
-          <MiniMetric label={`${tokenSymbol(tokenY)} balance`} value={walletData ? formatTokenAmount(walletData.balanceY, tokenY) : connected ? "loading" : "connect"} />
-          <MiniMetric data-testid="liquidity-native-balance" label="ETH for gas" value={nativeBalance !== null ? `${formatUnits(nativeBalance, 18)} ETH` : connected ? "loading" : "connect"} />
+          <MiniMetric label={`${nativeModeX ? "ETH" : tokenSymbol(tokenX)} balance`} value={nativeModeX ? nativeBalance !== null ? `${formatUnits(nativeBalance, 18)} ETH` : connected ? "loading" : "connect" : walletData ? formatTokenAmount(walletData.balanceX, tokenX) : connected ? "loading" : "connect"} />
+          <MiniMetric label={`${nativeModeY ? "ETH" : tokenSymbol(tokenY)} balance`} value={nativeModeY ? nativeBalance !== null ? `${formatUnits(nativeBalance, 18)} ETH` : connected ? "loading" : "connect" : walletData ? formatTokenAmount(walletData.balanceY, tokenY) : connected ? "loading" : "connect"} />
+          <MiniMetric data-testid="liquidity-native-balance" label={nativeAdd ? "ETH for value and gas" : "ETH for gas"} value={nativeBalance !== null ? `${formatUnits(nativeBalance, 18)} ETH` : connected ? "loading" : "connect"} />
         </div>
 
         <GasReview review={gasReview} />
@@ -7507,13 +8230,13 @@ function LiquidityView({
           <MiniMetric label="Max Bin" value={activeBin !== null && upperDelta !== null ? String(activeBin + upperDelta) : "n/a"} />
           <MiniMetric label="Liquidity Mode" value={liquidityMode ?? "n/a"} />
           <MiniMetric label="Bin Step" value={pool?.binStep.toString() ?? primaryPool?.binStep ?? "n/a"} />
-          <MiniMetric label={`${tokenSymbol(tokenX)} allowance`} value={walletData ? formatTokenAmount(walletData.allowanceX, tokenX) : "n/a"} />
-          <MiniMetric label={`${tokenSymbol(tokenY)} allowance`} value={walletData ? formatTokenAmount(walletData.allowanceY, tokenY) : "n/a"} />
+          <MiniMetric label={`${nativeModeX ? "ETH" : tokenSymbol(tokenX)} allowance`} value={nativeModeX ? "not required for ETH" : walletData ? formatTokenAmount(walletData.allowanceX, tokenX) : "n/a"} />
+          <MiniMetric label={`${nativeModeY ? "ETH" : tokenSymbol(tokenY)} allowance`} value={nativeModeY ? "not required for ETH" : walletData ? formatTokenAmount(walletData.allowanceY, tokenY) : "n/a"} />
           <MiniMetric label={`${tokenSymbol(tokenX)} approve`} value={needsXApproval && amountX !== null ? formatTokenAmount(amountX.toString(), tokenX) : "none"} />
           <MiniMetric label={`${tokenSymbol(tokenY)} approve`} value={needsYApproval && amountY !== null ? formatTokenAmount(amountY.toString(), tokenY) : "none"} />
         </div>
 
-        <ApprovalDetails
+        {!nativeModeX ? <ApprovalDetails
           amount={amountX}
           asset={tokenSymbol(tokenX)}
           currentState={walletData ? `${formatTokenAmount(walletData.allowanceX, tokenX)} allowance${needsXApproval ? " (approval needed)" : " (sufficient)"}` : "unavailable"}
@@ -7522,8 +8245,8 @@ function LiquidityView({
           scope="Exact token amount for this add-liquidity action"
           spender={registry.contracts.lbRouter}
           token={tokenX}
-        />
-        <ApprovalDetails
+        /> : <div className="state-row success" data-testid="liquidity-native-no-approval">ETH uses exact transaction value and never requests wrapper approval.</div>}
+        {!nativeModeY ? <ApprovalDetails
           amount={amountY}
           asset={tokenSymbol(tokenY)}
           currentState={walletData ? `${formatTokenAmount(walletData.allowanceY, tokenY)} allowance${needsYApproval ? " (approval needed)" : " (sufficient)"}` : "unavailable"}
@@ -7532,7 +8255,7 @@ function LiquidityView({
           scope="Exact token amount for this add-liquidity action"
           spender={registry.contracts.lbRouter}
           token={tokenY}
-        />
+        /> : <div className="state-row success" data-testid="liquidity-native-no-approval">ETH uses exact transaction value and never requests wrapper approval.</div>}
 
         <LiquidityDistributionPreview
           activeBin={activeBin}
@@ -7544,7 +8267,7 @@ function LiquidityView({
         />
 
         <div className="action-stack">
-          <button
+          {!nativeModeX ? <button
             className="secondary-button wide"
             data-testid="liquidity-approve-x-button"
             type="button"
@@ -7555,8 +8278,8 @@ function LiquidityView({
           >
             {liquiditySimulationPending || approveXWrite.isPending || approveXReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <CheckCircle2 size={18} />}
             <span>{needsXApproval ? `Approve ${tokenSymbol(tokenX)}` : `${tokenSymbol(tokenX)} approved`}</span>
-          </button>
-          <button
+          </button> : null}
+          {!nativeModeY ? <button
             className="secondary-button wide"
             data-testid="liquidity-approve-y-button"
             type="button"
@@ -7567,7 +8290,7 @@ function LiquidityView({
           >
             {liquiditySimulationPending || approveYWrite.isPending || approveYReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <CheckCircle2 size={18} />}
             <span>{needsYApproval ? `Approve ${tokenSymbol(tokenY)}` : `${tokenSymbol(tokenY)} approved`}</span>
-          </button>
+          </button> : null}
           <button className="primary-button wide" data-testid="liquidity-add-button" type="button" disabled={!addReady} onClick={handleAddLiquidity}>
             {liquiditySimulationPending || addWrite.isPending || addReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <Droplets size={18} />}
             <span>{addButtonLabel === "Add liquidity" ? (liquidityAddReview?.executionFingerprint === addExecutionFingerprint ? "Confirm add liquidity" : "Review add liquidity") : addButtonLabel}</span>
@@ -7579,7 +8302,7 @@ function LiquidityView({
           inputError={addInputError}
           insufficientBalance={insufficientX || insufficientY}
           pendingHash={addWrite.data ?? approveXWrite.data ?? approveYWrite.data}
-          successText={addSuccess ? "Liquidity added" : approveXSuccess || approveYSuccess ? "Token approval confirmed" : null}
+          successText={addSuccessReconciled ? "Liquidity added" : approveXSuccess || approveYSuccess ? "Token approval confirmed" : null}
           revertedText={addReverted ? "Add liquidity reverted" : approveXReverted ? `${tokenSymbol(tokenX)} approval reverted` : approveYReverted ? `${tokenSymbol(tokenY)} approval reverted` : null}
         />
       </section>
@@ -7602,6 +8325,17 @@ function LiquidityView({
             label={walletPositionsPageInfo ? paginationBadgeLabel(walletPositions.length, walletPositionsPageInfo, "bins") : `${walletPositions.length} bins`}
           />
         </div>
+
+        {connected && removeWrappedNative !== null && removeWrappedNativeSide !== null ? (
+          <fieldset className="routing-mode-control" data-testid="liquidity-remove-native-mode">
+            <legend>Wrapped-native withdrawal mode</legend>
+            <div className="segmented" role="group" aria-label="Wrapped-native withdrawal mode">
+              <button aria-pressed={removeAssetMode === "native"} className={removeAssetMode === "native" ? "segment active" : "segment"} onClick={() => { clearSubmittedRemoveReceipt(); setRemoveAssetMode("native"); }} type="button">ETH · native output</button>
+              <button aria-pressed={removeAssetMode === "erc20"} className={removeAssetMode === "erc20" ? "segment active" : "segment"} onClick={() => { clearSubmittedRemoveReceipt(); setRemoveAssetMode("erc20"); }} type="button">{removeWrappedNative.symbol} · ERC-20 output</button>
+            </div>
+            <p data-testid="liquidity-remove-wrapper-disclosure">ETH withdrawals use router-native unwrapping with zero transaction value. The other pool token remains an ERC-20 receipt. Pair-wide LB approval scope is unchanged.</p>
+          </fieldset>
+        ) : null}
 
         <span className="field-label" id="position-select-label">
           Positions
@@ -7675,6 +8409,7 @@ function LiquidityView({
           <span>{selectedRangeStatus}; same-block claims at {selectedBurnSnapshotQuery.data ? `block ${selectedBurnSnapshotQuery.data.blockNumber.toString()}` : "a pending head"}.</span>
           <span>Expected receipts include proportional principal and accrued fee growth. There is no separate fee claim or rent refund.</span>
           <span>Minimum receipts apply {slippageInput}% slippage protection before wallet confirmation.</span>
+          <span data-testid="withdraw-asset-mode">{nativeRemove ? `Native receipt: the ${removeWrappedNativeSide === "x" ? tokenSymbol(tokenX) : tokenSymbol(tokenY)} side is delivered as ETH; transaction value is 0 ETH.` : `ERC-20 receipt: ${tokenSymbol(tokenX)} and ${tokenSymbol(tokenY)} remain token transfers; ETH is used only for gas.`}</span>
           {fullExitUi?.workflowKey === currentFullExitWorkflowKey ? <span>{fullExitUi.message}</span> : null}
         </section>
 
@@ -7717,7 +8452,7 @@ function LiquidityView({
         </div>
 
         <LiquidityStateRows
-          actionError={removeQuoteReviewRequired ?? liquidityActionError}
+          actionError={currentRemoveOrphaned ? "Native withdrawal receipt was reorganized; canonical accounting was removed and retry remains journal-blocked." : nativeRemoveOrphanNotice ?? removeQuoteReviewRequired ?? liquidityActionError}
           inputError={removeInputError}
           insufficientBalance={false}
           pendingHash={liquidityReceiptPhase === "remove" ? removeWrite.data : liquidityReceiptPhase === "lb-approval" ? approveLbWrite.data : undefined}
@@ -7727,6 +8462,11 @@ function LiquidityView({
               : "Liquidity removed"
             : currentLbApprovalSuccess ? "LB approval confirmed" : null}
           revertedText={currentRemoveReverted ? "Remove liquidity reverted" : currentLbApprovalReverted ? "LB approval reverted" : null}
+        />
+        <NativeRemoveReceiptReview
+          error={nativeRemoveReceiptReconciliationQuery.error}
+          hash={canonicalNativeRemoveHash}
+          reconciliation={nativeRemoveReceiptReconciliationQuery.data}
         />
 
         <dl className="contract-list">

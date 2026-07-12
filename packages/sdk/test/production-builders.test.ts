@@ -15,11 +15,15 @@ import {
   applyBurnQuoteSlippage,
   applyLiquiditySlippageMin,
   assertQuoteMatchesExactInRequest,
+  buildAddLiquidityNativeTransaction,
   buildAddLiquidityTransaction,
   buildExactInCandidatePaths,
   buildExactInSwapTransaction,
+  buildExactNativeForTokensSwapTransaction,
+  buildExactTokensForNativeSwapTransaction,
   buildLiquidityDistribution,
   buildProtectedBurnMinimums,
+  buildRemoveLiquidityNativeTransaction,
   buildRemoveLiquidityTransaction,
   calculateAmountOutMin,
   deadlineFromNow,
@@ -28,6 +32,7 @@ import {
   getTotalFeeBps,
   getTokens,
   findTokenBySymbol,
+  lbPairAbi,
   lbRouterAbi,
   quoteLiquidityBurn,
   readDeploymentManifest,
@@ -299,6 +304,170 @@ test("builds exact-in swap calldata from a non-localnet registry with slippage a
   );
   assert.throws(() => deadlineFromNow(0.5, 1_700_000_000), /integer from 1 to 120/);
   assert.throws(() => deadlineFromNow(121, 1_700_000_000), /integer from 1 to 120/);
+});
+
+test("builds canonical exact native-input and native-output swap calldata with exact value", () => {
+  const registry = fixtureRegistry(readManifestFixture());
+  const deadline = 1_700_001_200n;
+  const nativeAmountIn = 1_000_000_000_000_000_000n;
+  const tokenAmountOut = 2_000_000n;
+  const nativeInQuote: ExactInQuote = {
+    route: [addresses.weth, addresses.usdc],
+    pairs: [addresses.pair],
+    binSteps: [25n],
+    versions: [LB_ROUTER_VERSION_V2_2],
+    amounts: [nativeAmountIn, tokenAmountOut],
+    virtualAmountsWithoutSlippage: [nativeAmountIn, 2_010_000n],
+    fees: [1_000_000_000_000_000n]
+  };
+  const nativeIn = buildExactNativeForTokensSwapTransaction(
+    registry,
+    addresses.weth,
+    nativeInQuote,
+    nativeAmountIn,
+    1_990_000n,
+    addresses.recipient,
+    deadline
+  );
+  const decodedNativeIn = decodeFunctionData({ abi: lbRouterAbi, data: nativeIn.data });
+
+  assert.equal(nativeIn.to, addresses.router);
+  assert.equal(nativeIn.value, nativeAmountIn);
+  assert.equal(decodedNativeIn.functionName, "swapExactNATIVEForTokens");
+  assert.deepEqual(decodedNativeIn.args, [
+    1_990_000n,
+    {
+      pairBinSteps: [25n],
+      versions: [LB_ROUTER_VERSION_V2_2],
+      tokenPath: [addresses.weth, addresses.usdc]
+    },
+    addresses.recipient,
+    deadline
+  ]);
+
+  const tokenAmountIn = 2_000_000n;
+  const nativeAmountOut = 990_000_000_000_000_000n;
+  const nativeOutQuote: ExactInQuote = {
+    route: [addresses.usdc, addresses.weth],
+    pairs: [addresses.pair],
+    binSteps: [25n],
+    versions: [LB_ROUTER_VERSION_V2_2],
+    amounts: [tokenAmountIn, nativeAmountOut],
+    virtualAmountsWithoutSlippage: [tokenAmountIn, 1_000_000_000_000_000_000n],
+    fees: [1_000_000_000_000_000n]
+  };
+  const nativeOut = buildExactTokensForNativeSwapTransaction(
+    registry,
+    addresses.weth,
+    nativeOutQuote,
+    tokenAmountIn,
+    985_000_000_000_000_000n,
+    addresses.recipient,
+    deadline
+  );
+  const decodedNativeOut = decodeFunctionData({ abi: lbRouterAbi, data: nativeOut.data });
+
+  assert.equal(nativeOut.to, addresses.router);
+  assert.equal(nativeOut.value, 0n);
+  assert.equal(decodedNativeOut.functionName, "swapExactTokensForNATIVE");
+  assert.deepEqual(decodedNativeOut.args, [
+    tokenAmountIn,
+    985_000_000_000_000_000n,
+    {
+      pairBinSteps: [25n],
+      versions: [LB_ROUTER_VERSION_V2_2],
+      tokenPath: [addresses.usdc, addresses.weth]
+    },
+    addresses.recipient,
+    deadline
+  ]);
+});
+
+test("native exact-input builders fail closed on wrapper, value, path, minimum, deadline, and recipient drift", () => {
+  const registry = fixtureRegistry(readManifestFixture());
+  const quote: ExactInQuote = {
+    route: [addresses.weth, addresses.usdc],
+    pairs: [addresses.pair],
+    binSteps: [25n],
+    versions: [LB_ROUTER_VERSION_V2_2],
+    amounts: [1_000n, 900n],
+    virtualAmountsWithoutSlippage: [1_000n, 910n],
+    fees: [1n]
+  };
+  const buildNativeIn = (candidate: ExactInQuote, overrides: {
+    amountIn?: bigint;
+    amountOutMin?: bigint;
+    deadline?: bigint;
+    recipient?: Address;
+    wrappedNative?: Address;
+  } = {}) => buildExactNativeForTokensSwapTransaction(
+    registry,
+    overrides.wrappedNative ?? addresses.weth,
+    candidate,
+    overrides.amountIn ?? 1_000n,
+    overrides.amountOutMin ?? 890n,
+    overrides.recipient ?? addresses.recipient,
+    overrides.deadline ?? 2n
+  );
+
+  assert.throws(() => buildNativeIn(quote, { amountIn: 999n }), /amount does not match the quote input/);
+  assert.throws(() => buildNativeIn(quote, { amountOutMin: 0n }), /minimum output must be positive/);
+  assert.throws(() => buildNativeIn(quote, { amountOutMin: 901n }), /no greater than the quoted output/);
+  assert.throws(() => buildNativeIn(quote, { deadline: 0n }), /deadline must be greater than zero/);
+  assert.throws(() => buildNativeIn(quote, { recipient: zeroAddress }), /recipient must be nonzero/);
+  assert.throws(() => buildNativeIn(quote, { wrappedNative: zeroAddress }), /identity must be nonzero/);
+  assert.throws(() => buildNativeIn(quote, { wrappedNative: addresses.usdc }), /registered wrapped-native token/);
+  assert.throws(
+    () => buildNativeIn({ ...quote, route: [addresses.usdc, addresses.weth] }),
+    /route must start with the router wrapped-native token/
+  );
+  assert.throws(
+    () => buildNativeIn({ ...quote, versions: [2] }),
+    /Only V2\.2 swap route versions/
+  );
+  assert.throws(
+    () => buildNativeIn({ ...quote, pairs: [] }),
+    /arrays do not match the route hop count/
+  );
+  assert.throws(
+    () => buildNativeIn({
+      ...quote,
+      route: [addresses.weth, addresses.usdc, addresses.weth],
+      pairs: [addresses.pair, addresses.router],
+      binSteps: [25n, 10n],
+      versions: [LB_ROUTER_VERSION_V2_2, LB_ROUTER_VERSION_V2_2],
+      amounts: [1_000n, 950n, 900n],
+      virtualAmountsWithoutSlippage: [1_000n, 960n, 910n],
+      fees: [1n, 1n]
+    }),
+    /only at its native endpoint/
+  );
+
+  const nativeOutQuote: ExactInQuote = { ...quote, route: [addresses.usdc, addresses.weth] };
+  assert.throws(
+    () => buildExactTokensForNativeSwapTransaction(
+      registry,
+      addresses.weth,
+      quote,
+      1_000n,
+      890n,
+      addresses.recipient,
+      2n
+    ),
+    /route must end with the router wrapped-native token/
+  );
+  assert.throws(
+    () => buildExactTokensForNativeSwapTransaction(
+      registry,
+      addresses.weth,
+      nativeOutQuote,
+      999n,
+      890n,
+      addresses.recipient,
+      2n
+    ),
+    /amount does not match the quote input/
+  );
 });
 
 test("accepts structurally complete multi-hop V2.2 swap routes", () => {
@@ -789,6 +958,239 @@ test("builds liquidity calldata against a manifest-driven production router", ()
       deadline
     }),
     /idSlippage must be from 0 to 2 bins/
+  );
+});
+
+test("builds canonical native liquidity calldata with derived value and orientation-safe minimums", () => {
+  const registry = fixtureRegistry(readManifestFixture());
+  const deadline = 1_700_000_600n;
+  const distribution = buildLiquidityDistribution(8_388_608, -1, 1);
+  const amountX = 10_000_000_000_000_000n;
+  const amountY = 20_000_000n;
+  const nativeX = buildAddLiquidityNativeTransaction(registry, {
+    tokenX: addresses.weth,
+    tokenY: addresses.usdc,
+    binStep: 25,
+    amountX,
+    amountY,
+    amountXMin: applyLiquiditySlippageMin(amountX, 100n),
+    amountYMin: applyLiquiditySlippageMin(amountY, 100n),
+    activeIdDesired: 8_388_608,
+    idSlippage: 2,
+    ...distribution,
+    to: addresses.recipient,
+    refundTo: addresses.refund,
+    deadline
+  });
+  const nativeXDecoded = decodeFunctionData({ abi: lbRouterAbi, data: nativeX.data });
+
+  assert.equal(nativeX.to, addresses.router);
+  assert.equal(nativeX.value, amountX);
+  assert.equal(nativeXDecoded.functionName, "addLiquidityNATIVE");
+  assert.deepEqual(nativeXDecoded.args[0], {
+    tokenX: addresses.weth,
+    tokenY: addresses.usdc,
+    binStep: 25n,
+    amountX,
+    amountY,
+    amountXMin: 9_900_000_000_000_000n,
+    amountYMin: 19_800_000n,
+    activeIdDesired: 8_388_608n,
+    idSlippage: 2n,
+    deltaIds: [-1n, 0n, 1n],
+    distributionX: [0n, DISTRIBUTION_PRECISION / 2n, DISTRIBUTION_PRECISION / 2n],
+    distributionY: [DISTRIBUTION_PRECISION / 2n, DISTRIBUTION_PRECISION / 2n, 0n],
+    to: addresses.recipient,
+    refundTo: addresses.refund,
+    deadline
+  });
+
+  const nativeY = buildAddLiquidityNativeTransaction(registry, {
+    tokenX: addresses.usdc,
+    tokenY: addresses.weth,
+    binStep: 25,
+    amountX: amountY,
+    amountY: amountX,
+    activeIdDesired: 8_388_608,
+    deltaIds: [0n],
+    distributionX: [DISTRIBUTION_PRECISION],
+    distributionY: [DISTRIBUTION_PRECISION],
+    to: addresses.recipient,
+    deadline
+  });
+  const nativeYDecoded = decodeFunctionData({ abi: lbRouterAbi, data: nativeY.data });
+  assert.equal(nativeY.value, amountX);
+  assert.equal(nativeYDecoded.functionName, "addLiquidityNATIVE");
+
+  const oneSidedNative = buildAddLiquidityNativeTransaction(registry, {
+    tokenX: addresses.weth,
+    tokenY: addresses.usdc,
+    binStep: 25,
+    amountX,
+    amountY: 0n,
+    activeIdDesired: 8_388_608,
+    deltaIds: [1n],
+    distributionX: [DISTRIBUTION_PRECISION],
+    distributionY: [0n],
+    to: addresses.recipient,
+    deadline
+  });
+  assert.equal(oneSidedNative.value, amountX);
+
+  const minimums = buildProtectedBurnMinimums(100n, 200n, 0n);
+  const removeNativeX = buildRemoveLiquidityNativeTransaction(registry, {
+    tokenX: addresses.weth,
+    tokenY: addresses.usdc,
+    binStep: 25,
+    minimums,
+    ids: [8_388_607n, 8_388_608n],
+    amounts: [3n, 4n],
+    to: addresses.recipient,
+    deadline
+  });
+  const removeNativeXDecoded = decodeFunctionData({ abi: lbRouterAbi, data: removeNativeX.data });
+  assert.equal(removeNativeX.value, 0n);
+  assert.equal(removeNativeXDecoded.functionName, "removeLiquidityNATIVE");
+  assert.deepEqual(removeNativeXDecoded.args, [
+    addresses.usdc,
+    25,
+    200n,
+    100n,
+    [8_388_607n, 8_388_608n],
+    [3n, 4n],
+    addresses.recipient,
+    deadline
+  ]);
+
+  const removeNativeY = buildRemoveLiquidityNativeTransaction(registry, {
+    tokenX: addresses.usdc,
+    tokenY: addresses.weth,
+    binStep: 25,
+    minimums,
+    ids: [8_388_608n],
+    amounts: [4n],
+    to: addresses.recipient,
+    deadline
+  });
+  const removeNativeYDecoded = decodeFunctionData({ abi: lbRouterAbi, data: removeNativeY.data });
+  assert.deepEqual(removeNativeYDecoded.args, [
+    addresses.usdc,
+    25,
+    100n,
+    200n,
+    [8_388_608n],
+    [4n],
+    addresses.recipient,
+    deadline
+  ]);
+
+  assert.ok(lbPairAbi.some((item) => item.type === "event" && item.name === "WithdrawnFromBins"));
+});
+
+test("native liquidity builders reject ERC-only, ambiguous, disabled, forged, and fee-on-transfer inputs", () => {
+  const deadline = 1_700_000_600n;
+  const baseAdd = {
+    tokenX: addresses.weth,
+    tokenY: addresses.usdc,
+    binStep: 25,
+    amountX: 1n,
+    amountY: 1n,
+    activeIdDesired: 8_388_608,
+    deltaIds: [0n],
+    distributionX: [DISTRIBUTION_PRECISION],
+    distributionY: [DISTRIBUTION_PRECISION],
+    to: addresses.recipient,
+    deadline
+  };
+  const registry = fixtureRegistry(readManifestFixture());
+
+  assert.throws(
+    () => buildAddLiquidityNativeTransaction(registry, { ...baseAdd, amountX: 0n }),
+    /Native add-liquidity amount must be positive/
+  );
+  assert.throws(
+    () => buildAddLiquidityNativeTransaction(registry, {
+      ...baseAdd,
+      tokenX: addresses.usdc,
+      tokenY: addresses.recipient
+    }),
+    /exactly one action-enabled wrapped-native endpoint/
+  );
+
+  const ambiguousRegistry = fixtureRegistry(readManifestFixture());
+  const ambiguousToken = ambiguousRegistry.tokens[addresses.recipient.toLowerCase()];
+  assert.ok(ambiguousToken);
+  ambiguousRegistry.tokens[addresses.recipient.toLowerCase()] = {
+    ...ambiguousToken,
+    tags: [...ambiguousToken.tags, "wrapped-native"]
+  };
+  assert.throws(
+    () => buildAddLiquidityNativeTransaction(ambiguousRegistry, {
+      ...baseAdd,
+      tokenY: addresses.recipient
+    }),
+    /exactly one action-enabled wrapped-native endpoint/
+  );
+
+  const disabledRegistry = fixtureRegistry(readManifestFixture());
+  const wrapper = disabledRegistry.tokens[addresses.weth.toLowerCase()];
+  assert.ok(wrapper);
+  disabledRegistry.tokens[addresses.weth.toLowerCase()] = {
+    ...wrapper,
+    risk: { ...wrapper.risk, disabledActions: [...wrapper.risk.disabledActions, "add-liquidity"] }
+  };
+  assert.throws(
+    () => buildAddLiquidityNativeTransaction(disabledRegistry, baseAdd),
+    /disabled for add-liquidity/
+  );
+
+  const forgedMinimums = { ...buildProtectedBurnMinimums(1n, 1n, 0n), amountXMin: 0n };
+  assert.throws(
+    () => buildRemoveLiquidityNativeTransaction(registry, {
+      tokenX: addresses.weth,
+      tokenY: addresses.usdc,
+      binStep: 25,
+      minimums: forgedMinimums,
+      ids: [8_388_608n],
+      amounts: [1n],
+      to: addresses.recipient,
+      deadline
+    }),
+    /must be created by buildProtectedBurnMinimums/
+  );
+  assert.throws(
+    () => buildRemoveLiquidityNativeTransaction(registry, {
+      tokenX: addresses.weth,
+      tokenY: addresses.usdc,
+      binStep: 25,
+      minimums: buildProtectedBurnMinimums(1n, 1n, 0n),
+      ids: [8_388_608n],
+      amounts: [],
+      to: addresses.recipient,
+      deadline
+    }),
+    /non-empty and have matching lengths/
+  );
+
+  const feeOnTransferRegistry = fixtureRegistry(readManifestFixture());
+  const nonNative = feeOnTransferRegistry.tokens[addresses.usdc.toLowerCase()];
+  assert.ok(nonNative);
+  feeOnTransferRegistry.tokens[addresses.usdc.toLowerCase()] = {
+    ...nonNative,
+    risk: { ...nonNative.risk, flags: [...nonNative.risk.flags, "fee-on-transfer"] }
+  };
+  assert.throws(
+    () => buildRemoveLiquidityNativeTransaction(feeOnTransferRegistry, {
+      tokenX: addresses.weth,
+      tokenY: addresses.usdc,
+      binStep: 25,
+      minimums: buildProtectedBurnMinimums(1n, 1n, 0n),
+      ids: [8_388_608n],
+      amounts: [1n],
+      to: addresses.recipient,
+      deadline
+    }),
+    /does not support fee-on-transfer tokens/
   );
 });
 

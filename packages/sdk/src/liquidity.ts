@@ -2,7 +2,7 @@ import { encodeFunctionData, type Address, type Hex, type PublicClient } from "v
 
 import { lbRouterAbi } from "./abi.js";
 import type { DexRegistry, LocalnetDexRegistry } from "./registry.js";
-import { assertTokenActionAllowed } from "./tokens.js";
+import { assertTokenActionAllowed, findTokenMetadata, type TokenAction, type TokenMetadata } from "./tokens.js";
 
 export const DISTRIBUTION_PRECISION = 1_000_000_000_000_000_000n;
 export const MAX_LIQUIDITY_BINS = 69;
@@ -138,50 +138,42 @@ export function buildAddLiquidityTransaction(
   registry: Pick<DexRegistry, "contracts" | "tokens">,
   input: AddLiquidityCalldataInput
 ): BuiltTransaction {
-  assertTokenActionAllowed(registry.tokens, [input.tokenX, input.tokenY], "add-liquidity");
-  const deltaIds = input.deltaIds ?? [0n];
-  const distributionX = input.distributionX ?? [DISTRIBUTION_PRECISION];
-  const distributionY = input.distributionY ?? [DISTRIBUTION_PRECISION];
-  const idSlippage = normalizeSafeIdSlippage(input.idSlippage);
-
-  assertMatchingArrayLengths(deltaIds, distributionX, distributionY);
-  assertLiquidityAmountsMatchDistribution(
-    input.amountX,
-    input.amountY,
-    input.amountXMin ?? 0n,
-    input.amountYMin ?? 0n,
-    distributionX,
-    distributionY
-  );
+  const parameters = normalizeAddLiquidityParameters(registry, input);
 
   const data = encodeFunctionData({
     abi: lbRouterAbi,
     functionName: "addLiquidity",
-    args: [
-      {
-        tokenX: input.tokenX,
-        tokenY: input.tokenY,
-        binStep: BigInt(input.binStep),
-        amountX: input.amountX,
-        amountY: input.amountY,
-        amountXMin: input.amountXMin ?? 0n,
-        amountYMin: input.amountYMin ?? 0n,
-        activeIdDesired: BigInt(input.activeIdDesired),
-        idSlippage,
-        deltaIds,
-        distributionX,
-        distributionY,
-        to: input.to,
-        refundTo: input.refundTo ?? input.to,
-        deadline: input.deadline
-      }
-    ]
+    args: [parameters]
   });
 
   return {
     to: registry.contracts.lbRouter,
     data,
     value: 0n
+  };
+}
+
+export function buildAddLiquidityNativeTransaction(
+  registry: Pick<DexRegistry, "contracts" | "tokens">,
+  input: AddLiquidityCalldataInput
+): BuiltTransaction {
+  const nativeEndpoint = resolveNativeLiquidityEndpoint(registry.tokens, input.tokenX, input.tokenY, "add-liquidity");
+  const value = nativeEndpoint.side === "x" ? input.amountX : input.amountY;
+  if (value <= 0n) {
+    throw new Error("Native add-liquidity amount must be positive; use addLiquidity for an ERC-20-only deposit");
+  }
+  const parameters = normalizeAddLiquidityParameters(registry, input);
+
+  const data = encodeFunctionData({
+    abi: lbRouterAbi,
+    functionName: "addLiquidityNATIVE",
+    args: [parameters]
+  });
+
+  return {
+    to: registry.contracts.lbRouter,
+    data,
+    value
   };
 }
 
@@ -223,11 +215,7 @@ export function buildRemoveLiquidityTransaction(
   registry: Pick<DexRegistry, "contracts" | "tokens">,
   input: RemoveLiquidityCalldataInput
 ): BuiltTransaction {
-  assertTokenActionAllowed(registry.tokens, [input.tokenX, input.tokenY], "remove-liquidity");
-  if (input.ids.length === 0 || input.ids.length !== input.amounts.length) {
-    throw new Error("Remove liquidity ids and amounts must be non-empty and have matching lengths");
-  }
-  assertProtectedBurnMinimums(input.minimums);
+  assertRemoveLiquidityInput(registry, input);
 
   const data = encodeFunctionData({
     abi: lbRouterAbi,
@@ -238,6 +226,40 @@ export function buildRemoveLiquidityTransaction(
       Number(input.binStep),
       input.minimums.amountXMin,
       input.minimums.amountYMin,
+      input.ids,
+      input.amounts,
+      input.to,
+      input.deadline
+    ]
+  });
+
+  return {
+    to: registry.contracts.lbRouter,
+    data,
+    value: 0n
+  };
+}
+
+export function buildRemoveLiquidityNativeTransaction(
+  registry: Pick<DexRegistry, "contracts" | "tokens">,
+  input: RemoveLiquidityCalldataInput
+): BuiltTransaction {
+  assertRemoveLiquidityInput(registry, input);
+  const nativeEndpoint = resolveNativeLiquidityEndpoint(registry.tokens, input.tokenX, input.tokenY, "remove-liquidity");
+  if (nativeEndpoint.token.risk.flags.includes("fee-on-transfer")) {
+    throw new Error("Native liquidity removal does not support fee-on-transfer tokens");
+  }
+  const amountTokenMin = nativeEndpoint.side === "x" ? input.minimums.amountYMin : input.minimums.amountXMin;
+  const amountNativeMin = nativeEndpoint.side === "x" ? input.minimums.amountXMin : input.minimums.amountYMin;
+
+  const data = encodeFunctionData({
+    abi: lbRouterAbi,
+    functionName: "removeLiquidityNATIVE",
+    args: [
+      nativeEndpoint.token.address,
+      Number(input.binStep),
+      amountTokenMin,
+      amountNativeMin,
       input.ids,
       input.amounts,
       input.to,
@@ -284,6 +306,82 @@ export function buildSeededWnativeUsdcRemoveLiquidityTransaction(
     tokenY: pool.tokenY,
     binStep: pool.binStep
   });
+}
+
+function normalizeAddLiquidityParameters(
+  registry: Pick<DexRegistry, "tokens">,
+  input: AddLiquidityCalldataInput
+) {
+  assertTokenActionAllowed(registry.tokens, [input.tokenX, input.tokenY], "add-liquidity");
+  const deltaIds = input.deltaIds ?? [0n];
+  const distributionX = input.distributionX ?? [DISTRIBUTION_PRECISION];
+  const distributionY = input.distributionY ?? [DISTRIBUTION_PRECISION];
+  const idSlippage = normalizeSafeIdSlippage(input.idSlippage);
+  const amountXMin = input.amountXMin ?? 0n;
+  const amountYMin = input.amountYMin ?? 0n;
+
+  assertMatchingArrayLengths(deltaIds, distributionX, distributionY);
+  assertLiquidityAmountsMatchDistribution(
+    input.amountX,
+    input.amountY,
+    amountXMin,
+    amountYMin,
+    distributionX,
+    distributionY
+  );
+
+  return {
+    tokenX: input.tokenX,
+    tokenY: input.tokenY,
+    binStep: BigInt(input.binStep),
+    amountX: input.amountX,
+    amountY: input.amountY,
+    amountXMin,
+    amountYMin,
+    activeIdDesired: BigInt(input.activeIdDesired),
+    idSlippage,
+    deltaIds,
+    distributionX,
+    distributionY,
+    to: input.to,
+    refundTo: input.refundTo ?? input.to,
+    deadline: input.deadline
+  };
+}
+
+function assertRemoveLiquidityInput(
+  registry: Pick<DexRegistry, "tokens">,
+  input: RemoveLiquidityCalldataInput
+): void {
+  assertTokenActionAllowed(registry.tokens, [input.tokenX, input.tokenY], "remove-liquidity");
+  if (input.ids.length === 0 || input.ids.length !== input.amounts.length) {
+    throw new Error("Remove liquidity ids and amounts must be non-empty and have matching lengths");
+  }
+  assertProtectedBurnMinimums(input.minimums);
+}
+
+function resolveNativeLiquidityEndpoint(
+  tokens: DexRegistry["tokens"],
+  tokenX: Address,
+  tokenY: Address,
+  action: TokenAction
+): { side: "x" | "y"; token: TokenMetadata } {
+  assertTokenActionAllowed(tokens, [tokenX, tokenY], action);
+  const tokenXMetadata = findTokenMetadata(tokens, tokenX);
+  const tokenYMetadata = findTokenMetadata(tokens, tokenY);
+  if (tokenXMetadata === null || tokenYMetadata === null) {
+    throw new Error("Native liquidity endpoints must reference registered tokens");
+  }
+
+  const tokenXIsWrappedNative = tokenXMetadata.tags.includes("wrapped-native");
+  const tokenYIsWrappedNative = tokenYMetadata.tags.includes("wrapped-native");
+  if (tokenXIsWrappedNative === tokenYIsWrappedNative) {
+    throw new Error("Native liquidity requires exactly one action-enabled wrapped-native endpoint");
+  }
+
+  return tokenXIsWrappedNative
+    ? { side: "x", token: tokenYMetadata }
+    : { side: "y", token: tokenXMetadata };
 }
 
 /**

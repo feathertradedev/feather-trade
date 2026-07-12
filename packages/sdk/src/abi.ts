@@ -64,8 +64,85 @@ export const lbRouterAbi = [
   },
   {
     type: "function",
+    name: "swapExactTokensForNATIVE",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "amountIn", type: "uint256" },
+      { name: "amountOutMinNATIVE", type: "uint256" },
+      {
+        name: "path",
+        type: "tuple",
+        components: [
+          { name: "pairBinSteps", type: "uint256[]" },
+          { name: "versions", type: "uint8[]" },
+          { name: "tokenPath", type: "address[]" }
+        ]
+      },
+      { name: "to", type: "address" },
+      { name: "deadline", type: "uint256" }
+    ],
+    outputs: [{ name: "amountOut", type: "uint256" }]
+  },
+  {
+    type: "function",
+    name: "swapExactNATIVEForTokens",
+    stateMutability: "payable",
+    inputs: [
+      { name: "amountOutMin", type: "uint256" },
+      {
+        name: "path",
+        type: "tuple",
+        components: [
+          { name: "pairBinSteps", type: "uint256[]" },
+          { name: "versions", type: "uint8[]" },
+          { name: "tokenPath", type: "address[]" }
+        ]
+      },
+      { name: "to", type: "address" },
+      { name: "deadline", type: "uint256" }
+    ],
+    outputs: [{ name: "amountOut", type: "uint256" }]
+  },
+  {
+    type: "function",
     name: "addLiquidity",
     stateMutability: "nonpayable",
+    inputs: [
+      {
+        name: "liquidityParameters",
+        type: "tuple",
+        components: [
+          { name: "tokenX", type: "address" },
+          { name: "tokenY", type: "address" },
+          { name: "binStep", type: "uint256" },
+          { name: "amountX", type: "uint256" },
+          { name: "amountY", type: "uint256" },
+          { name: "amountXMin", type: "uint256" },
+          { name: "amountYMin", type: "uint256" },
+          { name: "activeIdDesired", type: "uint256" },
+          { name: "idSlippage", type: "uint256" },
+          { name: "deltaIds", type: "int256[]" },
+          { name: "distributionX", type: "uint256[]" },
+          { name: "distributionY", type: "uint256[]" },
+          { name: "to", type: "address" },
+          { name: "refundTo", type: "address" },
+          { name: "deadline", type: "uint256" }
+        ]
+      }
+    ],
+    outputs: [
+      { name: "amountXAdded", type: "uint256" },
+      { name: "amountYAdded", type: "uint256" },
+      { name: "amountXLeft", type: "uint256" },
+      { name: "amountYLeft", type: "uint256" },
+      { name: "depositIds", type: "uint256[]" },
+      { name: "liquidityMinted", type: "uint256[]" }
+    ]
+  },
+  {
+    type: "function",
+    name: "addLiquidityNATIVE",
+    stateMutability: "payable",
     inputs: [
       {
         name: "liquidityParameters",
@@ -116,6 +193,25 @@ export const lbRouterAbi = [
     outputs: [
       { name: "amountX", type: "uint256" },
       { name: "amountY", type: "uint256" }
+    ]
+  },
+  {
+    type: "function",
+    name: "removeLiquidityNATIVE",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "token", type: "address" },
+      { name: "binStep", type: "uint16" },
+      { name: "amountTokenMin", type: "uint256" },
+      { name: "amountNATIVEMin", type: "uint256" },
+      { name: "ids", type: "uint256[]" },
+      { name: "amounts", type: "uint256[]" },
+      { name: "to", type: "address" },
+      { name: "deadline", type: "uint256" }
+    ],
+    outputs: [
+      { name: "amountToken", type: "uint256" },
+      { name: "amountNATIVE", type: "uint256" }
     ]
   }
 ] as const;
@@ -230,6 +326,17 @@ export const lbPairAbi = [
   {
     type: "event",
     name: "DepositedToBins",
+    anonymous: false,
+    inputs: [
+      { name: "sender", type: "address", indexed: true },
+      { name: "to", type: "address", indexed: true },
+      { name: "ids", type: "uint256[]", indexed: false },
+      { name: "amounts", type: "bytes32[]", indexed: false }
+    ]
+  },
+  {
+    type: "event",
+    name: "WithdrawnFromBins",
     anonymous: false,
     inputs: [
       { name: "sender", type: "address", indexed: true },

@@ -50,6 +50,8 @@ export interface SwapExecutionContext {
   reserveX: string | null;
   reserveY: string | null;
   routeMode: "exact-selected" | "best";
+  inputAssetMode: "erc20" | "native";
+  outputAssetMode: "erc20" | "native";
   rpcChainId: number | null;
   slippageBps: string | null;
   tokenIn: string | null;
@@ -61,6 +63,7 @@ export interface SwapExecutionContext {
 
 export interface BurnExecutionContext {
   account: string | null;
+  assetMode: "erc20" | "native";
   binStep: number | null;
   burnBps: string | null;
   deadlineMinutes: number | null;
@@ -69,11 +72,23 @@ export interface BurnExecutionContext {
   pair: string | null;
   registryChainId: number;
   router: string;
+  selectedAssetMode: "erc20" | "native";
   selectedPositionsKey: string;
   slippageBps: string | null;
   tokenX: string | null;
   tokenY: string | null;
+  transactionValue: string;
   walletChainId: number;
+  wrappedNative: string | null;
+  wrappedNativeSide: "x" | "y" | null;
+}
+
+export interface LiquidityAddAssetContext {
+  assetMode: "erc20" | "native";
+  selectedMode: "erc20" | "native";
+  transactionValue: string;
+  wrappedNative: string | null;
+  wrappedNativeSide: "x" | "y" | null;
 }
 
 export interface BurnQuoteExecutionBinding {
@@ -177,6 +192,8 @@ export function swapExecutionContextFingerprint(context: SwapExecutionContext): 
     context.reserveX,
     context.reserveY,
     context.routeMode,
+    context.inputAssetMode,
+    context.outputAssetMode,
     context.updatedAtBlock,
     normalizeContextAddress(context.tokenIn),
     normalizeContextAddress(context.tokenOut),
@@ -186,9 +203,90 @@ export function swapExecutionContextFingerprint(context: SwapExecutionContext): 
   ]);
 }
 
+export interface NativeSwapReceiptAccountingInput {
+  amountIn: bigint;
+  amountOutMin: bigint;
+  direction: "native-in" | "native-out";
+  effectiveGasPrice: bigint;
+  gasUsed: bigint;
+  nativeBalanceAfter: bigint;
+  nativeBalanceBefore: bigint;
+  tokenBalanceAfter: bigint;
+  tokenBalanceBefore: bigint;
+  transactionValue: bigint;
+}
+
+export interface NativeSwapReceiptAccounting {
+  direction: "native-in" | "native-out";
+  gasCost: bigint;
+  nativeAmount: bigint;
+  tokenAmount: bigint;
+}
+
+export interface NativeSwapSubmissionBinding {
+  account: string;
+  amountIn: string;
+  amountOutMin: string;
+  calldataFingerprint: string;
+  direction: "native-in" | "native-out";
+  executionFingerprint: string;
+  hash: string;
+  inputAssetMode: "erc20" | "native";
+  outputAssetMode: "erc20" | "native";
+  quoteIdentity: string;
+  target: string;
+  token: string;
+  transactionValue: string;
+}
+
+export function nativeSwapSubmissionFingerprint(binding: NativeSwapSubmissionBinding): string {
+  return JSON.stringify([
+    normalizeContextAddress(binding.account),
+    binding.hash.toLowerCase(),
+    normalizeContextAddress(binding.target),
+    binding.calldataFingerprint.toLowerCase(),
+    binding.executionFingerprint,
+    binding.quoteIdentity,
+    binding.direction,
+    binding.inputAssetMode,
+    binding.outputAssetMode,
+    normalizeContextAddress(binding.token),
+    binding.amountIn,
+    binding.amountOutMin,
+    binding.transactionValue
+  ]);
+}
+
+export function reconcileNativeSwapReceipt(input: NativeSwapReceiptAccountingInput): NativeSwapReceiptAccounting {
+  if (input.amountIn <= 0n || input.amountOutMin <= 0n || input.gasUsed < 0n || input.effectiveGasPrice < 0n) {
+    throw new Error("Native swap receipt accounting inputs must be positive and bounded");
+  }
+  const gasCost = input.gasUsed * input.effectiveGasPrice;
+  if (input.direction === "native-in") {
+    if (input.transactionValue !== input.amountIn) throw new Error("Native-input receipt value differs from the reviewed amount");
+    if (input.nativeBalanceBefore < input.nativeBalanceAfter + gasCost) throw new Error("Native-input receipt has an impossible ETH balance delta");
+    const nativeAmount = input.nativeBalanceBefore - input.nativeBalanceAfter - gasCost;
+    if (nativeAmount !== input.amountIn) throw new Error("Native-input receipt ETH spend differs from the exact reviewed value");
+    if (input.tokenBalanceAfter < input.tokenBalanceBefore) throw new Error("Native-input receipt output token balance decreased");
+    const tokenAmount = input.tokenBalanceAfter - input.tokenBalanceBefore;
+    if (tokenAmount < input.amountOutMin) throw new Error("Native-input receipt output token amount is below the reviewed minimum");
+    return { direction: input.direction, gasCost, nativeAmount, tokenAmount };
+  }
+  if (input.transactionValue !== 0n) throw new Error("Native-output receipt transaction value must be zero");
+  if (input.tokenBalanceBefore < input.tokenBalanceAfter) throw new Error("Native-output receipt input token balance increased");
+  const tokenAmount = input.tokenBalanceBefore - input.tokenBalanceAfter;
+  if (tokenAmount !== input.amountIn) throw new Error("Native-output receipt token spend differs from the exact reviewed input");
+  if (input.nativeBalanceAfter + gasCost < input.nativeBalanceBefore) throw new Error("Native-output receipt has an impossible ETH balance delta");
+  const nativeAmount = input.nativeBalanceAfter + gasCost - input.nativeBalanceBefore;
+  if (nativeAmount < input.amountOutMin) throw new Error("Native-output receipt ETH amount is below the reviewed minimum");
+  return { direction: input.direction, gasCost, nativeAmount, tokenAmount };
+}
+
 export function burnExecutionContextFingerprint(context: BurnExecutionContext): string {
   return JSON.stringify([
     context.mode,
+    context.assetMode,
+    context.selectedAssetMode,
     context.environment,
     context.registryChainId,
     context.walletChainId,
@@ -201,7 +299,20 @@ export function burnExecutionContextFingerprint(context: BurnExecutionContext): 
     context.burnBps,
     context.slippageBps,
     context.deadlineMinutes,
-    normalizeContextAddress(context.router)
+    normalizeContextAddress(context.router),
+    normalizeContextAddress(context.wrappedNative),
+    context.wrappedNativeSide,
+    context.transactionValue
+  ]);
+}
+
+export function liquidityAddAssetFingerprint(context: LiquidityAddAssetContext): string {
+  return JSON.stringify([
+    context.assetMode,
+    context.selectedMode,
+    normalizeContextAddress(context.wrappedNative),
+    context.wrappedNativeSide,
+    context.transactionValue
   ]);
 }
 

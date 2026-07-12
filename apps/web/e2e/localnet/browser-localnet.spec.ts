@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 
 import { expect, test, type Page, type Route } from "@playwright/test";
-import { createPublicClient, decodeFunctionData, http, type Address, type Hex } from "viem";
+import { createPublicClient, decodeFunctionData, encodeFunctionData, formatUnits, http, parseUnits, type Address, type Hex } from "viem";
 
 import { erc20Abi, lbPairAbi, lbRouterAbi } from "../../../../packages/sdk/src/abi";
 import { installUnlockedRpcWallet, readUnlockedRpcWallet } from "./fixtures/unlocked-rpc-wallet";
@@ -114,6 +114,60 @@ test("a real quote ages stale and remains handler-guarded when refresh fails", a
   await bypassDisabledButtonAndClick(page, "swap-approve-button");
   await bypassDisabledButtonAndClick(page, "swap-submit-button");
   expect((await readUnlockedRpcWallet(page)).sentTransactions).toEqual([]);
+});
+
+test("actual localnet executes native-input swap with exact value and no approval", async ({ page }) => {
+  await installBrowserStack(page, rpcUrl);
+  await client.request({ method: "anvil_setBalance", params: [browserAccount, `0x${(1_010_000_000_000_000_000n).toString(16)}`] });
+  const ethBeforeIn = await client.getBalance({ address: browserAccount });
+  const tokenBeforeIn = await readTokenBalance(pool.tokenY);
+  await page.goto("/#/swap");
+  await connectWallet(page);
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await expect(page.getByTestId("swap-approve-button")).toHaveCount(0);
+  await page.getByTestId("swap-max-button").click();
+  await expect(page.locator("#swap-amount")).not.toHaveValue("1.0");
+  await page.getByTestId("swap-submit-button").click();
+  if (!(await page.getByTestId("gas-review").textContent())?.includes(`= ${formatUnits(ethBeforeIn, 18)} ETH required`)) {
+    expect((await readUnlockedRpcWallet(page)).sentTransactions).toEqual([]);
+    const priorMax = await page.locator("#swap-amount").inputValue();
+    await page.getByTestId("swap-max-button").click();
+    await expect(page.locator("#swap-amount")).not.toHaveValue(priorMax);
+    await page.getByTestId("swap-submit-button").click();
+  }
+  await expect(page.getByTestId("gas-review")).toContainText(`= ${formatUnits(ethBeforeIn, 18)} ETH required`);
+  const swapGasReviewText = await page.getByTestId("gas-review").innerText();
+  await page.getByTestId("swap-submit-button").click();
+  await expect(page.getByTestId("native-swap-receipt-review")).toContainText("ETH spent", { timeout: 15_000 });
+  const walletAfterIn = await readUnlockedRpcWallet(page);
+  const nativeInTransaction = decodeSubmittedTransaction(walletAfterIn.sentTransactions[0]!);
+  expect(nativeInTransaction.functionName).toBe("swapExactNATIVEForTokens");
+  const nativeInputValue = BigInt((walletAfterIn.sentTransactions[0] as { value?: string }).value ?? "0x0");
+  expect(nativeInputValue).toBe(ethBeforeIn - bufferedReserveFromGasReview(swapGasReviewText));
+  expect(await readTokenBalance(pool.tokenY)).toBeGreaterThan(tokenBeforeIn);
+  expect(await client.getBalance({ address: browserAccount })).toBeLessThan(ethBeforeIn);
+  await client.request({ method: "anvil_setBalance", params: [browserAccount, `0x${(100n * 10n ** 18n).toString(16)}`] });
+});
+
+test("actual localnet executes native-output swap with ERC input approval and zero value", async ({ page }) => {
+  await installBrowserStack(page, rpcUrl);
+  await page.goto("/#/swap");
+  await connectWallet(page);
+  await page.getByTitle("Flip tokens").click();
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await expect(page.getByTestId("swap-approve-button")).toBeEnabled();
+  await clickReviewedAction(page, "swap-approve-button");
+  await expect(page.getByText("Approval confirmed")).toBeVisible();
+  const ethBeforeOut = await client.getBalance({ address: browserAccount });
+  await clickReviewedAction(page, "swap-submit-button");
+  await expect(page.getByTestId("native-swap-receipt-review")).toContainText("ETH received", { timeout: 15_000 });
+  const walletAfterOut = await readUnlockedRpcWallet(page);
+  const nativeOutRaw = walletAfterOut.sentTransactions[walletAfterOut.sentTransactions.length - 1]!;
+  expect(decodeSubmittedTransaction(nativeOutRaw).functionName).toBe("swapExactTokensForNATIVE");
+  expect(BigInt((nativeOutRaw as { value?: string }).value ?? "0x0")).toBe(0n);
+  const nativeOutHash = walletAfterOut.transactionHashes[walletAfterOut.transactionHashes.length - 1]!;
+  const nativeOutReceipt = await client.getTransactionReceipt({ hash: nativeOutHash });
+  expect((await client.getBalance({ address: browserAccount })) + nativeOutReceipt.gasUsed * nativeOutReceipt.effectiveGasPrice).toBeGreaterThan(ethBeforeOut);
 });
 
 test("actual UI submits approve, swap, add, LB approval, and remove transactions to isolated Anvil", async ({ page }) => {
@@ -357,6 +411,150 @@ test("actual UI deposits one-sided liquidity above and below the active bin with
   });
 });
 
+test("actual UI deposits one-sided native liquidity with exact ETH value and canonical wrapper and LP accounting", async ({ page }) => {
+  await installBrowserStack(page, rpcUrl);
+  const binIds = [pool.activeId + 1, pool.activeId + 2];
+  const [nativeBefore, wrapperBefore, lpBefore] = await Promise.all([
+    client.getBalance({ address: browserAccount }),
+    readTokenBalance(manifest.tokens.wnative),
+    readLbBalanceAcross(binIds)
+  ]);
+  await page.goto("/#/liquidity");
+  await connectWallet(page);
+  await page.getByTestId("liquidity-native-mode").getByRole("button", { name: "ETH · native" }).click();
+  await page.locator("#range-lower").fill("1");
+  await page.locator("#range-upper").fill("2");
+  await expect(page.getByTestId("liquidity-approve-x-button")).toHaveCount(0);
+  await page.getByTestId("liquidity-max-x").click();
+  await expect(page.getByTestId("liquidity-amount-x")).not.toHaveValue("0.01");
+  await page.getByTestId("liquidity-add-button").click();
+  if (!(await page.getByTestId("gas-review").textContent())?.includes(`= ${formatUnits(nativeBefore, 18)} ETH required`)) {
+    expect((await readUnlockedRpcWallet(page)).sentTransactions).toEqual([]);
+    const priorMax = await page.getByTestId("liquidity-amount-x").inputValue();
+    await page.getByTestId("liquidity-max-x").click();
+    await expect(page.getByTestId("liquidity-amount-x")).not.toHaveValue(priorMax);
+    await page.getByTestId("liquidity-add-button").click();
+  }
+  await expect(page.getByTestId("gas-review")).toContainText(`= ${formatUnits(nativeBefore, 18)} ETH required`);
+  const addGasReviewText = await page.getByTestId("gas-review").innerText();
+  await page.getByTestId("liquidity-add-button").click();
+  await expect.poll(async () => (await readUnlockedRpcWallet(page)).transactionHashes.length).toBe(1);
+  const wallet = await readUnlockedRpcWallet(page);
+  const submitted = wallet.sentTransactions[0]!;
+  const decoded = decodeSubmittedTransaction(submitted);
+  expect(decoded.functionName).toBe("addLiquidityNATIVE");
+  const parameters = (decoded.args as readonly [DecodedLiquidityParameters])[0];
+  const value = normalizeTransactionValue(submitted.value);
+  expect(value).toBe(parameters.amountX);
+  expect(value).toBe(nativeBefore - bufferedReserveFromGasReview(addGasReviewText));
+  expect(parameters.amountY).toBe(0n);
+  const receipt = await client.getTransactionReceipt({ hash: wallet.transactionHashes[0]! });
+  const [nativeAfter, wrapperAfter, lpAfter] = await Promise.all([
+    client.getBalance({ address: browserAccount }),
+    readTokenBalance(manifest.tokens.wnative),
+    readLbBalanceAcross(binIds)
+  ]);
+  expect(nativeBefore - nativeAfter - receipt.gasUsed * receipt.effectiveGasPrice).toBe(value);
+  expect(wrapperAfter).toBeGreaterThanOrEqual(wrapperBefore);
+  expect(lpAfter).toBeGreaterThan(lpBefore);
+  await mineBlocks(3);
+  await expect(page.getByTestId("liquidity-receipt-review")).toContainText("Exact native value", { timeout: 20_000 });
+  await client.request({ method: "anvil_setBalance", params: [browserAccount, `0x${(100n * 10n ** 18n).toString(16)}`] });
+});
+
+test("actual UI deposits balanced native liquidity after approving only the positive non-wrapper side", async ({ page }) => {
+  await sendUnlockedTransaction({
+    data: encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [manifest.contracts.lbRouter, 0n] }),
+    to: manifest.tokens.usdc,
+    value: 0n
+  });
+  await installBrowserStack(page, rpcUrl);
+  await page.goto("/#/liquidity");
+  await connectWallet(page);
+  await page.getByTestId("liquidity-native-mode").getByRole("button", { name: "ETH · native" }).click();
+  await expect(page.getByTestId("liquidity-approve-x-button")).toHaveCount(0);
+  await expect(page.getByTestId("liquidity-approve-y-button")).toContainText("Approve USDC");
+  await clickReviewedAction(page, "liquidity-approve-y-button");
+  await expect.poll(async () => (await readUnlockedRpcWallet(page)).transactionHashes.length).toBe(1);
+  const nativeBeforeAdd = await client.getBalance({ address: browserAccount });
+  await clickReviewedAction(page, "liquidity-add-button");
+  await expect.poll(async () => (await readUnlockedRpcWallet(page)).transactionHashes.length).toBe(2);
+  const wallet = await readUnlockedRpcWallet(page);
+  const submitted = wallet.sentTransactions[1]!;
+  const decoded = decodeSubmittedTransaction(submitted);
+  expect(wallet.sentTransactions.map(decodeSubmittedTransaction).map((transaction) => transaction.functionName)).toEqual(["approve", "addLiquidityNATIVE"]);
+  const parameters = (decoded.args as readonly [DecodedLiquidityParameters])[0];
+  expect(parameters.amountX).toBeGreaterThan(0n);
+  expect(parameters.amountY).toBeGreaterThan(0n);
+  const value = normalizeTransactionValue(submitted.value);
+  expect(value).toBe(parameters.amountX);
+  const receipt = await client.getTransactionReceipt({ hash: wallet.transactionHashes[1]! });
+  const nativeAfterAdd = await client.getBalance({ address: browserAccount });
+  expect(nativeBeforeAdd - nativeAfterAdd - receipt.gasUsed * receipt.effectiveGasPrice).toBe(value);
+  await mineBlocks(3);
+  await expect(page.getByTestId("liquidity-receipt-review")).toContainText("Exact native value", { timeout: 20_000 });
+});
+
+test("actual UI performs native partial withdrawal and native full exit with canonical balance accounting", async ({ page }) => {
+  await installBrowserStack(page, rpcUrl);
+  await page.goto("/#/liquidity");
+  await connectWallet(page);
+  if (await page.getByTestId("liquidity-approve-lb-button").isEnabled()) {
+    await clickReviewedAction(page, "liquidity-approve-lb-button");
+    await expect(page.getByText("LB approval confirmed")).toBeVisible();
+  }
+  const walletBefore = await readUnlockedRpcWallet(page);
+  const baselineTransactions = walletBefore.sentTransactions.length;
+  const nativeMode = page.getByRole("group", { name: "Wrapped-native withdrawal mode" });
+  await nativeMode.getByRole("button", { name: "ETH · native output" }).click();
+  await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "50%" }).click();
+  await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled();
+  const [nativeBeforePartial, tokenBeforePartial, lbBeforePartial] = await Promise.all([
+    client.getBalance({ address: browserAccount }),
+    readTokenBalance(manifest.tokens.usdc),
+    readLbBalance()
+  ]);
+  await clickReviewedAction(page, "liquidity-remove-button");
+  await expect.poll(async () => (await readUnlockedRpcWallet(page)).sentTransactions.length).toBe(baselineTransactions + 1);
+  const partialWallet = await readUnlockedRpcWallet(page);
+  const partialSubmitted = partialWallet.sentTransactions.at(-1)!;
+  const partialDecoded = decodeSubmittedTransaction(partialSubmitted);
+  expect(partialDecoded.functionName).toBe("removeLiquidityNATIVE");
+  expect(normalizeTransactionValue(partialSubmitted.value)).toBe(0n);
+  const partialArgs = partialDecoded.args as readonly [Address, bigint, bigint, bigint, readonly bigint[], readonly bigint[], Address, bigint];
+  const partialReceipt = await client.getTransactionReceipt({ hash: partialWallet.transactionHashes.at(-1)! });
+  const [nativeAfterPartial, tokenAfterPartial, lbAfterPartial] = await Promise.all([
+    client.getBalance({ address: browserAccount }),
+    readTokenBalance(manifest.tokens.usdc),
+    readLbBalance()
+  ]);
+  expect(nativeAfterPartial + partialReceipt.gasUsed * partialReceipt.effectiveGasPrice - nativeBeforePartial).toBeGreaterThanOrEqual(partialArgs[3]);
+  expect(tokenAfterPartial - tokenBeforePartial).toBeGreaterThanOrEqual(partialArgs[2]);
+  expect(lbBeforePartial - lbAfterPartial).toBe(partialArgs[5][0]);
+  await mineBlocks(3);
+  await expect(page.getByTestId("remove-receipt-review")).toContainText("exactly reconciled", { timeout: 20_000 });
+
+  await mineBlocks(12);
+  await expect.poll(() => page.evaluate(() => {
+    const raw = window.localStorage.getItem("feather.transaction-journal.v1");
+    if (raw === null) return 0;
+    const records = (JSON.parse(raw) as { records: Array<{ confirmations: number; reviewed: { intent: string } }> }).records;
+    return records.findLast((record) => record.reviewed.intent === "remove-liquidity")?.confirmations ?? 0;
+  }), { timeout: 20_000 }).toBeGreaterThanOrEqual(12);
+  await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "Max" }).click();
+  await expect(page.getByTestId("withdraw-transaction-review")).toContainText("Full exit");
+  const txCountBeforeFull = (await readUnlockedRpcWallet(page)).sentTransactions.length;
+  await clickReviewedAction(page, "liquidity-remove-button");
+  await expect.poll(async () => (await readUnlockedRpcWallet(page)).sentTransactions.length).toBe(txCountBeforeFull + 1);
+  const fullWallet = await readUnlockedRpcWallet(page);
+  const fullSubmitted = fullWallet.sentTransactions.at(-1)!;
+  expect(decodeSubmittedTransaction(fullSubmitted).functionName).toBe("removeLiquidityNATIVE");
+  expect(normalizeTransactionValue(fullSubmitted.value)).toBe(0n);
+  await mineBlocks(3);
+  await expect(page.getByTestId("remove-receipt-review")).toContainText("exactly reconciled", { timeout: 20_000 });
+  expect(await readLbBalance()).toBe(0n);
+});
+
 async function installBrowserStack(page: Page, runtimeRpcUrl: string): Promise<RpcControl> {
   const rpcControl: RpcControl = { failExactQuoteCalls: false, simulations: [], simulationTransactions: [] };
   await installRpcProxy(page, runtimeRpcUrl, rpcControl);
@@ -416,7 +614,9 @@ function recordTransactionSimulation(request: JsonRpcRequest, control: RpcContro
         "approveForAll",
         "swapExactTokensForTokens",
         "addLiquidity",
-        "removeLiquidity"
+        "addLiquidityNATIVE",
+        "removeLiquidity",
+        "removeLiquidityNATIVE"
       ].includes(decoded.functionName)
     ) {
       return;
@@ -550,7 +750,7 @@ async function connectWallet(page: Page): Promise<void> {
 
 async function clickReviewedAction(page: Page, testId: string): Promise<void> {
   const expectedAction = new Map<string, RegExp>([
-    ["swap-approve-button", /gas estimate for WNATIVE approval:/],
+    ["swap-approve-button", /gas estimate for (?:WNATIVE|USDC) approval:/],
     ["swap-submit-button", /gas estimate for swap:/],
     ["liquidity-approve-x-button", /gas estimate for WNATIVE approval:/],
     ["liquidity-approve-y-button", /gas estimate for USDC approval:/],
@@ -595,6 +795,31 @@ async function readLbBalanceAcross(binIds: number[]): Promise<bigint> {
   return balances.reduce((total, balance) => total + balance, 0n);
 }
 
+async function mineBlocks(count: number): Promise<void> {
+  await rawRpc("anvil_mine", [`0x${count.toString(16)}`]);
+}
+
+async function sendUnlockedTransaction(input: { data: Hex; to: Address; value: bigint }): Promise<void> {
+  const hash = await rawRpc("eth_sendTransaction", [{
+    data: input.data,
+    from: browserAccount,
+    to: input.to,
+    value: `0x${input.value.toString(16)}`
+  }]) as Hex;
+  await client.waitForTransactionReceipt({ hash });
+}
+
+async function rawRpc(method: string, params: unknown[]): Promise<unknown> {
+  const response = await fetch(rpcUrl, {
+    body: JSON.stringify({ id: 1, jsonrpc: "2.0", method, params }),
+    headers: { "content-type": "application/json" },
+    method: "POST"
+  });
+  const payload = await response.json() as { error?: { message?: string }; result?: unknown };
+  if (payload.error) throw new Error(payload.error.message ?? `${method} failed`);
+  return payload.result;
+}
+
 function decodeSubmittedTransaction(transaction: Record<string, unknown>) {
   if (typeof transaction.data !== "string") throw new Error("Submitted transaction is missing calldata");
   return decodeFunctionData({ abi: transactionSimulationAbi, data: transaction.data as Hex });
@@ -616,6 +841,14 @@ function normalizeTransactionValue(value: unknown): bigint {
     throw new Error("Transaction value is not numeric");
   }
   return BigInt(value);
+}
+
+function bufferedReserveFromGasReview(text: string): bigint {
+  const match = text.match(/limit (\d+) × ([0-9.]+) gwei \+ 25% gas buffer/);
+  if (!match) throw new Error(`Exact gas review is not parseable: ${text}`);
+  const gasLimit = BigInt(match[1]!);
+  const gasPrice = parseUnits(match[2]!, 9);
+  return (gasLimit * gasPrice * 12_500n + 9_999n) / 10_000n;
 }
 
 function normalizeAddress(value: unknown): string {

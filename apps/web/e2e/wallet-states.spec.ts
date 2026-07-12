@@ -39,6 +39,182 @@ test("disconnected wallet state disables guarded swap actions", async ({ page })
   await expect(page.getByTestId("swap-balance-value")).toHaveText("connect wallet");
 });
 
+test("native ETH input suppresses approval, sends exact value, and reconciles canonical balances", async ({ page }) => {
+  const nativeBefore = 10n * ONE_TOKEN;
+  const tokenBefore = 5n * ONE_TOKEN;
+  const amountIn = ONE_TOKEN;
+  const amountOut = 999n * ONE_TOKEN / 1_000n;
+  const rpc = await installMockRpc(page, {
+    balance: tokenBefore,
+    balanceAfterReceipt: tokenBefore + amountOut,
+    includePairs: true,
+    nativeBalance: nativeBefore,
+    nativeBalanceAfterReceipt: nativeBefore - amountIn - 100_000n,
+    receiptBlockNumber: 43n
+  });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
+  await page.goto("/#/swap");
+  await connectWallet(page);
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await expect(page.getByTestId("swap-token-in-identity")).toContainText(`ETH native asset · router wrapper WNATIVE ${WNATIVE}`);
+  await expect(page.getByTestId("swap-native-no-approval")).toBeVisible();
+  await expect(page.getByTestId("swap-approve-button")).toHaveCount(0);
+  await clickReviewedAction(page, "swap-submit-button");
+  await expect(page.getByTestId("native-swap-receipt-review")).toContainText("ETH spent", { timeout: 15_000 });
+
+  const wallet = await readMockWallet(page);
+  expect(wallet.sentTransactions).toHaveLength(1);
+  const transaction = wallet.sentTransactions[0] as { data: Hex; value: string };
+  expect(BigInt(transaction.value)).toBe(amountIn);
+  expect(decodeFunctionData({ abi: lbRouterAbi, data: transaction.data }).functionName).toBe("swapExactNATIVEForTokens");
+  rpc.update({ blockHash: `0x${"44".repeat(32)}` as Hex });
+  await expect(page.getByTestId("native-swap-receipt-error")).toContainText("reorganized", { timeout: 15_000 });
+  await expect(page.getByTestId("native-swap-receipt-review")).toHaveCount(0);
+});
+
+test("native ETH input gas review requires exact value plus buffered gas and opens no wallet", async ({ page }) => {
+  const amountIn = ONE_TOKEN;
+  const bufferedGas = 2_500_000_000_000_000n;
+  await setupConnectedSwap(page, {
+    estimatedGas: 2_000_000n,
+    includePairs: true,
+    nativeBalance: amountIn + bufferedGas - 1n
+  });
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await page.getByTestId("swap-submit-button").click();
+  await expect(page.getByTestId("gas-review")).toContainText("+ 1 ETH value");
+  await expect(page.getByTestId("gas-review")).toContainText("1.0025 ETH required");
+  await expect(page.getByTestId("swap-failure-state")).toContainText("Insufficient ETH for gas");
+  expect((await readMockWallet(page)).sentTransactions).toHaveLength(0);
+});
+
+test("delayed native receipt reconciles against submitted quote after live quote refresh", async ({ page }) => {
+  const nativeBefore = 10n * ONE_TOKEN;
+  const tokenBefore = 5n * ONE_TOKEN;
+  const submittedTokenOut = 999n * ONE_TOKEN / 1_000n;
+  const rpc = await setupConnectedSwap(page, {
+    balance: tokenBefore,
+    balanceAfterReceipt: tokenBefore + submittedTokenOut,
+    includePairs: true,
+    nativeBalance: nativeBefore,
+    nativeBalanceAfterReceipt: nativeBefore - ONE_TOKEN - 100_000n,
+    quoteRate: 999n,
+    receiptBlockNumber: 43n,
+    receiptDelayMs: 1_500
+  });
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  const submittedOutput = await page.locator("#swap-output").inputValue();
+  await clickReviewedAction(page, "swap-submit-button");
+  rpc.update({ blockNumber: 44n, indexerBlockNumber: 44n, quoteRate: 2_000n });
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect.poll(() => page.locator("#swap-output").inputValue()).not.toBe(submittedOutput);
+  await expect(page.getByTestId("native-swap-receipt-review")).toContainText("ETH spent", { timeout: 15_000 });
+  await expect(page.getByTestId("native-swap-receipt-error")).toHaveCount(0);
+  expect((await readMockWallet(page)).sentTransactions).toHaveLength(1);
+});
+
+test("native ETH output keeps ERC input approval, sends zero value, and reconciles canonical balances", async ({ page }) => {
+  const nativeBefore = 10n * ONE_TOKEN;
+  const tokenBefore = 5n * ONE_TOKEN;
+  const amountOut = 999n * ONE_TOKEN / 1_000n;
+  await installMockRpc(page, {
+    allowance: 10n * ONE_TOKEN,
+    balance: tokenBefore,
+    balanceAfterReceipt: tokenBefore - ONE_TOKEN,
+    includePairs: true,
+    nativeBalance: nativeBefore,
+    nativeBalanceAfterReceipt: nativeBefore + amountOut - 100_000n,
+    receiptBlockNumber: 43n
+  });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
+  await page.goto("/#/swap");
+  await connectWallet(page);
+  await page.getByTitle("Flip tokens").click();
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await expect(page.getByTestId("swap-token-out-identity")).toContainText("ETH native asset");
+  await expect(page.getByTestId("swap-approve-button")).toContainText("Approved");
+  await expect(page.getByTestId("swap-approve-button")).toBeDisabled();
+  await clickReviewedAction(page, "swap-submit-button");
+  await expect(page.getByTestId("native-swap-receipt-review")).toContainText("ETH received", { timeout: 15_000 });
+
+  const wallet = await readMockWallet(page);
+  expect(wallet.sentTransactions).toHaveLength(1);
+  const transaction = wallet.sentTransactions[0] as { data: Hex; value?: string };
+  expect(BigInt(transaction.value ?? "0x0")).toBe(0n);
+  expect(decodeFunctionData({ abi: lbRouterAbi, data: transaction.data }).functionName).toBe("swapExactTokensForNATIVE");
+});
+
+test("native swap mode change during delayed simulation invalidates the wallet request", async ({ page }) => {
+  await installMockRpc(page, { includePairs: true, simulationDelayMs: 750 });
+  await installMockWallet(page, { allowTransactions: false, chainId: LOCALNET_CHAIN_ID });
+  await page.goto("/#/swap");
+  await connectWallet(page);
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await page.getByTestId("swap-submit-button").click();
+  await page.waitForTimeout(100);
+  await page.getByRole("button", { name: "WNATIVE · ERC-20" }).click();
+  await page.waitForTimeout(900);
+  expect((await readMockWallet(page)).sentTransactions).toHaveLength(0);
+});
+
+test("native swap simulation failure opens no wallet request", async ({ page }) => {
+  await installMockRpc(page, { includePairs: true, simulationMode: "error" });
+  await installMockWallet(page, { allowTransactions: false, chainId: LOCALNET_CHAIN_ID });
+  await page.goto("/#/swap");
+  await connectWallet(page);
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await page.getByTestId("swap-submit-button").click();
+  await expect(page.getByText(/Simulation failed:/)).toBeVisible();
+  expect((await readMockWallet(page)).sentTransactions).toHaveLength(0);
+});
+
+test("native swap unresolved journal retry never creates a second wallet request", async ({ page }) => {
+  await installMockRpc(page, { includePairs: true });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID, transactionMode: "ambiguous" });
+  await page.goto("/#/swap");
+  await connectWallet(page);
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await page.getByTestId("swap-submit-button").click();
+  await expect(page.getByTestId("gas-review")).toBeVisible();
+  await page.getByTestId("swap-submit-button").click();
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+  await page.getByTestId("swap-submit-button").click();
+  expect((await readMockWallet(page)).sentTransactions).toHaveLength(1);
+  await expect(page.getByTestId("native-swap-receipt-review")).toHaveCount(0);
+});
+
+test("native swap wallet rejection never produces receipt success", async ({ page }) => {
+  await installMockRpc(page, { includePairs: true });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID, rejectTransactions: true });
+  await page.goto("/#/swap");
+  await connectWallet(page);
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await page.getByTestId("swap-submit-button").click();
+  await expect(page.getByTestId("gas-review")).toBeVisible();
+  await page.getByTestId("swap-submit-button").click();
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+  await expect(page.getByText("Swap confirmed")).toHaveCount(0);
+  await expect(page.getByTestId("native-swap-receipt-review")).toHaveCount(0);
+});
+
+test("native swap mined revert is truthful and duplicate clicks open one wallet request", async ({ page }) => {
+  await installMockRpc(page, { includePairs: true, receiptStatus: "reverted", simulationDelayMs: 100 });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID, transactionDelayMs: 500 });
+  await page.goto("/#/swap");
+  await connectWallet(page);
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await page.getByTestId("swap-submit-button").click();
+  await expect(page.getByTestId("gas-review")).toBeVisible();
+  await page.evaluate(() => {
+    const button = document.querySelector<HTMLButtonElement>('[data-testid="swap-submit-button"]');
+    button?.click();
+    button?.click();
+  });
+  await expect(page.getByText("Swap reverted")).toBeVisible({ timeout: 15_000 });
+  expect((await readMockWallet(page)).sentTransactions).toHaveLength(1);
+  await expect(page.getByTestId("native-swap-receipt-review")).toHaveCount(0);
+});
+
 test("broken token logos render a deterministic address-derived fallback", async ({ page }) => {
   await page.route("**/token-assets/wnative.svg", (route) => route.abort());
   await installMockRpc(page);
@@ -121,6 +297,8 @@ test("a pair code change during durable pre-wallet review aborts without broadca
   rpc.update({ pairCode: "0x" });
   await secondClick;
   await expect(page.getByTestId("submitted-transaction-journal")).toContainText("aborted");
+  await expect(page.getByTestId("swap-failure-state")).not.toContainText(/possible broadcast/i);
+  await expect(page.getByTestId("swap-failure-state")).toContainText(/code|context changed|attestation/i);
   expect((await readMockWallet(page)).sentTransactions).toEqual([]);
 
   rpc.update({ pairCode: "0x6001600055" });
@@ -836,6 +1014,7 @@ test("unavailable durable storage blocks wallet handoff and surfaces a controlle
 
   await clickReviewedAction(page, "swap-submit-button");
   await expect(page.getByTestId("swap-failure-state")).toContainText(/quota|storage|journal/i);
+  await expect(page.getByTestId("swap-failure-state")).not.toContainText(/possible broadcast/i);
   expect((await readMockWallet(page)).sentTransactions).toHaveLength(0);
 });
 
@@ -1022,6 +1201,81 @@ test("Swap Max binds the exact token balance and invalidates an in-flight stale 
   await page.getByTestId("swap-max-button").click();
   await expect(page.locator("#swap-amount")).toHaveValue("5");
   await expect(page.getByTestId("swap-failure-state")).toContainText("Execution context changed during simulation");
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
+test("native Swap Max reserves reviewed buffered gas and revalidates the exact final value", async ({ page }) => {
+  const nativeBalance = 10n * ONE_TOKEN;
+  const reserve = 625_000_000_000_000n;
+  const rpc = await setupConnectedSwap(page, { balance: 5n * ONE_TOKEN, nativeBalance });
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await expect(page.getByTestId("swap-max-button")).toBeEnabled();
+  const journalBeforeProbe = await page.evaluate(() => JSON.parse(window.localStorage.getItem("feather.transaction-journal.v1") ?? '{"records":[]}').records.length as number);
+  await page.getByTestId("swap-max-button").click();
+  await expect(page.locator("#swap-amount")).toHaveValue("9.999375");
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+  expect(await page.evaluate(() => JSON.parse(window.localStorage.getItem("feather.transaction-journal.v1") ?? '{"records":[]}').records.length as number)).toBe(journalBeforeProbe);
+  await clickReviewedAction(page, "swap-submit-button");
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+  const submitted = (await readMockWallet(page)).sentTransactions[0]!;
+  expect(BigInt(submitted.value ?? "0x0")).toBe(nativeBalance - reserve);
+  assertTransactionMatchesSimulation(submitted, rpc, "swapExactNATIVEForTokens");
+});
+
+test("native Swap Max blocks stale non-maximum value when gas falls or balance rises", async ({ page }) => {
+  const rpc = await setupConnectedSwap(page, { balance: 5n * ONE_TOKEN, gasPrice: 2_000_000_000n, nativeBalance: 10n * ONE_TOKEN });
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await page.getByTestId("swap-max-button").click();
+  await expect(page.locator("#swap-amount")).toHaveValue("9.99875");
+  rpc.update({ gasPrice: 1_000_000_000n, nativeBalance: 11n * ONE_TOKEN });
+  await page.getByTestId("swap-submit-button").click();
+  await expect(page.getByText(/Native Max changed with the latest balance or buffered gas/).first()).toBeVisible();
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
+test("native Swap Max fails closed when gas rises and requires a fresh reserve", async ({ page }) => {
+  const nativeBalance = 10n * ONE_TOKEN;
+  const rpc = await setupConnectedSwap(page, { balance: 5n * ONE_TOKEN, gasPrice: 1_000_000_000n, nativeBalance });
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await page.getByTestId("swap-max-button").click();
+  await expect(page.locator("#swap-amount")).toHaveValue("9.999375");
+  rpc.update({ gasPrice: 2_000_000_000n, nativeBalance: 9n * ONE_TOKEN });
+  await page.getByTestId("swap-submit-button").click();
+  await expect(page.getByText(/Native Max changed with the latest balance or buffered gas/).first()).toBeVisible();
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+  await page.getByTestId("swap-max-button").click();
+  await expect(page.locator("#swap-amount")).toHaveValue("8.99875");
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
+test("native Max requires a positive probe amount and never bootstraps invalid input", async ({ page }) => {
+  await setupConnectedSwap(page, { nativeBalance: 10n * ONE_TOKEN });
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await page.locator("#swap-amount").fill("");
+  await expect(page.getByTestId("swap-native-max-guidance")).toContainText("positive ETH probe amount");
+  await expect(page.getByTestId("swap-max-button")).toBeDisabled();
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
+test("native liquidity Max requires a positive probe amount", async ({ page }) => {
+  await setupConnectedLiquidity(page, { allowance: 5n * ONE_TOKEN, balance: 5n * ONE_TOKEN, nativeBalance: 10n * ONE_TOKEN });
+  await page.getByTestId("liquidity-native-mode").getByRole("button", { name: "ETH · native" }).click();
+  await page.locator("#range-lower").fill("1");
+  await page.locator("#range-upper").fill("2");
+  await page.getByTestId("liquidity-amount-x").fill("");
+  await expect(page.getByTestId("liquidity-native-max-guidance")).toContainText("positive ETH probe amount");
+  await expect(page.getByTestId("liquidity-max-x")).toBeDisabled();
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
+test("native Swap Max probe cannot populate after its route direction changes", async ({ page }) => {
+  await setupConnectedSwap(page, { balance: 5n * ONE_TOKEN, nativeBalance: 10n * ONE_TOKEN, simulationDelayMs: 600 });
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await page.getByTestId("swap-max-button").click();
+  await page.waitForTimeout(100);
+  await page.getByTitle("Flip tokens").click();
+  await page.waitForTimeout(700);
+  await expect(page.locator("#swap-amount")).toHaveValue("1.0");
   expect((await readMockWallet(page)).sentTransactions).toEqual([]);
 });
 
@@ -2059,8 +2313,90 @@ test("one-sided live burn quotes keep only the truly zero output minimum at zero
   expect(args[4] as bigint).toBeGreaterThan(0n);
 });
 
+test("native partial withdrawal uses the exact zero-value native router transaction", async ({ page }) => {
+  const rpc = await setupConnectedLiquidity(page, {
+    allowance: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    blockNumber: 45n,
+    lbApproved: true,
+    receiptBlockNumber: 43n
+  });
+  await page.getByRole("group", { name: "Wrapped-native withdrawal mode" }).getByRole("button", { name: "ETH · native output" }).click();
+  await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "50%" }).click();
+  await expect(page.getByTestId("withdraw-asset-mode")).toContainText("delivered as ETH");
+  await clickReviewedAction(page, "liquidity-remove-button");
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+
+  const submitted = (await readMockWallet(page)).sentTransactions[0]!;
+  const decoded = decodeSubmittedTransaction(submitted);
+  expect(decoded.functionName).toBe("removeLiquidityNATIVE");
+  expect(BigInt(submitted.value ?? "0x0")).toBe(0n);
+  const args = decoded.args as readonly unknown[];
+  expect(String(args[0]).toLowerCase()).toBe(USDC.toLowerCase());
+  expect(args[2] as bigint).toBeGreaterThan(0n);
+  expect(args[3] as bigint).toBeGreaterThan(0n);
+  assertTransactionMatchesSimulation(submitted, rpc, "removeLiquidityNATIVE");
+  await expect(page.getByTestId("remove-receipt-review")).toContainText("exactly reconciled", { timeout: 15_000 });
+  rpc.update({ blockHash: `0x${"66".repeat(32)}` as Hex, blockNumber: 46n });
+  await expect(page.getByTestId("remove-receipt-review")).toHaveCount(0, { timeout: 15_000 });
+  await expect(page.getByText(/prior withdrawal is orphaned/i).first()).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText("Liquidity removed")).toHaveCount(0);
+  await expect(page.getByText("Transaction finalized")).toHaveCount(0);
+});
+
+test("native withdrawal canonical other-token mismatch fails closed without success", async ({ page }) => {
+  await setupConnectedLiquidity(page, {
+    allowance: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    blockNumber: 45n,
+    lbApproved: true,
+    nativeRemoveReceiptMismatch: "other-token-transfer",
+    receiptBlockNumber: 43n
+  });
+  await page.getByRole("group", { name: "Wrapped-native withdrawal mode" }).getByRole("button", { name: "ETH · native output" }).click();
+  await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "50%" }).click();
+  await clickReviewedAction(page, "liquidity-remove-button");
+  await expect(page.getByTestId("remove-receipt-review-error")).toContainText("Transfer evidence differs", { timeout: 15_000 });
+  await expect(page.getByText("Liquidity removed")).toHaveCount(0);
+});
+
+test("native all-bin full exit uses removeLiquidityNATIVE without changing LB approval scope", async ({ page }) => {
+  const rpc = await setupConnectedLiquidity(page, {
+    allowance: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    lbApproved: true
+  });
+  await page.getByRole("group", { name: "Wrapped-native withdrawal mode" }).getByRole("button", { name: "ETH · native output" }).click();
+  await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "Max" }).click();
+  await expect(page.getByTestId("withdraw-transaction-review")).toContainText("Full exit");
+  await clickReviewedAction(page, "liquidity-remove-button");
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+  const submitted = (await readMockWallet(page)).sentTransactions[0]!;
+  expect(decodeSubmittedTransaction(submitted).functionName).toBe("removeLiquidityNATIVE");
+  expect(BigInt(submitted.value ?? "0x0")).toBe(0n);
+  expect(simulatedFunctions(rpc)).not.toContain("approve");
+  assertTransactionMatchesSimulation(submitted, rpc, "removeLiquidityNATIVE");
+});
+
+test("changing native withdrawal mode during delayed preflight cancels the wallet handoff", async ({ page }) => {
+  const rpc = await setupConnectedLiquidity(page, {
+    allowance: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    lbApproved: true,
+    simulationDelayMs: 600
+  });
+  const mode = page.getByRole("group", { name: "Wrapped-native withdrawal mode" });
+  await mode.getByRole("button", { name: "ETH · native output" }).click();
+  await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled();
+  await page.getByTestId("liquidity-remove-button").click();
+  await page.waitForTimeout(100);
+  await mode.getByRole("button", { name: "WNATIVE · ERC-20 output" }).click();
+  await page.waitForTimeout(700);
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
 test("withdrawal wallet rejection and reverted receipts remain retryable without false success", async ({ page }) => {
-  const rpc = await installMockRpc(page, { includePairs: true, includePositions: true, lbApproved: false, lbApprovedAfterReceipt: true });
+  const rpc = await installMockRpc(page, { blockNumber: 45n, includePairs: true, includePositions: true, lbApproved: false, lbApprovedAfterReceipt: true, receiptBlockNumber: 43n });
   await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/liquidity");
   await connectWallet(page);
@@ -2160,6 +2496,214 @@ test("one-sided ranges submit direct add-liquidity transactions with the unused 
   expect(belowParams.distributionX.every((weight) => weight === 0n)).toBe(true);
   expect(simulatedFunctions(rpc).filter((name) => name === "addLiquidity")).toHaveLength(2);
   expect(simulatedFunctions(rpc)).not.toContain("swapExactTokensForTokens");
+});
+
+test("native one-sided liquidity suppresses wrapper approval, sends exact value, and reconciles ETH WNATIVE and LP balances", async ({ page }) => {
+  const rpc = await setupConnectedLiquidity(page, {
+    allowance: 0n,
+    balance: 5n * ONE_TOKEN,
+    blockNumber: 45n,
+    nativeBalance: 10n * ONE_TOKEN,
+    receiptBlockNumber: 43n
+  });
+  await page.getByTestId("liquidity-native-mode").getByRole("button", { name: "ETH · native" }).click();
+  await page.locator("#range-lower").fill("1");
+  await page.locator("#range-upper").fill("2");
+  await expect(page.getByTestId("liquidity-range-mode")).toContainText("One-sided WNATIVE");
+  await expect(page.getByTestId("liquidity-token-x-identity")).toContainText("ETH native asset");
+  await expect(page.getByTestId("liquidity-native-no-approval")).toBeVisible();
+  await expect(page.getByTestId("liquidity-approve-x-button")).toHaveCount(0);
+  await clickReviewedAction(page, "liquidity-add-button");
+  await expect(page.getByTestId("liquidity-receipt-review")).toContainText("Exact native value", { timeout: 15_000 });
+
+  const wallet = await readMockWallet(page);
+  expect(wallet.sentTransactions).toHaveLength(1);
+  const submitted = wallet.sentTransactions[0] as { data: Hex; value?: string };
+  const decoded = decodeFunctionData({ abi: lbRouterAbi, data: submitted.data });
+  const parameters = (decoded.args as readonly [LiquidityParams])[0];
+  expect(decoded.functionName).toBe("addLiquidityNATIVE");
+  expect(BigInt(submitted.value ?? "0x0")).toBe(parameters.amountX);
+  expect(parameters.amountX).toBeGreaterThan(0n);
+  expect(parameters.amountY).toBe(0n);
+  expect(simulatedFunctions(rpc).filter((name) => name === "addLiquidityNATIVE")).toHaveLength(1);
+  rpc.update({ blockHash: `0x${"55".repeat(32)}` as Hex, blockNumber: 46n });
+  await expect(page.getByTestId("liquidity-receipt-review")).toHaveCount(0, { timeout: 15_000 });
+  await expect(page.getByTestId("liquidity-review-notice")).toContainText("reorganized", { timeout: 15_000 });
+});
+
+test("native liquidity Max reserves reviewed buffered gas before the final immutable add", async ({ page }) => {
+  const nativeBalance = 10n * ONE_TOKEN;
+  const reserve = 625_000_000_000_000n;
+  const rpc = await setupConnectedLiquidity(page, {
+    allowance: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    nativeBalance
+  });
+  await page.getByTestId("liquidity-native-mode").getByRole("button", { name: "ETH · native" }).click();
+  await page.locator("#range-lower").fill("1");
+  await page.locator("#range-upper").fill("2");
+  await expect(page.getByTestId("liquidity-max-x")).toBeEnabled();
+  const journalBeforeProbe = await page.evaluate(() => JSON.parse(window.localStorage.getItem("feather.transaction-journal.v1") ?? '{"records":[]}').records.length as number);
+  await page.getByTestId("liquidity-max-x").click();
+  await expect(page.getByTestId("liquidity-amount-x")).toHaveValue("9.999375");
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+  expect(await page.evaluate(() => JSON.parse(window.localStorage.getItem("feather.transaction-journal.v1") ?? '{"records":[]}').records.length as number)).toBe(journalBeforeProbe);
+  await clickReviewedAction(page, "liquidity-add-button");
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+  const submitted = (await readMockWallet(page)).sentTransactions[0]!;
+  expect(BigInt(submitted.value ?? "0x0")).toBe(nativeBalance - reserve);
+  assertTransactionMatchesSimulation(submitted, rpc, "addLiquidityNATIVE");
+});
+
+test("native liquidity Max blocks stale value after final gas and balance drift", async ({ page }) => {
+  const rpc = await setupConnectedLiquidity(page, {
+    allowance: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    gasPrice: 2_000_000_000n,
+    nativeBalance: 10n * ONE_TOKEN
+  });
+  await page.getByTestId("liquidity-native-mode").getByRole("button", { name: "ETH · native" }).click();
+  await page.locator("#range-lower").fill("1");
+  await page.locator("#range-upper").fill("2");
+  await page.getByTestId("liquidity-max-x").click();
+  await expect(page.getByTestId("liquidity-amount-x")).toHaveValue("9.99875");
+  rpc.update({ gasPrice: 1_000_000_000n, nativeBalance: 11n * ONE_TOKEN });
+  await page.getByTestId("liquidity-add-button").click();
+  await expect(page.getByText(/Native Max changed with the latest balance or buffered gas/).first()).toBeVisible();
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
+test("native liquidity Max probe cannot populate after its range changes", async ({ page }) => {
+  await setupConnectedLiquidity(page, {
+    allowance: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    nativeBalance: 10n * ONE_TOKEN,
+    simulationDelayMs: 600
+  });
+  await page.getByTestId("liquidity-native-mode").getByRole("button", { name: "ETH · native" }).click();
+  await page.locator("#range-lower").fill("1");
+  await page.locator("#range-upper").fill("2");
+  await page.getByTestId("liquidity-max-x").click();
+  await page.waitForTimeout(100);
+  await page.locator("#range-upper").fill("3");
+  await page.waitForTimeout(700);
+  await expect(page.getByTestId("liquidity-amount-x")).toHaveValue("0.01");
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
+test("native liquidity Max binding blocks a post-probe range change", async ({ page }) => {
+  await setupConnectedLiquidity(page, { allowance: 5n * ONE_TOKEN, balance: 5n * ONE_TOKEN, nativeBalance: 10n * ONE_TOKEN });
+  await page.getByTestId("liquidity-native-mode").getByRole("button", { name: "ETH · native" }).click();
+  await page.locator("#range-lower").fill("1");
+  await page.locator("#range-upper").fill("2");
+  await page.getByTestId("liquidity-max-x").click();
+  await expect(page.getByTestId("liquidity-amount-x")).toHaveValue("9.999375");
+  await page.locator("#range-upper").fill("3");
+  await page.getByTestId("liquidity-add-button").click();
+  await expect(page.getByText(/Native Max changed with the latest balance or buffered gas/).first()).toBeVisible();
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
+test("switching from native Max to ERC token Max submits zero-value ERC liquidity", async ({ page }) => {
+  const rpc = await setupConnectedLiquidity(page, { allowance: 5n * ONE_TOKEN, balance: 5n * ONE_TOKEN, nativeBalance: 10n * ONE_TOKEN });
+  const mode = page.getByTestId("liquidity-native-mode");
+  await mode.getByRole("button", { name: "ETH · native" }).click();
+  await page.locator("#range-lower").fill("1");
+  await page.locator("#range-upper").fill("2");
+  await page.getByTestId("liquidity-max-x").click();
+  await expect(page.getByTestId("liquidity-amount-x")).toHaveValue("9.999375");
+  await mode.getByRole("button", { name: "WNATIVE · ERC-20" }).click();
+  await page.getByTestId("liquidity-max-x").click();
+  await expect(page.getByTestId("liquidity-amount-x")).toHaveValue("5");
+  await clickReviewedAction(page, "liquidity-add-button");
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+  const submitted = (await readMockWallet(page)).sentTransactions[0]!;
+  expect(decodeSubmittedTransaction(submitted).functionName).toBe("addLiquidity");
+  expect(BigInt(submitted.value ?? "0x0")).toBe(0n);
+  assertTransactionMatchesSimulation(submitted, rpc, "addLiquidity");
+});
+
+test("native balanced liquidity preserves only the positive non-wrapper approval requirement", async ({ page }) => {
+  await setupConnectedLiquidity(page, { allowance: 0n, balance: 5n * ONE_TOKEN });
+  await page.getByTestId("liquidity-native-mode").getByRole("button", { name: "ETH · native" }).click();
+  await expect(page.getByTestId("liquidity-approve-x-button")).toHaveCount(0);
+  await expect(page.getByTestId("liquidity-approve-y-button")).toContainText("Approve USDC");
+  await expect(page.getByTestId("liquidity-approve-y-button")).toBeEnabled();
+  await expect(page.getByTestId("liquidity-wrapper-disclosure")).toContainText("refunded as WNATIVE ERC-20");
+});
+
+test("native mode keeps a non-wrapper-only range on ERC addLiquidity with zero value", async ({ page }) => {
+  await setupConnectedLiquidity(page, { allowance: 5n * ONE_TOKEN, balance: 5n * ONE_TOKEN });
+  await page.getByTestId("liquidity-native-mode").getByRole("button", { name: "ETH · native" }).click();
+  await page.locator("#range-lower").fill("-2");
+  await page.locator("#range-upper").fill("-1");
+  await expect(page.getByTestId("liquidity-native-unused-range")).toContainText("ERC-20 addLiquidity with 0 ETH value");
+  await clickReviewedAction(page, "liquidity-add-button");
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+  const submitted = (await readMockWallet(page)).sentTransactions[0] as { data: Hex; value?: string };
+  expect(decodeFunctionData({ abi: lbRouterAbi, data: submitted.data }).functionName).toBe("addLiquidity");
+  expect(BigInt(submitted.value ?? "0x0")).toBe(0n);
+});
+
+test("native liquidity mode change during delayed simulation invalidates the wallet request", async ({ page }) => {
+  await setupConnectedLiquidity(page, { allowance: 5n * ONE_TOKEN, balance: 5n * ONE_TOKEN, simulationDelayMs: 750 });
+  await page.getByTestId("liquidity-native-mode").getByRole("button", { name: "ETH · native" }).click();
+  await page.getByTestId("liquidity-add-button").click();
+  await page.waitForTimeout(100);
+  await page.getByTestId("liquidity-native-mode").getByRole("button", { name: "WNATIVE · ERC-20" }).click();
+  await page.waitForTimeout(900);
+  expect((await readMockWallet(page)).sentTransactions).toHaveLength(0);
+});
+
+test("native liquidity simulation failure opens no wallet request", async ({ page }) => {
+  await setupConnectedLiquidity(page, { balance: 5n * ONE_TOKEN, simulationMode: "error" });
+  await page.getByTestId("liquidity-native-mode").getByRole("button", { name: "ETH · native" }).click();
+  await page.getByTestId("liquidity-add-button").click();
+  await expect(page.getByText(/Simulation failed:/).first()).toBeVisible();
+  expect((await readMockWallet(page)).sentTransactions).toHaveLength(0);
+});
+
+test("native liquidity unresolved journal retry stays at one wallet request", async ({ page }) => {
+  await installMockRpc(page, { balance: 5n * ONE_TOKEN, includePairs: true, includePositions: true });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID, transactionMode: "ambiguous" });
+  await page.goto("/#/liquidity");
+  await connectWallet(page);
+  await page.getByTestId("liquidity-native-mode").getByRole("button", { name: "ETH · native" }).click();
+  await page.getByTestId("liquidity-add-button").click();
+  await expect(page.getByTestId("gas-review")).toBeVisible();
+  await page.getByTestId("liquidity-add-button").click();
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+  await bypassDisabledButtonAndClick(page, "liquidity-add-button");
+  expect((await readMockWallet(page)).sentTransactions).toHaveLength(1);
+  await expect(page.getByText("Liquidity added")).toHaveCount(0);
+});
+
+test("native liquidity wallet rejection never produces receipt success", async ({ page }) => {
+  await installMockRpc(page, { balance: 5n * ONE_TOKEN, includePairs: true, includePositions: true });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID, rejectTransactions: true });
+  await page.goto("/#/liquidity");
+  await connectWallet(page);
+  await page.getByTestId("liquidity-native-mode").getByRole("button", { name: "ETH · native" }).click();
+  await page.getByTestId("liquidity-add-button").click();
+  await expect(page.getByTestId("gas-review")).toBeVisible();
+  await page.getByTestId("liquidity-add-button").click();
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+  await expect(page.getByText("Liquidity added")).toHaveCount(0);
+  await expect(page.getByTestId("liquidity-receipt-review")).toHaveCount(0);
+});
+
+test("native liquidity mined revert remains truthful and duplicate submit creates one wallet request", async ({ page }) => {
+  await setupConnectedLiquidity(page, { allowance: 5n * ONE_TOKEN, balance: 5n * ONE_TOKEN, receiptStatus: "reverted" });
+  await page.getByTestId("liquidity-native-mode").getByRole("button", { name: "ETH · native" }).click();
+  await page.getByTestId("liquidity-add-button").click();
+  await expect(page.getByTestId("gas-review")).toBeVisible();
+  await page.getByTestId("liquidity-add-button").evaluate((button) => {
+    (button as HTMLButtonElement).click();
+    (button as HTMLButtonElement).click();
+  });
+  await expect(page.getByText("Add liquidity reverted")).toBeVisible({ timeout: 15_000 });
+  expect((await readMockWallet(page)).sentTransactions).toHaveLength(1);
+  await expect(page.getByText("Liquidity added")).toHaveCount(0);
 });
 
 test("strategy and synchronized range controls enforce the 69-bin product envelope", async ({ page }) => {
@@ -3053,6 +3597,7 @@ function simulatedFunctions(rpc: InstalledMockRpc): string[] {
     .filter((functionName) =>
       [
         "addLiquidity",
+        "addLiquidityNATIVE",
         "approve",
         "approveForAll",
         "removeLiquidity",

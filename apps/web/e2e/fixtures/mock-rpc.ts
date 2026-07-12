@@ -2,7 +2,7 @@ import type { Page } from "@playwright/test";
 import { decodeFunctionData, encodeAbiParameters, encodeEventTopics, encodeFunctionResult, numberToHex, type Address, type Hex } from "viem";
 
 import { erc20Abi, lbFactoryAbi, lbPairAbi, lbQuoterAbi, lbRouterAbi } from "../../../../packages/sdk/src/abi";
-import { LB_Q128, quoteAddLiquidityMath } from "../../../../packages/sdk/src/liquidity-review";
+import { LB_Q128, quoteAddLiquidityMath, type AddLiquidityMathQuote } from "../../../../packages/sdk/src/liquidity-review";
 
 export const LOCALNET_RPC_URL = "http://127.0.0.1:8545";
 export const LOCALNET_INDEXER_URL = "http://127.0.0.1:8000/subgraphs/name/robinhood-lb/localnet";
@@ -52,6 +52,7 @@ export interface MockRpcOptions {
   allowance?: bigint;
   allowanceAfterReceipt?: bigint;
   balance?: bigint;
+  balanceAfterReceipt?: bigint;
   binReserveX?: bigint;
   binReserveY?: bigint;
   binTotalSupply?: bigint;
@@ -94,6 +95,8 @@ export interface MockRpcOptions {
   maxRemoveLiquidityBinsForEstimate?: number;
   maxRemoveLiquidityBinsForSimulation?: number;
   nativeBalance?: bigint;
+  nativeBalanceAfterReceipt?: bigint;
+  nativeRemoveReceiptMismatch?: "other-token-transfer" | "lp-balance";
   noCodeAddresses?: Address[];
   omitActivePoolBin?: boolean;
   ownerPositionCount?: number;
@@ -128,6 +131,7 @@ export interface MockRpcOptions {
   quoteVersion?: number;
   receiptStatus?: "success" | "reverted";
   receiptBlockNumber?: bigint;
+  receiptDelayMs?: number;
   simulationDelayMs?: number;
   simulationMode?: "success" | "error";
   walletReadMode?: "ready" | "error";
@@ -141,11 +145,29 @@ export interface MockRpcSnapshot {
   graphRequests: Array<{ query: string; variables: GraphRequest["variables"] }>;
   methods: string[];
   rpcHttpRequests: number;
+  receiptObserved: boolean;
   creationConfirmed: boolean;
   createdTokenX: Address | null;
   createdTokenY: Address | null;
   createdBinStep: number | null;
   createdActiveId: number | null;
+  lastAddLiquidity: {
+    functionName: "addLiquidity" | "addLiquidityNATIVE";
+    parameters: {
+      amountX: bigint;
+      amountY: bigint;
+      tokenX: Address;
+      tokenY: Address;
+    };
+    quote: AddLiquidityMathQuote;
+  } | null;
+  lastRemoveLiquidity: {
+    amounts: bigint[];
+    amountX: bigint;
+    amountY: bigint;
+    functionName: "removeLiquidity" | "removeLiquidityNATIVE";
+    ids: bigint[];
+  } | null;
 }
 
 export interface InstalledMockRpc {
@@ -186,11 +208,14 @@ export async function installMockRpc(page: Page, options: MockRpcOptions = {}): 
     graphRequests: [],
     methods: [],
     rpcHttpRequests: 0,
+    receiptObserved: false,
     creationConfirmed: false,
     createdTokenX: null,
     createdTokenY: null,
     createdBinStep: null,
-    createdActiveId: null
+    createdActiveId: null,
+    lastAddLiquidity: null,
+    lastRemoveLiquidity: null
   };
 
   await page.route(`${LOCALNET_RPC_URL}/`, async (route) => {
@@ -476,7 +501,9 @@ async function handleRpc(request: RpcRequest, options: MockRpcOptions, state: Mo
       case "eth_gasPrice":
         return rpcResult(request, numberToHex(options.gasPrice ?? 1_000_000_000n));
       case "eth_getTransactionReceipt":
+        if (options.receiptDelayMs !== undefined) await delay(options.receiptDelayMs);
         const receiptBlockNumber = options.receiptBlockNumber ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER;
+        state.receiptObserved = true;
         if ((options.receiptStatus ?? "success") === "success") {
           if (options.clearPositionsAfterReceipt === true) options.includePositions = false;
           if (options.allowanceAfterReceipt !== undefined) options.allowance = options.allowanceAfterReceipt;
@@ -501,8 +528,24 @@ async function handleRpc(request: RpcRequest, options: MockRpcOptions, state: Mo
         return rpcResult(request, transactionReceipt(receiptBlockNumber, options.receiptStatus ?? "success", options, state));
       case "eth_getTransactionByHash":
         return rpcResult(request, transactionByHash(options.receiptBlockNumber ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER, state));
-      case "eth_getBalance":
-        return rpcResult(request, numberToHex(options.nativeBalance ?? DEFAULT_BALANCE));
+      case "eth_getBalance": {
+        const requestedBlock = request.params?.[1];
+        const receiptBlock = numberToHex(options.receiptBlockNumber ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER);
+        const nativeAddValue = state.lastAddLiquidity?.functionName === "addLiquidityNATIVE"
+          ? addressEquals(state.lastAddLiquidity.parameters.tokenX, WNATIVE)
+            ? state.lastAddLiquidity.parameters.amountX
+            : state.lastAddLiquidity.parameters.amountY
+          : null;
+        const nativeRemoveAmount = state.lastRemoveLiquidity?.functionName === "removeLiquidityNATIVE"
+          ? state.lastRemoveLiquidity.amountX
+          : null;
+        const balance = requestedBlock === receiptBlock
+          ? options.nativeBalanceAfterReceipt ?? (nativeRemoveAmount !== null
+            ? (options.nativeBalance ?? DEFAULT_BALANCE) + nativeRemoveAmount - 100_000n
+            : nativeAddValue === null ? options.nativeBalance ?? DEFAULT_BALANCE : (options.nativeBalance ?? DEFAULT_BALANCE) - nativeAddValue - 100_000n)
+          : options.nativeBalance ?? DEFAULT_BALANCE;
+        return rpcResult(request, numberToHex(balance));
+      }
       case "eth_getCode": {
         const address = String(request.params?.[0] ?? "").toLowerCase();
         if (options.noCodeAddresses?.some((candidate) => candidate.toLowerCase() === address)) {
@@ -560,7 +603,7 @@ async function handleEthCall(
 
   if (
     options.simulationDelayMs !== undefined &&
-    ["addLiquidity", "approve", "approveForAll", "createLBPair", "removeLiquidity", "swapExactTokensForTokens"].includes(
+    ["addLiquidity", "addLiquidityNATIVE", "approve", "approveForAll", "createLBPair", "removeLiquidity", "removeLiquidityNATIVE", "swapExactTokensForTokens", "swapExactNATIVEForTokens", "swapExactTokensForNATIVE"].includes(
       functionName
     )
   ) {
@@ -816,14 +859,42 @@ async function handleEthCall(
 
   if (functionName === "balanceOf") {
     if (decoded.args.length === 2) {
+      const binId = decoded.args[1] as bigint;
+      const receiptBlock = numberToHex(options.receiptBlockNumber ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER);
+      const removedIndex = state.lastRemoveLiquidity?.ids.findIndex((id) => id === binId) ?? -1;
+      const mintedIndex = state.lastAddLiquidity?.quote.bins.findIndex((bin) => bin.binId === binId) ?? -1;
+      const base = options.livePositionBalance ?? options.positionLiquidity ?? DEFAULT_POSITION_LIQUIDITY;
       return encodeFunctionResult({
         abi: lbPairAbi,
         functionName,
-        result: options.livePositionBalance ?? options.positionLiquidity ?? DEFAULT_POSITION_LIQUIDITY
+        result: state.receiptObserved && blockTag === receiptBlock && removedIndex >= 0
+          ? base - state.lastRemoveLiquidity!.amounts[removedIndex]! + (options.nativeRemoveReceiptMismatch === "lp-balance" ? 1n : 0n)
+          : blockTag === receiptBlock && mintedIndex >= 0 ? base + state.lastAddLiquidity!.quote.bins[mintedIndex]!.mintedShares : base
       });
     }
 
-    return encodeFunctionResult({ abi: erc20Abi, functionName, result: options.balance ?? DEFAULT_BALANCE });
+    const receiptBlock = numberToHex(options.receiptBlockNumber ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER);
+    const base = options.balance ?? DEFAULT_BALANCE;
+    let derivedAfter = options.balanceAfterReceipt;
+    if (derivedAfter === undefined && blockTag === receiptBlock && state.lastAddLiquidity?.functionName === "addLiquidityNATIVE") {
+      const { parameters, quote } = state.lastAddLiquidity;
+      if (addressEquals(call.to ?? "", WNATIVE)) {
+        derivedAfter = base + (addressEquals(parameters.tokenX, WNATIVE) ? quote.amountXLeft : quote.amountYLeft);
+      } else {
+        derivedAfter = base - (addressEquals(parameters.tokenX, WNATIVE)
+          ? parameters.amountY - quote.amountYLeft
+          : parameters.amountX - quote.amountXLeft);
+      }
+    }
+    if (derivedAfter === undefined && state.receiptObserved && blockTag === receiptBlock && state.lastRemoveLiquidity?.functionName === "removeLiquidityNATIVE") {
+      const otherTokenAmount = state.lastRemoveLiquidity.amountY;
+      if (!addressEquals(call.to ?? "", WNATIVE)) derivedAfter = base + otherTokenAmount;
+    }
+    return encodeFunctionResult({
+      abi: erc20Abi,
+      functionName,
+      result: blockTag === receiptBlock && derivedAfter !== undefined ? derivedAfter : base
+    });
   }
 
   if (functionName === "isApprovedForAll") {
@@ -865,7 +936,18 @@ async function handleEthCall(
     return encodeFunctionResult({ abi: lbRouterAbi, functionName, result: decoded.args[1] as bigint });
   }
 
-  if (functionName === "addLiquidity") {
+  if (functionName === "swapExactNATIVEForTokens" || functionName === "swapExactTokensForNATIVE") {
+    if (options.simulationMode === "error") throw new Error("Mock native swap simulation failed");
+    const path = functionName === "swapExactNATIVEForTokens" ? decoded.args[1] : decoded.args[2];
+    for (let index = 0; index < path.tokenPath.length - 1; index += 1) {
+      const expectedBinStep = quoteBinStepForLeg(path.tokenPath[index], path.tokenPath[index + 1], options.quoteUseAlternateDirectPool === true);
+      if (path.pairBinSteps[index] !== expectedBinStep || path.versions[index] !== 3) throw new Error("Mock native swap path does not match an executable V2.2 pair leg");
+    }
+    const minimum = (functionName === "swapExactNATIVEForTokens" ? decoded.args[0] : decoded.args[1]) as bigint;
+    return encodeFunctionResult({ abi: lbRouterAbi, functionName, result: minimum });
+  }
+
+  if (functionName === "addLiquidity" || functionName === "addLiquidityNATIVE") {
     if (options.simulationMode === "error") throw new Error("Mock add-liquidity simulation failed");
     const params = decoded.args[0] as {
       amountX: bigint;
@@ -907,6 +989,11 @@ async function handleEthCall(
         timeOfLastUpdate: 1_720_000_000n
       }
     });
+    state.lastAddLiquidity = {
+      functionName,
+      parameters: { amountX: params.amountX, amountY: params.amountY, tokenX: (decoded.args[0] as { tokenX: Address }).tokenX, tokenY: (decoded.args[0] as { tokenY: Address }).tokenY },
+      quote
+    };
 
     return encodeFunctionResult({
       abi: lbRouterAbi,
@@ -922,19 +1009,27 @@ async function handleEthCall(
     });
   }
 
-  if (functionName === "removeLiquidity") {
+  if (functionName === "removeLiquidity" || functionName === "removeLiquidityNATIVE") {
     if (options.simulationMode === "error") throw new Error("Mock remove-liquidity simulation failed");
+    state.receiptObserved = false;
     const args = decoded.args as readonly unknown[];
+    const idsIndex = functionName === "removeLiquidityNATIVE" ? 4 : 5;
     if (
       options.maxRemoveLiquidityBinsForSimulation !== undefined &&
-      Array.isArray(args[5]) &&
-      args[5].length > options.maxRemoveLiquidityBinsForSimulation
+      Array.isArray(args[idsIndex]) &&
+      args[idsIndex].length > options.maxRemoveLiquidityBinsForSimulation
     ) throw new Error("Mock remove-liquidity batch exceeds the simulation-safe bin bound");
 
+    const ids = args[idsIndex] as bigint[];
+    const amounts = args[idsIndex + 1] as bigint[];
+    const totalSupply = options.binTotalSupply ?? options.positionLiquidity ?? DEFAULT_POSITION_LIQUIDITY;
+    const amountX = amounts.reduce((sum, amount) => sum + amount * (options.binReserveX ?? 4n * DEFAULT_POSITION_LIQUIDITY) / totalSupply, 0n);
+    const amountY = amounts.reduce((sum, amount) => sum + amount * (options.binReserveY ?? 2n * DEFAULT_POSITION_LIQUIDITY) / totalSupply, 0n);
+    state.lastRemoveLiquidity = { amounts: [...amounts], amountX, amountY, functionName, ids: [...ids] };
     return encodeFunctionResult({
       abi: lbRouterAbi,
       functionName,
-      result: [1n, 1n]
+      result: functionName === "removeLiquidityNATIVE" ? [amountY, amountX] : [amountX, amountY]
     });
   }
 
@@ -945,9 +1040,10 @@ function removeLiquidityBinCount(data: Hex | undefined): number {
   if (!data || data === "0x") return 0;
   try {
     const decoded = decodeFunctionData({ abi: lbRouterAbi, data });
-    if (decoded.functionName !== "removeLiquidity") return 0;
+    if (decoded.functionName !== "removeLiquidity" && decoded.functionName !== "removeLiquidityNATIVE") return 0;
     const args = decoded.args as readonly unknown[];
-    return Array.isArray(args[5]) ? args[5].length : 0;
+    const idsIndex = decoded.functionName === "removeLiquidityNATIVE" ? 4 : 5;
+    return Array.isArray(args[idsIndex]) ? args[idsIndex].length : 0;
   } catch {
     return 0;
   }
@@ -1103,8 +1199,9 @@ function transactionReceipt(
   options: MockRpcOptions,
   state: MockRpcSnapshot
 ): Record<string, unknown> {
-  const logs = status === "success" && state.creationConfirmed && state.createdTokenX && state.createdTokenY && state.createdBinStep !== null
-    ? [{
+  const logs: Record<string, unknown>[] = [];
+  if (status === "success" && state.creationConfirmed && state.createdTokenX && state.createdTokenY && state.createdBinStep !== null) {
+    logs.push({
         address: options.factoryAddress ?? LB_FACTORY,
         blockHash: options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222",
         blockNumber: numberToHex(blockNumber),
@@ -1121,8 +1218,101 @@ function transactionReceipt(
         }),
         transactionHash: TX_HASH,
         transactionIndex: "0x0"
-      }]
-    : [];
+      });
+  }
+  if (status === "success" && state.lastAddLiquidity) {
+    const add = state.lastAddLiquidity;
+    const pair = options.pairAddress ?? WNATIVE_USDC_PAIR;
+    const blockHash = options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222";
+    const pushEvent = (address: Address, abi: typeof lbPairAbi | typeof erc20Abi, eventName: string, indexedArgs: Record<string, unknown>, dataTypes: readonly Record<string, unknown>[], dataValues: readonly unknown[]) => {
+      logs.push({
+        address,
+        blockHash,
+        blockNumber: numberToHex(blockNumber),
+        data: encodeAbiParameters(dataTypes as never, dataValues as never),
+        logIndex: numberToHex(BigInt(logs.length)),
+        removed: false,
+        topics: encodeEventTopics({ abi, eventName: eventName as never, args: indexedArgs as never }),
+        transactionHash: TX_HASH,
+        transactionIndex: "0x0"
+      });
+    };
+    for (const bin of add.quote.bins) {
+      if (bin.compositionFeeX > 0n || bin.compositionFeeY > 0n) {
+        pushEvent(pair as Address, lbPairAbi, "CompositionFees", { sender: LB_ROUTER },
+          [{ type: "uint24" }, { type: "bytes32" }, { type: "bytes32" }],
+          [bin.binId, packedAmounts(bin.compositionFeeX, bin.compositionFeeY), packedAmounts(bin.protocolFeeX, bin.protocolFeeY)]);
+      }
+    }
+    pushEvent(pair as Address, lbPairAbi, "DepositedToBins", { sender: LB_ROUTER, to: DEFAULT_ACCOUNT },
+      [{ type: "uint256[]" }, { type: "bytes32[]" }],
+      [add.quote.bins.map((bin) => bin.binId), add.quote.bins.map((bin) => packedAmounts(bin.depositedX, bin.depositedY))]);
+    pushEvent(pair as Address, lbPairAbi, "TransferBatch", { sender: LB_ROUTER, from: "0x0000000000000000000000000000000000000000", to: DEFAULT_ACCOUNT },
+      [{ type: "uint256[]" }, { type: "uint256[]" }],
+      [add.quote.bins.map((bin) => bin.binId), add.quote.bins.map((bin) => bin.mintedShares)]);
+    const nativeX = add.functionName === "addLiquidityNATIVE" && addressEquals(add.parameters.tokenX, WNATIVE);
+    const nativeY = add.functionName === "addLiquidityNATIVE" && addressEquals(add.parameters.tokenY, WNATIVE);
+    const transfer = (token: Address, from: Address, to: Address, value: bigint) => {
+      if (value === 0n) return;
+      pushEvent(token, erc20Abi, "Transfer", { from, to }, [{ type: "uint256" }], [value]);
+    };
+    transfer(add.parameters.tokenX, nativeX ? LB_ROUTER : DEFAULT_ACCOUNT, pair as Address, add.parameters.amountX);
+    transfer(add.parameters.tokenY, nativeY ? LB_ROUTER : DEFAULT_ACCOUNT, pair as Address, add.parameters.amountY);
+    transfer(add.parameters.tokenX, pair as Address, DEFAULT_ACCOUNT, add.quote.amountXLeft);
+    transfer(add.parameters.tokenY, pair as Address, DEFAULT_ACCOUNT, add.quote.amountYLeft);
+  }
+  if (status === "success" && state.lastRemoveLiquidity?.functionName === "removeLiquidityNATIVE") {
+    const remove = state.lastRemoveLiquidity;
+    const pair = (options.pairAddress ?? WNATIVE_USDC_PAIR) as Address;
+    const blockHash = options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222";
+    const pushEvent = (address: Address, abi: typeof lbPairAbi | typeof erc20Abi, eventName: string, indexedArgs: Record<string, unknown>, dataTypes: readonly Record<string, unknown>[], dataValues: readonly unknown[]) => {
+      logs.push({
+        address,
+        blockHash,
+        blockNumber: numberToHex(blockNumber),
+        data: encodeAbiParameters(dataTypes as never, dataValues as never),
+        logIndex: numberToHex(BigInt(logs.length)),
+        removed: false,
+        topics: encodeEventTopics({ abi, eventName: eventName as never, args: indexedArgs as never }),
+        transactionHash: TX_HASH,
+        transactionIndex: "0x0"
+      });
+    };
+    const totalSupply = options.binTotalSupply ?? options.positionLiquidity ?? DEFAULT_POSITION_LIQUIDITY;
+    pushEvent(pair, lbPairAbi, "WithdrawnFromBins", { sender: LB_ROUTER, to: LB_ROUTER },
+      [{ type: "uint256[]" }, { type: "bytes32[]" }],
+      [remove.ids, remove.amounts.map((amount) => packedAmounts(
+        amount * (options.binReserveX ?? 4n * DEFAULT_POSITION_LIQUIDITY) / totalSupply,
+        amount * (options.binReserveY ?? 2n * DEFAULT_POSITION_LIQUIDITY) / totalSupply
+      ))]);
+    pushEvent(pair, lbPairAbi, "TransferBatch", { sender: LB_ROUTER, from: DEFAULT_ACCOUNT, to: "0x0000000000000000000000000000000000000000" },
+      [{ type: "uint256[]" }, { type: "uint256[]" }], [remove.ids, remove.amounts]);
+    const transferAmount = options.nativeRemoveReceiptMismatch === "other-token-transfer" ? remove.amountY - 1n : remove.amountY;
+    pushEvent(USDC, erc20Abi, "Transfer", { from: LB_ROUTER, to: DEFAULT_ACCOUNT }, [{ type: "uint256" }], [transferAmount]);
+  }
+  const nativeSwapCall = state.ethCalls.findLast((call) => call.functionName === "swapExactNATIVEForTokens" || call.functionName === "swapExactTokensForNATIVE");
+  if (status === "success" && nativeSwapCall) {
+    const decoded = decodeFunctionData({ abi: lbRouterAbi, data: nativeSwapCall.data });
+    const nativeIn = decoded.functionName === "swapExactNATIVEForTokens";
+    const path = (nativeIn ? decoded.args[1] : decoded.args[2]) as { tokenPath: readonly Address[] };
+    const token = nativeIn ? path.tokenPath[path.tokenPath.length - 1] : path.tokenPath[0];
+    const amount = nativeIn
+      ? (options.balanceAfterReceipt ?? DEFAULT_BALANCE) - (options.balance ?? DEFAULT_BALANCE)
+      : decoded.args[0] as bigint;
+    const from = nativeIn ? WNATIVE_USDC_PAIR : DEFAULT_ACCOUNT;
+    const to = nativeIn ? DEFAULT_ACCOUNT : WNATIVE_USDC_PAIR;
+    logs.push({
+      address: token,
+      blockHash: options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222",
+      blockNumber: numberToHex(blockNumber),
+      data: encodeAbiParameters([{ name: "value", type: "uint256" }], [amount]),
+      logIndex: numberToHex(BigInt(logs.length)),
+      removed: false,
+      topics: encodeEventTopics({ abi: erc20Abi, eventName: "Transfer", args: { from, to } }),
+      transactionHash: TX_HASH,
+      transactionIndex: "0x0"
+    });
+  }
   return {
     blockHash: "0x2222222222222222222222222222222222222222222222222222222222222222",
     blockNumber: numberToHex(blockNumber),
@@ -1141,9 +1331,13 @@ function transactionReceipt(
   };
 }
 
+function packedAmounts(x: bigint, y: bigint): Hex {
+  return `0x${((y << 128n) | x).toString(16).padStart(64, "0")}`;
+}
+
 function transactionByHash(blockNumber: bigint, state: MockRpcSnapshot): Record<string, unknown> {
   const simulatedTransaction = state.ethCalls.findLast((call) =>
-    ["addLiquidity", "approve", "approveForAll", "createLBPair", "removeLiquidity", "swapExactTokensForTokens"].includes(
+    ["addLiquidity", "addLiquidityNATIVE", "approve", "approveForAll", "createLBPair", "removeLiquidity", "removeLiquidityNATIVE", "swapExactTokensForTokens", "swapExactNATIVEForTokens", "swapExactTokensForNATIVE"].includes(
       call.functionName
     )
   );

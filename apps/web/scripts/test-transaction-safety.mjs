@@ -19,9 +19,12 @@ try {
     burnQuoteExecutionFingerprint,
     evaluateTransactionSafety,
     idSlippageInputError,
+    liquidityAddAssetFingerprint,
+    nativeSwapSubmissionFingerprint,
     parseDeadlineMinutes,
     parseIdSlippage,
     quoteIsStale,
+    reconcileNativeSwapReceipt,
     swapExecutionContextFingerprint
   } = await server.ssrLoadModule("/src/transaction-safety.ts");
   const now = 1_800_000_000_000;
@@ -123,6 +126,28 @@ try {
   assert.equal(idSlippageInputError("invalid"), "Enter an id slippage from 0 to 2 bins");
   assert.equal(idSlippageInputError("2"), null);
 
+  const nativeLiquidityAsset = liquidityAddAssetFingerprint({
+    assetMode: "native",
+    selectedMode: "native",
+    transactionValue: "10000000000000000",
+    wrappedNative: "0x2222222222222222222222222222222222222222",
+    wrappedNativeSide: "x"
+  });
+  assert.notEqual(nativeLiquidityAsset, liquidityAddAssetFingerprint({
+    assetMode: "erc20",
+    selectedMode: "erc20",
+    transactionValue: "0",
+    wrappedNative: "0x2222222222222222222222222222222222222222",
+    wrappedNativeSide: "x"
+  }));
+  assert.notEqual(nativeLiquidityAsset, liquidityAddAssetFingerprint({
+    assetMode: "native",
+    selectedMode: "native",
+    transactionValue: "10000000000000001",
+    wrappedNative: "0x2222222222222222222222222222222222222222",
+    wrappedNativeSide: "x"
+  }));
+
   const executionContext = {
     activeId: 8_388_608,
     amountIn: "1000",
@@ -135,6 +160,8 @@ try {
     reserveX: "100",
     reserveY: "200",
     routeMode: "exact-selected",
+    inputAssetMode: "erc20",
+    outputAssetMode: "erc20",
     rpcChainId: 31_337,
     slippageBps: "50",
     tokenIn: "0x2222222222222222222222222222222222222222",
@@ -156,6 +183,8 @@ try {
     reserveX: "101",
     reserveY: "201",
     routeMode: "best",
+    inputAssetMode: "native",
+    outputAssetMode: "native",
     rpcChainId: 46_630,
     slippageBps: "51",
     tokenIn: "0x6666666666666666666666666666666666666666",
@@ -170,6 +199,73 @@ try {
       `${field} must invalidate the swap execution context`
     );
   }
+
+  const nativeSubmission = {
+    account: "0x4444444444444444444444444444444444444444",
+    amountIn: "1000",
+    amountOutMin: "800",
+    calldataFingerprint: `0x${"11".repeat(32)}`,
+    direction: "native-in",
+    executionFingerprint,
+    hash: `0x${"22".repeat(32)}`,
+    inputAssetMode: "native",
+    outputAssetMode: "erc20",
+    quoteIdentity: "quote-1",
+    target: "0x5555555555555555555555555555555555555555",
+    token: "0x6666666666666666666666666666666666666666",
+    transactionValue: "1000"
+  };
+  const nativeSubmissionIdentity = nativeSwapSubmissionFingerprint(nativeSubmission);
+  for (const [field, value] of Object.entries({
+    account: "0x7777777777777777777777777777777777777777",
+    amountIn: "1001",
+    amountOutMin: "801",
+    calldataFingerprint: `0x${"33".repeat(32)}`,
+    direction: "native-out",
+    executionFingerprint: `${executionFingerprint}:changed`,
+    hash: `0x${"44".repeat(32)}`,
+    inputAssetMode: "erc20",
+    outputAssetMode: "native",
+    quoteIdentity: "quote-2",
+    target: "0x8888888888888888888888888888888888888888",
+    token: "0x9999999999999999999999999999999999999999",
+    transactionValue: "0"
+  })) {
+    assert.notEqual(nativeSwapSubmissionFingerprint({ ...nativeSubmission, [field]: value }), nativeSubmissionIdentity, `${field} must bind native receipt accounting`);
+  }
+
+  assert.deepEqual(reconcileNativeSwapReceipt({
+    amountIn: 1_000n,
+    amountOutMin: 800n,
+    direction: "native-in",
+    effectiveGasPrice: 2n,
+    gasUsed: 50n,
+    nativeBalanceBefore: 10_000n,
+    nativeBalanceAfter: 8_900n,
+    tokenBalanceBefore: 2_000n,
+    tokenBalanceAfter: 2_850n,
+    transactionValue: 1_000n
+  }), { direction: "native-in", gasCost: 100n, nativeAmount: 1_000n, tokenAmount: 850n });
+  assert.deepEqual(reconcileNativeSwapReceipt({
+    amountIn: 500n,
+    amountOutMin: 700n,
+    direction: "native-out",
+    effectiveGasPrice: 2n,
+    gasUsed: 50n,
+    nativeBalanceBefore: 10_000n,
+    nativeBalanceAfter: 10_650n,
+    tokenBalanceBefore: 2_000n,
+    tokenBalanceAfter: 1_500n,
+    transactionValue: 0n
+  }), { direction: "native-out", gasCost: 100n, nativeAmount: 750n, tokenAmount: 500n });
+  assert.throws(() => reconcileNativeSwapReceipt({
+    amountIn: 1_000n, amountOutMin: 900n, direction: "native-in", effectiveGasPrice: 2n, gasUsed: 50n,
+    nativeBalanceBefore: 10_000n, nativeBalanceAfter: 8_900n, tokenBalanceBefore: 2_000n, tokenBalanceAfter: 2_899n, transactionValue: 1_000n
+  }), /below the reviewed minimum/);
+  assert.throws(() => reconcileNativeSwapReceipt({
+    amountIn: 500n, amountOutMin: 700n, direction: "native-out", effectiveGasPrice: 2n, gasUsed: 50n,
+    nativeBalanceBefore: 10_000n, nativeBalanceAfter: 10_650n, tokenBalanceBefore: 2_000n, tokenBalanceAfter: 1_501n, transactionValue: 0n
+  }), /exact reviewed input/);
 
   const burnQuoteBinding = {
     balances: [{ binId: "8388608", balance: "2000" }],
@@ -209,6 +305,7 @@ try {
 
   const burnContext = {
     account: "0x1111111111111111111111111111111111111111",
+    assetMode: "erc20",
     binStep: 10,
     burnBps: "10000",
     deadlineMinutes: 20,
@@ -217,15 +314,20 @@ try {
     pair: "0x2222222222222222222222222222222222222222",
     registryChainId: 31_337,
     router: "0x3333333333333333333333333333333333333333",
+    selectedAssetMode: "erc20",
     selectedPositionsKey: "position-1:8388608",
     slippageBps: "50",
     tokenX: "0x4444444444444444444444444444444444444444",
     tokenY: "0x5555555555555555555555555555555555555555",
-    walletChainId: 31_337
+    transactionValue: "0",
+    walletChainId: 31_337,
+    wrappedNative: "0x4444444444444444444444444444444444444444",
+    wrappedNativeSide: "x"
   };
   const burnFingerprint = burnExecutionContextFingerprint(burnContext);
   for (const [field, value] of Object.entries({
     account: "0x6666666666666666666666666666666666666666",
+    assetMode: "native",
     binStep: 25,
     burnBps: "5000",
     deadlineMinutes: 21,
@@ -233,11 +335,15 @@ try {
     pair: "0x7777777777777777777777777777777777777777",
     registryChainId: 46_630,
     router: "0x8888888888888888888888888888888888888888",
+    selectedAssetMode: "native",
     selectedPositionsKey: "position-2:8388609",
     slippageBps: "51",
     tokenX: "0x9999999999999999999999999999999999999999",
     tokenY: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    walletChainId: 46_630
+    transactionValue: "1",
+    walletChainId: 46_630,
+    wrappedNative: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    wrappedNativeSide: "y"
   })) {
     assert.notEqual(
       burnExecutionContextFingerprint({ ...burnContext, [field]: value }),

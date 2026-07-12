@@ -43,6 +43,7 @@ try {
   assert.throws(() => safeMaxAmount({ asset: "native", balance: 100n }), /reviewed gas reserve/);
   assert.throws(() => safeMaxAmount({ asset: "native", balance: 100n, gasReserveWei: -1n }), /uint256 bounds/);
   assert.equal(maxAmountInput({ asset: "token", balance: parseUnits("123.456789", 6), decimals: 6 }), "123.456789");
+  assert.equal(maxAmountInput({ asset: "native", balance: parseUnits("10", 18), decimals: 18, gasReserveWei: parseUnits("0.000625", 18) }), "9.999375");
   assert.throws(() => maxAmountInput({ asset: "token", balance: 1n, decimals: 256 }), /integer from 0 to 255/);
   assert.throws(() => maxAmountInput({ asset: "native", balance: 1n, decimals: 8, gasReserveWei: 0n }), /requires 18 decimals/);
 
