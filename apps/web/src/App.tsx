@@ -7183,7 +7183,7 @@ function PortfolioPositionCard({
           ? "Cost basis is unavailable because the position was transferred or its history is partial."
           : "Fee growth is already reflected in the position's token claims and value; there is no separate fee-claim action."}
       </p>
-      <p className="position-freshness">Claims pinned at {position.asOfBlock ? `block ${position.asOfBlock}` : "an unavailable head"}. {headPinned ? "RPC head matches." : "RPC head does not match; withdrawal actions are disabled."}</p>
+      <p className="position-freshness">Claims pinned at {position.asOfBlock ? `block ${position.asOfBlock}` : "an unavailable head"}. {headPinned ? "Analytics, indexer, and RPC heads match." : "Analytics, indexer, and RPC heads are reconciling; withdrawal actions are disabled."}</p>
 
       <div className="portfolio-actions">
         {!detail ? <a className="secondary-button" href={`#/positions/${encodeURIComponent(id)}`}>Details</a> : null}
@@ -7219,7 +7219,9 @@ function portfolioPositionHeadPinned(
     position.asOfBlock !== null &&
     analyticsHeadBlock === position.asOfBlock &&
     snapshot?.runtime.status === "ready" &&
-    snapshot.runtime.blockNumber === position.asOfBlock
+    snapshot.runtime.blockNumber === position.asOfBlock &&
+    snapshot.indexer.status === "ready" &&
+    snapshot.indexer.blockNumber === position.asOfBlock
   );
 }
 
