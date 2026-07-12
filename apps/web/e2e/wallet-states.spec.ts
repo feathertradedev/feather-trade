@@ -2805,7 +2805,26 @@ test("portfolio disables withdrawals when analytics and RPC heads do not reconci
   await connectWallet(page);
 
   const card = page.getByTestId("portfolio-position-card");
-  await expect(card).toContainText("RPC head does not match");
+  await expect(card).toContainText("Analytics, indexer, and RPC heads are reconciling");
+  await expect(page.getByRole("link", { name: "Partial withdraw" })).toHaveCount(0);
+  await expect(page.getByRole("link", { name: "Full exit" })).toHaveCount(0);
+});
+
+test("portfolio disables withdrawals when the indexer is one block behind reconciled analytics and RPC heads", async ({ page }) => {
+  await installMockRpc(page, {
+    analyticsAsOfBlock: 42n,
+    blockNumber: 42n,
+    includePairs: true,
+    includePositions: true,
+    indexerBlockNumber: 41n
+  });
+  await installMockWallet(page);
+  await page.goto("/#/positions");
+  await connectWallet(page);
+
+  const card = page.getByTestId("portfolio-position-card");
+  await expect(page.getByText("partial data")).toBeVisible();
+  await expect(card).toContainText("Analytics, indexer, and RPC heads are reconciling");
   await expect(page.getByRole("link", { name: "Partial withdraw" })).toHaveCount(0);
   await expect(page.getByRole("link", { name: "Full exit" })).toHaveCount(0);
 });
