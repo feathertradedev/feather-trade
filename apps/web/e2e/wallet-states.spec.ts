@@ -904,8 +904,10 @@ test("approval confirmation invalidates the reviewed quote until fresh wallet, m
   const preApprovalReserve = await selectedMarket.getAttribute("data-reserve-x");
 
   await clickReviewedAction(page, "swap-approve-button");
-  await expect(page.getByText("Approval confirmed")).toBeVisible({ timeout: 12_000 });
-  await page.waitForTimeout(250);
+  await expect(page.getByTestId("swap-failure-state")).toContainText(
+    "Refreshing balance, allowance, and quote after approval"
+  );
+  await expect(page.getByTestId("swap-failure-state")).toHaveClass(/\bpending\b/);
   await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
   await expect(selectedMarket).toHaveAttribute("data-reserve-x", preApprovalReserve ?? "");
   expect(swapQuoteCallCount(rpc)).toBe(quoteCallsBeforeApproval);
@@ -980,8 +982,10 @@ test("post-approval snapshot refresh rejects a malformed token identity at an ot
 
   await expect(selectedMarket).toHaveAttribute("data-token-x", WNATIVE);
   await clickReviewedAction(page, "swap-approve-button");
-  await expect(page.getByText("Approval confirmed")).toBeVisible({ timeout: 12_000 });
-  await page.waitForTimeout(200);
+  await expect(page.getByTestId("swap-failure-state")).toContainText(
+    "Refreshing balance, allowance, and quote after approval"
+  );
+  await expect(page.getByTestId("swap-failure-state")).toHaveClass(/\bpending\b/);
   await expect(selectedMarket).toHaveAttribute("data-token-x", WNATIVE);
   await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
 

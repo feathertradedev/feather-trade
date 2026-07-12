@@ -2470,6 +2470,7 @@ function SwapView({
         <SwapStateRows
           amountError={inputError}
           actionError={actionError}
+          approvalRefreshPending={postApprovalReviewPending && postApprovalRefreshError === null}
           approvalHash={approvalReceiptMatchesCurrentIntent ? approvalWrite.data : undefined}
           approvalPending={approvalWrite.isPending || (approvalReceiptMatchesCurrentIntent && approvalReceipt.isLoading)}
           approvalReverted={approvalReverted}
@@ -2877,6 +2878,7 @@ function quoteMatchesSwapRequest(quote: ExactInQuote, tokenIn: Address, tokenOut
 function SwapStateRows({
   actionError,
   amountError,
+  approvalRefreshPending,
   approvalHash,
   approvalPending,
   approvalReverted,
@@ -2892,6 +2894,7 @@ function SwapStateRows({
 }: {
   actionError: string | null;
   amountError: string | null;
+  approvalRefreshPending: boolean;
   approvalHash: Address | undefined;
   approvalPending: boolean;
   approvalReverted: boolean;
@@ -2908,7 +2911,7 @@ function SwapStateRows({
   const receiptFailure = swapReverted ? "Swap reverted" : approvalReverted ? "Approval reverted" : null;
   const failure =
     receiptFailure ??
-    amountError ??
+    (approvalRefreshPending ? null : amountError) ??
     (insufficientBalance ? "Insufficient token balance" : null) ??
     (insufficientGas ? "Insufficient ETH for gas" : null) ??
     (quoteError ? quoteError.message : null) ??
@@ -2920,6 +2923,8 @@ function SwapStateRows({
       ? { icon: <CheckCircle2 size={16} />, message: "Swap confirmed", tone: "success" }
       : swapPending || swapHash
         ? { icon: <LoaderCircle className="spin" size={16} />, message: swapHash ? `Swap pending ${formatCompactAddress(swapHash)}` : "Awaiting swap wallet confirmation", tone: "pending" }
+        : approvalRefreshPending
+          ? { icon: <LoaderCircle className="spin" size={16} />, message: "Refreshing balance, allowance, and quote after approval", tone: "pending" }
         : approvalSuccess
           ? { icon: <CheckCircle2 size={16} />, message: "Approval confirmed", tone: "success" }
           : approvalPending || approvalHash
