@@ -15,6 +15,7 @@ export interface PoolWorkspaceRow<T extends PoolRow = PoolRow> {
   pool: T;
   metric: PoolAnalyticsMetric | null;
   analyticsStatus: AnalyticsStatus;
+  analyticsIssue: string | null;
 }
 
 export interface WorkspaceMetricTile {
@@ -67,15 +68,34 @@ export function joinPoolWorkspaceRows<T extends PoolRow>(
   pools: readonly T[],
   metrics: Pick<AnalyticsPage<PoolAnalyticsMetric>, "rows" | "status">
 ): PoolWorkspaceRow<T>[] {
-  const metricByPair = new Map(metrics.rows.map((metric) => [canonical(metric.pair), metric]));
+  const metricByPair = new Map<string, PoolAnalyticsMetric>();
+  for (const metric of metrics.rows) {
+    const pair = canonical(metric.pair);
+    if (metricByPair.has(pair)) throw new Error(`Duplicate pool analytics metric for ${pair}`);
+    metricByPair.set(pair, metric);
+  }
   return pools.map((pool) => {
     const metric = metricByPair.get(canonical(pool.address)) ?? null;
+    const identityMatches = metric !== null &&
+      canonical(metric.tokenX) === canonical(pool.tokenXAddress) &&
+      canonical(metric.tokenY) === canonical(pool.tokenYAddress);
+    if (metric !== null && !identityMatches) {
+      return {
+        pool,
+        metric: null,
+        analyticsStatus: "PARTIAL",
+        analyticsIssue: "Analytics token identity does not match the indexed pool."
+      };
+    }
     return {
       pool,
       metric,
       analyticsStatus: metric === null
         ? metrics.status === "UNAVAILABLE" ? "UNAVAILABLE" : "PARTIAL"
-        : weakestStatus(metrics.status, metric.status)
+        : weakestStatus(metrics.status, metric.status),
+      analyticsIssue: metric === null
+        ? metrics.status === "UNAVAILABLE" ? "Pool analytics are unavailable." : "Pool analytics are missing from this result."
+        : null
     };
   });
 }

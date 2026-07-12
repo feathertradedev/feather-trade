@@ -40,8 +40,20 @@ try {
   };
   const joined = joinPoolWorkspaceRows(pools, metrics);
   assert.deepEqual(joined.map((row) => row.analyticsStatus), ["PARTIAL", "PARTIAL", "PARTIAL"]);
+  assert.deepEqual(joined.map((row) => row.analyticsIssue), [null, null, "Pool analytics are missing from this result."]);
   assert.deepEqual(sortPoolWorkspaceRows(joined, "tvl").map((row) => row.pool.address), [pairA, pairB, pairC]);
   assert.deepEqual(sortPoolWorkspaceRows(joined, "volume24h").map((row) => row.pool.address), [pairB, pairA, pairC]);
+  assert.throws(() => joinPoolWorkspaceRows(pools, { status: "READY", rows: [metrics.rows[0], metrics.rows[0]] }), /Duplicate pool analytics metric/);
+  const mismatched = joinPoolWorkspaceRows([pool(pairA)], {
+    status: "READY",
+    rows: [{ ...metrics.rows[0], tokenX: tokenY }]
+  });
+  assert.equal(mismatched[0].metric, null);
+  assert.equal(mismatched[0].analyticsStatus, "PARTIAL");
+  assert.match(mismatched[0].analyticsIssue, /token identity/);
+  const ready = joinPoolWorkspaceRows([pool(pairA)], { status: "READY", rows: [metrics.rows[0]] });
+  assert.equal(ready[0].analyticsStatus, "READY");
+  assert.equal(ready[0].analyticsIssue, null);
 
   const tiles = workspaceMetricTiles(metrics.rows[0]);
   assert.deepEqual(tiles.map((tile) => tile.label), ["TVL", "24h volume", "24h LP fees", "24h LP fee / TVL", "Indexed price"]);
