@@ -849,24 +849,40 @@ test("add status advances from approval pending through current add pending to f
 });
 
 test("remove status advances from LB approval through current remove pending to final success", async ({ page }) => {
+  test.setTimeout(60_000);
+  const approvalHash = "0x1111111111111111111111111111111111111111111111111111111111111111";
+  const removeHash = "0x2222222222222222222222222222222222222222222222222222222222222222";
   await setupConnectedLiquidity(page, {
     allowance: 5n * ONE_TOKEN,
     balance: 5n * ONE_TOKEN,
     lbApproved: false,
     lbApprovedAfterReceipt: true,
-    receiptDelayMs: 1_200
-  }, { transactionDelayMs: 5_000 });
+    transactionEffectsByHash: {
+      [approvalHash]: "lb-approval",
+      [removeHash]: "remove"
+    }
+  }, {
+    transactionHashes: [approvalHash, removeHash],
+    transactionMode: "controlled"
+  });
 
   await clickReviewedAction(page, "liquidity-approve-lb-button");
   const status = page.getByTestId("liquidity-remove-status");
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length, { timeout: 15_000 }).toBe(1);
+  await expect(status).toContainText("Awaiting approval wallet confirmation");
+  await page.evaluate(() => window.__mockWalletControl.releaseNextTransaction());
   await expect(status).toContainText("LB approval confirmed", { timeout: 12_000 });
   await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled({ timeout: 12_000 });
 
   await page.getByTestId("liquidity-remove-button").click();
-  await expect(page.getByTestId("gas-review")).toBeVisible();
+  await expect(page.getByTestId("gas-review")).toContainText(/liquidity (withdrawal|exit)/);
   await page.getByTestId("liquidity-remove-button").click();
+  // Wait for every pre-wallet guard to finish, then hold the current request open while
+  // asserting its status. This avoids coupling the assertion to refresh/simulation speed.
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length, { timeout: 15_000 }).toBe(2);
   await expect(status).toContainText(/Awaiting action wallet confirmation|Pending/);
   await expect(status).not.toContainText("LB approval confirmed");
+  await page.evaluate(() => window.__mockWalletControl.releaseNextTransaction());
   await expect(status).toContainText("Liquidity removed", { timeout: 12_000 });
   await expect(page.locator("#liquidity-withdraw .mini-metric").filter({ hasText: "Live Balance" }).locator("strong")).toHaveText("0", { timeout: 12_000 });
   await expect(status).toContainText("Liquidity removed");

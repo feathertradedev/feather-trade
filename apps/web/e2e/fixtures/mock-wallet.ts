@@ -20,7 +20,8 @@ export interface MockWalletOptions {
   switchMode?: "ready" | "add-required" | "add-rejected" | "switch-rejected";
   transactionDelayMs?: number;
   transactionHash?: `0x${string}`;
-  transactionMode?: "ready" | "ambiguous";
+  transactionHashes?: `0x${string}`[];
+  transactionMode?: "ready" | "ambiguous" | "controlled";
 }
 
 export interface MockWalletSnapshot {
@@ -35,7 +36,7 @@ export interface MockWalletSnapshot {
 
 export async function installMockWallet(page: Page, options: MockWalletOptions = {}): Promise<void> {
   await page.addInitScript(
-    ({ account, additionalProviders, allowTransactions, chainId, connectMode, primaryProvider, rejectTransactions, switchMode, transactionDelayMs, transactionHash, transactionMode }) => {
+    ({ account, additionalProviders, allowTransactions, chainId, connectMode, primaryProvider, rejectTransactions, switchMode, transactionDelayMs, transactionHash, transactionHashes, transactionMode }) => {
       type Listener = (...args: unknown[]) => void;
       type ProviderState = Window["__mockWalletState"];
 
@@ -55,7 +56,7 @@ export async function installMockWallet(page: Page, options: MockWalletOptions =
         };
       }
 
-      function createProvider(state: ProviderState) {
+      function createProvider(state: ProviderState, transactionReleases: Array<() => void>) {
         const listeners = new Map<string, Set<Listener>>();
 
         function emit(event: string, ...args: unknown[]) {
@@ -124,9 +125,11 @@ export async function installMockWallet(page: Page, options: MockWalletOptions =
               }
               return null;
             }
-            case "eth_sendTransaction":
+            case "eth_sendTransaction": {
+              const transactionIndex = state.sentTransactions.length;
               state.sentTransactions.push(params?.[0] ?? null);
               if (!allowTransactions) throw new Error("Mock wallet should not receive guarded transactions");
+              if (transactionMode === "controlled") await new Promise<void>((resolve) => transactionReleases.push(resolve));
               if (transactionDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, transactionDelayMs));
               if (state.rejectTransactions) {
                 const rejection = new Error("User rejected the transaction request") as Error & { code: number };
@@ -134,7 +137,8 @@ export async function installMockWallet(page: Page, options: MockWalletOptions =
                 throw rejection;
               }
               if (transactionMode === "ambiguous") throw rpcError("Transport closed after possible broadcast", -32_603);
-              return transactionHash;
+              return transactionHashes[transactionIndex] ?? transactionHash;
+            }
             default:
               throw new Error(`Unhandled mock wallet method: ${method}`);
           }
@@ -161,7 +165,8 @@ export async function installMockWallet(page: Page, options: MockWalletOptions =
       ];
       const providers = providerDefinitions.map((definition) => {
         const state = createProviderState(definition.account);
-        return { definition, provider: createProvider(state), state };
+        const transactionReleases: Array<() => void> = [];
+        return { definition, provider: createProvider(state, transactionReleases), state, transactionReleases };
       });
       const [{ provider, state }] = providers;
 
@@ -183,6 +188,9 @@ export async function installMockWallet(page: Page, options: MockWalletOptions =
           disconnect(rdns = providerDefinitions[0].rdns) {
             const selected = providers.find((item) => item.definition.rdns === rdns);
             selected?.provider.emit("disconnect", { code: 4_900, message: "Disconnected" });
+          },
+          releaseNextTransaction(rdns = providerDefinitions[0].rdns) {
+            providers.find((item) => item.definition.rdns === rdns)?.transactionReleases.shift()?.();
           },
           setAccounts(accounts: string[], rdns = providerDefinitions[0].rdns) {
             const selected = providers.find((item) => item.definition.rdns === rdns);
@@ -228,6 +236,7 @@ export async function installMockWallet(page: Page, options: MockWalletOptions =
       switchMode: options.switchMode ?? "ready",
       transactionDelayMs: options.transactionDelayMs ?? 0,
       transactionHash: options.transactionHash ?? "0x1111111111111111111111111111111111111111111111111111111111111111",
+      transactionHashes: options.transactionHashes ?? [],
       transactionMode: options.transactionMode ?? "ready"
     }
   );
@@ -262,6 +271,7 @@ declare global {
     __mockWalletStates: Record<string, Window["__mockWalletState"]>;
     __mockWalletControl: {
       disconnect(rdns?: string): void;
+      releaseNextTransaction(rdns?: string): void;
       setAccounts(accounts: string[], rdns?: string): void;
       setChain(chainId: number, rdns?: string): void;
     };
