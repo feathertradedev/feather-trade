@@ -65,7 +65,7 @@ interface DecodedLiquidityParameters {
 }
 
 interface RpcControl {
-  failQuoterCalls: boolean;
+  failExactQuoteCalls: boolean;
   simulations: Array<{ functionName: string; to: string }>;
   simulationTransactions: RecordedSimulationTransaction[];
 }
@@ -105,7 +105,7 @@ test("a real quote ages stale and remains handler-guarded when refresh fails", a
   await expect.poll(() => page.locator("#swap-output").inputValue()).not.toBe("0");
   await expect(page.getByTestId("swap-approve-button")).toBeEnabled();
 
-  rpcControl.failQuoterCalls = true;
+  rpcControl.failExactQuoteCalls = true;
   await page.clock.fastForward(16_000);
 
   await expect(page.getByText("Quote is stale; refresh before swapping")).toBeVisible();
@@ -358,7 +358,7 @@ test("actual UI deposits one-sided liquidity above and below the active bin with
 });
 
 async function installBrowserStack(page: Page, runtimeRpcUrl: string): Promise<RpcControl> {
-  const rpcControl: RpcControl = { failQuoterCalls: false, simulations: [], simulationTransactions: [] };
+  const rpcControl: RpcControl = { failExactQuoteCalls: false, simulations: [], simulationTransactions: [] };
   await installRpcProxy(page, runtimeRpcUrl, rpcControl);
   await installChainBackedIndexerBridge(page);
   await installUnlockedRpcWallet(page, { account: browserAccount, chainId: manifest.chainId, rpcUrl });
@@ -390,7 +390,7 @@ async function forwardRpcRequest(
   control: RpcControl
 ): Promise<unknown> {
   recordTransactionSimulation(request, control);
-  if (control.failQuoterCalls && isQuoterCall(request)) {
+  if (control.failExactQuoteCalls && isExactQuoteCall(request)) {
     return { id: request.id, jsonrpc: "2.0", error: { code: -32_000, message: "E2E intentionally paused quote refresh" } };
   }
 
@@ -433,10 +433,16 @@ function recordTransactionSimulation(request: JsonRpcRequest, control: RpcContro
   }
 }
 
-function isQuoterCall(request: JsonRpcRequest): boolean {
+function isExactQuoteCall(request: JsonRpcRequest): boolean {
   if (request.method !== "eth_call") return false;
-  const call = request.params?.[0] as { to?: string } | undefined;
-  return call?.to?.toLowerCase() === manifest.contracts.lbQuoter.toLowerCase();
+  const call = request.params?.[0] as { data?: string; to?: string } | undefined;
+  if (call?.to?.toLowerCase() !== manifest.contracts.lbRouter.toLowerCase() || typeof call.data !== "string") return false;
+
+  try {
+    return decodeFunctionData({ abi: lbRouterAbi, data: call.data as Hex }).functionName === "getSwapOut";
+  } catch {
+    return false;
+  }
 }
 
 async function installChainBackedIndexerBridge(page: Page): Promise<void> {
@@ -565,8 +571,11 @@ async function clickReviewedAction(page: Page, testId: string): Promise<void> {
 }
 
 async function bypassDisabledButtonAndClick(page: Page, testId: string): Promise<void> {
-  await page.evaluate((id) => document.querySelector(`[data-testid="${id}"]`)?.removeAttribute("disabled"), testId);
-  await page.getByTestId(testId).click();
+  await page.evaluate((id) => {
+    const button = document.querySelector<HTMLButtonElement>(`[data-testid="${id}"]`);
+    button?.removeAttribute("disabled");
+    button?.click();
+  }, testId);
 }
 
 async function readTokenBalance(token: Address): Promise<bigint> {
