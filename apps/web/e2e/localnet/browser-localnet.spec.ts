@@ -174,6 +174,13 @@ test("actual UI submits approve, swap, add, LB approval, and remove transactions
   await clickReviewedAction(page, "liquidity-remove-button");
   await expect.poll(async () => (await readUnlockedRpcWallet(page)).transactionHashes.length).toBe(7);
   await expect(page.getByText("Liquidity removed")).toBeVisible();
+  await client.request({ method: "anvil_mine", params: ["0xb"] });
+  await expect.poll(() => page.evaluate(() => {
+    const raw = window.localStorage.getItem("feather.transaction-journal.v1");
+    if (raw === null) return 0;
+    const records = (JSON.parse(raw) as { records: Array<{ confirmations: number; reviewed: { intent: string } }> }).records;
+    return records.findLast((record) => record.reviewed.intent === "remove-liquidity")?.confirmations ?? 0;
+  }), { timeout: 15_000 }).toBeGreaterThanOrEqual(12);
   const lbBalanceAfterPartial = await readLbBalance();
   expect(lbBalanceAfterPartial).toBeGreaterThan(lbBalanceBeforeAdd);
   expect(lbBalanceAfterPartial).toBeLessThan(lbBalanceAfterAdd);
@@ -204,8 +211,17 @@ test("actual UI submits approve, swap, add, LB approval, and remove transactions
   await expect(page.getByTestId("withdraw-transaction-review")).toContainText("Full exit");
   await clickReviewedAction(page, "liquidity-remove-button");
   await expect.poll(async () => (await readUnlockedRpcWallet(page)).transactionHashes.length).toBe(1);
-  await expect(page.getByText("Liquidity removed")).toBeVisible();
+  await expect(page.getByText(/Full-exit batch mined/)).toBeVisible();
   expect(await readLbBalance()).toBe(lbBalanceBeforeAdd);
+  await client.request({ method: "anvil_mine", params: ["0xb"] });
+  await expect.poll(() => page.evaluate(() => {
+    const raw = window.localStorage.getItem("feather.transaction-journal.v1");
+    if (raw === null) return 0;
+    const records = (JSON.parse(raw) as { records: Array<{ confirmations: number; reviewed: { intent: string } }> }).records;
+    return records.findLast((record) => record.reviewed.intent === "remove-liquidity")?.confirmations ?? 0;
+  }), { timeout: 15_000 }).toBeGreaterThanOrEqual(12);
+  await page.getByTestId("resume-full-exit-button").click();
+  await expect(page.getByTestId("full-exit-workflow-status")).toContainText("Full exit verified complete");
 
   const fullWallet = await readUnlockedRpcWallet(page);
   const wallet = {
@@ -245,6 +261,7 @@ test("actual UI submits approve, swap, add, LB approval, and remove transactions
     { functionName: "addLiquidity", to: manifest.contracts.lbRouter.toLowerCase() },
     { functionName: "approveForAll", to: pool.pair.toLowerCase() },
     { functionName: "approveForAll", to: pool.pair.toLowerCase() },
+    { functionName: "removeLiquidity", to: manifest.contracts.lbRouter.toLowerCase() },
     { functionName: "removeLiquidity", to: manifest.contracts.lbRouter.toLowerCase() },
     { functionName: "removeLiquidity", to: manifest.contracts.lbRouter.toLowerCase() },
     { functionName: "removeLiquidity", to: manifest.contracts.lbRouter.toLowerCase() },
