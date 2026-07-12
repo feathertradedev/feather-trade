@@ -2470,6 +2470,13 @@ test("portfolio partial and full exits preserve all-bin intent and full exit sub
   await expect(page.getByText("Liquidity removed")).toBeVisible();
   await page.locator("#remove-percent").fill("40");
   await expect(page.getByText("Liquidity removed")).toHaveCount(0);
+  rpc.update({ blockNumber: 53n, indexerBlockNumber: 53n, receiptBlockNumber: 42n });
+  await expect.poll(() => page.evaluate(() => {
+    const raw = window.localStorage.getItem("feather.transaction-journal.v1");
+    if (raw === null) return 0;
+    const records = (JSON.parse(raw) as { records: Array<{ confirmations: number; reviewed: { intent: string } }> }).records;
+    return records.findLast((record) => record.reviewed.intent === "remove-liquidity")?.confirmations ?? 0;
+  }), { timeout: 12_000 }).toBeGreaterThanOrEqual(12);
   rpc.update({ simulationMode: "error" });
   await page.getByTestId("liquidity-remove-button").click();
   await expect(page.getByText(/Simulation failed/).first()).toBeVisible();
@@ -2482,13 +2489,6 @@ test("portfolio partial and full exits preserve all-bin intent and full exit sub
   expect(partialArgs[5]).toHaveLength(3);
   expect(partialArgs[6]).toHaveLength(3);
   assertTransactionMatchesSimulation((await readMockWallet(page)).sentTransactions[0], rpc, "removeLiquidity");
-  rpc.update({ blockNumber: 53n, receiptBlockNumber: 42n });
-  await expect.poll(() => page.evaluate(() => {
-    const raw = window.localStorage.getItem("feather.transaction-journal.v1");
-    if (raw === null) return 0;
-    const records = (JSON.parse(raw) as { records: Array<{ confirmations: number; reviewed: { intent: string } }> }).records;
-    return records.findLast((record) => record.reviewed.intent === "remove-liquidity")?.confirmations ?? 0;
-  }), { timeout: 12_000 }).toBeGreaterThanOrEqual(12);
 
   await page.goto("/#/positions");
   await expect(page.getByRole("link", { name: "Full exit" })).toBeVisible();
@@ -2501,7 +2501,9 @@ test("portfolio partial and full exits preserve all-bin intent and full exit sub
   await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled();
   await clickReviewedAction(page, "liquidity-remove-button");
   await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(2);
-  await expect(page.getByText("Liquidity removed")).toBeVisible();
+  await expect(page.getByText(/Full-exit batch mined; the full exit is not complete/)).toBeVisible();
+  await expect(page.getByText("Liquidity removed")).toHaveCount(0);
+  await expect(page.getByTestId("full-exit-workflow-status")).toContainText("Batch 1 reached 12-confirmation finality");
 
   const submitted = decodeSubmittedTransaction((await readMockWallet(page)).sentTransactions[1]);
   expect(submitted.functionName).toBe("removeLiquidity");
@@ -2588,6 +2590,7 @@ test("full exit replans around a newly enumerated exact-head bin instead of sile
   await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/liquidity");
   await connectWallet(page);
+  await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "Max" }).click();
   await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled();
   rpc.update({ ownerPositionCount: 2 });
   await clickReviewedAction(page, "liquidity-remove-button");
@@ -2604,6 +2607,7 @@ test("full exit planning tolerates continuous head advance while preserving its 
     lbApproved: true,
     simulationDelayMs: 600
   });
+  await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "Max" }).click();
   await page.getByTestId("liquidity-remove-button").click();
   await expect.poll(() => simulatedFunctions(rpc).filter((name) => name === "removeLiquidity")).toHaveLength(1);
   rpc.update({ blockNumber: 43n });
@@ -2622,6 +2626,7 @@ test("full exit aborts when its exact-head block hash is reorganized", async ({ 
     lbApproved: true,
     simulationDelayMs: 600
   });
+  await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "Max" }).click();
   await page.getByTestId("liquidity-remove-button").click();
   await expect.poll(() => simulatedFunctions(rpc).filter((name) => name === "removeLiquidity")).toHaveLength(1);
   rpc.update({ blockHash: "0x3333333333333333333333333333333333333333333333333333333333333333" });

@@ -4148,9 +4148,7 @@ function LiquidityView({
           ? "Enter a deadline from 1 to 120 minutes"
           : currentRemoveFamilyConflict !== null
             ? `A prior withdrawal is ${currentRemoveFamilyConflict.status} at ${currentRemoveFamilyConflict.confirmations}/${TRANSACTION_JOURNAL_MONITOR_CONFIRMATIONS} confirmations; no sibling partial or full exit may start before finality`
-          : (fullExit
-              ? indexerSubmissionFreshnessError(snapshot, snapshotQueryErrored) ?? ownerPositionPaginationError(walletPositionsQuery.data, walletPositionsQuery.isError)
-              : removeDataFreshnessIssue) ??
+          : removeDataFreshnessIssue ??
             (!removeSelectedPool.ready
               ? poolDescriptorError(removeSelectedPool)
               : removeBurnPlanIssue ??
