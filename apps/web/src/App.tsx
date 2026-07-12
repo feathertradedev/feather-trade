@@ -8868,9 +8868,11 @@ function LiquidityView({
               ? "Full-exit batch mined; the full exit is not complete until 12-confirmation finality and a fresh zero-bin verification"
               : "Liquidity removed"
             : null}
-          inputError={liquidityReceiptPhase === "remove" && removeInputError?.startsWith("A prior withdrawal is ")
+          inputError={currentRemoveSuccess
             ? null
-            : removeInputError}
+            : liquidityReceiptPhase === "remove" && removeInputError?.startsWith("A prior withdrawal is ")
+              ? null
+              : removeInputError}
           insufficientBalance={false}
           pendingHash={liquidityReceiptPhase === "remove" ? removeWrite.data : liquidityReceiptPhase === "lb-approval" ? approveLbWrite.data : undefined}
           prerequisitePending={liquidityReceiptPhase === "lb-approval" && (approveLbWrite.isPending || approveLbReceipt.isLoading)}
