@@ -135,6 +135,7 @@ export interface MockRpcOptions {
   receiptStatus?: "success" | "reverted";
   receiptBlockNumber?: bigint;
   receiptDelayMs?: number;
+  transactionEffectsByHash?: Readonly<Record<string, "lb-approval" | "remove">>;
   simulationDelayMs?: number;
   simulationMode?: "success" | "error";
   walletReadMode?: "ready" | "error";
@@ -590,22 +591,30 @@ async function handleRpc(request: RpcRequest, options: MockRpcOptions, state: Mo
         return rpcResult(request, numberToHex(options.estimatedGas ?? 500_000n));
       case "eth_gasPrice":
         return rpcResult(request, numberToHex(options.gasPrice ?? 1_000_000_000n));
-      case "eth_getTransactionReceipt":
+      case "eth_getTransactionReceipt": {
         if (options.receiptDelayMs !== undefined) await delay(options.receiptDelayMs);
         const receiptBlockNumber = options.receiptBlockNumber ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER;
-        state.receiptObserved = true;
+        const transactionHash = typeof request.params?.[0] === "string" ? request.params[0] as Hex : TX_HASH;
+        const transactionEffect = options.transactionEffectsByHash?.[transactionHash.toLowerCase()] ?? "default";
+        if (transactionEffect !== "lb-approval") state.receiptObserved = true;
         if ((options.receiptStatus ?? "success") === "success") {
-          if (options.clearPositionsAfterReceipt === true) options.includePositions = false;
-          if (options.allowanceAfterReceipt !== undefined) options.allowance = options.allowanceAfterReceipt;
-          if (options.indexerDelayMsAfterReceipt !== undefined) options.indexerDelayMs = options.indexerDelayMsAfterReceipt;
+          if (transactionEffect !== "lb-approval") {
+            if (options.clearPositionsAfterReceipt === true) options.includePositions = false;
+            if (options.allowanceAfterReceipt !== undefined) options.allowance = options.allowanceAfterReceipt;
+            if (options.indexerDelayMsAfterReceipt !== undefined) options.indexerDelayMs = options.indexerDelayMsAfterReceipt;
+          }
           if (options.lbApprovedAfterReceipt !== undefined) options.lbApproved = options.lbApprovedAfterReceipt;
-          if (options.pairReserveXAfterReceipt !== undefined) options.pairReserveX = options.pairReserveXAfterReceipt;
-          if (options.pairTokenXAfterReceipt !== undefined) options.pairTokenX = options.pairTokenXAfterReceipt;
-          if (options.quoteDelayMsAfterReceipt !== undefined) options.quoteDelayMs = options.quoteDelayMsAfterReceipt;
-          if (options.quoteRateAfterReceipt !== undefined) options.quoteRate = options.quoteRateAfterReceipt;
-          if (options.blockNumberAfterReceipt !== undefined) options.blockNumber = options.blockNumberAfterReceipt;
-          const createCall = state.ethCalls.findLast((call) => call.functionName === "createLBPair");
-          if (createCall) {
+          if (transactionEffect !== "lb-approval") {
+            if (options.pairReserveXAfterReceipt !== undefined) options.pairReserveX = options.pairReserveXAfterReceipt;
+            if (options.pairTokenXAfterReceipt !== undefined) options.pairTokenX = options.pairTokenXAfterReceipt;
+            if (options.quoteDelayMsAfterReceipt !== undefined) options.quoteDelayMs = options.quoteDelayMsAfterReceipt;
+            if (options.quoteRateAfterReceipt !== undefined) options.quoteRate = options.quoteRateAfterReceipt;
+            if (options.blockNumberAfterReceipt !== undefined) options.blockNumber = options.blockNumberAfterReceipt;
+          }
+          const createCall = transactionEffect === "default"
+            ? state.ethCalls.findLast((call) => call.functionName === "createLBPair")
+            : undefined;
+          if (createCall !== undefined) {
             const decoded = decodeFunctionData({ abi: lbRouterAbi, data: createCall.data });
             const [tokenX, tokenY, activeId, binStep] = decoded.args as readonly [Address, Address, number, number];
             state.creationConfirmed = true;
@@ -615,9 +624,13 @@ async function handleRpc(request: RpcRequest, options: MockRpcOptions, state: Mo
             state.createdBinStep = binStep;
           }
         }
-        return rpcResult(request, transactionReceipt(receiptBlockNumber, options.receiptStatus ?? "success", options, state));
-      case "eth_getTransactionByHash":
-        return rpcResult(request, transactionByHash(options.receiptBlockNumber ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER, state));
+        return rpcResult(request, transactionReceipt(receiptBlockNumber, options.receiptStatus ?? "success", options, state, transactionHash, transactionEffect));
+      }
+      case "eth_getTransactionByHash": {
+        const transactionHash = typeof request.params?.[0] === "string" ? request.params[0] as Hex : TX_HASH;
+        const transactionEffect = options.transactionEffectsByHash?.[transactionHash.toLowerCase()] ?? "default";
+        return rpcResult(request, transactionByHash(options.receiptBlockNumber ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER, state, transactionHash, transactionEffect));
+      }
       case "eth_getBalance": {
         const requestedBlock = request.params?.[1];
         const receiptBlock = numberToHex(options.receiptBlockNumber ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER);
@@ -1287,10 +1300,12 @@ function transactionReceipt(
   blockNumber: bigint,
   status: "success" | "reverted",
   options: MockRpcOptions,
-  state: MockRpcSnapshot
+  state: MockRpcSnapshot,
+  transactionHash: Hex,
+  transactionEffect: "default" | "lb-approval" | "remove"
 ): Record<string, unknown> {
   const logs: Record<string, unknown>[] = [];
-  if (status === "success" && state.creationConfirmed && state.createdTokenX && state.createdTokenY && state.createdBinStep !== null) {
+  if (status === "success" && transactionEffect === "default" && state.creationConfirmed && state.createdTokenX && state.createdTokenY && state.createdBinStep !== null) {
     logs.push({
         address: options.factoryAddress ?? LB_FACTORY,
         blockHash: options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222",
@@ -1306,11 +1321,11 @@ function transactionReceipt(
           eventName: "LBPairCreated",
           args: { tokenX: state.createdTokenX, tokenY: state.createdTokenY, binStep: BigInt(state.createdBinStep) }
         }),
-        transactionHash: TX_HASH,
+        transactionHash,
         transactionIndex: "0x0"
       });
   }
-  if (status === "success" && state.lastAddLiquidity) {
+  if (status === "success" && transactionEffect === "default" && state.lastAddLiquidity) {
     const add = state.lastAddLiquidity;
     const pair = options.pairAddress ?? WNATIVE_USDC_PAIR;
     const blockHash = options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222";
@@ -1323,7 +1338,7 @@ function transactionReceipt(
         logIndex: numberToHex(BigInt(logs.length)),
         removed: false,
         topics: encodeEventTopics({ abi, eventName: eventName as never, args: indexedArgs as never }),
-        transactionHash: TX_HASH,
+        transactionHash,
         transactionIndex: "0x0"
       });
     };
@@ -1351,7 +1366,7 @@ function transactionReceipt(
     transfer(add.parameters.tokenX, pair as Address, DEFAULT_ACCOUNT, add.quote.amountXLeft);
     transfer(add.parameters.tokenY, pair as Address, DEFAULT_ACCOUNT, add.quote.amountYLeft);
   }
-  if (status === "success" && state.lastRemoveLiquidity?.functionName === "removeLiquidityNATIVE") {
+  if (status === "success" && transactionEffect !== "lb-approval" && state.lastRemoveLiquidity?.functionName === "removeLiquidityNATIVE") {
     const remove = state.lastRemoveLiquidity;
     const pair = (options.pairAddress ?? WNATIVE_USDC_PAIR) as Address;
     const blockHash = options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222";
@@ -1364,7 +1379,7 @@ function transactionReceipt(
         logIndex: numberToHex(BigInt(logs.length)),
         removed: false,
         topics: encodeEventTopics({ abi, eventName: eventName as never, args: indexedArgs as never }),
-        transactionHash: TX_HASH,
+        transactionHash,
         transactionIndex: "0x0"
       });
     };
@@ -1381,7 +1396,7 @@ function transactionReceipt(
     pushEvent(USDC, erc20Abi, "Transfer", { from: LB_ROUTER, to: DEFAULT_ACCOUNT }, [{ type: "uint256" }], [transferAmount]);
   }
   const nativeSwapCall = state.ethCalls.findLast((call) => call.functionName === "swapExactNATIVEForTokens" || call.functionName === "swapExactTokensForNATIVE");
-  if (status === "success" && nativeSwapCall) {
+  if (status === "success" && transactionEffect === "default" && nativeSwapCall) {
     const decoded = decodeFunctionData({ abi: lbRouterAbi, data: nativeSwapCall.data });
     const nativeIn = decoded.functionName === "swapExactNATIVEForTokens";
     const path = (nativeIn ? decoded.args[1] : decoded.args[2]) as { tokenPath: readonly Address[] };
@@ -1399,7 +1414,7 @@ function transactionReceipt(
       logIndex: numberToHex(BigInt(logs.length)),
       removed: false,
       topics: encodeEventTopics({ abi: erc20Abi, eventName: "Transfer", args: { from, to } }),
-      transactionHash: TX_HASH,
+      transactionHash,
       transactionIndex: "0x0"
     });
   }
@@ -1415,7 +1430,7 @@ function transactionReceipt(
     logsBloom: `0x${"0".repeat(512)}`,
     status: status === "success" ? "0x1" : "0x0",
     to: "0x0165878A594ca255338adfa4d48449f69242Eb8F",
-    transactionHash: TX_HASH,
+    transactionHash,
     transactionIndex: "0x0",
     type: "0x2"
   };
@@ -1425,11 +1440,19 @@ function packedAmounts(x: bigint, y: bigint): Hex {
   return `0x${((y << 128n) | x).toString(16).padStart(64, "0")}`;
 }
 
-function transactionByHash(blockNumber: bigint, state: MockRpcSnapshot): Record<string, unknown> {
+function transactionByHash(
+  blockNumber: bigint,
+  state: MockRpcSnapshot,
+  transactionHash: Hex,
+  transactionEffect: "default" | "lb-approval" | "remove"
+): Record<string, unknown> {
+  const functions = transactionEffect === "lb-approval"
+    ? ["approveForAll"]
+    : transactionEffect === "remove"
+      ? ["removeLiquidity", "removeLiquidityNATIVE"]
+      : ["addLiquidity", "addLiquidityNATIVE", "approve", "approveForAll", "createLBPair", "removeLiquidity", "removeLiquidityNATIVE", "swapExactTokensForTokens", "swapExactNATIVEForTokens", "swapExactTokensForNATIVE"];
   const simulatedTransaction = state.ethCalls.findLast((call) =>
-    ["addLiquidity", "addLiquidityNATIVE", "approve", "approveForAll", "createLBPair", "removeLiquidity", "removeLiquidityNATIVE", "swapExactTokensForTokens", "swapExactNATIVEForTokens", "swapExactTokensForNATIVE"].includes(
-      call.functionName
-    )
+    functions.includes(call.functionName)
   );
 
   return {
@@ -1439,7 +1462,7 @@ function transactionByHash(blockNumber: bigint, state: MockRpcSnapshot): Record<
     from: DEFAULT_ACCOUNT,
     gas: numberToHex(500_000n),
     gasPrice: numberToHex(1n),
-    hash: TX_HASH,
+    hash: transactionHash,
     input: simulatedTransaction?.data ?? "0x",
     nonce: "0x0",
     r: `0x${"1".padStart(64, "0")}`,

@@ -1377,12 +1377,14 @@ a {
 
 .transaction-journal {
   padding: 10px 14px;
-  border: 1px solid #dce4e8;
+  color: var(--bone);
+  border: 1px solid var(--hairline);
   border-radius: 8px;
-  background: #f8fafb;
+  background: var(--panel);
 }
 
 .transaction-journal summary {
+  color: var(--bone-bright);
   cursor: pointer;
   font-size: 12px;
   font-weight: 800;
@@ -1392,6 +1394,7 @@ a {
   display: grid;
   gap: 6px;
   padding-top: 8px;
+  color: var(--ink-60);
   font-family: var(--font-mono);
   font-size: 11px;
 }
