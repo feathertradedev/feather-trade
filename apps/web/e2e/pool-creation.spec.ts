@@ -31,6 +31,8 @@ async function openCreationWizard(page: Page) {
   await expect(page.getByTestId("wallet-account-button")).toContainText("0xf39F...2266");
   await page.getByTestId("pool-create-launch").click();
   await expect(page.getByTestId("pool-creation-wizard")).toBeVisible();
+  await expect(page.getByTestId("pool-create-token-x")).not.toHaveValue("");
+  await expect(page.getByTestId("pool-create-token-y")).not.toHaveValue("");
 }
 
 async function configureCreation(page: Page, createAndAdd = false) {
