@@ -91,6 +91,13 @@ test("canonical Feather liquidity desktop", async ({ page }, testInfo) => {
   await connectWallet(page);
   await expect(page.getByTestId("withdraw-transaction-review")).toBeVisible();
   await expect(page).toHaveScreenshot("feather-liquidity-desktop.png", screenshotOptions);
+  await page.setViewportSize({ height: 900, width: 640 });
+  await expect(page.getByTestId("liquidity-range-fields")).toBeVisible();
+  await expect(page.getByTestId("liquidity-range-risk")).toBeVisible();
+  for (const id of ["range-lower", "range-lower-bin", "range-min-price", "range-upper", "range-upper-bin", "range-max-price"]) {
+    await expect(page.locator(`#${id}`)).toBeVisible();
+  }
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
 test("canonical Feather liquidity mobile", async ({ page }, testInfo) => {
@@ -100,6 +107,9 @@ test("canonical Feather liquidity mobile", async ({ page }, testInfo) => {
   await page.goto("/#/liquidity");
   await connectWallet(page);
   await expect(page.getByTestId("withdraw-transaction-review")).toBeVisible();
+  await expect(page.getByTestId("liquidity-range-fields")).toBeVisible();
+  await expect(page.getByTestId("liquidity-range-risk")).toBeVisible();
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   await expect(page).toHaveScreenshot("feather-liquidity-mobile.png", screenshotOptions);
 });
 
