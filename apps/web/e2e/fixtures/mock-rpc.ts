@@ -52,6 +52,7 @@ export interface MockRpcOptions {
   allowance?: bigint;
   allowanceAfterReceipt?: bigint;
   balance?: bigint;
+  balanceAfterReceipt?: bigint;
   binReserveX?: bigint;
   binReserveY?: bigint;
   binTotalSupply?: bigint;
@@ -94,6 +95,7 @@ export interface MockRpcOptions {
   maxRemoveLiquidityBinsForEstimate?: number;
   maxRemoveLiquidityBinsForSimulation?: number;
   nativeBalance?: bigint;
+  nativeBalanceAfterReceipt?: bigint;
   noCodeAddresses?: Address[];
   omitActivePoolBin?: boolean;
   ownerPositionCount?: number;
@@ -501,8 +503,14 @@ async function handleRpc(request: RpcRequest, options: MockRpcOptions, state: Mo
         return rpcResult(request, transactionReceipt(receiptBlockNumber, options.receiptStatus ?? "success", options, state));
       case "eth_getTransactionByHash":
         return rpcResult(request, transactionByHash(options.receiptBlockNumber ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER, state));
-      case "eth_getBalance":
-        return rpcResult(request, numberToHex(options.nativeBalance ?? DEFAULT_BALANCE));
+      case "eth_getBalance": {
+        const requestedBlock = request.params?.[1];
+        const receiptBlock = numberToHex(options.receiptBlockNumber ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER);
+        const balance = requestedBlock === receiptBlock && options.nativeBalanceAfterReceipt !== undefined
+          ? options.nativeBalanceAfterReceipt
+          : options.nativeBalance ?? DEFAULT_BALANCE;
+        return rpcResult(request, numberToHex(balance));
+      }
       case "eth_getCode": {
         const address = String(request.params?.[0] ?? "").toLowerCase();
         if (options.noCodeAddresses?.some((candidate) => candidate.toLowerCase() === address)) {
@@ -560,7 +568,7 @@ async function handleEthCall(
 
   if (
     options.simulationDelayMs !== undefined &&
-    ["addLiquidity", "approve", "approveForAll", "createLBPair", "removeLiquidity", "swapExactTokensForTokens"].includes(
+    ["addLiquidity", "approve", "approveForAll", "createLBPair", "removeLiquidity", "swapExactTokensForTokens", "swapExactNATIVEForTokens", "swapExactTokensForNATIVE"].includes(
       functionName
     )
   ) {
@@ -823,7 +831,12 @@ async function handleEthCall(
       });
     }
 
-    return encodeFunctionResult({ abi: erc20Abi, functionName, result: options.balance ?? DEFAULT_BALANCE });
+    const receiptBlock = numberToHex(options.receiptBlockNumber ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER);
+    return encodeFunctionResult({
+      abi: erc20Abi,
+      functionName,
+      result: blockTag === receiptBlock && options.balanceAfterReceipt !== undefined ? options.balanceAfterReceipt : options.balance ?? DEFAULT_BALANCE
+    });
   }
 
   if (functionName === "isApprovedForAll") {
@@ -863,6 +876,17 @@ async function handleEthCall(
       }
     }
     return encodeFunctionResult({ abi: lbRouterAbi, functionName, result: decoded.args[1] as bigint });
+  }
+
+  if (functionName === "swapExactNATIVEForTokens" || functionName === "swapExactTokensForNATIVE") {
+    if (options.simulationMode === "error") throw new Error("Mock native swap simulation failed");
+    const path = functionName === "swapExactNATIVEForTokens" ? decoded.args[1] : decoded.args[2];
+    for (let index = 0; index < path.tokenPath.length - 1; index += 1) {
+      const expectedBinStep = quoteBinStepForLeg(path.tokenPath[index], path.tokenPath[index + 1], options.quoteUseAlternateDirectPool === true);
+      if (path.pairBinSteps[index] !== expectedBinStep || path.versions[index] !== 3) throw new Error("Mock native swap path does not match an executable V2.2 pair leg");
+    }
+    const minimum = (functionName === "swapExactNATIVEForTokens" ? decoded.args[0] : decoded.args[1]) as bigint;
+    return encodeFunctionResult({ abi: lbRouterAbi, functionName, result: minimum });
   }
 
   if (functionName === "addLiquidity") {
@@ -1103,8 +1127,9 @@ function transactionReceipt(
   options: MockRpcOptions,
   state: MockRpcSnapshot
 ): Record<string, unknown> {
-  const logs = status === "success" && state.creationConfirmed && state.createdTokenX && state.createdTokenY && state.createdBinStep !== null
-    ? [{
+  const logs: Record<string, unknown>[] = [];
+  if (status === "success" && state.creationConfirmed && state.createdTokenX && state.createdTokenY && state.createdBinStep !== null) {
+    logs.push({
         address: options.factoryAddress ?? LB_FACTORY,
         blockHash: options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222",
         blockNumber: numberToHex(blockNumber),
@@ -1121,8 +1146,31 @@ function transactionReceipt(
         }),
         transactionHash: TX_HASH,
         transactionIndex: "0x0"
-      }]
-    : [];
+      });
+  }
+  const nativeSwapCall = state.ethCalls.findLast((call) => call.functionName === "swapExactNATIVEForTokens" || call.functionName === "swapExactTokensForNATIVE");
+  if (status === "success" && nativeSwapCall) {
+    const decoded = decodeFunctionData({ abi: lbRouterAbi, data: nativeSwapCall.data });
+    const nativeIn = decoded.functionName === "swapExactNATIVEForTokens";
+    const path = (nativeIn ? decoded.args[1] : decoded.args[2]) as { tokenPath: readonly Address[] };
+    const token = nativeIn ? path.tokenPath[path.tokenPath.length - 1] : path.tokenPath[0];
+    const amount = nativeIn
+      ? (options.balanceAfterReceipt ?? DEFAULT_BALANCE) - (options.balance ?? DEFAULT_BALANCE)
+      : decoded.args[0] as bigint;
+    const from = nativeIn ? WNATIVE_USDC_PAIR : DEFAULT_ACCOUNT;
+    const to = nativeIn ? DEFAULT_ACCOUNT : WNATIVE_USDC_PAIR;
+    logs.push({
+      address: token,
+      blockHash: options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222",
+      blockNumber: numberToHex(blockNumber),
+      data: encodeAbiParameters([{ name: "value", type: "uint256" }], [amount]),
+      logIndex: numberToHex(BigInt(logs.length)),
+      removed: false,
+      topics: encodeEventTopics({ abi: erc20Abi, eventName: "Transfer", args: { from, to } }),
+      transactionHash: TX_HASH,
+      transactionIndex: "0x0"
+    });
+  }
   return {
     blockHash: "0x2222222222222222222222222222222222222222222222222222222222222222",
     blockNumber: numberToHex(blockNumber),
@@ -1143,7 +1191,7 @@ function transactionReceipt(
 
 function transactionByHash(blockNumber: bigint, state: MockRpcSnapshot): Record<string, unknown> {
   const simulatedTransaction = state.ethCalls.findLast((call) =>
-    ["addLiquidity", "approve", "approveForAll", "createLBPair", "removeLiquidity", "swapExactTokensForTokens"].includes(
+    ["addLiquidity", "approve", "approveForAll", "createLBPair", "removeLiquidity", "swapExactTokensForTokens", "swapExactNATIVEForTokens", "swapExactTokensForNATIVE"].includes(
       call.functionName
     )
   );

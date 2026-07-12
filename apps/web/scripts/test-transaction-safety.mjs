@@ -22,6 +22,7 @@ try {
     parseDeadlineMinutes,
     parseIdSlippage,
     quoteIsStale,
+    reconcileNativeSwapReceipt,
     swapExecutionContextFingerprint
   } = await server.ssrLoadModule("/src/transaction-safety.ts");
   const now = 1_800_000_000_000;
@@ -135,6 +136,8 @@ try {
     reserveX: "100",
     reserveY: "200",
     routeMode: "exact-selected",
+    inputAssetMode: "erc20",
+    outputAssetMode: "erc20",
     rpcChainId: 31_337,
     slippageBps: "50",
     tokenIn: "0x2222222222222222222222222222222222222222",
@@ -156,6 +159,8 @@ try {
     reserveX: "101",
     reserveY: "201",
     routeMode: "best",
+    inputAssetMode: "native",
+    outputAssetMode: "native",
     rpcChainId: 46_630,
     slippageBps: "51",
     tokenIn: "0x6666666666666666666666666666666666666666",
@@ -170,6 +175,39 @@ try {
       `${field} must invalidate the swap execution context`
     );
   }
+
+  assert.deepEqual(reconcileNativeSwapReceipt({
+    amountIn: 1_000n,
+    amountOutMin: 800n,
+    direction: "native-in",
+    effectiveGasPrice: 2n,
+    gasUsed: 50n,
+    nativeBalanceBefore: 10_000n,
+    nativeBalanceAfter: 8_900n,
+    tokenBalanceBefore: 2_000n,
+    tokenBalanceAfter: 2_850n,
+    transactionValue: 1_000n
+  }), { direction: "native-in", gasCost: 100n, nativeAmount: 1_000n, tokenAmount: 850n });
+  assert.deepEqual(reconcileNativeSwapReceipt({
+    amountIn: 500n,
+    amountOutMin: 700n,
+    direction: "native-out",
+    effectiveGasPrice: 2n,
+    gasUsed: 50n,
+    nativeBalanceBefore: 10_000n,
+    nativeBalanceAfter: 10_650n,
+    tokenBalanceBefore: 2_000n,
+    tokenBalanceAfter: 1_500n,
+    transactionValue: 0n
+  }), { direction: "native-out", gasCost: 100n, nativeAmount: 750n, tokenAmount: 500n });
+  assert.throws(() => reconcileNativeSwapReceipt({
+    amountIn: 1_000n, amountOutMin: 900n, direction: "native-in", effectiveGasPrice: 2n, gasUsed: 50n,
+    nativeBalanceBefore: 10_000n, nativeBalanceAfter: 8_900n, tokenBalanceBefore: 2_000n, tokenBalanceAfter: 2_899n, transactionValue: 1_000n
+  }), /below the reviewed minimum/);
+  assert.throws(() => reconcileNativeSwapReceipt({
+    amountIn: 500n, amountOutMin: 700n, direction: "native-out", effectiveGasPrice: 2n, gasUsed: 50n,
+    nativeBalanceBefore: 10_000n, nativeBalanceAfter: 10_650n, tokenBalanceBefore: 2_000n, tokenBalanceAfter: 1_501n, transactionValue: 0n
+  }), /exact reviewed input/);
 
   const burnQuoteBinding = {
     balances: [{ binId: "8388608", balance: "2000" }],

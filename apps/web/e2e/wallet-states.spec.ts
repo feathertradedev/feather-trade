@@ -39,6 +39,141 @@ test("disconnected wallet state disables guarded swap actions", async ({ page })
   await expect(page.getByTestId("swap-balance-value")).toHaveText("connect wallet");
 });
 
+test("native ETH input suppresses approval, sends exact value, and reconciles canonical balances", async ({ page }) => {
+  const nativeBefore = 10n * ONE_TOKEN;
+  const tokenBefore = 5n * ONE_TOKEN;
+  const amountIn = ONE_TOKEN;
+  const amountOut = 999n * ONE_TOKEN / 1_000n;
+  const rpc = await installMockRpc(page, {
+    balance: tokenBefore,
+    balanceAfterReceipt: tokenBefore + amountOut,
+    includePairs: true,
+    nativeBalance: nativeBefore,
+    nativeBalanceAfterReceipt: nativeBefore - amountIn - 100_000n,
+    receiptBlockNumber: 43n
+  });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
+  await page.goto("/#/swap");
+  await connectWallet(page);
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await expect(page.getByTestId("swap-token-in-identity")).toContainText(`ETH native asset · router wrapper WNATIVE ${WNATIVE}`);
+  await expect(page.getByTestId("swap-native-no-approval")).toBeVisible();
+  await expect(page.getByTestId("swap-approve-button")).toHaveCount(0);
+  await clickReviewedAction(page, "swap-submit-button");
+  await expect(page.getByTestId("native-swap-receipt-review")).toContainText("ETH spent", { timeout: 15_000 });
+
+  const wallet = await readMockWallet(page);
+  expect(wallet.sentTransactions).toHaveLength(1);
+  const transaction = wallet.sentTransactions[0] as { data: Hex; value: string };
+  expect(BigInt(transaction.value)).toBe(amountIn);
+  expect(decodeFunctionData({ abi: lbRouterAbi, data: transaction.data }).functionName).toBe("swapExactNATIVEForTokens");
+  rpc.update({ blockHash: `0x${"44".repeat(32)}` as Hex });
+  await expect(page.getByTestId("native-swap-receipt-error")).toContainText("reorganized", { timeout: 15_000 });
+  await expect(page.getByTestId("native-swap-receipt-review")).toHaveCount(0);
+});
+
+test("native ETH output keeps ERC input approval, sends zero value, and reconciles canonical balances", async ({ page }) => {
+  const nativeBefore = 10n * ONE_TOKEN;
+  const tokenBefore = 5n * ONE_TOKEN;
+  const amountOut = 999n * ONE_TOKEN / 1_000n;
+  await installMockRpc(page, {
+    allowance: 10n * ONE_TOKEN,
+    balance: tokenBefore,
+    balanceAfterReceipt: tokenBefore - ONE_TOKEN,
+    includePairs: true,
+    nativeBalance: nativeBefore,
+    nativeBalanceAfterReceipt: nativeBefore + amountOut - 100_000n,
+    receiptBlockNumber: 43n
+  });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
+  await page.goto("/#/swap");
+  await connectWallet(page);
+  await page.getByTitle("Flip tokens").click();
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await expect(page.getByTestId("swap-token-out-identity")).toContainText("ETH native asset");
+  await expect(page.getByTestId("swap-approve-button")).toContainText("Approved");
+  await expect(page.getByTestId("swap-approve-button")).toBeDisabled();
+  await clickReviewedAction(page, "swap-submit-button");
+  await expect(page.getByTestId("native-swap-receipt-review")).toContainText("ETH received", { timeout: 15_000 });
+
+  const wallet = await readMockWallet(page);
+  expect(wallet.sentTransactions).toHaveLength(1);
+  const transaction = wallet.sentTransactions[0] as { data: Hex; value?: string };
+  expect(BigInt(transaction.value ?? "0x0")).toBe(0n);
+  expect(decodeFunctionData({ abi: lbRouterAbi, data: transaction.data }).functionName).toBe("swapExactTokensForNATIVE");
+});
+
+test("native swap mode change during delayed simulation invalidates the wallet request", async ({ page }) => {
+  await installMockRpc(page, { includePairs: true, simulationDelayMs: 750 });
+  await installMockWallet(page, { allowTransactions: false, chainId: LOCALNET_CHAIN_ID });
+  await page.goto("/#/swap");
+  await connectWallet(page);
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await page.getByTestId("swap-submit-button").click();
+  await page.waitForTimeout(100);
+  await page.getByRole("button", { name: "WNATIVE · ERC-20" }).click();
+  await page.waitForTimeout(900);
+  expect((await readMockWallet(page)).sentTransactions).toHaveLength(0);
+});
+
+test("native swap simulation failure opens no wallet request", async ({ page }) => {
+  await installMockRpc(page, { includePairs: true, simulationMode: "error" });
+  await installMockWallet(page, { allowTransactions: false, chainId: LOCALNET_CHAIN_ID });
+  await page.goto("/#/swap");
+  await connectWallet(page);
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await page.getByTestId("swap-submit-button").click();
+  await expect(page.getByText(/Simulation failed:/)).toBeVisible();
+  expect((await readMockWallet(page)).sentTransactions).toHaveLength(0);
+});
+
+test("native swap unresolved journal retry never creates a second wallet request", async ({ page }) => {
+  await installMockRpc(page, { includePairs: true });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID, transactionMode: "ambiguous" });
+  await page.goto("/#/swap");
+  await connectWallet(page);
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await page.getByTestId("swap-submit-button").click();
+  await expect(page.getByTestId("gas-review")).toBeVisible();
+  await page.getByTestId("swap-submit-button").click();
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+  await page.getByTestId("swap-submit-button").click();
+  expect((await readMockWallet(page)).sentTransactions).toHaveLength(1);
+  await expect(page.getByTestId("native-swap-receipt-review")).toHaveCount(0);
+});
+
+test("native swap wallet rejection never produces receipt success", async ({ page }) => {
+  await installMockRpc(page, { includePairs: true });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID, rejectTransactions: true });
+  await page.goto("/#/swap");
+  await connectWallet(page);
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await page.getByTestId("swap-submit-button").click();
+  await expect(page.getByTestId("gas-review")).toBeVisible();
+  await page.getByTestId("swap-submit-button").click();
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+  await expect(page.getByText("Swap confirmed")).toHaveCount(0);
+  await expect(page.getByTestId("native-swap-receipt-review")).toHaveCount(0);
+});
+
+test("native swap mined revert is truthful and duplicate clicks open one wallet request", async ({ page }) => {
+  await installMockRpc(page, { includePairs: true, receiptStatus: "reverted", simulationDelayMs: 100 });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID, transactionDelayMs: 500 });
+  await page.goto("/#/swap");
+  await connectWallet(page);
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await page.getByTestId("swap-submit-button").click();
+  await expect(page.getByTestId("gas-review")).toBeVisible();
+  await page.evaluate(() => {
+    const button = document.querySelector<HTMLButtonElement>('[data-testid="swap-submit-button"]');
+    button?.click();
+    button?.click();
+  });
+  await expect(page.getByText("Swap reverted")).toBeVisible({ timeout: 15_000 });
+  expect((await readMockWallet(page)).sentTransactions).toHaveLength(1);
+  await expect(page.getByTestId("native-swap-receipt-review")).toHaveCount(0);
+});
+
 test("broken token logos render a deterministic address-derived fallback", async ({ page }) => {
   await page.route("**/token-assets/wnative.svg", (route) => route.abort());
   await installMockRpc(page);

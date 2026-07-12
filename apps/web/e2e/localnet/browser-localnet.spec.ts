@@ -116,6 +116,45 @@ test("a real quote ages stale and remains handler-guarded when refresh fails", a
   expect((await readUnlockedRpcWallet(page)).sentTransactions).toEqual([]);
 });
 
+test("actual localnet executes native-input swap with exact value and no approval", async ({ page }) => {
+  await installBrowserStack(page, rpcUrl);
+  const ethBeforeIn = await client.getBalance({ address: browserAccount });
+  const tokenBeforeIn = await readTokenBalance(pool.tokenY);
+  await page.goto("/#/swap");
+  await connectWallet(page);
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await expect(page.getByTestId("swap-approve-button")).toHaveCount(0);
+  await clickReviewedAction(page, "swap-submit-button");
+  await expect(page.getByTestId("native-swap-receipt-review")).toContainText("ETH spent", { timeout: 15_000 });
+  const walletAfterIn = await readUnlockedRpcWallet(page);
+  const nativeInTransaction = decodeSubmittedTransaction(walletAfterIn.sentTransactions[0]!);
+  expect(nativeInTransaction.functionName).toBe("swapExactNATIVEForTokens");
+  expect(BigInt((walletAfterIn.sentTransactions[0] as { value?: string }).value ?? "0x0")).toBe(1_000_000_000_000_000_000n);
+  expect(await readTokenBalance(pool.tokenY)).toBeGreaterThan(tokenBeforeIn);
+  expect(await client.getBalance({ address: browserAccount })).toBeLessThan(ethBeforeIn);
+});
+
+test("actual localnet executes native-output swap with ERC input approval and zero value", async ({ page }) => {
+  await installBrowserStack(page, rpcUrl);
+  await page.goto("/#/swap");
+  await connectWallet(page);
+  await page.getByTitle("Flip tokens").click();
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await expect(page.getByTestId("swap-approve-button")).toBeEnabled();
+  await clickReviewedAction(page, "swap-approve-button");
+  await expect(page.getByText("Approval confirmed")).toBeVisible();
+  const ethBeforeOut = await client.getBalance({ address: browserAccount });
+  await clickReviewedAction(page, "swap-submit-button");
+  await expect(page.getByTestId("native-swap-receipt-review")).toContainText("ETH received", { timeout: 15_000 });
+  const walletAfterOut = await readUnlockedRpcWallet(page);
+  const nativeOutRaw = walletAfterOut.sentTransactions[walletAfterOut.sentTransactions.length - 1]!;
+  expect(decodeSubmittedTransaction(nativeOutRaw).functionName).toBe("swapExactTokensForNATIVE");
+  expect(BigInt((nativeOutRaw as { value?: string }).value ?? "0x0")).toBe(0n);
+  const nativeOutHash = walletAfterOut.transactionHashes[walletAfterOut.transactionHashes.length - 1]!;
+  const nativeOutReceipt = await client.getTransactionReceipt({ hash: nativeOutHash });
+  expect((await client.getBalance({ address: browserAccount })) + nativeOutReceipt.gasUsed * nativeOutReceipt.effectiveGasPrice).toBeGreaterThan(ethBeforeOut);
+});
+
 test("actual UI submits approve, swap, add, LB approval, and remove transactions to isolated Anvil", async ({ page }) => {
   const rpcControl = await installBrowserStack(page, rpcUrl);
   const lbBalanceBeforeAdd = await readLbBalance();
@@ -550,7 +589,7 @@ async function connectWallet(page: Page): Promise<void> {
 
 async function clickReviewedAction(page: Page, testId: string): Promise<void> {
   const expectedAction = new Map<string, RegExp>([
-    ["swap-approve-button", /gas estimate for WNATIVE approval:/],
+    ["swap-approve-button", /gas estimate for (?:WNATIVE|USDC) approval:/],
     ["swap-submit-button", /gas estimate for swap:/],
     ["liquidity-approve-x-button", /gas estimate for WNATIVE approval:/],
     ["liquidity-approve-y-button", /gas estimate for USDC approval:/],
