@@ -1,4 +1,11 @@
 import { QueryClient, QueryClientProvider, useQuery, type QueryObserverResult } from "@tanstack/react-query";
+import {
+  decimalPriceToQ128,
+  formatExactPriceFraction,
+  normalizeQ128Price,
+  readIdFromPrice,
+  readPriceFromId
+} from "../../../packages/sdk/src/liquidity-price";
 import { erc20Abi, lbPairAbi, lbRouterAbi } from "@robinhood-lb/sdk/abi";
 import { createDexPublicClient } from "@robinhood-lb/sdk/client";
 import {
@@ -166,6 +173,7 @@ import {
 const queryClient = new QueryClient();
 const SNAPSHOT_REFRESH_INTERVAL_MS = 10_000;
 const SWAP_QUOTE_REFRESH_INTERVAL_MS = 10_000;
+const MAX_LIQUIDITY_BIN_ID = 16_777_215;
 
 interface FullExitUiState {
   batchOrdinal: number;
@@ -3376,6 +3384,15 @@ function LiquidityView({
   const [amountYInput, setAmountYInput] = useState("1");
   const [lowerDeltaInput, setLowerDeltaInput] = useState("-1");
   const [upperDeltaInput, setUpperDeltaInput] = useState("1");
+  const [lowerBinInput, setLowerBinInput] = useState("");
+  const [upperBinInput, setUpperBinInput] = useState("");
+  const [lowerBinId, setLowerBinId] = useState<number | null>(null);
+  const [upperBinId, setUpperBinId] = useState<number | null>(null);
+  const [lowerPriceInput, setLowerPriceInput] = useState("");
+  const [upperPriceInput, setUpperPriceInput] = useState("");
+  const [rangeEditError, setRangeEditError] = useState<string | null>(null);
+  const [narrowPresetInput, setNarrowPresetInput] = useState("3");
+  const [widePresetInput, setWidePresetInput] = useState("21");
   const [liquidityStrategy, setLiquidityStrategy] = useState<LiquidityStrategy>("spot");
   const [slippageInput, setSlippageInput] = useState("0.5");
   const [idSlippageInput, setIdSlippageInput] = useState("2");
@@ -3404,6 +3421,8 @@ function LiquidityView({
   const [submittedAddReceiptContext, setSubmittedAddReceiptContext] = useState<string | null>(null);
   const intentionalEmptySelectionRef = useRef(false);
   const portfolioPrefillKeyRef = useRef<string | null>(null);
+  const rangePoolKeyRef = useRef<string | null>(null);
+  const rangeEditGenerationRef = useRef(0);
   const liquidityOperationGenerationRef = useRef(0);
   const approveXSubmitInFlightRef = useRef<number | null>(null);
   const approveYSubmitInFlightRef = useRef<number | null>(null);
@@ -3517,12 +3536,97 @@ function LiquidityView({
       : localnetRegistry !== null
         ? snapshot?.runtime.seededActiveId ?? null
         : null);
+  const rangePoolKey = [environmentKey, pool?.pair ?? "", pool?.tokenX ?? "", pool?.tokenY ?? "", pool?.binStep.toString() ?? ""].join("|");
+  const commitAbsoluteRange = (nextLowerBin: number, nextUpperBin: number): boolean => {
+    if (
+      !Number.isSafeInteger(nextLowerBin) ||
+      !Number.isSafeInteger(nextUpperBin) ||
+      nextLowerBin < 0 ||
+      nextUpperBin > MAX_LIQUIDITY_BIN_ID
+    ) {
+      setRangeEditError("Range bin IDs must fit uint24");
+      return false;
+    }
+    if (nextUpperBin < nextLowerBin) {
+      setRangeEditError("Lower range must not exceed upper range");
+      return false;
+    }
+    if (nextUpperBin - nextLowerBin + 1 > MAX_LIQUIDITY_BINS) {
+      setRangeEditError(`Liquidity range must include between 1 and ${MAX_LIQUIDITY_BINS} bins`);
+      return false;
+    }
+
+    rangeEditGenerationRef.current += 1;
+    setLowerBinId(nextLowerBin);
+    setUpperBinId(nextUpperBin);
+    setLowerBinInput(String(nextLowerBin));
+    setUpperBinInput(String(nextUpperBin));
+    if (activeBin !== null) {
+      setLowerDeltaInput(String(nextLowerBin - activeBin));
+      setUpperDeltaInput(String(nextUpperBin - activeBin));
+    }
+    setRangeEditError(null);
+    return true;
+  };
+  useEffect(() => {
+    if (activeBin === null) return;
+    if (rangePoolKeyRef.current !== rangePoolKey || lowerBinId === null || upperBinId === null) {
+      rangePoolKeyRef.current = rangePoolKey;
+      const nextLowerBin = Math.max(0, activeBin - 1);
+      const nextUpperBin = Math.min(MAX_LIQUIDITY_BIN_ID, activeBin + 1);
+      commitAbsoluteRange(nextLowerBin, nextUpperBin);
+      return;
+    }
+
+    setLowerDeltaInput(String(lowerBinId - activeBin));
+    setUpperDeltaInput(String(upperBinId - activeBin));
+  }, [activeBin, rangePoolKey]);
   const parsedAmountXResult = parseTokenAmount(amountXInput, tokenX?.decimals ?? 18);
   const parsedAmountYResult = parseTokenAmount(amountYInput, tokenY?.decimals ?? 18);
   const parsedAmountX = parsedAmountXResult.amount;
   const parsedAmountY = parsedAmountYResult.amount;
-  const lowerDelta = parseIntegerInput(lowerDeltaInput);
-  const upperDelta = parseIntegerInput(upperDeltaInput);
+  const lowerDelta =
+    rangeEditError === null && lowerBinId !== null && activeBin !== null
+      ? lowerBinId - activeBin
+      : rangeEditError === null
+        ? parseIntegerInput(lowerDeltaInput)
+        : null;
+  const upperDelta =
+    rangeEditError === null && upperBinId !== null && activeBin !== null
+      ? upperBinId - activeBin
+      : rangeEditError === null
+        ? parseIntegerInput(upperDeltaInput)
+        : null;
+  const rangePriceOptions =
+    tokenX === null || tokenY === null
+      ? null
+      : { baseDecimals: tokenX.decimals, quoteDecimals: tokenY.decimals };
+  const rangePriceQuery = useQuery({
+    queryKey: ["liquidityRangePrices", environmentKey, pool?.pair, lowerBinId, upperBinId],
+    queryFn: async () => {
+      if (pool === null || lowerBinId === null || upperBinId === null) throw new Error("Liquidity range is unavailable");
+      const [lowerPriceQ128, upperPriceQ128] = await Promise.all([
+        readPriceFromId(publicClient, pool.pair, lowerBinId),
+        readPriceFromId(publicClient, pool.pair, upperBinId)
+      ]);
+      return { lowerPriceQ128, upperPriceQ128 };
+    },
+    enabled: pool !== null && lowerBinId !== null && upperBinId !== null,
+    retry: false
+  });
+  useEffect(() => {
+    if (rangePriceQuery.data === undefined || rangePriceOptions === null) return;
+    setLowerPriceInput(formatExactPriceFraction(normalizeQ128Price(rangePriceQuery.data.lowerPriceQ128, rangePriceOptions), 24));
+    setUpperPriceInput(formatExactPriceFraction(normalizeQ128Price(rangePriceQuery.data.upperPriceQ128, rangePriceOptions), 24));
+  }, [rangePriceOptions?.baseDecimals, rangePriceOptions?.quoteDecimals, rangePriceQuery.data]);
+  const lowerInversePrice =
+    rangePriceQuery.data !== undefined && rangePriceOptions !== null
+      ? formatExactPriceFraction(normalizeQ128Price(rangePriceQuery.data.lowerPriceQ128, { ...rangePriceOptions, inverse: true }), 24)
+      : "n/a";
+  const upperInversePrice =
+    rangePriceQuery.data !== undefined && rangePriceOptions !== null
+      ? formatExactPriceFraction(normalizeQ128Price(rangePriceQuery.data.upperPriceQ128, { ...rangePriceOptions, inverse: true }), 24)
+      : "n/a";
   const slippageBps = parseSlippageToBps(slippageInput);
   const idSlippage = parseIdSlippage(idSlippageInput);
   const idSlippageError = idSlippageInputError(idSlippageInput);
@@ -3532,6 +3636,86 @@ function LiquidityView({
   const liquidityMode = distributionResult.distribution?.mode ?? null;
   const amountX = liquidityMode === "token-y" ? 0n : parsedAmountX;
   const amountY = liquidityMode === "token-x" ? 0n : parsedAmountY;
+  const rangeControlError =
+    rangeEditError ??
+    (rangePriceQuery.error ? `Range price read failed: ${getWriteError(rangePriceQuery.error) ?? "price unavailable"}` : null) ??
+    (pool !== null && lowerBinId !== null && upperBinId !== null && rangePriceQuery.data === undefined
+      ? "Loading exact range prices"
+      : null);
+  const updateLowerDelta = (value: string) => {
+    setLowerDeltaInput(value);
+    const nextLowerDelta = parseIntegerInput(value);
+    const nextUpperDelta = parseIntegerInput(upperDeltaInput);
+    if (activeBin === null || nextLowerDelta === null || nextUpperDelta === null) {
+      setRangeEditError("Enter integer bin deltas");
+      return;
+    }
+    commitAbsoluteRange(activeBin + nextLowerDelta, activeBin + nextUpperDelta);
+  };
+  const updateUpperDelta = (value: string) => {
+    setUpperDeltaInput(value);
+    const nextLowerDelta = parseIntegerInput(lowerDeltaInput);
+    const nextUpperDelta = parseIntegerInput(value);
+    if (activeBin === null || nextLowerDelta === null || nextUpperDelta === null) {
+      setRangeEditError("Enter integer bin deltas");
+      return;
+    }
+    commitAbsoluteRange(activeBin + nextLowerDelta, activeBin + nextUpperDelta);
+  };
+  const updateLowerBin = (value: string) => {
+    setLowerBinInput(value);
+    const nextLowerBin = parseIntegerInput(value);
+    const nextUpperBin = parseIntegerInput(upperBinInput);
+    if (nextLowerBin === null || nextUpperBin === null) {
+      setRangeEditError("Enter integer bin IDs");
+      return;
+    }
+    commitAbsoluteRange(nextLowerBin, nextUpperBin);
+  };
+  const updateUpperBin = (value: string) => {
+    setUpperBinInput(value);
+    const nextLowerBin = parseIntegerInput(lowerBinInput);
+    const nextUpperBin = parseIntegerInput(value);
+    if (nextLowerBin === null || nextUpperBin === null) {
+      setRangeEditError("Enter integer bin IDs");
+      return;
+    }
+    commitAbsoluteRange(nextLowerBin, nextUpperBin);
+  };
+  const updatePriceBoundary = async (boundary: "lower" | "upper", value: string) => {
+    if (pool === null || rangePriceOptions === null || lowerBinId === null || upperBinId === null) {
+      setRangeEditError("Liquidity price conversion is unavailable");
+      return;
+    }
+    const generation = rangeEditGenerationRef.current + 1;
+    rangeEditGenerationRef.current = generation;
+    try {
+      const requestedQ128 = decimalPriceToQ128(value, rangePriceOptions);
+      const mappedBin = Number(await readIdFromPrice(publicClient, pool.pair, requestedQ128));
+      if (rangeEditGenerationRef.current !== generation) return;
+      const mappedPriceQ128 = await readPriceFromId(publicClient, pool.pair, mappedBin);
+      if (rangeEditGenerationRef.current !== generation) return;
+      const committed = boundary === "lower"
+        ? commitAbsoluteRange(mappedBin, upperBinId)
+        : commitAbsoluteRange(lowerBinId, mappedBin);
+      if (!committed) return;
+      const mappedPrice = formatExactPriceFraction(normalizeQ128Price(mappedPriceQ128, rangePriceOptions), 24);
+      if (boundary === "lower") setLowerPriceInput(mappedPrice);
+      else setUpperPriceInput(mappedPrice);
+    } catch (error) {
+      if (rangeEditGenerationRef.current !== generation) return;
+      setRangeEditError(error instanceof Error ? error.message : "Price cannot be represented by an LB bin");
+    }
+  };
+  const applyRangePreset = (value: string) => {
+    const width = parseIntegerInput(value);
+    if (activeBin === null || width === null || width < 1 || width > MAX_LIQUIDITY_BINS) {
+      setRangeEditError(`Preset width must include between 1 and ${MAX_LIQUIDITY_BINS} bins`);
+      return;
+    }
+    const nextLowerBin = activeBin - Math.floor((width - 1) / 2);
+    commitAbsoluteRange(nextLowerBin, nextLowerBin + width - 1);
+  };
   const addExecutionFingerprint = [
     environmentKey,
     registry.chainId.toString(),
@@ -4111,6 +4295,7 @@ function LiquidityView({
   }, [currentFullExitRecords, currentFullExitWorkflowKey, fullExitUi]);
   const removeBurnPlanIssue = positionBurnSubmissionError(removeBurnPlan);
   const addInputError =
+    rangeControlError ??
     distributionResult.error ??
     (liquidityMode !== "token-y" && parsedAmountXResult.error !== null
       ? tokenAmountErrorMessage(parsedAmountXResult.error, tokenX?.decimals ?? 18)
@@ -5994,29 +6179,95 @@ function LiquidityView({
           ))}
         </fieldset>
 
+        <fieldset className="range-presets" aria-label="Liquidity range presets">
+          <legend>Editable range presets</legend>
+          <label>
+            <span>Narrow bins</span>
+            <input aria-label="Narrow preset bin count" inputMode="numeric" value={narrowPresetInput} onChange={(event) => setNarrowPresetInput(event.target.value)} />
+            <button data-testid="liquidity-preset-narrow" onClick={() => applyRangePreset(narrowPresetInput)} type="button">Apply Narrow</button>
+          </label>
+          <label>
+            <span>Wide bins</span>
+            <input aria-label="Wide preset bin count" inputMode="numeric" value={widePresetInput} onChange={(event) => setWidePresetInput(event.target.value)} />
+            <button data-testid="liquidity-preset-wide" onClick={() => applyRangePreset(widePresetInput)} type="button">Apply Wide</button>
+          </label>
+        </fieldset>
+
         <div className="range-sliders" data-testid="liquidity-range-sliders">
           <label>Lower handle<input aria-label="Lower range handle" max={rangeSliderMax} min={rangeSliderMin} step="1" type="range" value={lowerDelta ?? 0} onChange={(event) => {
             const next = Number(event.target.value);
-            setLowerDeltaInput(String(next));
-            if (upperDelta !== null && upperDelta - next + 1 > MAX_LIQUIDITY_BINS) setUpperDeltaInput(String(next + MAX_LIQUIDITY_BINS - 1));
+            if (activeBin === null || upperBinId === null) return;
+            const nextLowerBin = activeBin + next;
+            commitAbsoluteRange(nextLowerBin, Math.min(upperBinId, nextLowerBin + MAX_LIQUIDITY_BINS - 1));
           }} /></label>
           <label>Upper handle<input aria-label="Upper range handle" max={rangeSliderMax} min={rangeSliderMin} step="1" type="range" value={upperDelta ?? 0} onChange={(event) => {
             const next = Number(event.target.value);
-            setUpperDeltaInput(String(next));
-            if (lowerDelta !== null && next - lowerDelta + 1 > MAX_LIQUIDITY_BINS) setLowerDeltaInput(String(next - MAX_LIQUIDITY_BINS + 1));
+            if (activeBin === null || lowerBinId === null) return;
+            const nextUpperBin = activeBin + next;
+            commitAbsoluteRange(Math.max(lowerBinId, nextUpperBin - MAX_LIQUIDITY_BINS + 1), nextUpperBin);
           }} /></label>
-          <p>{lowerDelta !== null && upperDelta !== null && upperDelta >= lowerDelta ? `${upperDelta - lowerDelta + 1} bins` : "Invalid range"} · max {MAX_LIQUIDITY_BINS}. Every exact distribution is simulated before wallet submission.</p>
+          <p>{lowerBinId !== null && upperBinId !== null && upperBinId >= lowerBinId ? `${upperBinId - lowerBinId + 1} bins` : "Invalid range"} · max {MAX_LIQUIDITY_BINS}. Every exact distribution is simulated before wallet submission.</p>
+        </div>
+
+        <div className="liquidity-range-fields" data-testid="liquidity-range-fields">
+          <label htmlFor="range-lower">
+            <span>Lower Delta</span>
+            <input id="range-lower" inputMode="numeric" value={lowerDeltaInput} onChange={(event) => updateLowerDelta(event.target.value)} />
+          </label>
+          <label htmlFor="range-lower-bin">
+            <span>Lower Bin</span>
+            <input id="range-lower-bin" inputMode="numeric" value={lowerBinInput} onChange={(event) => updateLowerBin(event.target.value)} />
+          </label>
+          <label htmlFor="range-min-price">
+            <span>Min {tokenSymbol(tokenY)} per {tokenSymbol(tokenX)}</span>
+            <input
+              id="range-min-price"
+              inputMode="decimal"
+              value={lowerPriceInput}
+              onChange={(event) => {
+                setLowerPriceInput(event.target.value);
+                setRangeEditError("Review the edited minimum price");
+              }}
+              onBlur={() => void updatePriceBoundary("lower", lowerPriceInput)}
+            />
+          </label>
+          <div className="range-inverse" data-testid="liquidity-min-price-inverse">
+            <span>Inverse min</span>
+            <output>{lowerInversePrice} {tokenSymbol(tokenX)} per {tokenSymbol(tokenY)}</output>
+          </div>
+          <label htmlFor="range-upper">
+            <span>Upper Delta</span>
+            <input id="range-upper" inputMode="numeric" value={upperDeltaInput} onChange={(event) => updateUpperDelta(event.target.value)} />
+          </label>
+          <label htmlFor="range-upper-bin">
+            <span>Upper Bin</span>
+            <input id="range-upper-bin" inputMode="numeric" value={upperBinInput} onChange={(event) => updateUpperBin(event.target.value)} />
+          </label>
+          <label htmlFor="range-max-price">
+            <span>Max {tokenSymbol(tokenY)} per {tokenSymbol(tokenX)}</span>
+            <input
+              id="range-max-price"
+              inputMode="decimal"
+              value={upperPriceInput}
+              onChange={(event) => {
+                setUpperPriceInput(event.target.value);
+                setRangeEditError("Review the edited maximum price");
+              }}
+              onBlur={() => void updatePriceBoundary("upper", upperPriceInput)}
+            />
+          </label>
+          <div className="range-inverse" data-testid="liquidity-max-price-inverse">
+            <span>Inverse max</span>
+            <output>{upperInversePrice} {tokenSymbol(tokenX)} per {tokenSymbol(tokenY)}</output>
+          </div>
+        </div>
+
+        <div className="state-row warning liquidity-range-risk" data-testid="liquidity-range-risk">
+          <AlertTriangle size={16} />
+          <span>Narrow ranges concentrate liquidity and can move out of range sooner. Only the active portion trades; above- or below-active ranges become one-sided, and out-of-range liquidity may stop earning trading fees until price returns. Returns are not guaranteed.</span>
         </div>
 
         <div className="swap-settings">
-          <label htmlFor="range-lower">
-            <span>Lower Delta</span>
-            <input id="range-lower" inputMode="numeric" value={lowerDeltaInput} onChange={(event) => setLowerDeltaInput(event.target.value)} />
-          </label>
-          <label htmlFor="range-upper">
-            <span>Upper Delta</span>
-            <input id="range-upper" inputMode="numeric" value={upperDeltaInput} onChange={(event) => setUpperDeltaInput(event.target.value)} />
-          </label>
           <label htmlFor="liquidity-slippage">
             <span>Slippage</span>
             <input id="liquidity-slippage" inputMode="decimal" value={slippageInput} onChange={(event) => {
@@ -6070,7 +6321,14 @@ function LiquidityView({
           token={tokenY}
         />
 
-        <LiquidityDistributionPreview bins={distributionResult.preview} />
+        <LiquidityDistributionPreview
+          activeBin={activeBin}
+          bins={distributionResult.preview}
+          lowerBinId={lowerBinId}
+          lowerPrice={lowerPriceInput}
+          upperBinId={upperBinId}
+          upperPrice={upperPriceInput}
+        />
 
         <div className="action-stack">
           <button
@@ -6338,7 +6596,21 @@ function BurnPlanWarnings({ plan }: { plan: PositionBurnPlanResult }) {
   );
 }
 
-function LiquidityDistributionPreview({ bins }: { bins: LiquidityDistributionView[] }) {
+function LiquidityDistributionPreview({
+  activeBin,
+  bins,
+  lowerBinId,
+  lowerPrice,
+  upperBinId,
+  upperPrice
+}: {
+  activeBin: number | null;
+  bins: LiquidityDistributionView[];
+  lowerBinId: number | null;
+  lowerPrice: string;
+  upperBinId: number | null;
+  upperPrice: string;
+}) {
   if (bins.length === 0) {
     return <EmptyState state="empty" />;
   }
@@ -6346,9 +6618,22 @@ function LiquidityDistributionPreview({ bins }: { bins: LiquidityDistributionVie
   return (
     <div className="distribution-panel">
       <div className="range-map" aria-label="Liquidity bin distribution">
-        {bins.map((bin) => (
-          <span className={bin.delta === "0" ? "bin active" : "bin"} key={bin.key} style={{ height: bin.height }} title={`Bin ${bin.binId}`} />
-        ))}
+        {bins.map((bin) => {
+          const binId = Number(bin.binId);
+          const boundary = binId === lowerBinId ? "lower" : binId === upperBinId ? "upper" : null;
+          const price = boundary === "lower" ? lowerPrice : boundary === "upper" ? upperPrice : null;
+          return (
+            <span
+              aria-label={`Selected bin ${bin.binId}${binId === activeBin ? "; active bin" : ""}${boundary ? `; ${boundary} boundary${price ? `; ${price}` : ""}` : ""}`}
+              className={["bin", binId === activeBin ? "active" : "", boundary ? "boundary" : ""].filter(Boolean).join(" ")}
+              data-bin-id={bin.binId}
+              key={bin.key}
+              role="img"
+              style={{ height: bin.height }}
+              title={`Bin ${bin.binId}`}
+            />
+          );
+        })}
       </div>
       <details className="distribution-details" open={bins.length <= 15 ? true : undefined}>
         <summary>Per-bin weights ({bins.length})</summary>

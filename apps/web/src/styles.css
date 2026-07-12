@@ -2280,6 +2280,115 @@ a {
   line-height: 1.4;
 }
 
+.range-presets {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 14px 0 10px;
+  padding: 10px;
+  border: 1px solid #e2e9ec;
+  border-radius: 8px;
+}
+
+.range-presets legend {
+  grid-column: 1 / -1;
+  color: #53656d;
+  font-size: 0.78rem;
+  font-weight: 850;
+  text-transform: uppercase;
+}
+
+.range-presets label {
+  display: grid;
+  grid-template-columns: minmax(72px, 1fr) 72px auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.range-presets input,
+.liquidity-range-fields input {
+  width: 100%;
+  min-width: 0;
+}
+
+.range-presets button {
+  min-height: 38px;
+  padding: 7px 10px;
+}
+
+.liquidity-range-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 12px 0;
+}
+
+.liquidity-range-fields label,
+.range-inverse {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.liquidity-range-fields label > span,
+.range-inverse > span {
+  color: #6a7a82;
+  font-size: 0.72rem;
+}
+
+.range-inverse {
+  padding: 10px;
+  overflow-wrap: anywhere;
+  background: #f8fafb;
+  border: 1px solid #e2e9ec;
+  border-radius: 8px;
+}
+
+.range-inverse output {
+  font-size: 0.78rem;
+}
+
+.liquidity-range-risk {
+  align-items: flex-start;
+}
+
+.range-map .bin.boundary {
+  outline: 2px solid #d9a94c;
+  outline-offset: 1px;
+}
+
+.app-shell .range-presets,
+.app-shell .liquidity-range-fields label,
+.app-shell .range-inverse {
+  color: var(--bone);
+  background: var(--carbon);
+  border-color: rgb(233 236 231 / 10%);
+}
+
+.app-shell .range-presets legend,
+.app-shell .range-presets label > span,
+.app-shell .liquidity-range-fields label > span,
+.app-shell .range-inverse > span {
+  color: var(--ink-45);
+}
+
+.app-shell .range-presets input,
+.app-shell .liquidity-range-fields input {
+  color: var(--bone-bright);
+  background: var(--card);
+  border-color: var(--hairline);
+}
+
+.app-shell .range-presets button {
+  color: var(--bone);
+  background: var(--panel);
+  border-color: var(--hairline);
+}
+
+.app-shell .range-inverse output {
+  color: var(--bone);
+}
+
 .distribution-panel .range-map {
   margin: 0;
 }
@@ -2698,10 +2807,21 @@ a {
   }
 
   .swap-settings,
+  .liquidity-range-fields,
+  .range-presets,
   .quote-grid,
   .portfolio-metrics,
   .position-bin-row {
     grid-template-columns: 1fr;
+  }
+
+  .range-presets label {
+    grid-template-columns: minmax(0, 1fr) 72px;
+  }
+
+  .range-presets button {
+    grid-column: 1 / -1;
+    width: 100%;
   }
 
   .position-history-row {
