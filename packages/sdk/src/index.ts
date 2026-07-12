@@ -6,6 +6,7 @@ export * from "./liquidity.js";
 export * from "./liquidity-price.js";
 export * from "./liquidity-review.js";
 export * from "./manifest.js";
+export * from "./pool-creation.js";
 export * from "./registry.js";
 export * from "./routing-policy.js";
 export * from "./swap.js";
