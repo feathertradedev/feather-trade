@@ -297,6 +297,8 @@ test("a pair code change during durable pre-wallet review aborts without broadca
   rpc.update({ pairCode: "0x" });
   await secondClick;
   await expect(page.getByTestId("submitted-transaction-journal")).toContainText("aborted");
+  await expect(page.getByTestId("swap-failure-state")).not.toContainText(/possible broadcast/i);
+  await expect(page.getByTestId("swap-failure-state")).toContainText(/code|context changed|attestation/i);
   expect((await readMockWallet(page)).sentTransactions).toEqual([]);
 
   rpc.update({ pairCode: "0x6001600055" });
@@ -1012,6 +1014,7 @@ test("unavailable durable storage blocks wallet handoff and surfaces a controlle
 
   await clickReviewedAction(page, "swap-submit-button");
   await expect(page.getByTestId("swap-failure-state")).toContainText(/quota|storage|journal/i);
+  await expect(page.getByTestId("swap-failure-state")).not.toContainText(/possible broadcast/i);
   expect((await readMockWallet(page)).sentTransactions).toHaveLength(0);
 });
 

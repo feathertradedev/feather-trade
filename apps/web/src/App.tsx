@@ -508,19 +508,29 @@ async function submitJournaledTransaction(input: {
       throw error;
     }
   }
+  let hash: Address;
   try {
-    const hash = await input.send();
-    try {
-      await input.journal.submitted(handle, hash);
-    } catch {
-      throw new Error(`Wallet returned ${formatCompactAddress(hash)}, but durable hash persistence failed; retry remains blocked in this session`);
-    }
-    return hash;
+    hash = await input.send();
   } catch (error) {
-    if (!(error instanceof Error && error.message.includes("durable hash persistence failed"))) {
-      await input.journal.fail(handle, error);
-    }
-    throw error;
+    await input.journal.fail(handle, error);
+    if (isUserRejectedSubmission(error)) throw error;
+    throw new AmbiguousWalletSubmissionError(error);
+  }
+  try {
+    await input.journal.submitted(handle, hash);
+  } catch {
+    throw new Error(`Wallet returned ${formatCompactAddress(hash)}, but durable hash persistence failed; retry remains blocked in this session`);
+  }
+  return hash;
+}
+
+class AmbiguousWalletSubmissionError extends Error {
+  readonly cause: unknown;
+
+  constructor(cause: unknown) {
+    super("Wallet transport failed after submission handoff; a possible broadcast has no returned transaction hash. Retry remains blocked while the durable journal reconciles it.");
+    this.name = "AmbiguousWalletSubmissionError";
+    this.cause = cause;
   }
 }
 
@@ -2211,7 +2221,9 @@ function SwapView({
         });
       }
     } catch (error) {
-      if (!isUserRejectedSubmission(error)) setSwapSimulationError(getWriteError(error) ?? "Transaction journal blocked swap submission");
+      if (!isUserRejectedSubmission(error)) {
+        setSwapSimulationError(getWriteError(error) ?? "Transaction journal blocked swap submission");
+      }
       // The wagmi mutation retains the rejection for the originating mounted session.
     }
     } finally {
@@ -6219,7 +6231,7 @@ function LiquidityView({
     liquidityExitAttestationQuery.error === null &&
     liveLbApproved &&
     !removeBurnPlan.blocked &&
-    liquiditySimulationError === null &&
+    (liquiditySimulationError === null || liquiditySimulationError.startsWith("Simulation failed:")) &&
     !liquiditySimulationPending &&
     !removeWrite.isPending &&
     !removeReceipt.isLoading;
