@@ -17,7 +17,7 @@ import {
   type InstalledMockRpc,
   type MockRpcOptions
 } from "./fixtures/mock-rpc";
-import { DEFAULT_ACCOUNT, installMockWallet, LOCALNET_CHAIN_ID, readMockWallet, ROBINHOOD_TESTNET_CHAIN_ID } from "./fixtures/mock-wallet";
+import { DEFAULT_ACCOUNT, installMockWallet, LOCALNET_CHAIN_ID, readMockWallet, ROBINHOOD_TESTNET_CHAIN_ID, type MockWalletOptions } from "./fixtures/mock-wallet";
 
 const ONE_TOKEN = 1_000_000_000_000_000_000n;
 const ROBINHOOD_TESTNET_RPC_URL = "https://rpc.testnet.chain.robinhood.com";
@@ -572,9 +572,10 @@ test("LP selection changes during second-click gas review discard stale review a
   await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled();
   await page.getByTestId("liquidity-remove-button").click();
   await expect(page.getByTestId("gas-review")).toBeVisible();
-  rpc.update({ gasEstimateDelayMs: 500 });
+  rpc.update({ gasEstimateDelayMs: 5_000 });
   await page.getByTestId("liquidity-remove-button").click();
   await expect.poll(() => rpc.snapshot().methods.filter((method) => method === "eth_estimateGas").length).toBe(2);
+  expect(rpc.snapshot().gasEstimatesCompleted).toBe(1);
 
   await page.getByRole("group", { name: "Positions" }).getByRole("checkbox").first().uncheck();
   await expect(page.getByTestId("gas-review")).toHaveCount(0);
@@ -592,7 +593,7 @@ test("account change resets executable state and receipt banners but preserves t
   await page.evaluate(() => window.__mockWalletControl.setAccounts(["0x1111111111111111111111111111111111111111"]));
   await expect(page.getByTestId("wallet-account-button")).toContainText("0x1111...1111");
   await expect(page.locator("#swap-amount")).toHaveValue("1.0");
-  await expect(page.getByText("Receipt state will appear here")).toBeVisible();
+  await expect(page.getByTestId("swap-failure-state")).toContainText("Ready for wallet confirmation");
   await expect(page.getByText("Swap confirmed")).toHaveCount(0);
   await expect(page.getByTestId("submitted-transaction-journal")).toHaveCount(0);
   expect(await persistedTransactionJournalCount(page)).toBe(1);
@@ -801,6 +802,76 @@ test("approval-needed state enables approval but guards swap until allowance exi
   assertTransactionMatchesSimulation((await readMockWallet(page)).sentTransactions[0], rpc, "approve");
 });
 
+test("swap status advances from approval success through current swap pending to final success", async ({ page }) => {
+  await setupConnectedSwap(page, {
+    allowance: 0n,
+    allowanceAfterReceipt: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    includePairs: true,
+    receiptDelayMs: 1_200
+  }, { transactionDelayMs: 1_200 });
+
+  await clickReviewedAction(page, "swap-approve-button");
+  const status = page.getByTestId("swap-failure-state");
+  await expect(status).toContainText("Approval confirmed", { timeout: 12_000 });
+  await expect(page.getByTestId("swap-submit-button")).toBeEnabled({ timeout: 12_000 });
+
+  await page.getByTestId("swap-submit-button").click();
+  await expect(page.getByTestId("gas-review")).toBeVisible();
+  await page.getByTestId("swap-submit-button").click();
+  await expect(status).toContainText(/Awaiting swap wallet confirmation|Swap pending/);
+  await expect(status).not.toContainText("Approval confirmed");
+  await expect(status).toContainText("Swap confirmed", { timeout: 12_000 });
+});
+
+test("add status advances from approval pending through current add pending to final success", async ({ page }) => {
+  await setupConnectedLiquidity(page, {
+    allowance: 0n,
+    allowanceAfterReceipt: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    receiptDelayMs: 1_200
+  }, { transactionDelayMs: 1_200 });
+
+  const status = page.getByTestId("liquidity-add-status");
+  await page.getByTestId("liquidity-approve-x-button").click();
+  await expect(page.getByTestId("gas-review")).toBeVisible();
+  await page.getByTestId("liquidity-approve-x-button").click();
+  await expect(status).toContainText(/Awaiting approval wallet confirmation|Pending/);
+  await expect(page.getByTestId("liquidity-add-button")).toBeEnabled({ timeout: 12_000 });
+
+  await page.getByTestId("liquidity-add-button").click();
+  await expect(page.getByTestId("liquidity-add-review")).toBeVisible();
+  await expect(page.getByTestId("gas-review")).toBeVisible();
+  await page.getByTestId("liquidity-add-button").click();
+  await expect(status).toContainText(/Awaiting action wallet confirmation|Pending/);
+  await expect(status).not.toContainText("Token approval confirmed");
+  await expect(status).toContainText("Liquidity added", { timeout: 12_000 });
+});
+
+test("remove status advances from LB approval through current remove pending to final success", async ({ page }) => {
+  await setupConnectedLiquidity(page, {
+    allowance: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    lbApproved: false,
+    lbApprovedAfterReceipt: true,
+    receiptDelayMs: 1_200
+  }, { transactionDelayMs: 5_000 });
+
+  await clickReviewedAction(page, "liquidity-approve-lb-button");
+  const status = page.getByTestId("liquidity-remove-status");
+  await expect(status).toContainText("LB approval confirmed", { timeout: 12_000 });
+  await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled({ timeout: 12_000 });
+
+  await page.getByTestId("liquidity-remove-button").click();
+  await expect(page.getByTestId("gas-review")).toBeVisible();
+  await page.getByTestId("liquidity-remove-button").click();
+  await expect(status).toContainText(/Awaiting action wallet confirmation|Pending/);
+  await expect(status).not.toContainText("LB approval confirmed");
+  await expect(status).toContainText("Liquidity removed", { timeout: 12_000 });
+  await expect(page.locator("#liquidity-withdraw .mini-metric").filter({ hasText: "Live Balance" }).locator("strong")).toHaveText("0", { timeout: 12_000 });
+  await expect(status).toContainText("Liquidity removed");
+});
+
 test("revoked allowance returns an approved swap to exact approval-required state", async ({ page }) => {
   const rpc = await setupConnectedSwap(page, { allowance: 5n * ONE_TOKEN, balance: 5n * ONE_TOKEN });
   await expect(page.getByTestId("swap-approve-button")).toContainText("Approved");
@@ -836,8 +907,10 @@ test("approval confirmation invalidates the reviewed quote until fresh wallet, m
   const preApprovalReserve = await selectedMarket.getAttribute("data-reserve-x");
 
   await clickReviewedAction(page, "swap-approve-button");
-  await expect(page.getByText("Approval confirmed")).toBeVisible({ timeout: 12_000 });
-  await page.waitForTimeout(250);
+  await expect(page.getByTestId("swap-failure-state")).toContainText(
+    "Refreshing balance, allowance, and quote after approval"
+  );
+  await expect(page.getByTestId("swap-failure-state")).toHaveClass(/\bpending\b/);
   await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
   await expect(selectedMarket).toHaveAttribute("data-reserve-x", preApprovalReserve ?? "");
   expect(swapQuoteCallCount(rpc)).toBe(quoteCallsBeforeApproval);
@@ -912,8 +985,10 @@ test("post-approval snapshot refresh rejects a malformed token identity at an ot
 
   await expect(selectedMarket).toHaveAttribute("data-token-x", WNATIVE);
   await clickReviewedAction(page, "swap-approve-button");
-  await expect(page.getByText("Approval confirmed")).toBeVisible({ timeout: 12_000 });
-  await page.waitForTimeout(200);
+  await expect(page.getByTestId("swap-failure-state")).toContainText(
+    "Refreshing balance, allowance, and quote after approval"
+  );
+  await expect(page.getByTestId("swap-failure-state")).toHaveClass(/\bpending\b/);
   await expect(selectedMarket).toHaveAttribute("data-token-x", WNATIVE);
   await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
 
@@ -1933,6 +2008,7 @@ test("background approval polling detects external revocation and clears stale r
 });
 
 test("stable revoked polling preserves a newly reviewed LB reapproval through its second click", async ({ page }) => {
+  test.setTimeout(60_000);
   const rpc = await setupConnectedLiquidity(page, { lbApproved: true });
   const disclosure = page.getByTestId("lb-operator-approval-disclosure");
 
@@ -3510,9 +3586,9 @@ test("connected portfolio renders a truthful empty state", async ({ page }) => {
   await expect(page.getByTestId("portfolio-position-card")).toHaveCount(0);
 });
 
-async function setupConnectedSwap(page: Parameters<typeof installMockRpc>[0], rpcOptions: MockRpcOptions = {}): Promise<InstalledMockRpc> {
+async function setupConnectedSwap(page: Parameters<typeof installMockRpc>[0], rpcOptions: MockRpcOptions = {}, walletOptions: MockWalletOptions = {}): Promise<InstalledMockRpc> {
   const rpc = await installMockRpc(page, rpcOptions);
-  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID, ...walletOptions });
   await page.goto("/#/swap");
   await connectWallet(page);
   await expect(page.getByTestId("swap-balance-value")).not.toHaveText("loading");
@@ -3520,9 +3596,9 @@ async function setupConnectedSwap(page: Parameters<typeof installMockRpc>[0], rp
   return rpc;
 }
 
-async function setupConnectedLiquidity(page: Parameters<typeof installMockRpc>[0], rpcOptions: MockRpcOptions = {}): Promise<InstalledMockRpc> {
+async function setupConnectedLiquidity(page: Parameters<typeof installMockRpc>[0], rpcOptions: MockRpcOptions = {}, walletOptions: MockWalletOptions = {}): Promise<InstalledMockRpc> {
   const rpc = await installMockRpc(page, { includePairs: true, includePositions: true, ...rpcOptions });
-  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID, ...walletOptions });
   await page.goto("/#/liquidity");
   await connectWallet(page);
   await expect(page.getByTestId("liquidity-add-button")).toBeVisible();

@@ -1440,7 +1440,9 @@ a {
 }
 
 .inline-error {
-  max-width: 220px;
+  max-width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
   color: #8d2525;
   font-size: 0.78rem;
 }
@@ -1704,6 +1706,16 @@ a {
   padding: 9px 10px;
   font-size: 0.84rem;
   border-radius: 8px;
+}
+
+.state-row > span,
+.transaction-status {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.state-row > svg {
+  flex: 0 0 auto;
 }
 
 .state-row.pending {
@@ -3234,4 +3246,21 @@ a {
     grid-template-columns: 1fr;
   }
 }
+}
+
+/* Final target-size floor: placed after route-specific compact controls so the
+   computed hit area remains 44 CSS pixels without widening inline text links. */
+.app-shell :where(button, summary, input:not([type="checkbox"]), select, .primary-button, .secondary-button, .nav-item, .operations-quick-link, .back-link),
+.app-shell :where(.position-option, .check-row) {
+  min-block-size: 44px;
+}
+
+.app-shell :where(button, .icon-button, .flip-button) {
+  min-inline-size: 44px;
+}
+
+.app-shell .state-row.ready {
+  color: var(--ink-60);
+  background: var(--carbon);
+  border-color: rgb(233 236 231 / 14%);
 }
