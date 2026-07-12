@@ -5362,8 +5362,8 @@ function LiquidityView({
   const approveLbSubmitInFlightRef = useRef<number | null>(null);
   const addSubmitInFlightRef = useRef<number | null>(null);
   const nativeAddMaxProbeRef = useRef<"x" | "y" | null>(null);
-  const nativeAddMaxBindingRef = useRef<{ context: string; side: "x" | "y"; value: bigint } | null>(null);
-  const latestAddGasObservationRef = useRef<{ balance: bigint; context: string; reserve: bigint } | null>(null);
+  const nativeAddMaxBindingRef = useRef<{ balance: bigint; context: string; gasPrice: bigint; reserve: bigint; side: "x" | "y"; value: bigint } | null>(null);
+  const latestAddGasObservationRef = useRef<{ balance: bigint; context: string; gasPrice: bigint; reserve: bigint } | null>(null);
   const [nativeAddMaxPending, setNativeAddMaxPending] = useState(false);
   const latestLiquidityAddReviewRef = useRef<LiquidityAddReviewState | null>(null);
   const removeSubmitInFlightRef = useRef<number | null>(null);
@@ -7394,7 +7394,7 @@ function LiquidityView({
         setReview: setGasReview,
         onReview: (review, latestNativeBalance) => {
           gasObservation.value = { balance: latestNativeBalance, review };
-          latestAddGasObservationRef.current = { balance: latestNativeBalance, context: addMaxContextFingerprint, reserve: review.bufferedWei };
+          latestAddGasObservationRef.current = { balance: latestNativeBalance, context: addMaxContextFingerprint, gasPrice: review.gasPrice, reserve: review.bufferedWei };
           if (nativeMaxProbeSide === null) return;
           const max = safeMaxAmount({ asset: "native", balance: latestNativeBalance, gasReserveWei: review.bufferedWei });
           if (max === 0n) {
@@ -7402,7 +7402,7 @@ function LiquidityView({
             return;
           }
           const value = maxAmountInput({ asset: "native", balance: latestNativeBalance, decimals: 18, gasReserveWei: review.bufferedWei });
-          nativeAddMaxBindingRef.current = { context: addMaxContextFingerprint, side: nativeMaxProbeSide, value: max };
+          nativeAddMaxBindingRef.current = { balance: latestNativeBalance, context: addMaxContextFingerprint, gasPrice: review.gasPrice, reserve: review.bufferedWei, side: nativeMaxProbeSide, value: max };
           if (nativeMaxProbeSide === "x") setAmountXInput(value);
           else setAmountYInput(value);
         },
@@ -7414,7 +7414,15 @@ function LiquidityView({
         const binding = nativeAddMaxBindingRef.current;
         const submittedNativeAmount = binding.side === "x" ? amountX : amountY;
         const exactMax = safeMaxAmount({ asset: "native", balance: finalGasObservation.balance, gasReserveWei: finalGasObservation.review.bufferedWei });
-        if (binding.side !== liquidityWrappedNativeSide || binding.context !== addMaxContextFingerprint || submittedNativeAmount !== binding.value || submittedNativeAmount !== exactMax) {
+        if (
+          binding.side !== liquidityWrappedNativeSide ||
+          binding.context !== addMaxContextFingerprint ||
+          binding.balance !== finalGasObservation.balance ||
+          binding.gasPrice !== finalGasObservation.review.gasPrice ||
+          submittedNativeAmount !== binding.value ||
+          submittedNativeAmount > exactMax ||
+          finalGasObservation.review.bufferedWei > binding.reserve
+        ) {
           setGasReviewError("Native Max changed with the latest balance or buffered gas; press Max again before wallet confirmation");
           return;
         }
@@ -7498,7 +7506,7 @@ function LiquidityView({
         return;
       }
       const value = maxAmountInput({ asset: "native", balance: observation.balance, decimals: 18, gasReserveWei: observation.reserve });
-      nativeAddMaxBindingRef.current = { context: addMaxContextFingerprint, side, value: max };
+      nativeAddMaxBindingRef.current = { balance: observation.balance, context: addMaxContextFingerprint, gasPrice: observation.gasPrice, reserve: observation.reserve, side, value: max };
       if (side === "x") setAmountXInput(value);
       else setAmountYInput(value);
       return;

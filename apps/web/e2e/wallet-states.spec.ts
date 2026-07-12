@@ -2652,6 +2652,54 @@ test("native liquidity Max reserves reviewed buffered gas before the final immut
   assertTransactionMatchesSimulation(submitted, rpc, "addLiquidityNATIVE");
 });
 
+test("native liquidity Max accepts a conservative value when calldata gas estimation oscillates", async ({ page }) => {
+  const nativeBalance = 50_000_000_000_000_000n;
+  const conservativeMax = 49_647_150_000_000_000n;
+  const rpc = await setupConnectedLiquidity(page, {
+    allowance: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    estimatedGas: 282_280n,
+    estimatedGasByValue: {
+      [conservativeMax.toString()]: 282_268n
+    },
+    nativeBalance
+  });
+  await page.getByTestId("liquidity-native-mode").getByRole("button", { name: "ETH · native" }).click();
+  await page.locator("#range-lower").fill("1");
+  await page.locator("#range-upper").fill("2");
+  await page.getByTestId("liquidity-max-x").click();
+  await expect(page.getByTestId("liquidity-amount-x")).toHaveValue("0.04964715");
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+  await page.getByTestId("liquidity-add-button").click();
+  await expect(page.getByTestId("gas-review")).toContainText("limit 282268 × 1 gwei");
+  await expect(page.getByTestId("gas-review")).toContainText("0.049999985 ETH required");
+  await page.getByTestId("liquidity-add-button").click();
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+  const submitted = (await readMockWallet(page)).sentTransactions[0]!;
+  expect(BigInt(submitted.value ?? "0x0")).toBe(conservativeMax);
+  expect(conservativeMax + 352_835_000_000_000n).toBeLessThanOrEqual(nativeBalance);
+  assertTransactionMatchesSimulation(submitted, rpc, "addLiquidityNATIVE");
+});
+
+test("native liquidity Max rejects gas-price drift even when the wallet balance is unchanged", async ({ page }) => {
+  const nativeBalance = 10n * ONE_TOKEN;
+  const rpc = await setupConnectedLiquidity(page, {
+    allowance: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    gasPrice: 2_000_000_000n,
+    nativeBalance
+  });
+  await page.getByTestId("liquidity-native-mode").getByRole("button", { name: "ETH · native" }).click();
+  await page.locator("#range-lower").fill("1");
+  await page.locator("#range-upper").fill("2");
+  await page.getByTestId("liquidity-max-x").click();
+  await expect(page.getByTestId("liquidity-amount-x")).toHaveValue("9.99875");
+  rpc.update({ gasPrice: 1_000_000_000n });
+  await page.getByTestId("liquidity-add-button").click();
+  await expect(page.getByText(/Native Max changed with the latest balance or buffered gas/).first()).toBeVisible();
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
 test("native liquidity Max blocks stale value after final gas and balance drift", async ({ page }) => {
   const rpc = await setupConnectedLiquidity(page, {
     allowance: 5n * ONE_TOKEN,
