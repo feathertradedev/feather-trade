@@ -257,6 +257,10 @@ interface OwnerPairPositionsGraph {
   positions: DashboardGraph["positions"];
 }
 
+interface OwnerPositionsGraph {
+  positions: DashboardGraph["positions"];
+}
+
 interface PairBinsGraph {
   bins: Array<{
     id: string;
@@ -399,6 +403,23 @@ const POSITIONS_PAGE_QUERY = `
 const OWNER_PAIR_POSITIONS_QUERY = `
   query OwnerPairPositions($owner: Bytes!, $pair: String!, $first: Int!, $skip: Int!) {
     positions(first: $first, skip: $skip, orderBy: updatedAtBlock, orderDirection: desc, where: { owner: $owner, pair: $pair, liquidity_gt: 0 }) {
+      id
+      owner
+      liquidity
+      updatedAtBlock
+      pair {
+        id
+      }
+      bin {
+        binId
+      }
+    }
+  }
+`;
+
+const OWNER_POSITIONS_QUERY = `
+  query OwnerPositions($owner: Bytes!, $first: Int!, $skip: Int!) {
+    positions(first: $first, skip: $skip, orderBy: updatedAtBlock, orderDirection: desc, where: { owner: $owner, liquidity_gt: 0 }) {
       id
       owner
       liquidity
@@ -582,6 +603,25 @@ export async function loadPoolById(
 
 export async function loadPositionsForOwnerPair(registry: DexRegistry, owner: Address, pair: Address): Promise<PositionRow[]> {
   return (await loadPaginatedPositionsForOwnerPair(registry, owner, pair)).rows;
+}
+
+export async function loadPaginatedPositionsForOwner(
+  registry: DexRegistry,
+  owner: Address,
+  options: AppDataLoadOptions = {}
+): Promise<PaginatedRows<PositionRow>> {
+  if (registry.endpoints.indexerUrl === null) {
+    return { rows: [], pageInfo: emptyPaginationInfo() };
+  }
+
+  return loadPaginatedGraphRows<OwnerPositionsGraph, DashboardGraph["positions"][number], PositionRow>({
+    endpoint: registry.endpoints.indexerUrl,
+    query: OWNER_POSITIONS_QUERY,
+    variables: { owner: owner.toLowerCase() },
+    select: (data) => data.positions,
+    map: toPositionRow,
+    timeoutMs: normalizeGraphqlTimeout(options.graphqlTimeoutMs)
+  });
 }
 
 export async function loadPaginatedPositionsForOwnerPair(
