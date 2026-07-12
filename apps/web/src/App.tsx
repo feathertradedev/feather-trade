@@ -3535,7 +3535,8 @@ function PoolsView({
   );
   const [creationOpen, setCreationOpen] = useState(false);
   const pageSize = 10;
-  const ownerEndpoint = analyticsEndpointForRegistry(registry);
+  const analyticsBaseEndpoint = analyticsEndpointForRegistry(registry);
+  const ownerEndpoint = analyticsBaseEndpoint === null ? null : `${analyticsBaseEndpoint}/graphql`;
   const ownerPortfolioQuery = useQuery({
     queryKey: ["poolDiscoveryOwner", environmentKey, account.address, ownerEndpoint],
     queryFn: async () => {
@@ -4838,7 +4839,8 @@ function PoolDetailView({
 }) {
   const registry = registries[environmentKey];
   const account = useAccount();
-  const analyticsEndpoint = analyticsEndpointForRegistry(registry);
+  const analyticsBaseEndpoint = analyticsEndpointForRegistry(registry);
+  const analyticsEndpoint = analyticsBaseEndpoint === null ? null : `${analyticsBaseEndpoint}/graphql`;
   const discoveryState = parsePoolDiscoveryState(window.location.hash);
   const backHref = discoveryHref(discoveryState);
   const detailReturnHref = pool === null ? backHref : poolDetailHref(pool.id, discoveryState);

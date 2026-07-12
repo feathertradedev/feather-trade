@@ -1432,16 +1432,18 @@ test("pool discovery deep-links to real indexed bins and preselects liquidity ac
 
   await expect(page).toHaveURL(/#\/pools\//);
   await expect(page.getByText("Live liquidity bins")).toBeVisible();
-  await expect(page.locator(".pool-bin-chart .pool-bin")).toHaveCount(7);
-  await expect(page.locator(".pool-bin-chart .pool-bin.active")).toHaveCount(1);
+  await expect(page.locator(".pool-bin-chart .pool-bin-stack")).toHaveCount(7);
+  await expect(page.locator(".pool-bin-chart .pool-bin-stack.active")).toHaveCount(1);
+  await expect(page.getByTestId("pool-bin-distribution-table").locator("tbody tr")).toHaveCount(7);
   await expect.poll(() => rpc.snapshot().graphQueries.some((query) => query.includes("PairBinWindow"))).toBe(true);
   await expect.poll(() => rpc.snapshot().graphQueries.some((query) => query.includes("OwnerPairPositions"))).toBe(true);
 
   await page.reload();
-  await expect(page.locator(".pool-bin-chart .pool-bin")).toHaveCount(7);
+  await expect(page.locator(".pool-bin-chart .pool-bin-stack")).toHaveCount(7);
 
   await page.getByRole("link", { name: "Withdraw" }).click();
-  await expect(page).toHaveURL(/#\/liquidity\/withdraw\/0x/i);
+  await expect(page).toHaveURL(/#\/liquidity\/withdraw\/0x.+\?returnTo=/i);
+  await expect(page.getByTestId("pool-action-back")).toHaveAttribute("href", /#\/pools\/.+q=WNATIVE/);
   await expect(page.locator("#liquidity-withdraw")).toBeInViewport();
 
   await page.goBack();
@@ -1465,7 +1467,9 @@ test("pool detail keeps an empty active-bin marker and reports capped wallet pos
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR.toLowerCase()}`);
   await connectWallet(page);
 
-  await expect(page.locator(".pool-bin-chart .pool-bin.active")).toHaveCount(1);
+  await expect(page.locator(".pool-bin-chart .pool-bin-stack.active")).toHaveCount(1);
+  await expect(page.locator(".pool-bin-chart .pool-bin-stack.active")).toHaveAttribute("aria-label", /active bin/);
+  await expect(page.getByTestId("pool-bin-distribution-table").locator("tbody tr").filter({ hasText: "Active" })).toHaveCount(1);
   await expect(page.locator(".table-panel").filter({ hasText: "Your bins" }).locator(".status-badge")).toContainText("partial");
   await expect(page.getByText("The owner/pair position query is partial; destructive actions remain blocked.")).toBeVisible();
 });
@@ -1477,7 +1481,8 @@ test("pool and action deep links resolve outside the dashboard page and survive 
   await expect(page.getByText("Live liquidity bins")).toBeVisible();
   await expect(page.getByText(/bin step 11/)).toBeVisible();
   await page.getByRole("link", { name: "Withdraw" }).click();
-  await expect(page).toHaveURL(new RegExp(`#/liquidity/withdraw/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}$`, "i"));
+  await expect(page).toHaveURL(new RegExp(`#/liquidity/withdraw/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}\\?returnTo=`, "i"));
+  await expect(page.getByTestId("pool-action-back")).toHaveAttribute("href", new RegExp(`#/pools/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}`, "i"));
 
   await page.reload();
   await expect(page.locator("#liquidity-pair")).toHaveValue(SECOND_WNATIVE_USDC_PAIR.toLowerCase());

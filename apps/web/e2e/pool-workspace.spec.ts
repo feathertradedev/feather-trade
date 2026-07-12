@@ -9,6 +9,10 @@ async function connectWallet(page: Parameters<typeof installMockRpc>[0]) {
 }
 
 test("unified pool workspace preserves URL filters, analytics, actions, and accessible charts", async ({ page }) => {
+  const analyticsUrls: string[] = [];
+  page.on("request", (request) => {
+    if (request.url().startsWith("http://127.0.0.1:8787")) analyticsUrls.push(request.url());
+  });
   await installMockRpc(page, { includePairs: true, includePositions: true, poolBinCount: 5, poolCount: 2 });
   await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
 
@@ -26,6 +30,8 @@ test("unified pool workspace preserves URL filters, analytics, actions, and acce
   await expect(page).toHaveURL(/sort=tvl/);
   await expect(page).toHaveURL(/mine=1/);
   await expect(page.getByTestId("pool-analytics-state")).toContainText("Current through block 42");
+  expect(analyticsUrls.length).toBeGreaterThan(0);
+  expect(analyticsUrls.every((url) => url === "http://127.0.0.1:8787/graphql")).toBe(true);
   await expect(page.locator(".workspace-table-metric").filter({ hasText: "$500,000" })).toBeVisible();
   const discoveryMetrics = page.locator(".discovery-table .table-row:not(.header)").first().locator(".workspace-table-metric");
   for (const [index, label, value] of [
