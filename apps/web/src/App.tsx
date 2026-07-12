@@ -3551,6 +3551,37 @@ function PoolsView({
     refetchOnWindowFocus: "always",
     retry: false
   });
+  const poolAddressKey = pools.map((pool) => pool.address.toLowerCase()).sort().join("|");
+  const metricsQuery = useQuery({
+    queryKey: ["poolWorkspaceMetrics", environmentKey, ownerEndpoint, poolAddressKey],
+    queryFn: () => loadPoolMetrics(ownerEndpoint, pools.map((pool) => pool.address)),
+    enabled: pools.length > 0,
+    refetchInterval: SNAPSHOT_REFRESH_INTERVAL_MS,
+    refetchOnWindowFocus: "always",
+    retry: false
+  });
+  const analyticsHealthQuery = useQuery({
+    queryKey: ["poolWorkspaceHealth", environmentKey, ownerEndpoint],
+    queryFn: () => loadAnalyticsHealth(ownerEndpoint),
+    refetchInterval: SNAPSHOT_REFRESH_INTERVAL_MS,
+    refetchOnWindowFocus: "always",
+    retry: false
+  });
+  const metricsPage: AnalyticsPage<PoolAnalyticsMetric> = metricsQuery.data ?? {
+    rows: [],
+    status: metricsQuery.isError ? "UNAVAILABLE" : "PARTIAL",
+    error: metricsQuery.error instanceof Error ? metricsQuery.error.message : null,
+    pageInfo: { endCursor: null, hasNextPage: false, partial: true, pagesLoaded: 0 }
+  };
+  const workspaceRows = useMemo(() => joinPoolWorkspaceRows(pools, metricsPage), [metricsPage, pools]);
+  const workspaceRowsByPair = useMemo(
+    () => new Map(workspaceRows.map((row) => [row.pool.address.toLowerCase(), row])),
+    [workspaceRows]
+  );
+  const economicRanks = useMemo(() => {
+    if (!isPoolEconomicSort(discoveryState.sort)) return null;
+    return new Map(sortPoolWorkspaceRows(workspaceRows, discoveryState.sort).map((row, index) => [row.pool.address.toLowerCase(), index]));
+  }, [discoveryState.sort, workspaceRows]);
   const ownerLiquidity = ownerPortfolioQuery.data
     ? buildOwnerLiquidityIndex(ownerPortfolioQuery.data.positions, {
         capped: ownerPortfolioQuery.data.pageInfo.hasNextPage,
@@ -3558,9 +3589,16 @@ function PoolsView({
       })
     : null;
   const filteredPage = useMemo(
-    () => filterPoolPage(pools, discoveryState, ownerLiquidity, pageSize),
-    [discoveryState, ownerLiquidity, pools]
+    () => filterPoolPage(pools, discoveryState, ownerLiquidity, pageSize, (left, right, sort) => {
+      if (!isPoolEconomicSort(sort) || economicRanks === null) return null;
+      return (economicRanks.get(left.address.toLowerCase()) ?? Number.MAX_SAFE_INTEGER) -
+        (economicRanks.get(right.address.toLowerCase()) ?? Number.MAX_SAFE_INTEGER);
+    }),
+    [discoveryState, economicRanks, ownerLiquidity, pools]
   );
+  const analyticsState = metricsQuery.isPending || analyticsHealthQuery.isPending
+    ? { status: "PARTIAL" as const, label: "Loading application analytics", detail: "Pool metrics and freshness are being resolved." }
+    : workspaceAnalyticsState(metricsPage.status, analyticsHealthQuery.data?.value ?? null);
 
   useEffect(() => {
     const read = () => setDiscoveryState(parsePoolDiscoveryState(window.location.hash));
@@ -3573,6 +3611,8 @@ function PoolsView({
     setDiscoveryState(state);
     window.history.replaceState(null, "", discoveryHref(state));
   };
+  const ownerFilterLoading = discoveryState.hasLiquidity && account.address !== undefined && ownerEndpoint !== null &&
+    (ownerPortfolioQuery.isPending || ownerPortfolioQuery.isFetching);
 
   return (
     <div className="view-grid">
@@ -3605,6 +3645,11 @@ function PoolsView({
               : `Confirmed by RPC at block ${rpcOverlay.row.updatedAtBlock}; indexing is catching up. This empty pool cannot quote swaps.`}</span>
           </div>
         ) : null}
+        <div className={`workspace-analytics-state ${analyticsState.status.toLowerCase()}`} data-testid="pool-analytics-state" role="status">
+          <span>{analyticsState.label}</span>
+          {analyticsState.detail ? <small>{analyticsState.detail}</small> : null}
+          {metricsPage.error ? <small>{metricsPage.error}</small> : null}
+        </div>
         <div className="pool-controls">
           <label>
             <span className="field-label">Search</span>
@@ -3643,6 +3688,10 @@ function PoolsView({
               onChange={(event) => updateDiscovery({ sort: event.target.value as PoolDiscoveryState["sort"] })}
               value={discoveryState.sort}
             >
+              <option value="tvl">TVL</option>
+              <option value="volume24h">24h volume</option>
+              <option value="lpFees24h">24h LP fees</option>
+              <option value="feeToTvl">24h LP fee / TVL</option>
               <option value="swaps">Swap count</option>
               <option value="deposits">Deposit count</option>
               <option value="updated">Recently updated</option>
@@ -3654,46 +3703,46 @@ function PoolsView({
             <div className="pool-table discovery-table">
               <div className="table-row header">
                 <span>Pool</span>
-                <span>Token reserves</span>
-                <span>Lifetime volume</span>
-                <span>Lifetime fees</span>
+                <span>TVL</span>
+                <span>24h volume</span>
+                <span>24h LP fees</span>
+                <span>LP fee / TVL</span>
                 <span>Action</span>
               </div>
-              {filteredPage.rows.map((pool) => (
-                <div className="table-row" key={pool.id}>
+              {filteredPage.rows.map((pool) => {
+                const workspaceRow = workspaceRowsByPair.get(pool.address.toLowerCase()) ?? null;
+                const tiles = workspaceMetricTiles(workspaceRow?.metric ?? null);
+                return <div className="table-row" key={pool.id}>
                   <a className="pair-name" href={poolDetailHref(pool.id, discoveryState)}>
                     {tokenSymbol(pool.tokenX)} / {tokenSymbol(pool.tokenY)}
                     <small>DLMM · bin step {pool.binStep} · {formatCompactAddress(pool.address)}</small>
                     <small>{pool.tokenX?.name ?? "Unknown token"} · {pool.tokenXAddress} · chain {pool.tokenX?.chainId ?? "?"} · review {pool.tokenX?.risk.reviewStatus ?? "unlisted"}</small>
                     <small>{pool.tokenY?.name ?? "Unknown token"} · {pool.tokenYAddress} · chain {pool.tokenY?.chainId ?? "?"} · review {pool.tokenY?.risk.reviewStatus ?? "unlisted"}</small>
                   </a>
-                  <span>
-                    {formatTokenAmount(pool.reserveX, pool.tokenX)} {tokenSymbol(pool.tokenX)} · {formatTokenAmount(pool.reserveY, pool.tokenY)} {tokenSymbol(pool.tokenY)}
-                  </span>
-                  <span>
-                    {formatTokenAmount(pool.volumeX, pool.tokenX)} / {formatTokenAmount(pool.volumeY, pool.tokenY)}
-                  </span>
-                  <span>
-                    {formatTokenAmount(pool.feesX, pool.tokenX)} / {formatTokenAmount(pool.feesY, pool.tokenY)}
-                  </span>
+                  <WorkspaceTableMetric tile={tiles[0]} />
+                  <WorkspaceTableMetric tile={tiles[1]} />
+                  <WorkspaceTableMetric tile={tiles[2]} />
+                  <WorkspaceTableMetric tile={tiles[3]} />
                   <a className="secondary-button" href={poolDetailHref(pool.id, discoveryState)}>
                     View
                   </a>
-                </div>
-              ))}
+                  {workspaceRow?.analyticsIssue ? <small className="workspace-row-issue">{workspaceRow.analyticsIssue}</small> : null}
+                </div>;
+              })}
             </div>
             {filteredPage.rows.length === 0 ? <p className="inline-empty">No pools match these filters.</p> : null}
             {discoveryState.hasLiquidity && filteredPage.ownerStatus !== "ready" ? (
               <p className="state-row warning" data-testid="owner-pool-filter-status">
-                {ownerPortfolioQuery.isPending || ownerPortfolioQuery.isFetching
-                  ? "Loading wallet liquidity from application analytics."
-                  : filteredPage.ownerStatus === "partial"
+                {!account.address
+                  ? "Connect a wallet to filter pools by your liquidity."
+                  : ownerFilterLoading
+                    ? "Loading wallet liquidity from application analytics."
+                    : filteredPage.ownerStatus === "partial"
                   ? "Wallet liquidity results are partial; only verified loaded pools are shown."
-                  : account.address
-                    ? ownerEndpoint === null
+                  : ownerEndpoint === null
                       ? "Wallet liquidity analytics are not configured for this environment."
                       : "Wallet liquidity analytics are unavailable."
-                    : "Connect a wallet to filter pools by your liquidity."}
+                }
               </p>
             ) : null}
             <div className="pagination-controls" aria-label="Pool pages">
@@ -3707,6 +3756,19 @@ function PoolsView({
         )}
       </section>
     </div>
+  );
+}
+
+function isPoolEconomicSort(sort: PoolDiscoveryState["sort"]): sort is PoolEconomicSort {
+  return sort === "tvl" || sort === "volume24h" || sort === "lpFees24h" || sort === "feeToTvl";
+}
+
+function WorkspaceTableMetric({ tile }: { tile: ReturnType<typeof workspaceMetricTiles>[number] }) {
+  return (
+    <span className="workspace-table-metric" data-analytics-status={tile.status}>
+      <strong>{tile.value}</strong>
+      <small>{tile.status === "READY" ? "ready" : tile.status.toLowerCase()}</small>
+    </span>
   );
 }
 
@@ -4763,7 +4825,7 @@ function PoolDetailView({
   onSelectPool,
   pool,
   poolDetailId,
-  pools: _pools,
+  pools,
   snapshotState
 }: {
   environmentKey: EnvironmentKey;
@@ -4775,6 +4837,42 @@ function PoolDetailView({
 }) {
   const registry = registries[environmentKey];
   const account = useAccount();
+  const analyticsEndpoint = analyticsEndpointForRegistry(registry);
+  const discoveryState = parsePoolDiscoveryState(window.location.hash);
+  const backHref = discoveryHref(discoveryState);
+  const detailReturnHref = pool === null ? backHref : poolDetailHref(pool.id, discoveryState);
+  const currentHourBoundary = Math.floor(Date.now() / 3_600_000) * 3_600;
+  const candleEnd = currentHourBoundary - 3_600;
+  const candleStart = currentHourBoundary - 24 * 3_600;
+  const poolMetricsQuery = useQuery({
+    queryKey: ["poolDetailMetrics", environmentKey, analyticsEndpoint, pool?.address],
+    queryFn: () => {
+      if (pool === null) throw new Error("Pool analytics target is unavailable");
+      return loadPoolMetrics(analyticsEndpoint, [pool.address]);
+    },
+    enabled: pool !== null,
+    refetchInterval: SNAPSHOT_REFRESH_INTERVAL_MS,
+    refetchOnWindowFocus: "always",
+    retry: false
+  });
+  const pairCandlesQuery = useQuery({
+    queryKey: ["poolDetailCandles", environmentKey, analyticsEndpoint, pool?.address, candleStart, candleEnd],
+    queryFn: () => {
+      if (pool === null) throw new Error("Pool candle target is unavailable");
+      return loadPairCandles(analyticsEndpoint, pool.address, "HOUR", candleStart, candleEnd);
+    },
+    enabled: pool !== null,
+    refetchInterval: SNAPSHOT_REFRESH_INTERVAL_MS,
+    refetchOnWindowFocus: "always",
+    retry: false
+  });
+  const analyticsHealthQuery = useQuery({
+    queryKey: ["poolDetailAnalyticsHealth", environmentKey, analyticsEndpoint],
+    queryFn: () => loadAnalyticsHealth(analyticsEndpoint),
+    refetchInterval: SNAPSHOT_REFRESH_INTERVAL_MS,
+    refetchOnWindowFocus: "always",
+    retry: false
+  });
   const binsQuery = useQuery({
     queryKey: ["poolBinWindow", environmentKey, pool?.address, pool?.activeId, registry.endpoints.indexerUrl],
     queryFn: () => {
@@ -4806,7 +4904,7 @@ function PoolDetailView({
     return (
       <div className="view-grid">
         <section className="table-panel">
-          <a className="back-link" href="#/pools">← All pools</a>
+          <a className="back-link" href={backHref}>← All pools</a>
           <EmptyState state={lookupResolved ? "empty" : snapshotState} />
           {lookupResolved ? (
             <p className="inline-error">Pool {formatCompactAddress(poolDetailId)} was not found in the current environment.</p>
@@ -4818,6 +4916,29 @@ function PoolDetailView({
 
   const indexedBins = binsQuery.data ?? [];
   const bins = withActiveBin(indexedBins, pool.activeId);
+  const metricPage: AnalyticsPage<PoolAnalyticsMetric> = poolMetricsQuery.data ?? {
+    rows: [],
+    status: poolMetricsQuery.isError ? "UNAVAILABLE" : "PARTIAL",
+    error: poolMetricsQuery.error instanceof Error ? poolMetricsQuery.error.message : null,
+    pageInfo: { endCursor: null, hasNextPage: false, partial: true, pagesLoaded: 0 }
+  };
+  const detailWorkspaceRow = joinPoolWorkspaceRows([pool], metricPage)[0]!;
+  const metric = detailWorkspaceRow.metric;
+  const metricTiles = workspaceMetricTiles(metric);
+  const detailAnalyticsState = poolMetricsQuery.isPending || analyticsHealthQuery.isPending
+    ? { status: "PARTIAL" as const, label: "Loading application analytics", detail: "Pool metrics and freshness are being resolved." }
+    : workspaceAnalyticsState(detailWorkspaceRow.analyticsStatus, analyticsHealthQuery.data?.value ?? null);
+  const candlePage = pairCandlesQuery.data ?? {
+    rows: [],
+    status: pairCandlesQuery.isError ? "UNAVAILABLE" as const : "PARTIAL" as const,
+    error: pairCandlesQuery.error instanceof Error ? pairCandlesQuery.error.message : null,
+    pageInfo: { endCursor: null, hasNextPage: false, partial: true, pagesLoaded: 0 }
+  };
+  const candleModel = buildCandleChartModel(candlePage);
+  const binDistribution = pool.tokenX !== null && pool.tokenY !== null
+    ? buildBinDistribution(bins, pool.activeId, pool.tokenX.decimals, pool.tokenY.decimals)
+    : null;
+  const siblingPools = samePairPools(pools, pool);
   const walletPositions = walletPositionsQuery.data?.rows ?? [];
   const positionsPartial = isPartialPagination(walletPositionsQuery.data?.pageInfo);
   const binsState: LoadState = registry.endpoints.indexerUrl === null
@@ -4856,25 +4977,45 @@ function PoolDetailView({
   return (
     <div className="view-grid pool-detail">
       <section className="table-panel pool-detail-header">
-        <a className="back-link" href="#/pools">← All pools</a>
+        <a className="back-link" href={backHref}>← All pools</a>
         <div className="pool-title-row">
           <div>
             <h2>{tokenSymbol(pool.tokenX)} / {tokenSymbol(pool.tokenY)}</h2>
             <p>{formatCompactAddress(pool.address)} · DLMM · bin step {pool.binStep}</p>
           </div>
           <div className="pool-actions">
-            <a className="secondary-button" href={`#/swap/${encodeURIComponent(pool.id)}`} onClick={selectPool}>Swap</a>
-            <a className="secondary-button" href={`#/liquidity/withdraw/${encodeURIComponent(pool.id)}`} onClick={selectPool}>Withdraw</a>
-            <a className="primary-button" href={`#/liquidity/add/${encodeURIComponent(pool.id)}`} onClick={selectPool}>Deposit</a>
+            <a className="secondary-button" href={actionHref("swap", pool.id, detailReturnHref)} onClick={selectPool}>Swap</a>
+            <a className="secondary-button" href={actionHref("withdraw", pool.id, detailReturnHref)} onClick={selectPool}>Withdraw</a>
+            <a className="primary-button" href={actionHref("add", pool.id, detailReturnHref)} onClick={selectPool}>Deposit</a>
           </div>
         </div>
       </section>
 
-      <section className="pool-detail-metrics">
-        <MetricTile label="Token reserves" value={`${formatTokenAmount(pool.reserveX, pool.tokenX)} / ${formatTokenAmount(pool.reserveY, pool.tokenY)}`} tone="neutral" />
-        <MetricTile label="Lifetime volume" value={`${formatTokenAmount(pool.volumeX, pool.tokenX)} / ${formatTokenAmount(pool.volumeY, pool.tokenY)}`} tone="neutral" />
-        <MetricTile label="Lifetime fees" value={`${formatTokenAmount(pool.feesX, pool.tokenX)} / ${formatTokenAmount(pool.feesY, pool.tokenY)}`} tone="good" />
-        <MetricTile label="Swaps / active bin" value={`${pool.swapCount} / ${pool.activeId ?? "n/a"}`} tone="neutral" />
+      <section className={`workspace-analytics-state detail ${detailAnalyticsState.status.toLowerCase()}`} data-testid="pool-detail-analytics-state" role="status">
+        <span>{detailAnalyticsState.label}</span>
+        {detailAnalyticsState.detail ? <small>{detailAnalyticsState.detail}</small> : null}
+        {metricPage.error ? <small>{metricPage.error}</small> : null}
+        {detailWorkspaceRow.analyticsIssue ? <small>{detailWorkspaceRow.analyticsIssue}</small> : null}
+      </section>
+
+      <section className="pool-detail-metrics workspace-metrics" aria-label="Pool analytics metrics">
+        {metricTiles.map((tile) => <WorkspaceMetricTileView key={tile.key} tile={tile} />)}
+      </section>
+
+      <section className="pool-detail-metrics indexed-lifetime-metrics" aria-label="Indexed lifetime pool counters">
+        <MetricTile label="Indexed token reserves" value={`${formatTokenAmount(pool.reserveX, pool.tokenX)} / ${formatTokenAmount(pool.reserveY, pool.tokenY)}`} tone="neutral" />
+        <MetricTile label="Indexed lifetime volume" value={`${formatTokenAmount(pool.volumeX, pool.tokenX)} / ${formatTokenAmount(pool.volumeY, pool.tokenY)}`} tone="neutral" />
+        <MetricTile label="Indexed lifetime fees" value={`${formatTokenAmount(pool.feesX, pool.tokenX)} / ${formatTokenAmount(pool.feesY, pool.tokenY)}`} tone="good" />
+        <MetricTile label="Indexed swaps / active bin" value={`${pool.swapCount} / ${pool.activeId ?? "n/a"}`} tone="neutral" />
+      </section>
+
+      <section className="info-panel pool-market-chart" data-testid="pool-market-chart">
+        <div className="panel-heading">
+          <span>24h hourly OHLCV</span>
+          <span className="analytics-status-label" data-analytics-status={candleModel.status}>{candleModel.status.toLowerCase()}</span>
+        </div>
+        <PoolCandleChart model={candleModel} />
+        {candlePage.error ? <p className="inline-error">{candlePage.error}</p> : null}
       </section>
 
       <section className="info-panel">
@@ -4882,9 +5023,28 @@ function PoolDetailView({
           <span>Live liquidity bins</span>
           <StatusBadge state={binsState} label={binsQuery.data ? `${indexedBins.length} indexed bins` : binsState} />
         </div>
-        <PoolBinChart activeId={pool.activeId} bins={bins} state={binsState} />
+        <PoolBinDistributionChart
+          points={binDistribution}
+          state={binsState}
+          tokenX={pool.tokenX === null ? null : tokenSymbol(pool.tokenX)}
+          tokenY={pool.tokenY === null ? null : tokenSymbol(pool.tokenY)}
+        />
         {binsQuery.error ? <p className="inline-error">{getWriteError(binsQuery.error) ?? "Pool bins unavailable"}</p> : null}
       </section>
+
+      {siblingPools.length > 0 ? (
+        <section className="table-panel same-pair-pools" data-testid="same-pair-pools">
+          <div className="panel-heading"><span>Same pair · other bin steps</span><span>{siblingPools.length}</span></div>
+          <div className="same-pair-list">
+            {siblingPools.map((candidate) => (
+              <a href={poolDetailHref(candidate.id, discoveryState)} key={candidate.id}>
+                <span>Bin step {candidate.binStep}</span>
+                <small>{formatCompactAddress(candidate.address)}</small>
+              </a>
+            ))}
+          </div>
+        </section>
+      ) : null}
 
       <section className="table-panel">
         <div className="panel-heading">
@@ -4927,6 +5087,129 @@ function PoolDetailView({
       </section>
     </div>
   );
+}
+
+function WorkspaceMetricTileView({ tile }: { tile: ReturnType<typeof workspaceMetricTiles>[number] }) {
+  return (
+    <div className="metric-tile workspace-metric-tile" data-analytics-status={tile.status}>
+      <span>{tile.label}</span>
+      <strong>{tile.value}</strong>
+      <small>{tile.status.toLowerCase()}</small>
+    </div>
+  );
+}
+
+function PoolCandleChart({ model }: { model: CandleChartModel }) {
+  if (model.points.length === 0) return <EmptyState state={analyticsStatusToLoadState(model.status)} />;
+  const segments: string[][] = [];
+  let segment: string[] = [];
+  let previousEnd: number | null = null;
+  const firstStart = model.points[0]!.startTimestamp;
+  const lastStart = model.points.at(-1)!.startTimestamp;
+  model.points.forEach((point) => {
+    if (previousEnd !== null && previousEnd !== point.startTimestamp && segment.length > 0) {
+      segments.push(segment);
+      segment = [];
+    }
+    previousEnd = point.endTimestamp;
+    if (point.normalizedClose === null) {
+      if (segment.length > 0) segments.push(segment);
+      segment = [];
+      return;
+    }
+    const x = lastStart === firstStart ? 50 : (point.startTimestamp - firstStart) * 100 / (lastStart - firstStart);
+    const y = 94 - point.normalizedClose * 0.84;
+    segment.push(`${x.toFixed(2)},${y.toFixed(2)}`);
+  });
+  if (segment.length > 0) segments.push(segment);
+  const maximumSwaps = Math.max(1, ...model.points.map((point) => point.swapCount));
+  const intervalSeconds = model.points[0]!.endTimestamp - model.points[0]!.startTimestamp;
+  const pointsByStart = new Map(model.points.map((point) => [point.startTimestamp, point]));
+  const activitySlots = intervalSeconds > 0
+    ? Array.from({ length: Math.floor((lastStart - firstStart) / intervalSeconds) + 1 }, (_, index) => pointsByStart.get(firstStart + index * intervalSeconds) ?? null)
+    : model.points;
+
+  return (
+    <div className="candle-workspace" data-testid="pool-candle-workspace">
+      <div className="candle-chart" role="img" aria-label={`Hourly close price with swap-count activity; ${model.points.length} candles${model.hasGaps ? "; partial history with gaps" : ""}`}>
+        <svg aria-hidden="true" preserveAspectRatio="none" viewBox="0 0 100 100">
+          {segments.map((points, index) => <polyline fill="none" key={index} points={points.join(" ")} vectorEffect="non-scaling-stroke" />)}
+        </svg>
+        <div className="candle-volume" aria-hidden="true">
+          {activitySlots.map((point, index) => point === null
+            ? <i className="gap" key={`gap-${index}`} />
+            : <i key={point.startTimestamp} style={{ height: `${Math.max(4, point.swapCount * 100 / maximumSwaps)}%` }} />)}
+        </div>
+        <span className="candle-legend">Close price · swap-count activity</span>
+      </div>
+      <div className="semantic-table-scroll">
+        <table className="analytics-table" data-testid="pool-candle-table">
+          <caption>Hourly OHLCV and LP-net fee data</caption>
+          <thead><tr><th>Hour</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Volume</th><th>LP fees</th><th>TVL</th><th>Swaps</th><th>Status</th></tr></thead>
+          <tbody>
+            {model.points.map((point) => (
+              <tr key={point.startTimestamp}>
+                <th scope="row"><time dateTime={new Date(point.startTimestamp * 1_000).toISOString()}>{formatCandleHour(point.startTimestamp)}</time></th>
+                <td>{point.open}</td><td>{point.high}</td><td>{point.low}</td><td>{point.close}</td>
+                <td>{point.volume}</td><td>{point.lpFees}</td><td>{point.tvl}</td><td>{point.swapCount}</td><td>{point.status.toLowerCase()}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function PoolBinDistributionChart({
+  points,
+  state,
+  tokenX,
+  tokenY
+}: {
+  points: ReturnType<typeof buildBinDistribution> | null;
+  state: LoadState;
+  tokenX: string | null;
+  tokenY: string | null;
+}) {
+  if (points === null || tokenX === null || tokenY === null) {
+    return <p className="state-row warning">Token decimals are unavailable; reserve amounts and distribution heights are not inferred.</p>;
+  }
+  if (points.length === 0 || state !== "ready") return <EmptyState state={state} />;
+  return (
+    <div className="bin-distribution-workspace">
+      <div className="pool-bin-chart distribution" aria-label={`Indexed ${tokenX}, ${tokenY}, and LB supply by bin`}>
+        {points.map((point) => (
+          <span
+            aria-label={`Bin ${point.binId}; ${tokenX} ${point.tokenX}; ${tokenY} ${point.tokenY}; LB supply ${point.lbSupply}${point.active ? "; active bin" : ""}`}
+            className={point.active ? "pool-bin-stack active" : "pool-bin-stack"}
+            key={point.id}
+            role="img"
+            tabIndex={0}
+          >
+            <i className="token-x" style={{ height: `${Math.max(2, point.tokenXHeight)}%` }} />
+            <i className="token-y" style={{ height: `${Math.max(2, point.tokenYHeight)}%` }} />
+            <i className="lb-supply" style={{ height: `${Math.max(2, point.lbSupplyHeight)}%` }} />
+          </span>
+        ))}
+      </div>
+      <div className="semantic-table-scroll">
+        <table className="analytics-table compact" data-testid="pool-bin-distribution-table">
+          <caption>Indexed bin reserve and LB supply data</caption>
+          <thead><tr><th>Bin</th><th>{tokenX}</th><th>{tokenY}</th><th>LB supply</th><th>Range</th></tr></thead>
+          <tbody>{points.map((point) => <tr key={point.id}><th scope="row">{point.binId}</th><td>{point.tokenX}</td><td>{point.tokenY}</td><td>{point.lbSupply}</td><td>{point.active ? "Active" : "Indexed"}</td></tr>)}</tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function analyticsStatusToLoadState(status: AnalyticsStatus): LoadState {
+  return status === "UNAVAILABLE" ? "unavailable" : status === "PARTIAL" ? "partial" : "ready";
+}
+
+function formatCandleHour(timestamp: number): string {
+  return new Intl.DateTimeFormat("en", { day: "2-digit", hour: "2-digit", hour12: false, month: "short", timeZone: "UTC" }).format(new Date(timestamp * 1_000));
 }
 
 function PoolBinChart({ activeId, bins, state }: { activeId: string | null; bins: BinRow[]; state: LoadState }) {
