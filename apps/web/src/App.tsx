@@ -1,12 +1,24 @@
 import { QueryClient, QueryClientProvider, useQuery, type QueryObserverResult } from "@tanstack/react-query";
 import {
+  activeIdFromPriceQ128,
   decimalPriceToQ128,
   formatExactPriceFraction,
   normalizeQ128Price,
+  priceQ128FromActiveId,
   readIdFromPrice,
   readPriceFromId
 } from "../../../packages/sdk/src/liquidity-price";
-import { erc20Abi, lbPairAbi, lbRouterAbi } from "@robinhood-lb/sdk/abi";
+import {
+  buildCreateLBPairTransaction,
+  parseLBPairCreatedReceipt,
+  preflightPoolCreation,
+  readPoolCreationFactoryDiscovery,
+  reconcileCreatedPool,
+  type CreatablePoolPreflight,
+  type PoolCreationFactoryDiscovery,
+  type PoolCreationSelection
+} from "../../../packages/sdk/src/pool-creation";
+import { erc20Abi, lbFactoryAbi, lbPairAbi, lbRouterAbi } from "@robinhood-lb/sdk/abi";
 import { createDexPublicClient } from "@robinhood-lb/sdk/client";
 import {
   applyBurnQuoteSlippage,
@@ -49,7 +61,7 @@ import {
   Wallet
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ComponentType } from "react";
-import { encodeFunctionData, isAddressEqual, keccak256, type Address, type Chain, formatUnits } from "viem";
+import { encodeFunctionData, isAddress, isAddressEqual, keccak256, zeroAddress, type Address, type Chain, type Hex, type PublicClient, formatUnits } from "viem";
 import {
   useAccount,
   useChainId,
@@ -170,11 +182,38 @@ import {
   parseTokenAmount,
   tokenAmountErrorMessage
 } from "./token-safety";
+import {
+  createPoolCreationReview,
+  poolCreationReviewIsCurrent,
+  recordAmbiguousCreateSubmission,
+  recordCanonicalPoolConfirmation,
+  recordCreateMinedRevert,
+  recordCreateWalletRejection,
+  recordDuplicatePool,
+  recordPoolCreationReorg,
+  recordPoolIndexingLag,
+  recordCreatedPoolEmpty,
+  type LiveCreatedPool,
+  type PoolCreationPresetReview,
+  type PoolCreationRecoveryState,
+  type PoolCreationReview,
+  type PoolCreationMode
+} from "./pool-creation";
 
 const queryClient = new QueryClient();
 const SNAPSHOT_REFRESH_INTERVAL_MS = 10_000;
 const SWAP_QUOTE_REFRESH_INTERVAL_MS = 10_000;
 const MAX_LIQUIDITY_BIN_ID = 16_777_215;
+const LB_PAIR_RESERVES_ABI = [{
+  type: "function",
+  name: "getReserves",
+  stateMutability: "view",
+  inputs: [],
+  outputs: [
+    { name: "reserveX", type: "uint128" },
+    { name: "reserveY", type: "uint128" }
+  ]
+}] as const;
 
 interface FullExitUiState {
   batchOrdinal: number;
@@ -282,6 +321,39 @@ interface SubmittedLiquidityAddReview extends LiquidityAddReviewState {
   chainId: number;
   environment: EnvironmentKey;
   submittedAt: number;
+}
+
+interface ConfirmedPoolOverlay {
+  row: PoolRow;
+  recovery: Extract<PoolCreationRecoveryState, { kind: "duplicate" | "created-empty" | "indexing-lag" | "canonical-confirmation" }>;
+}
+
+interface DuplicatePoolObservation {
+  pool: LiveCreatedPool;
+  reserveX: bigint;
+  reserveY: bigint;
+}
+
+interface PoolCreationTokenChoice {
+  address: Address;
+  decimals: number;
+  name: string;
+  symbol: string;
+  listed: boolean;
+}
+
+interface PoolCreationPreparedReview {
+  review: PoolCreationReview;
+  preflight: CreatablePoolPreflight;
+  transaction: ReturnType<typeof buildCreateLBPairTransaction>;
+  preset: PoolCreationPresetReview;
+  requestedPriceQ128: bigint;
+  representedPriceQ128: bigint;
+  representedQuotePerBase: string;
+  inverseBasePerQuote: string;
+  deviationBps: bigint;
+  tokenX: PoolCreationTokenChoice;
+  tokenY: PoolCreationTokenChoice;
 }
 
 const GAS_BUFFER_BPS = 12_500n;
@@ -898,7 +970,14 @@ function ContentView({
   snapshotState: LoadState;
   onRefresh: SnapshotRefetch;
 }) {
-  const pools = snapshot?.indexer.pools ?? [];
+  const indexedPools = snapshot?.indexer.pools ?? [];
+  const [confirmedPoolOverlay, setConfirmedPoolOverlay] = useState<ConfirmedPoolOverlay | null>(null);
+  const overlayIndexed = confirmedPoolOverlay !== null && indexedPools.some((pool) =>
+    isAddressEqual(pool.address, confirmedPoolOverlay.row.address)
+  );
+  const pools = confirmedPoolOverlay !== null
+    ? [confirmedPoolOverlay.row, ...indexedPools.filter((pool) => !isAddressEqual(pool.address, confirmedPoolOverlay.row.address))]
+    : indexedPools;
   const [selectedPoolId, setSelectedPoolId] = useState("");
   const poolIdsKey = pools.map((pool) => pool.id).join("|");
   const defaultPool = selectDefaultIndexedPool(pools);
@@ -1035,7 +1114,17 @@ function ContentView({
       );
     }
 
-    return <PoolsView pools={pools} snapshot={snapshot} snapshotState={snapshotState} />;
+    return (
+      <PoolsView
+        environmentKey={environmentKey}
+        onConfirmedPool={setConfirmedPoolOverlay}
+        onRefresh={onRefresh}
+        pools={pools}
+        rpcOverlay={confirmedPoolOverlay !== null && !overlayIndexed ? confirmedPoolOverlay : null}
+        snapshot={snapshot}
+        snapshotState={snapshotState}
+      />
+    );
   }
 
   if (routeKey === "liquidity") {
@@ -3047,12 +3136,29 @@ function PairAttestationReview({
 type PoolCategory = "all" | "active" | "stables";
 type PoolSort = "swaps" | "deposits" | "updated";
 
-function PoolsView({ pools, snapshot, snapshotState }: { pools: PoolRow[]; snapshot: AppSnapshot | undefined; snapshotState: LoadState }) {
+function PoolsView({
+  environmentKey,
+  onConfirmedPool,
+  onRefresh,
+  pools,
+  rpcOverlay,
+  snapshot,
+  snapshotState
+}: {
+  environmentKey: EnvironmentKey;
+  onConfirmedPool: (overlay: ConfirmedPoolOverlay | null) => void;
+  onRefresh: SnapshotRefetch;
+  pools: PoolRow[];
+  rpcOverlay: ConfirmedPoolOverlay | null;
+  snapshot: AppSnapshot | undefined;
+  snapshotState: LoadState;
+}) {
   const poolState = isPartialPagination(snapshot?.indexer.pagination.pools) ? "partial" : pools.length > 0 ? "ready" : snapshotState;
   const [query, setQuery] = useState("");
   const [category, setCategory] = useState<PoolCategory>("all");
   const [sort, setSort] = useState<PoolSort>("swaps");
   const [page, setPage] = useState(0);
+  const [creationOpen, setCreationOpen] = useState(false);
   const pageSize = 10;
   const filteredPools = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -3091,14 +3197,35 @@ function PoolsView({ pools, snapshot, snapshotState }: { pools: PoolRow[]; snaps
 
   return (
     <div className="view-grid">
+      {creationOpen ? (
+        <PoolCreationWizard
+          environmentKey={environmentKey}
+          indexedPools={pools}
+          onClose={() => setCreationOpen(false)}
+          onConfirmedPool={onConfirmedPool}
+          onRefresh={onRefresh}
+          snapshot={snapshot}
+        />
+      ) : null}
       <section className="table-panel">
         <div className="panel-heading">
           <span>Liquidity pools</span>
-          <StatusBadge
-            state={poolState}
-            label={snapshot?.indexer.pagination.pools ? paginationBadgeLabel(pools.length, snapshot.indexer.pagination.pools, "pools") : snapshotState}
-          />
+          <div className="pool-heading-actions">
+            <StatusBadge
+              state={poolState}
+              label={snapshot?.indexer.pagination.pools ? paginationBadgeLabel(pools.length, snapshot.indexer.pagination.pools, "pools") : snapshotState}
+            />
+            <button className="primary-button" data-testid="pool-create-launch" onClick={() => setCreationOpen(true)} type="button">Create pool</button>
+          </div>
         </div>
+        {rpcOverlay ? (
+          <div className="state-row warning" data-testid="pool-rpc-overlay" role="status">
+            <Server size={16} />
+            <span>{rpcOverlay.recovery.kind === "duplicate"
+              ? `Resolved from the live factory at block ${rpcOverlay.row.updatedAtBlock}; the exact RPC workspace remains available while indexing catches up.`
+              : `Confirmed by RPC at block ${rpcOverlay.row.updatedAtBlock}; indexing is catching up. This empty pool cannot quote swaps.`}</span>
+          </div>
+        ) : null}
         <div className="pool-controls">
           <label>
             <span className="field-label">Search</span>
@@ -3176,6 +3303,1054 @@ function PoolsView({ pools, snapshot, snapshotState }: { pools: PoolRow[]; snaps
       </section>
     </div>
   );
+}
+
+type PoolCreationStep = "tokens" | "configure" | "review" | "create";
+
+function PoolCreationWizard({
+  environmentKey,
+  indexedPools,
+  onClose,
+  onConfirmedPool,
+  onRefresh,
+  snapshot
+}: {
+  environmentKey: EnvironmentKey;
+  indexedPools: PoolRow[];
+  onClose: () => void;
+  onConfirmedPool: (overlay: ConfirmedPoolOverlay | null) => void;
+  onRefresh: SnapshotRefetch;
+  snapshot: AppSnapshot | undefined;
+}) {
+  const registry = registries[environmentKey];
+  const account = useAccount();
+  const walletChainId = useChainId();
+  const transactionJournal = useTransactionJournal();
+  const createWrite = useSendTransaction();
+  const publicClient = useMemo(() => createDexPublicClient(registry.chain, registry.endpoints.rpcUrl), [registry]);
+  const [step, setStep] = useState<PoolCreationStep>("tokens");
+  const [tokenXInput, setTokenXInput] = useState("");
+  const [tokenYAddress, setTokenYAddress] = useState("");
+  const [tokenX, setTokenX] = useState<PoolCreationTokenChoice | null>(null);
+  const [tokenY, setTokenY] = useState<PoolCreationTokenChoice | null>(null);
+  const [binStepInput, setBinStepInput] = useState("");
+  const [priceInput, setPriceInput] = useState("1");
+  const [mode, setMode] = useState<PoolCreationMode>("create-only");
+  const [riskAcknowledged, setRiskAcknowledged] = useState(false);
+  const [prepared, setPrepared] = useState<PoolCreationPreparedReview | null>(null);
+  const [gasReview, setGasReview] = useState<ExactGasReview | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [recovery, setRecovery] = useState<PoolCreationRecoveryState | null>(null);
+  const [submittedFingerprint, setSubmittedFingerprint] = useState<string | null>(null);
+  const [canonicalRetryNonce, setCanonicalRetryNonce] = useState(0);
+  const handledCanonicalHash = useRef<Hex | null>(null);
+  const canonicalReconciliationHash = useRef<Hex | null>(null);
+  const handledRevertedHash = useRef<Hex | null>(null);
+  const submitInFlight = useRef(false);
+  const operationGeneration = useRef(0);
+  const contextIdentity = [
+    environmentKey,
+    deploymentEpoch(registry),
+    account.address?.toLowerCase() ?? "disconnected",
+    walletChainId,
+    snapshot?.runtime.chainId ?? "rpc-unavailable"
+  ].join("|");
+
+  const discoveryQuery = useQuery({
+    queryKey: ["poolCreationDiscovery", environmentKey, deploymentEpoch(registry)],
+    queryFn: async () => {
+      const [rpcChainId, block] = await Promise.all([
+        publicClient.getChainId(),
+        publicClient.getBlock({ blockTag: "latest" })
+      ]);
+      if (rpcChainId !== registry.chainId || block.hash === null) throw new Error("Pool-creation RPC chain or canonical head is unavailable");
+      const discovery = await readPoolCreationFactoryDiscovery(publicClient, registry.contracts.lbFactory, block.number);
+      const canonical = await publicClient.getBlock({ blockNumber: block.number });
+      if (canonical.hash === null || canonical.hash.toLowerCase() !== block.hash.toLowerCase()) {
+        throw new Error("Pool-creation discovery head reorganized during pinned reads");
+      }
+      return { blockHash: block.hash, blockNumber: block.number, discovery };
+    },
+    retry: false,
+    staleTime: 0
+  });
+  const discovery = discoveryQuery.data?.discovery ?? null;
+
+  useEffect(() => {
+    operationGeneration.current += 1;
+    setPrepared(null);
+    setGasReview(null);
+    setRecovery(null);
+    setSubmittedFingerprint(null);
+    setError(null);
+    setNotice(null);
+    setStep("tokens");
+  }, [contextIdentity]);
+
+  useEffect(() => () => {
+    operationGeneration.current += 1;
+    submitInFlight.current = false;
+  }, []);
+
+  useEffect(() => {
+    if (!discovery) return;
+    const firstQuote = discovery.quoteAssets[0];
+    if (tokenYAddress === "" && firstQuote) setTokenYAddress(firstQuote);
+    if (binStepInput === "" && discovery.openBinSteps[0] !== undefined) setBinStepInput(discovery.openBinSteps[0].toString());
+    if (tokenXInput === "") {
+      const candidate = Object.values(registry.tokens).find((token) =>
+        !discovery.quoteAssets.some((quote) => isAddressEqual(quote, token.address)) && token.risk.reviewStatus !== "blocked"
+      ) ?? Object.values(registry.tokens)[0];
+      if (candidate) setTokenXInput(candidate.address);
+    }
+  }, [binStepInput, discovery, registry.tokens, tokenXInput, tokenYAddress]);
+
+  const pricePreview = useMemo(() => {
+    if (!tokenX || !tokenY || !/^\d+$/.test(binStepInput)) return null;
+    try {
+      const binStep = BigInt(binStepInput);
+      const requestedPriceQ128 = decimalPriceToQ128(priceInput, {
+        baseDecimals: tokenX.decimals,
+        quoteDecimals: tokenY.decimals
+      });
+      const activeId = activeIdFromPriceQ128(requestedPriceQ128, binStep);
+      const representedPriceQ128 = priceQ128FromActiveId(activeId, binStep);
+      const representedQuotePerBase = formatExactPriceFraction(normalizeQ128Price(representedPriceQ128, {
+        baseDecimals: tokenX.decimals,
+        quoteDecimals: tokenY.decimals
+      }), 36);
+      const inverseBasePerQuote = formatExactPriceFraction(normalizeQ128Price(representedPriceQ128, {
+        baseDecimals: tokenX.decimals,
+        quoteDecimals: tokenY.decimals,
+        inverse: true
+      }), 36);
+      const delta = representedPriceQ128 > requestedPriceQ128
+        ? representedPriceQ128 - requestedPriceQ128
+        : requestedPriceQ128 - representedPriceQ128;
+      return {
+        activeId,
+        requestedPriceQ128,
+        representedPriceQ128,
+        representedQuotePerBase,
+        inverseBasePerQuote,
+        deviationBps: delta * 10_000n / requestedPriceQ128
+      };
+    } catch (previewError) {
+      return { error: getWriteError(previewError) ?? "Price is outside the representable LB range" };
+    }
+  }, [binStepInput, priceInput, tokenX, tokenY]);
+
+  const journalRecord = submittedFingerprint === null ? null : transactionJournal.records.find((record) =>
+    record.reviewed.intent === "create-pool" &&
+    record.reviewed.executionFingerprint === submittedFingerprint &&
+    record.reviewed.account.toLowerCase() === account.address?.toLowerCase()
+  ) ?? null;
+
+  const reviewIsCurrent = (review: PoolCreationReview): boolean => poolCreationReviewIsCurrent(review, {
+    ...review.binding,
+    account: account.address ?? zeroAddress,
+    walletChainId,
+    rpcChainId: snapshot?.runtime.chainId ?? -1
+  });
+
+  const resolveTokenStage = async () => {
+    if (!discoveryQuery.data) return;
+    setBusy(true);
+    setError(null);
+    try {
+      if (!isAddress(tokenXInput) || !isAddress(tokenYAddress)) throw new Error("Enter valid token addresses");
+      const selectedY = tokenYAddress as Address;
+      if (!discoveryQuery.data.discovery.quoteAssets.some((asset) => isAddressEqual(asset, selectedY))) {
+        throw new Error("Semantic token Y must be a current factory quote asset");
+      }
+      const [resolvedX, resolvedY] = await Promise.all([
+        readPoolCreationToken(publicClient, registry, tokenXInput as Address, discoveryQuery.data.blockNumber),
+        readPoolCreationToken(publicClient, registry, selectedY, discoveryQuery.data.blockNumber)
+      ]);
+      if (isAddressEqual(resolvedX.address, resolvedY.address)) throw new Error("Semantic token X and token Y must be distinct");
+      setTokenX(resolvedX);
+      setTokenY(resolvedY);
+      if (!resolvedX.listed || !resolvedY.listed) setMode("create-only");
+      setStep("configure");
+    } catch (tokenError) {
+      setError(getWriteError(tokenError) ?? "Token validation failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const applyDuplicateRecovery = async (
+    review: PoolCreationReview,
+    pair: Address,
+    selection: PoolCreationSelection,
+    blockNumber: bigint,
+    blockHash: Hex,
+    source: "preexisting" | "race-winner",
+    reviewedTokenX: PoolCreationTokenChoice,
+    reviewedTokenY: PoolCreationTokenChoice
+  ) => {
+    const observation = await readDuplicatePoolIdentity(
+      publicClient,
+      registry.contracts.lbFactory,
+      pair,
+      selection,
+      blockNumber,
+      blockHash
+    );
+    const duplicate = recordDuplicatePool(review, observation.pool, source);
+    setRecovery(duplicate);
+    setPrepared(null);
+    setGasReview(null);
+    setStep("create");
+    const indexed = indexedPools.find((pool) => isAddressEqual(pool.address, pair));
+    const row = duplicatePoolOverlayRow(observation, reviewedTokenX, reviewedTokenY, registry);
+    onConfirmedPool({ row, recovery: duplicate });
+    setNotice(indexed
+      ? `The exact pool already exists. Live reserves were refreshed as ${observation.reserveX.toString()} X / ${observation.reserveY.toString()} Y; no wallet request was sent.`
+      : `The exact live pool won the race. RPC reserves are ${observation.reserveX.toString()} X / ${observation.reserveY.toString()} Y; active ID and price were refreshed and any position requires a new explicit review.`);
+  };
+
+  const buildCurrentReview = async (): Promise<PoolCreationPreparedReview | null> => {
+    if (!account.address || !tokenX || !tokenY || !pricePreview || "error" in pricePreview) {
+      throw new Error("Complete a valid connected pool configuration first");
+    }
+    if (walletChainId !== registry.chainId || snapshot?.runtime.chainId !== registry.chainId) {
+      throw new Error("Wallet and RPC must match the selected pool-creation chain");
+    }
+    if (!riskAcknowledged) throw new Error("Acknowledge the initial-price arbitrage and loss risk before review");
+    const capturedGeneration = operationGeneration.current;
+    const [rpcChainId, block] = await Promise.all([publicClient.getChainId(), publicClient.getBlock({ blockTag: "latest" })]);
+    if (capturedGeneration !== operationGeneration.current) throw new Error("Pool-creation context changed during pinned reads");
+    if (rpcChainId !== registry.chainId || block.hash === null) throw new Error("Pool-creation canonical RPC head is unavailable");
+    const freshDiscovery = await readPoolCreationFactoryDiscovery(publicClient, registry.contracts.lbFactory, block.number);
+    if (capturedGeneration !== operationGeneration.current) throw new Error("Pool-creation context changed during factory discovery");
+    const selection: PoolCreationSelection = {
+      tokenX: tokenX.address,
+      tokenY: tokenY.address,
+      binStep: BigInt(binStepInput)
+    };
+    if (!freshDiscovery.openBinSteps.includes(selection.binStep)) throw new Error("The reviewed factory preset is no longer open");
+    if (!freshDiscovery.quoteAssets.some((asset) => isAddressEqual(asset, selection.tokenY))) {
+      throw new Error("Semantic token Y is no longer a factory quote asset");
+    }
+    const [freshTokenX, freshTokenY, preflight, rawPreset] = await Promise.all([
+      readPoolCreationToken(publicClient, registry, selection.tokenX, block.number),
+      readPoolCreationToken(publicClient, registry, selection.tokenY, block.number),
+      preflightPoolCreation(publicClient, registry.contracts.lbFactory, selection, block.number),
+      publicClient.readContract({
+        address: registry.contracts.lbFactory,
+        abi: lbFactoryAbi,
+        functionName: "getPreset",
+        args: [selection.binStep],
+        blockNumber: block.number
+      })
+    ]);
+    if (capturedGeneration !== operationGeneration.current) throw new Error("Pool-creation context changed during preflight");
+    if (freshTokenX.decimals !== tokenX.decimals || freshTokenY.decimals !== tokenY.decimals) {
+      throw new Error("Token decimal metadata changed during pool-creation review");
+    }
+    const canonical = await publicClient.getBlock({ blockNumber: block.number });
+    if (canonical.hash === null || canonical.hash.toLowerCase() !== block.hash.toLowerCase()) {
+      throw new Error("Pool-creation review head reorganized during pinned reads");
+    }
+    if (preflight.kind === "existing") {
+      const duplicateReview = prepared?.review ?? createDuplicateReviewFallback({
+        account: account.address,
+        activeId: pricePreview.activeId,
+        blockHash: block.hash,
+        blockNumber: block.number,
+        environmentKey,
+        mode,
+        priceInput,
+        pricePreview,
+        preset: normalizePoolCreationPreset(rawPreset),
+        registry,
+        riskAcknowledged,
+        selection,
+        tokenX: freshTokenX,
+        tokenY: freshTokenY
+      });
+      await applyDuplicateRecovery(
+        duplicateReview,
+        preflight.pair,
+        selection,
+        block.number,
+        block.hash,
+        prepared ? "race-winner" : "preexisting",
+        freshTokenX,
+        freshTokenY
+      );
+      return null;
+    }
+    const preset = normalizePoolCreationPreset(rawPreset);
+    const transaction = buildCreateLBPairTransaction(registry.contracts.lbRouter, preflight, pricePreview.activeId);
+    const review = createPoolCreationReview({
+      environment: environmentKey,
+      deploymentEpoch: deploymentEpoch(registry),
+      chainId: registry.chainId,
+      walletChainId,
+      rpcChainId,
+      account: account.address,
+      factory: registry.contracts.lbFactory,
+      router: registry.contracts.lbRouter,
+      tokenX: selection.tokenX,
+      tokenY: selection.tokenY,
+      tokenXDecimals: freshTokenX.decimals,
+      tokenYDecimals: freshTokenY.decimals,
+      binStep: selection.binStep,
+      activeId: pricePreview.activeId,
+      requestedQuotePerBase: priceInput,
+      representableQuotePerBase: pricePreview.representedQuotePerBase,
+      representablePriceQ128: pricePreview.representedPriceQ128,
+      preset,
+      pinnedHead: { number: block.number, hash: block.hash },
+      mode,
+      transaction,
+      roundingRiskAcknowledged: true
+    });
+    return {
+      review,
+      preflight,
+      transaction,
+      preset,
+      requestedPriceQ128: pricePreview.requestedPriceQ128,
+      representedPriceQ128: pricePreview.representedPriceQ128,
+      representedQuotePerBase: pricePreview.representedQuotePerBase,
+      inverseBasePerQuote: pricePreview.inverseBasePerQuote,
+      deviationBps: pricePreview.deviationBps,
+      tokenX: freshTokenX,
+      tokenY: freshTokenY
+    };
+  };
+
+  const recheckPreparedAuthority = async (reviewed: PoolCreationPreparedReview) => {
+    const reviewedHead = await publicClient.getBlock({ blockNumber: reviewed.review.binding.pinnedHead.number });
+    if (
+      reviewedHead.hash === null ||
+      reviewedHead.hash.toLowerCase() !== reviewed.review.binding.pinnedHead.hash.toLowerCase()
+    ) {
+      throw new Error("The pinned pool-creation review head is no longer canonical");
+    }
+    const [rpcChainId, latest] = await Promise.all([
+      publicClient.getChainId(),
+      publicClient.getBlock({ blockTag: "latest" })
+    ]);
+    if (rpcChainId !== registry.chainId || latest.hash === null) throw new Error("Current pool-creation RPC authority is unavailable");
+    const selection = reviewed.preflight.selection;
+    const freshDiscovery = await readPoolCreationFactoryDiscovery(publicClient, registry.contracts.lbFactory, latest.number);
+    if (!freshDiscovery.openBinSteps.includes(selection.binStep)) throw new Error("The reviewed factory preset is no longer open");
+    if (!freshDiscovery.quoteAssets.some((asset) => isAddressEqual(asset, selection.tokenY))) {
+      throw new Error("Semantic token Y is no longer a factory quote asset");
+    }
+    const [freshTokenX, freshTokenY, preflight, rawPreset] = await Promise.all([
+      readPoolCreationToken(publicClient, registry, selection.tokenX, latest.number),
+      readPoolCreationToken(publicClient, registry, selection.tokenY, latest.number),
+      preflightPoolCreation(publicClient, registry.contracts.lbFactory, selection, latest.number),
+      publicClient.readContract({
+        address: registry.contracts.lbFactory,
+        abi: lbFactoryAbi,
+        functionName: "getPreset",
+        args: [selection.binStep],
+        blockNumber: latest.number
+      })
+    ]);
+    const freshPreset = normalizePoolCreationPreset(rawPreset);
+    if (
+      freshTokenX.decimals !== reviewed.tokenX.decimals ||
+      freshTokenY.decimals !== reviewed.tokenY.decimals ||
+      freshTokenX.symbol !== reviewed.tokenX.symbol ||
+      freshTokenY.symbol !== reviewed.tokenY.symbol ||
+      !samePoolCreationPreset(freshPreset, reviewed.preset)
+    ) {
+      throw new Error("Pool-creation token metadata or fee preset changed after review");
+    }
+    const canonical = await publicClient.getBlock({ blockNumber: latest.number });
+    if (canonical.hash === null || canonical.hash.toLowerCase() !== latest.hash.toLowerCase()) {
+      throw new Error("Latest pool-creation authority head reorganized during recheck");
+    }
+    return { blockHash: latest.hash, blockNumber: latest.number, freshTokenX, freshTokenY, preflight };
+  };
+
+  const handlePrepareReview = async () => {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const next = await buildCurrentReview();
+      if (next) {
+        setPrepared(next);
+        setGasReview(null);
+        setRecovery(null);
+        setStep("review");
+      }
+    } catch (reviewError) {
+      setError(getWriteError(reviewError) ?? "Pool-creation review failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleCreate = async () => {
+    if (!prepared || !account.address || submitInFlight.current) return;
+    submitInFlight.current = true;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const capturedGeneration = operationGeneration.current;
+      const authority = await recheckPreparedAuthority(prepared);
+      if (authority.preflight.kind === "existing") {
+        await applyDuplicateRecovery(
+          prepared.review,
+          authority.preflight.pair,
+          prepared.preflight.selection,
+          authority.blockNumber,
+          authority.blockHash,
+          "race-winner",
+          authority.freshTokenX,
+          authority.freshTokenY
+        );
+        return;
+      }
+      if (!reviewIsCurrent(prepared.review)) throw new Error("Pool-creation review is stale for the current account, chain, or deployment");
+      const gasCurrent = () => reviewIsCurrent(prepared.review) && operationGeneration.current === capturedGeneration;
+      const gasApproved = await reviewExactGas({
+        action: "Create LB pool",
+        currentReview: gasReview,
+        estimateGas: () => publicClient.estimateGas({
+          account: account.address,
+          to: prepared.transaction.to,
+          data: prepared.transaction.data,
+          value: prepared.transaction.value
+        }),
+        executionFingerprint: prepared.review.fingerprint,
+        getBalance: () => publicClient.getBalance({ address: account.address! }),
+        getGasPrice: () => publicClient.getGasPrice(),
+        isCurrent: gasCurrent,
+        setError,
+        setReview: setGasReview
+      });
+      if (!gasApproved) {
+        setNotice("Exact gas and balance are pinned below. Submit again to re-preflight, simulate, and open the wallet.");
+        return;
+      }
+      const simulationAuthority = await recheckPreparedAuthority(prepared);
+      if (simulationAuthority.preflight.kind === "existing") {
+        await applyDuplicateRecovery(
+          prepared.review,
+          simulationAuthority.preflight.pair,
+          prepared.preflight.selection,
+          simulationAuthority.blockNumber,
+          simulationAuthority.blockHash,
+          "race-winner",
+          simulationAuthority.freshTokenX,
+          simulationAuthority.freshTokenY
+        );
+        return;
+      }
+      await publicClient.simulateContract({
+        account: account.address,
+        address: prepared.transaction.to,
+        abi: lbRouterAbi,
+        functionName: "createLBPair",
+        args: [
+          prepared.review.binding.tokenX,
+          prepared.review.binding.tokenY,
+          Number(prepared.review.binding.activeId),
+          Number(prepared.review.binding.binStep)
+        ]
+      });
+      if (!gasCurrent()) throw new Error("Pool-creation context changed during exact simulation");
+      const reviewed = reviewedTransactionIntent({
+        account: account.address,
+        calldataFingerprint: keccak256(prepared.transaction.data),
+        chainId: registry.chainId,
+        deploymentEpoch: deploymentEpoch(registry),
+        environment: environmentKey,
+        executionFingerprint: prepared.review.fingerprint,
+        intent: "create-pool",
+        target: prepared.transaction.to,
+        value: 0n
+      }, {
+        poolId: null,
+        recipient: null,
+        refundRecipient: null,
+        settingsFingerprint: [
+          environmentKey,
+          deploymentEpoch(registry),
+          registry.contracts.lbFactory.toLowerCase(),
+          ...[
+            prepared.review.binding.tokenX.toLowerCase(),
+            prepared.review.binding.tokenY.toLowerCase()
+          ].sort(),
+          prepared.review.binding.binStep.toString()
+        ].join("|")
+      });
+      setSubmittedFingerprint(prepared.review.fingerprint);
+      setStep("create");
+      const hash = await submitJournaledTransaction({
+        isCurrent: gasCurrent,
+        journal: transactionJournal,
+        reviewed,
+        preWalletGuard: async () => {
+          const finalAuthority = await recheckPreparedAuthority(prepared);
+          if (finalAuthority.preflight.kind === "existing") {
+            await applyDuplicateRecovery(
+              prepared.review,
+              finalAuthority.preflight.pair,
+              prepared.preflight.selection,
+              finalAuthority.blockNumber,
+              finalAuthority.blockHash,
+              "race-winner",
+              finalAuthority.freshTokenX,
+              finalAuthority.freshTokenY
+            );
+            throw new Error("Exact pool was created by another actor before wallet submission");
+          }
+          if (!gasCurrent()) throw new Error("Exact pool identity changed before wallet submission");
+        },
+        send: () => createWrite.sendTransactionAsync(prepared.transaction)
+      });
+      if (hash) setNotice(`Creation submitted as ${formatCompactAddress(hash)}. Canonical receipt and live factory identity must reconcile before the pool appears.`);
+    } catch (submitError) {
+      if (isUserRejectedSubmission(submitError)) {
+        setRecovery(recordCreateWalletRejection(prepared.review));
+        setNotice("Wallet rejected pool creation. No pool was created and retry requires a fresh review.");
+      } else {
+        setError(getWriteError(submitError) ?? "Pool-creation submission failed or remains ambiguous");
+      }
+    } finally {
+      setBusy(false);
+      submitInFlight.current = false;
+    }
+  };
+
+  useEffect(() => {
+    if (!journalRecord || !prepared) return;
+    if (journalRecord.status === "rejected") {
+      setRecovery(recordCreateWalletRejection(prepared.review));
+      return;
+    }
+    if (["unknown-submission", "reconciling", "timed-out", "awaiting-wallet"].includes(journalRecord.status)) {
+      setRecovery(recordAmbiguousCreateSubmission(prepared.review, journalRecord.activeHash));
+      return;
+    }
+    if (journalRecord.status === "reverted" && journalRecord.canonicalReceipt) {
+      const revertedReceipt = journalRecord.canonicalReceipt;
+      if (handledRevertedHash.current === revertedReceipt.hash) return;
+      handledRevertedHash.current = revertedReceipt.hash;
+      void (async () => {
+        try {
+          const authority = await recheckPreparedAuthority(prepared);
+          if (authority.preflight.kind === "existing") {
+            await applyDuplicateRecovery(
+              prepared.review,
+              authority.preflight.pair,
+              prepared.preflight.selection,
+              authority.blockNumber,
+              authority.blockHash,
+              "race-winner",
+              authority.freshTokenX,
+              authority.freshTokenY
+            );
+            return;
+          }
+          setRecovery(recordCreateMinedRevert(prepared.review, revertedReceipt.hash, {
+            number: BigInt(revertedReceipt.blockNumber),
+            hash: revertedReceipt.blockHash
+          }));
+        } catch (revertRecoveryError) {
+          setRecovery(recordCreateMinedRevert(prepared.review, revertedReceipt.hash, {
+            number: BigInt(revertedReceipt.blockNumber),
+            hash: revertedReceipt.blockHash
+          }));
+          setError(`Creation reverted; exact race-winner recovery is unavailable: ${getWriteError(revertRecoveryError) ?? "live factory lookup failed"}`);
+        }
+      })();
+      return;
+    }
+    if (journalRecord.status === "orphaned" && recovery && ["canonical-confirmation", "indexing-lag", "created-empty"].includes(recovery.kind)) {
+      const poolState = recovery as Extract<PoolCreationRecoveryState, { kind: "canonical-confirmation" | "indexing-lag" | "created-empty" }>;
+      void publicClient.getBlock({ blockTag: "latest" }).then((head) => {
+        if (head.hash === null) return;
+        setRecovery(recordPoolCreationReorg(poolState, { number: head.number, hash: head.hash }));
+        onConfirmedPool(null);
+      }).catch(() => setError("Creation receipt was orphaned; waiting for the current canonical head before recovery"));
+      return;
+    }
+    if (
+      journalRecord.status !== "canonical" ||
+      !journalRecord.activeHash ||
+      handledCanonicalHash.current === journalRecord.activeHash ||
+      canonicalReconciliationHash.current === journalRecord.activeHash
+    ) return;
+    canonicalReconciliationHash.current = journalRecord.activeHash;
+    const reconciliationHash = journalRecord.activeHash;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const receipt = await publicClient.getTransactionReceipt({ hash: journalRecord.activeHash! });
+        const canonicalBlock = await publicClient.getBlock({ blockNumber: receipt.blockNumber });
+        if (canonicalBlock.hash?.toLowerCase() !== receipt.blockHash.toLowerCase()) throw new Error("Pool-creation receipt block was reorganized");
+        const created = parseLBPairCreatedReceipt({
+          blockNumber: receipt.blockNumber,
+          status: receipt.status,
+          logs: receipt.logs.map((log) => ({ address: log.address, data: log.data, topics: log.topics as readonly Hex[] }))
+        }, registry.contracts.lbFactory, prepared.preflight.selection);
+        const reconciled = await reconcileCreatedPool(publicClient, {
+          created,
+          expectedActiveId: prepared.review.binding.activeId,
+          expectedPriceQ128: prepared.review.binding.representablePriceQ128
+        });
+        const livePool: LiveCreatedPool = {
+          pair: reconciled.pair,
+          factory: reconciled.factory,
+          tokenX: reconciled.selection.tokenX,
+          tokenY: reconciled.selection.tokenY,
+          binStep: reconciled.selection.binStep,
+          activeId: reconciled.activeId,
+          priceQ128: reconciled.priceQ128,
+          observedHead: { number: reconciled.blockNumber, hash: receipt.blockHash }
+        };
+        const confirmation = recordCanonicalPoolConfirmation(prepared.review, receipt.transactionHash, livePool);
+        const [activeBin, activeSupply, pairReserves] = await Promise.all([
+          publicClient.readContract({ address: reconciled.pair, abi: lbPairAbi, functionName: "getBin", args: [Number(reconciled.activeId)], blockNumber: reconciled.blockNumber }),
+          publicClient.readContract({ address: reconciled.pair, abi: lbPairAbi, functionName: "totalSupply", args: [reconciled.activeId], blockNumber: reconciled.blockNumber }),
+          publicClient.readContract({ address: reconciled.pair, abi: LB_PAIR_RESERVES_ABI, functionName: "getReserves", blockNumber: reconciled.blockNumber })
+        ]);
+        if (activeBin[0] !== 0n || activeBin[1] !== 0n || activeSupply !== 0n || pairReserves[0] !== 0n || pairReserves[1] !== 0n) {
+          throw new Error("Created pool was not empty at its canonical creation receipt block");
+        }
+        const postReadCanonicalBlock = await publicClient.getBlock({ blockNumber: receipt.blockNumber });
+        if (postReadCanonicalBlock.hash?.toLowerCase() !== receipt.blockHash.toLowerCase()) {
+          throw new Error("Pool-creation receipt block reorganized during live reconciliation");
+        }
+        const empty = recordCreatedPoolEmpty(confirmation, livePool, true);
+        const indexed = indexedPools.some((pool) => isAddressEqual(pool.address, reconciled.pair));
+        const indexerHead = snapshot?.indexer.blockNumber === null || snapshot?.indexer.blockNumber === undefined
+          ? null
+          : BigInt(snapshot.indexer.blockNumber);
+        const runtimeBlock = await publicClient.getBlock({ blockTag: "latest" });
+        if (runtimeBlock.hash === null) throw new Error("Runtime canonical head is unavailable after pool creation");
+        const currentHead = runtimeBlock.number;
+        const currentHash = runtimeBlock.hash;
+        const indexerBehind = indexerHead === null || indexerHead < reconciled.blockNumber;
+        const resolvedRecovery = !indexed && indexerBehind
+          ? recordPoolIndexingLag(confirmation, { number: currentHead, hash: currentHash }, indexerHead)
+          : empty;
+        if (cancelled) return;
+        handledCanonicalHash.current = reconciliationHash;
+        canonicalReconciliationHash.current = null;
+        setRecovery(resolvedRecovery);
+        const row = poolOverlayRow(reconciled.pair, prepared, reconciled.blockNumber, registry);
+        onConfirmedPool({ row, recovery: resolvedRecovery });
+        if (!indexed && !indexerBehind) {
+          setError("Indexer inconsistency: it processed through the creation block but omitted the confirmed pair. RPC identity remains visible; indexed actions stay blocked.");
+          setNotice("Pool creation is canonical by RPC, but the indexer is inconsistent rather than merely behind.");
+        } else {
+          setNotice(indexed ? "Pool creation is canonical and indexed." : "Pool creation is canonical by RPC. The empty-pool workspace is available while indexing catches up; swaps remain disabled.");
+        }
+        void onRefresh().catch((refreshError) => {
+          if (!cancelled) {
+            setNotice(`Pool creation remains canonically reconciled. Indexed-data refresh failed and can be retried from the pool list: ${getWriteError(refreshError) ?? "unknown refresh error"}`);
+          }
+        });
+      } catch (receiptError) {
+        if (!cancelled) {
+          canonicalReconciliationHash.current = null;
+          setError(getWriteError(receiptError) ?? "Canonical pool receipt reconciliation failed");
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (canonicalReconciliationHash.current === reconciliationHash && handledCanonicalHash.current !== reconciliationHash) {
+        canonicalReconciliationHash.current = null;
+      }
+    };
+  }, [canonicalRetryNonce, journalRecord?.activeHash, journalRecord?.canonicalReceipt?.hash, journalRecord?.id, journalRecord?.status, prepared?.review.fingerprint]);
+
+  const configured = tokenX !== null && tokenY !== null && pricePreview !== null && !("error" in pricePreview) && riskAcknowledged;
+  const existingPool = recovery?.kind === "duplicate" ? recovery.pool : null;
+  const confirmedPool = recovery && ["canonical-confirmation", "indexing-lag", "created-empty"].includes(recovery.kind)
+    ? (recovery as Extract<PoolCreationRecoveryState, { kind: "canonical-confirmation" | "indexing-lag" | "created-empty" }>).pool
+    : null;
+  const canonicalRecoveryResolved = confirmedPool !== null;
+  const existingLiveTokenX = existingPool && tokenX && tokenY
+    ? (isAddressEqual(existingPool.tokenX, tokenX.address) ? tokenX : tokenY)
+    : tokenX;
+  const existingLiveTokenY = existingPool && tokenX && tokenY
+    ? (isAddressEqual(existingPool.tokenY, tokenY.address) ? tokenY : tokenX)
+    : tokenY;
+
+  return (
+    <section className="pool-creation-panel" data-testid="pool-creation-wizard" aria-label="Create permissionless LB pool">
+      <div className="panel-heading">
+        <span>Create permissionless pool</span>
+        <button className="icon-button" aria-label="Close pool creation" onClick={onClose} type="button">×</button>
+      </div>
+      <div className="pool-creation-steps" aria-label="Pool creation progress">
+        {(["tokens", "configure", "review", "create"] as const).map((candidate, index) => (
+          <span className={step === candidate ? "active" : ""} key={candidate}>{index + 1}. {candidate === "create" ? "Create / indexing" : candidate}</span>
+        ))}
+      </div>
+      {step === "tokens" ? (
+        <div className="pool-creation-grid">
+          <label><span className="field-label">Token X · semantic base</span><input data-testid="pool-create-token-x" value={tokenXInput} onChange={(event) => setTokenXInput(event.target.value)} placeholder="ERC-20 address" /></label>
+          <label><span className="field-label">Token Y · factory quote asset</span><select data-testid="pool-create-token-y" value={tokenYAddress} onChange={(event) => setTokenYAddress(event.target.value)}>
+            <option value="">Select quote asset</option>
+            {(discovery?.quoteAssets ?? []).map((address) => {
+              const metadata = registry.tokens[address.toLowerCase()];
+              return <option key={address} value={address}>{metadata ? `${metadata.symbol} · ` : ""}{address}</option>;
+            })}
+          </select></label>
+          <p className="pool-creation-copy">X is preserved as base and Y as quote even when their addresses sort in the opposite order. X may be any code-bearing ERC-20 with bounded decimals; Y must be live-whitelisted by this factory.</p>
+          <button className="primary-button" disabled={busy || discoveryQuery.isLoading || discoveryQuery.isError} onClick={() => void resolveTokenStage()} type="button">{busy ? "Validating…" : "Continue to configure"}</button>
+        </div>
+      ) : null}
+      {step === "configure" && tokenX && tokenY ? (
+        <div className="pool-creation-grid">
+          <div className="pool-creation-token-summary"><strong>{tokenX.symbol} / {tokenY.symbol}</strong><span>{tokenX.address}</span><span>{tokenY.address}</span></div>
+          <label><span className="field-label">Open bin-step preset</span><select data-testid="pool-create-bin-step" value={binStepInput} onChange={(event) => { setBinStepInput(event.target.value); setPrepared(null); }}>
+            {(discovery?.openBinSteps ?? []).map((value) => <option key={value.toString()} value={value.toString()}>{value.toString()} bps step</option>)}
+          </select></label>
+          <label><span className="field-label">Initial price · {tokenY.symbol} per {tokenX.symbol}</span><input data-testid="pool-create-price" value={priceInput} onChange={(event) => { setPriceInput(event.target.value); setPrepared(null); }} inputMode="decimal" /></label>
+          {pricePreview && !("error" in pricePreview) ? (
+            <dl className="pool-creation-preview" data-testid="pool-create-price-preview">
+              <div><dt>Derived active ID</dt><dd>{pricePreview.activeId.toString()}</dd></div>
+              <div><dt>Representable quote/base</dt><dd>{pricePreview.representedQuotePerBase}</dd></div>
+              <div><dt>Inverse base/quote</dt><dd>{pricePreview.inverseBasePerQuote}</dd></div>
+              <div><dt>Deviation</dt><dd>{formatBps(pricePreview.deviationBps)}</dd></div>
+            </dl>
+          ) : pricePreview && "error" in pricePreview ? <p className="inline-error">{pricePreview.error}</p> : null}
+          <label className="check-row"><input checked={mode === "create-and-add"} disabled={!tokenX.listed || !tokenY.listed} onChange={(event) => setMode(event.target.checked ? "create-and-add" : "create-only")} type="checkbox" /><span>{tokenX.listed && tokenY.listed ? "After canonical creation, offer a separate fresh Create Position review" : "Create Position handoff requires both tokens in the supported Feather token registry; permissionless pool creation remains available in create-only mode"}</span></label>
+          <label className="check-row risk-ack"><input data-testid="pool-create-risk-ack" checked={riskAcknowledged} onChange={(event) => setRiskAcknowledged(event.target.checked)} type="checkbox" /><span>I understand an incorrect initial price can cause immediate arbitrage and permanent loss. The representable rounded price—not my typed decimal—will initialize the pool.</span></label>
+          <div className="wizard-actions"><button className="secondary-button" onClick={() => setStep("tokens")} type="button">Back</button><button className="primary-button" disabled={!configured || busy} onClick={() => void handlePrepareReview()} type="button">{busy ? "Pinning review…" : "Review exact creation"}</button></div>
+        </div>
+      ) : null}
+      {step === "review" && prepared ? (
+        <div className="pool-creation-review" data-testid="pool-create-review">
+          <div className="state-row warning"><AlertTriangle size={16} /><span>Initial price is irreversible at creation and can invite immediate arbitrage. Transaction value is exactly zero; gas is not guaranteed until mined.</span></div>
+          <dl className="review-grid">
+            <div><dt>Semantic pair</dt><dd>{prepared.tokenX.symbol} (X/base) → {prepared.tokenY.symbol} (Y/quote)</dd></div>
+            <div><dt>Factory</dt><dd>{registry.contracts.lbFactory}</dd></div>
+            <div><dt>Router</dt><dd>{prepared.transaction.to}</dd></div>
+            <div><dt>Pinned head</dt><dd>{prepared.review.binding.pinnedHead.number.toString()} · {formatCompactAddress(prepared.review.binding.pinnedHead.hash)}</dd></div>
+            <div><dt>Preset / active ID</dt><dd>{prepared.review.binding.binStep.toString()} / {prepared.review.binding.activeId.toString()}</dd></div>
+            <div><dt>Requested → representable</dt><dd>{prepared.review.binding.requestedQuotePerBase} → {prepared.representedQuotePerBase}</dd></div>
+            <div><dt>Inverse / deviation</dt><dd>{prepared.inverseBasePerQuote} / {formatBps(prepared.deviationBps)}</dd></div>
+            <div><dt>Fees</dt><dd>base {prepared.preset.baseFactor.toString()} · variable {prepared.preset.variableFeeControl.toString()} · protocol {prepared.preset.protocolShare.toString()}</dd></div>
+            <div><dt>Preset timing</dt><dd>filter {prepared.preset.filterPeriod.toString()} · decay {prepared.preset.decayPeriod.toString()} · reduction {prepared.preset.reductionFactor.toString()} · max volatility {prepared.preset.maxVolatilityAccumulator.toString()}</dd></div>
+            <div><dt>Mode</dt><dd>{prepared.review.binding.mode === "create-and-add" ? "Create, then separately review position" : "Create empty pool only"}</dd></div>
+          </dl>
+          <GasReview review={gasReview} />
+          <div className="wizard-actions"><button className="secondary-button" onClick={() => { setStep("configure"); setPrepared(null); setGasReview(null); }} type="button">Back</button><button className="primary-button" data-testid="pool-create-submit" disabled={busy || !reviewIsCurrent(prepared.review)} onClick={() => void handleCreate()} type="button">{busy ? "Checking…" : gasReview ? "Create pool" : "Review gas"}</button></div>
+        </div>
+      ) : null}
+      {step === "create" ? (
+        <div className="pool-creation-result" data-testid="pool-create-result">
+          <strong>{poolCreationRecoveryTitle(recovery, journalRecord)}</strong>
+          <p>{poolCreationRecoveryCopy(recovery, journalRecord)}</p>
+          {existingPool ? (
+            <dl className="review-grid"><div><dt>Winning pair</dt><dd>{existingPool.pair}</dd></div><div><dt>Fresh live X/Y</dt><dd>{existingLiveTokenX?.symbol ?? existingPool.tokenX} / {existingLiveTokenY?.symbol ?? existingPool.tokenY}</dd></div><div><dt>Fresh live ID / price</dt><dd>{existingPool.activeId.toString()} / {formatExactPriceFraction(normalizeQ128Price(existingPool.priceQ128, { baseDecimals: existingLiveTokenX?.decimals ?? 18, quoteDecimals: existingLiveTokenY?.decimals ?? 18 }), 24)}</dd></div></dl>
+          ) : null}
+          {(confirmedPool || existingPool) ? (
+            <div className="wizard-actions">
+              <a className="secondary-button" href={`#/pools/${encodeURIComponent((confirmedPool ?? existingPool)!.pair)}`}>Open exact pool workspace</a>
+              {mode === "create-and-add" ? <a className="primary-button" data-testid="pool-create-position" href={`#/liquidity/add/${encodeURIComponent((confirmedPool ?? existingPool)!.pair)}`}>Create Position · fresh review</a> : null}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      {notice ? <p className="state-row warning" role="status">{notice}</p> : null}
+      {error ? <p className="inline-error" role="alert">{error}</p> : null}
+      {error && journalRecord?.status === "canonical" && !canonicalRecoveryResolved ? <button className="secondary-button" data-testid="pool-create-reconcile-retry" onClick={() => { setError(null); setCanonicalRetryNonce((value) => value + 1); }} type="button">Retry canonical reconciliation</button> : null}
+      {discoveryQuery.isError ? <p className="inline-error" role="alert">{getWriteError(discoveryQuery.error) ?? "Factory discovery failed"}</p> : null}
+    </section>
+  );
+}
+
+async function readPoolCreationToken(
+  client: PublicClient,
+  registry: DexRegistry,
+  address: Address,
+  blockNumber: bigint
+): Promise<PoolCreationTokenChoice> {
+  if (!isAddress(address) || isAddressEqual(address, zeroAddress)) throw new Error("Pool-creation token must be a nonzero address");
+  const listed = registry.tokens[address.toLowerCase()] ?? null;
+  if (listed?.risk.reviewStatus === "blocked") throw new Error(`${listed.symbol} is blocked by the Feather token policy`);
+  const [code, decimals, symbol] = await Promise.all([
+    client.getBytecode({ address, blockNumber }),
+    client.readContract({ address, abi: erc20Abi, functionName: "decimals", blockNumber }),
+    client.readContract({ address, abi: erc20Abi, functionName: "symbol", blockNumber })
+  ]);
+  if (code === undefined || code === "0x") throw new Error(`Token ${address} has no code at the pinned block`);
+  if (!Number.isSafeInteger(decimals) || decimals < 0 || decimals > 36) throw new Error(`Token ${address} decimals must be from 0 to 36`);
+  const normalizedSymbol = symbol.trim();
+  if (normalizedSymbol.length === 0 || normalizedSymbol.length > 32 || /[\u0000-\u001f\u007f]/.test(normalizedSymbol)) {
+    throw new Error(`Token ${address} returned an unsafe symbol`);
+  }
+  if (listed && (listed.decimals !== decimals || listed.symbol !== normalizedSymbol)) {
+    throw new Error(`Token ${address} live metadata differs from the supported token registry`);
+  }
+  return {
+    address,
+    decimals,
+    name: listed?.name ?? normalizedSymbol,
+    symbol: normalizedSymbol,
+    listed: listed !== null
+  };
+}
+
+function normalizePoolCreationPreset(value: unknown): PoolCreationPresetReview {
+  if (!Array.isArray(value) || value.length !== 8 || value[7] !== true || value.slice(0, 7).some((item) => typeof item !== "bigint" || item < 0n)) {
+    throw new Error("Factory returned a malformed or closed pool-creation preset");
+  }
+  return {
+    baseFactor: value[0] as bigint,
+    filterPeriod: value[1] as bigint,
+    decayPeriod: value[2] as bigint,
+    reductionFactor: value[3] as bigint,
+    variableFeeControl: value[4] as bigint,
+    protocolShare: value[5] as bigint,
+    maxVolatilityAccumulator: value[6] as bigint,
+    isOpen: true
+  };
+}
+
+function samePoolCreationPreset(left: PoolCreationPresetReview, right: PoolCreationPresetReview): boolean {
+  return left.isOpen === right.isOpen &&
+    left.baseFactor === right.baseFactor &&
+    left.filterPeriod === right.filterPeriod &&
+    left.decayPeriod === right.decayPeriod &&
+    left.reductionFactor === right.reductionFactor &&
+    left.variableFeeControl === right.variableFeeControl &&
+    left.protocolShare === right.protocolShare &&
+    left.maxVolatilityAccumulator === right.maxVolatilityAccumulator;
+}
+
+async function readDuplicatePoolIdentity(
+  client: PublicClient,
+  factory: Address,
+  pair: Address,
+  selection: PoolCreationSelection,
+  blockNumber: bigint,
+  blockHash: Hex
+): Promise<DuplicatePoolObservation> {
+  const [code, liveFactory, tokenX, tokenY, binStep, activeId, reserves] = await Promise.all([
+    client.getBytecode({ address: pair, blockNumber }),
+    client.readContract({ address: pair, abi: lbPairAbi, functionName: "getFactory", blockNumber }),
+    client.readContract({ address: pair, abi: lbPairAbi, functionName: "getTokenX", blockNumber }),
+    client.readContract({ address: pair, abi: lbPairAbi, functionName: "getTokenY", blockNumber }),
+    client.readContract({ address: pair, abi: lbPairAbi, functionName: "getBinStep", blockNumber }),
+    client.readContract({ address: pair, abi: lbPairAbi, functionName: "getActiveId", blockNumber }),
+    client.readContract({ address: pair, abi: LB_PAIR_RESERVES_ABI, functionName: "getReserves", blockNumber })
+  ]);
+  if (code === undefined || code === "0x") throw new Error("Factory duplicate lookup resolved a pair with no code");
+  if (!isAddressEqual(liveFactory, factory)) throw new Error("Duplicate pair factory does not match the selected deployment");
+  const exactOrientation = isAddressEqual(tokenX, selection.tokenX) && isAddressEqual(tokenY, selection.tokenY);
+  const reverseOrientation = isAddressEqual(tokenX, selection.tokenY) && isAddressEqual(tokenY, selection.tokenX);
+  if (!exactOrientation && !reverseOrientation) {
+    throw new Error("Duplicate pair token identity differs from the requested normalized pair");
+  }
+  if (BigInt(binStep) !== selection.binStep) throw new Error("Duplicate pair bin step differs from the requested preset");
+  const normalizedActiveId = BigInt(activeId);
+  const priceQ128 = await client.readContract({
+    address: pair,
+    abi: lbPairAbi,
+    functionName: "getPriceFromId",
+    args: [Number(normalizedActiveId)],
+    blockNumber
+  });
+  const recoveredId = await client.readContract({
+    address: pair,
+    abi: lbPairAbi,
+    functionName: "getIdFromPrice",
+    args: [priceQ128],
+    blockNumber
+  });
+  const idDelta = BigInt(recoveredId) > normalizedActiveId
+    ? BigInt(recoveredId) - normalizedActiveId
+    : normalizedActiveId - BigInt(recoveredId);
+  if (idDelta > 1n || priceQ128FromActiveId(normalizedActiveId, selection.binStep) !== priceQ128) {
+    throw new Error("Duplicate pair live price and active ID failed exact reconciliation");
+  }
+  const canonical = await client.getBlock({ blockNumber });
+  if (canonical.hash === null || canonical.hash.toLowerCase() !== blockHash.toLowerCase()) {
+    throw new Error("Duplicate pair observation reorganized during pinned reads");
+  }
+  return {
+    pool: {
+      pair,
+      factory,
+      tokenX,
+      tokenY,
+      binStep: selection.binStep,
+      activeId: normalizedActiveId,
+      priceQ128,
+      observedHead: { number: blockNumber, hash: blockHash }
+    },
+    reserveX: reserves[0],
+    reserveY: reserves[1]
+  };
+}
+
+function createDuplicateReviewFallback(input: {
+  account: Address;
+  activeId: bigint;
+  blockHash: Hex;
+  blockNumber: bigint;
+  environmentKey: EnvironmentKey;
+  mode: PoolCreationMode;
+  priceInput: string;
+  pricePreview: {
+    inverseBasePerQuote: string;
+    representedPriceQ128: bigint;
+    representedQuotePerBase: string;
+  };
+  preset: PoolCreationPresetReview;
+  registry: DexRegistry;
+  riskAcknowledged: boolean;
+  selection: PoolCreationSelection;
+  tokenX: PoolCreationTokenChoice;
+  tokenY: PoolCreationTokenChoice;
+}): PoolCreationReview {
+  if (!input.riskAcknowledged) throw new Error("Pool-creation risk acknowledgement is missing");
+  const preflight: CreatablePoolPreflight = {
+    kind: "creatable",
+    blockNumber: input.blockNumber,
+    selection: input.selection
+  };
+  const transaction = buildCreateLBPairTransaction(input.registry.contracts.lbRouter, preflight, input.activeId);
+  return createPoolCreationReview({
+    environment: input.environmentKey,
+    deploymentEpoch: deploymentEpoch(input.registry),
+    chainId: input.registry.chainId,
+    walletChainId: input.registry.chainId,
+    rpcChainId: input.registry.chainId,
+    account: input.account,
+    factory: input.registry.contracts.lbFactory,
+    router: input.registry.contracts.lbRouter,
+    tokenX: input.selection.tokenX,
+    tokenY: input.selection.tokenY,
+    tokenXDecimals: input.tokenX.decimals,
+    tokenYDecimals: input.tokenY.decimals,
+    binStep: input.selection.binStep,
+    activeId: input.activeId,
+    requestedQuotePerBase: input.priceInput,
+    representableQuotePerBase: input.pricePreview.representedQuotePerBase,
+    representablePriceQ128: input.pricePreview.representedPriceQ128,
+    preset: input.preset,
+    pinnedHead: { number: input.blockNumber, hash: input.blockHash },
+    mode: input.mode,
+    transaction,
+    roundingRiskAcknowledged: true
+  });
+}
+
+function poolOverlayRow(
+  pair: Address,
+  prepared: PoolCreationPreparedReview,
+  blockNumber: bigint,
+  registry: DexRegistry
+): PoolRow {
+  return {
+    id: pair,
+    address: pair,
+    tokenXAddress: prepared.review.binding.tokenX,
+    tokenYAddress: prepared.review.binding.tokenY,
+    tokenX: prepared.tokenX.listed ? registry.tokens[prepared.tokenX.address.toLowerCase()] ?? null : null,
+    tokenY: prepared.tokenY.listed ? registry.tokens[prepared.tokenY.address.toLowerCase()] ?? null : null,
+    activeId: prepared.review.binding.activeId.toString(),
+    binStep: prepared.review.binding.binStep.toString(),
+    reserveX: "0",
+    reserveY: "0",
+    volumeX: "0",
+    volumeY: "0",
+    feesX: "0",
+    feesY: "0",
+    factoryAddress: registry.contracts.lbFactory,
+    hooksParameters: null,
+    ignoredForRouting: false,
+    swapCount: "0",
+    depositCount: "0",
+    updatedAtBlock: blockNumber.toString()
+  };
+}
+
+function duplicatePoolOverlayRow(
+  observation: DuplicatePoolObservation,
+  tokenX: PoolCreationTokenChoice,
+  tokenY: PoolCreationTokenChoice,
+  registry: DexRegistry
+): PoolRow {
+  const pool = observation.pool;
+  const liveTokenX = isAddressEqual(pool.tokenX, tokenX.address) ? tokenX : tokenY;
+  const liveTokenY = isAddressEqual(pool.tokenY, tokenY.address) ? tokenY : tokenX;
+  return {
+    id: pool.pair,
+    address: pool.pair,
+    tokenXAddress: pool.tokenX,
+    tokenYAddress: pool.tokenY,
+    tokenX: liveTokenX.listed ? registry.tokens[liveTokenX.address.toLowerCase()] ?? null : null,
+    tokenY: liveTokenY.listed ? registry.tokens[liveTokenY.address.toLowerCase()] ?? null : null,
+    activeId: pool.activeId.toString(),
+    binStep: pool.binStep.toString(),
+    reserveX: observation.reserveX.toString(),
+    reserveY: observation.reserveY.toString(),
+    volumeX: "0",
+    volumeY: "0",
+    feesX: "0",
+    feesY: "0",
+    factoryAddress: pool.factory,
+    hooksParameters: null,
+    ignoredForRouting: false,
+    swapCount: "0",
+    depositCount: "0",
+    updatedAtBlock: pool.observedHead.number.toString()
+  };
+}
+
+function poolCreationRecoveryTitle(
+  recovery: PoolCreationRecoveryState | null,
+  journal: TransactionJournalRecord | null
+): string {
+  if (recovery === null) return journal ? `Creation ${journal.status}` : "Preparing creation";
+  switch (recovery.kind) {
+    case "duplicate": return recovery.source === "race-winner" ? "Another creator won the race" : "Exact pool already exists";
+    case "wallet-rejection": return "Wallet rejected creation";
+    case "ambiguous-submission": return "Submission identity is ambiguous";
+    case "mined-revert": return "Creation reverted onchain";
+    case "canonical-confirmation": return "Pool creation confirmed";
+    case "reorg": return "Creation receipt was reorganized";
+    case "indexing-lag": return "Pool confirmed · indexing catching up";
+    case "created-empty": return "Empty pool created";
+    case "add-rejected": return "Position creation rejected · pool preserved";
+    case "add-reverted": return "Position creation reverted · pool preserved";
+    case "add-ambiguous-submission": return "Position submission ambiguous · pool preserved";
+  }
+}
+
+function poolCreationRecoveryCopy(
+  recovery: PoolCreationRecoveryState | null,
+  journal: TransactionJournalRecord | null
+): string {
+  if (recovery === null) return journal?.rejectionReason ?? "No transaction has been accepted as canonical yet.";
+  switch (recovery.kind) {
+    case "duplicate": return "No create transaction was sent. Live active ID and price were re-read; any position requires a new explicit add review.";
+    case "wallet-rejection": return "No transaction hash was accepted. Refresh the exact review before retrying.";
+    case "ambiguous-submission": return "Retry is blocked while the durable journal searches by sender and nonce for a broadcast.";
+    case "mined-revert": return "The canonical receipt reverted. No pool overlay or position action is enabled.";
+    case "canonical-confirmation": return "Factory event and live pair identity reconciled at the canonical receipt block.";
+    case "reorg": return "The prior receipt is no longer canonical. The RPC overlay was removed and retry requires a fresh review.";
+    case "indexing-lag": return "RPC confirms the exact empty pool. It remains visible here while the indexer is behind; swaps are disabled.";
+    case "created-empty": return "The pool exists with zero creation-block reserves. Position creation is a separate fresh review and never starts automatically.";
+    case "add-rejected":
+    case "add-reverted":
+    case "add-ambiguous-submission": return "The canonical pool remains available. Blind add retry is blocked until live state is refreshed and reviewed again.";
+  }
 }
 
 function PoolDetailView({

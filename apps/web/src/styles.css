@@ -2728,6 +2728,132 @@ a {
   box-shadow: 0 0 12px rgb(74 197 124 / 28%);
 }
 
+.pool-heading-actions,
+.wizard-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.pool-creation-panel {
+  min-width: 0;
+  padding: 18px;
+  background: var(--panel);
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  box-shadow: 0 10px 28px rgb(16 26 31 / 6%);
+}
+
+.pool-creation-steps {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.pool-creation-steps span {
+  padding: 8px;
+  overflow-wrap: anywhere;
+  color: var(--ink-60);
+  font-size: 0.76rem;
+  font-weight: 750;
+  text-align: center;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+}
+
+.pool-creation-steps span.active {
+  color: var(--ink);
+  background: color-mix(in srgb, var(--green) 14%, var(--panel));
+  border-color: var(--green);
+}
+
+.pool-creation-grid,
+.pool-creation-review,
+.pool-creation-result {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.pool-creation-grid > label,
+.pool-creation-grid input,
+.pool-creation-grid select {
+  min-width: 0;
+  width: 100%;
+}
+
+.pool-creation-copy,
+.pool-creation-token-summary span,
+.pool-creation-preview dd,
+.review-grid dd {
+  overflow-wrap: anywhere;
+}
+
+.pool-creation-token-summary {
+  display: grid;
+  gap: 4px;
+}
+
+.pool-creation-token-summary span {
+  color: var(--ink-60);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.72rem;
+}
+
+.pool-creation-preview,
+.review-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0;
+}
+
+.pool-creation-preview div,
+.review-grid div {
+  min-width: 0;
+  padding: 11px;
+  background: var(--card);
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+}
+
+.pool-creation-preview dt,
+.review-grid dt {
+  color: var(--ink-60);
+  font-size: 0.72rem;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+
+.pool-creation-preview dd,
+.review-grid dd {
+  margin: 6px 0 0;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.check-row {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+
+.check-row input {
+  width: auto;
+  margin-top: 3px;
+}
+
+.risk-ack {
+  padding: 12px;
+  color: #663d00;
+  background: #fff4d6;
+  border: 1px solid #f1cf7a;
+  border-radius: 8px;
+}
+
 @keyframes spin {
   to {
     transform: rotate(360deg);
@@ -2868,6 +2994,23 @@ a {
   .route-step {
     align-items: start;
     flex-direction: column;
+  }
+
+  .pool-heading-actions,
+  .wizard-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .pool-heading-actions > *,
+  .wizard-actions > * {
+    width: 100%;
+  }
+
+  .pool-creation-steps,
+  .pool-creation-preview,
+  .review-grid {
+    grid-template-columns: 1fr;
   }
 }
 }

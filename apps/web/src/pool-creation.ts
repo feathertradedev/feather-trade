@@ -244,7 +244,7 @@ export function recordDuplicatePool(
     kind: "duplicate",
     source,
     review,
-    pool: normalizeLivePool(review, pool, false),
+    pool: normalizeLivePool(review, pool, false, true),
     freshAddReviewRequired: review.binding.mode === "create-and-add",
     canAutoSeed: false
   });
@@ -523,14 +523,17 @@ function presetFingerprintFields(preset: PoolCreationPresetReview): string[] {
 function normalizeLivePool(
   review: PoolCreationReview,
   input: LiveCreatedPool,
-  requireReviewedPrice: boolean
+  requireReviewedPrice: boolean,
+  acceptNormalizedTokenPair = false
 ): Readonly<LiveCreatedPool> {
   const pair = normalizeAddress(input.pair, "live pair");
   const factory = normalizeAddress(input.factory, "live factory");
   const tokenX = normalizeAddress(input.tokenX, "live tokenX");
   const tokenY = normalizeAddress(input.tokenY, "live tokenY");
   if (!isAddressEqual(factory, review.binding.factory)) throw new Error("Live pool factory differs from the reviewed factory");
-  if (!isAddressEqual(tokenX, review.binding.tokenX) || !isAddressEqual(tokenY, review.binding.tokenY)) {
+  const exactOrientation = isAddressEqual(tokenX, review.binding.tokenX) && isAddressEqual(tokenY, review.binding.tokenY);
+  const reverseOrientation = isAddressEqual(tokenX, review.binding.tokenY) && isAddressEqual(tokenY, review.binding.tokenX);
+  if (!exactOrientation && !(acceptNormalizedTokenPair && reverseOrientation)) {
     throw new Error("Live pool semantic X/Y differs from the reviewed token order");
   }
   if (input.binStep !== review.binding.binStep) throw new Error("Live pool bin step differs from the reviewed preset");

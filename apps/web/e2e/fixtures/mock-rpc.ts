@@ -1,5 +1,5 @@
 import type { Page } from "@playwright/test";
-import { decodeFunctionData, encodeFunctionResult, numberToHex, type Address, type Hex } from "viem";
+import { decodeFunctionData, encodeAbiParameters, encodeEventTopics, encodeFunctionResult, numberToHex, type Address, type Hex } from "viem";
 
 import { erc20Abi, lbFactoryAbi, lbPairAbi, lbQuoterAbi, lbRouterAbi } from "../../../../packages/sdk/src/abi";
 import { LB_Q128, quoteAddLiquidityMath } from "../../../../packages/sdk/src/liquidity-review";
@@ -18,6 +18,7 @@ export const WNATIVE_USDT_PAIR = "0x1111111111111111111111111111111111111102";
 export const USDT_USDC_PAIR = "0x1111111111111111111111111111111111111103";
 export const WNATIVE_WETH_PAIR = "0x1111111111111111111111111111111111111104";
 export const WETH_USDC_PAIR = "0x1111111111111111111111111111111111111105";
+export const CREATED_WETH_USDT_PAIR = "0x3333333333333333333333333333333333333301";
 export const LB_ROUTER = "0x0165878A594ca255338adfa4d48449f69242Eb8F";
 export const LB_FACTORY = "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9";
 export const DEFAULT_ACCOUNT = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
@@ -29,7 +30,14 @@ const DEFAULT_ALLOWANCE = 10_000_000_000_000_000_000n;
 const DEFAULT_BLOCK_NUMBER = 42n;
 const DEFAULT_POSITION_LIQUIDITY = 2_000_000_000_000_000_000n;
 const TX_HASH = "0x1111111111111111111111111111111111111111111111111111111111111111";
-const RPC_ABI = [...erc20Abi, ...lbFactoryAbi, ...lbPairAbi, ...lbQuoterAbi, ...lbRouterAbi] as const;
+const LB_PAIR_RESERVES_ABI = [{
+  type: "function",
+  name: "getReserves",
+  stateMutability: "view",
+  inputs: [],
+  outputs: [{ name: "reserveX", type: "uint128" }, { name: "reserveY", type: "uint128" }]
+}] as const;
+const RPC_ABI = [...erc20Abi, ...lbFactoryAbi, ...lbPairAbi, ...lbQuoterAbi, ...lbRouterAbi, ...LB_PAIR_RESERVES_ABI] as const;
 const ZERO_HOOKS = `0x${"0".repeat(64)}` as Hex;
 
 export interface MockRpcOptions {
@@ -49,6 +57,7 @@ export interface MockRpcOptions {
   binTotalSupply?: bigint;
   blockHash?: Hex;
   blockNumber?: bigint;
+  blockNumberAfterReceipt?: bigint;
   chainId?: number;
   clearPositionsAfterReceipt?: boolean;
   dashboardPoolLimit?: number;
@@ -60,6 +69,10 @@ export interface MockRpcOptions {
   factoryAddress?: Address;
   factoryLookupIgnored?: boolean;
   factoryLookupPair?: Address;
+  createdPairAddress?: Address;
+  poolCreationOpenBinSteps?: bigint[];
+  poolCreationQuoteAssets?: Address[];
+  poolCreationPresetOpen?: boolean;
   hookAddress?: Address;
   hookCode?: Hex;
   hooksParameters?: Hex;
@@ -81,6 +94,7 @@ export interface MockRpcOptions {
   maxRemoveLiquidityBinsForEstimate?: number;
   maxRemoveLiquidityBinsForSimulation?: number;
   nativeBalance?: bigint;
+  noCodeAddresses?: Address[];
   omitActivePoolBin?: boolean;
   ownerPositionCount?: number;
   ownerPositionsFailAtSkip?: number;
@@ -127,6 +141,11 @@ export interface MockRpcSnapshot {
   graphRequests: Array<{ query: string; variables: GraphRequest["variables"] }>;
   methods: string[];
   rpcHttpRequests: number;
+  creationConfirmed: boolean;
+  createdTokenX: Address | null;
+  createdTokenY: Address | null;
+  createdBinStep: number | null;
+  createdActiveId: number | null;
 }
 
 export interface InstalledMockRpc {
@@ -166,7 +185,12 @@ export async function installMockRpc(page: Page, options: MockRpcOptions = {}): 
     graphQueries: [],
     graphRequests: [],
     methods: [],
-    rpcHttpRequests: 0
+    rpcHttpRequests: 0,
+    creationConfirmed: false,
+    createdTokenX: null,
+    createdTokenY: null,
+    createdBinStep: null,
+    createdActiveId: null
   };
 
   await page.route(`${LOCALNET_RPC_URL}/`, async (route) => {
@@ -452,6 +476,7 @@ async function handleRpc(request: RpcRequest, options: MockRpcOptions, state: Mo
       case "eth_gasPrice":
         return rpcResult(request, numberToHex(options.gasPrice ?? 1_000_000_000n));
       case "eth_getTransactionReceipt":
+        const receiptBlockNumber = options.receiptBlockNumber ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER;
         if ((options.receiptStatus ?? "success") === "success") {
           if (options.clearPositionsAfterReceipt === true) options.includePositions = false;
           if (options.allowanceAfterReceipt !== undefined) options.allowance = options.allowanceAfterReceipt;
@@ -461,14 +486,28 @@ async function handleRpc(request: RpcRequest, options: MockRpcOptions, state: Mo
           if (options.pairTokenXAfterReceipt !== undefined) options.pairTokenX = options.pairTokenXAfterReceipt;
           if (options.quoteDelayMsAfterReceipt !== undefined) options.quoteDelayMs = options.quoteDelayMsAfterReceipt;
           if (options.quoteRateAfterReceipt !== undefined) options.quoteRate = options.quoteRateAfterReceipt;
+          if (options.blockNumberAfterReceipt !== undefined) options.blockNumber = options.blockNumberAfterReceipt;
+          const createCall = state.ethCalls.findLast((call) => call.functionName === "createLBPair");
+          if (createCall) {
+            const decoded = decodeFunctionData({ abi: lbRouterAbi, data: createCall.data });
+            const [tokenX, tokenY, activeId, binStep] = decoded.args as readonly [Address, Address, number, number];
+            state.creationConfirmed = true;
+            state.createdTokenX = tokenX;
+            state.createdTokenY = tokenY;
+            state.createdActiveId = activeId;
+            state.createdBinStep = binStep;
+          }
         }
-        return rpcResult(request, transactionReceipt(options.receiptBlockNumber ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER, options.receiptStatus ?? "success"));
+        return rpcResult(request, transactionReceipt(receiptBlockNumber, options.receiptStatus ?? "success", options, state));
       case "eth_getTransactionByHash":
         return rpcResult(request, transactionByHash(options.receiptBlockNumber ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER, state));
       case "eth_getBalance":
         return rpcResult(request, numberToHex(options.nativeBalance ?? DEFAULT_BALANCE));
       case "eth_getCode": {
         const address = String(request.params?.[0] ?? "").toLowerCase();
+        if (options.noCodeAddresses?.some((candidate) => candidate.toLowerCase() === address)) {
+          return rpcResult(request, "0x");
+        }
         if (options.hookAddress && address === options.hookAddress.toLowerCase()) {
           return rpcResult(request, options.hookCode ?? "0x6001600055");
         }
@@ -521,7 +560,7 @@ async function handleEthCall(
 
   if (
     options.simulationDelayMs !== undefined &&
-    ["addLiquidity", "approve", "approveForAll", "removeLiquidity", "swapExactTokensForTokens"].includes(
+    ["addLiquidity", "approve", "approveForAll", "createLBPair", "removeLiquidity", "swapExactTokensForTokens"].includes(
       functionName
     )
   ) {
@@ -536,16 +575,74 @@ async function handleEthCall(
     throw new Error("Mock wallet read failed");
   }
 
+  if (functionName === "decimals") {
+    return encodeFunctionResult({ abi: erc20Abi, functionName, result: 18 });
+  }
+
+  if (functionName === "symbol") {
+    const symbol = addressEquals(call.to ?? "", WNATIVE)
+      ? "WNATIVE"
+      : addressEquals(call.to ?? "", USDC)
+        ? "USDC"
+        : addressEquals(call.to ?? "", USDT)
+          ? "USDT"
+          : addressEquals(call.to ?? "", WETH)
+            ? "WETH"
+            : "MOCK";
+    return encodeFunctionResult({ abi: erc20Abi, functionName, result: symbol });
+  }
+
+  if (functionName === "getOpenBinSteps") {
+    return encodeFunctionResult({ abi: lbFactoryAbi, functionName, result: options.poolCreationOpenBinSteps ?? [10n, 25n] });
+  }
+
+  if (functionName === "getNumberOfQuoteAssets") {
+    return encodeFunctionResult({ abi: lbFactoryAbi, functionName, result: BigInt((options.poolCreationQuoteAssets ?? [USDC, USDT]).length) });
+  }
+
+  if (functionName === "getQuoteAssetAtIndex") {
+    const [index] = decoded.args as readonly [bigint];
+    const quote = (options.poolCreationQuoteAssets ?? [USDC, USDT])[Number(index)];
+    if (!quote) throw new Error("Missing mock quote asset");
+    return encodeFunctionResult({ abi: lbFactoryAbi, functionName, result: quote });
+  }
+
+  if (functionName === "isQuoteAsset") {
+    const [token] = decoded.args as readonly [Address];
+    return encodeFunctionResult({
+      abi: lbFactoryAbi,
+      functionName,
+      result: (options.poolCreationQuoteAssets ?? [USDC, USDT]).some((asset) => addressEquals(asset, token))
+    });
+  }
+
+  if (functionName === "getPreset") {
+    return encodeFunctionResult({
+      abi: lbFactoryAbi,
+      functionName,
+      result: [20n, 30n, 600n, 5_000n, 40_000n, 1_000n, 350_000n, options.poolCreationPresetOpen ?? true]
+    });
+  }
+
   if (functionName === "getTokenX") {
-    return encodeFunctionResult({ abi: lbPairAbi, functionName, result: options.pairRuntimeTokenX ?? pairMetadata(call.to, options).tokenX });
+    const createdPair = options.createdPairAddress ?? CREATED_WETH_USDT_PAIR;
+    const result = state.creationConfirmed && addressEquals(call.to ?? "", createdPair)
+      ? state.createdTokenX!
+      : options.pairRuntimeTokenX ?? pairMetadata(call.to, options).tokenX;
+    return encodeFunctionResult({ abi: lbPairAbi, functionName, result });
   }
 
   if (functionName === "getTokenY") {
-    return encodeFunctionResult({ abi: lbPairAbi, functionName, result: options.pairRuntimeTokenY ?? pairMetadata(call.to, options).tokenY });
+    const createdPair = options.createdPairAddress ?? CREATED_WETH_USDT_PAIR;
+    const result = state.creationConfirmed && addressEquals(call.to ?? "", createdPair)
+      ? state.createdTokenY!
+      : options.pairRuntimeTokenY ?? pairMetadata(call.to, options).tokenY;
+    return encodeFunctionResult({ abi: lbPairAbi, functionName, result });
   }
 
   if (functionName === "getFactory") {
-    const pairCall = allPairMetadata(options).some((item) => addressEquals(item.pair, call.to ?? ""));
+    const pairCall = allPairMetadata(options).some((item) => addressEquals(item.pair, call.to ?? "")) ||
+      (state.creationConfirmed && addressEquals(call.to ?? "", options.createdPairAddress ?? CREATED_WETH_USDT_PAIR));
     return encodeFunctionResult({ abi: lbPairAbi, functionName, result: pairCall ? options.pairFactoryAddress ?? options.factoryAddress ?? LB_FACTORY : options.factoryAddress ?? LB_FACTORY });
   }
 
@@ -563,7 +660,11 @@ async function handleEthCall(
   }
 
   if (functionName === "getBinStep") {
-    return encodeFunctionResult({ abi: lbPairAbi, functionName, result: options.pairRuntimeBinStep ?? pairMetadata(call.to, options).binStep });
+    const createdPair = options.createdPairAddress ?? CREATED_WETH_USDT_PAIR;
+    const result = state.creationConfirmed && addressEquals(call.to ?? "", createdPair)
+      ? state.createdBinStep!
+      : options.pairRuntimeBinStep ?? pairMetadata(call.to, options).binStep;
+    return encodeFunctionResult({ abi: lbPairAbi, functionName, result });
   }
 
   if (functionName === "getLBHooksParameters") {
@@ -575,12 +676,18 @@ async function handleEthCall(
     const metadata = allPairMetadata(options).find((item) =>
       item.binStep === Number(requestedBinStep) && tokenPairKey(item.tokenX, item.tokenY) === tokenPairKey(tokenX, tokenY)
     );
+    const createdPair = options.createdPairAddress ?? CREATED_WETH_USDT_PAIR;
+    const createdMatch = state.creationConfirmed && state.createdTokenX && state.createdTokenY && state.createdBinStep === Number(requestedBinStep) &&
+      tokenPairKey(state.createdTokenX, state.createdTokenY) === tokenPairKey(tokenX, tokenY);
+    const resolvedPair = options.factoryLookupPair ?? (createdMatch ? createdPair : metadata?.pair) ?? "0x0000000000000000000000000000000000000000";
     return encodeFunctionResult({
       abi: lbFactoryAbi,
       functionName,
       result: {
-        LBPair: options.factoryLookupPair ?? metadata?.pair ?? "0x0000000000000000000000000000000000000000",
-        binStep: options.pairRuntimeBinStep ?? metadata?.binStep ?? Number(requestedBinStep),
+        LBPair: resolvedPair,
+        binStep: addressEquals(resolvedPair, "0x0000000000000000000000000000000000000000")
+          ? 0
+          : options.pairRuntimeBinStep ?? (createdMatch ? state.createdBinStep! : metadata?.binStep) ?? Number(requestedBinStep),
         createdByOwner: false,
         ignoredForRouting: options.factoryLookupIgnored ?? false
       }
@@ -588,7 +695,9 @@ async function handleEthCall(
   }
 
   if (functionName === "getActiveId") {
-    return encodeFunctionResult({ abi: lbPairAbi, functionName, result: activeIdFor(options) });
+    const createdPair = options.createdPairAddress ?? CREATED_WETH_USDT_PAIR;
+    const result = state.creationConfirmed && addressEquals(call.to ?? "", createdPair) ? state.createdActiveId! : activeIdFor(options);
+    return encodeFunctionResult({ abi: lbPairAbi, functionName, result });
   }
 
   if (functionName === "getPriceFromId") {
@@ -685,6 +794,14 @@ async function handleEthCall(
     });
   }
 
+  if (functionName === "getReserves") {
+    return encodeFunctionResult({
+      abi: LB_PAIR_RESERVES_ABI,
+      functionName,
+      result: [options.pairReserveX ?? 0n, options.pairReserveY ?? 0n]
+    });
+  }
+
   if (functionName === "totalSupply") {
     return encodeFunctionResult({
       abi: lbPairAbi,
@@ -721,6 +838,15 @@ async function handleEthCall(
   if (functionName === "approveForAll") {
     if (options.simulationMode === "error") throw new Error("Mock LB approval simulation failed");
     return "0x";
+  }
+
+  if (functionName === "createLBPair") {
+    if (options.simulationMode === "error") throw new Error("Mock pool creation simulation failed");
+    return encodeFunctionResult({
+      abi: lbRouterAbi,
+      functionName,
+      result: options.createdPairAddress ?? CREATED_WETH_USDT_PAIR
+    });
   }
 
   if (functionName === "swapExactTokensForTokens") {
@@ -971,7 +1097,32 @@ function addressEquals(left: string, right: string): boolean {
   return left.toLowerCase() === right.toLowerCase();
 }
 
-function transactionReceipt(blockNumber: bigint, status: "success" | "reverted"): Record<string, unknown> {
+function transactionReceipt(
+  blockNumber: bigint,
+  status: "success" | "reverted",
+  options: MockRpcOptions,
+  state: MockRpcSnapshot
+): Record<string, unknown> {
+  const logs = status === "success" && state.creationConfirmed && state.createdTokenX && state.createdTokenY && state.createdBinStep !== null
+    ? [{
+        address: options.factoryAddress ?? LB_FACTORY,
+        blockHash: options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222",
+        blockNumber: numberToHex(blockNumber),
+        data: encodeAbiParameters(
+          [{ name: "LBPair", type: "address" }, { name: "pid", type: "uint256" }],
+          [options.createdPairAddress ?? CREATED_WETH_USDT_PAIR, 6n]
+        ),
+        logIndex: "0x0",
+        removed: false,
+        topics: encodeEventTopics({
+          abi: lbFactoryAbi,
+          eventName: "LBPairCreated",
+          args: { tokenX: state.createdTokenX, tokenY: state.createdTokenY, binStep: BigInt(state.createdBinStep) }
+        }),
+        transactionHash: TX_HASH,
+        transactionIndex: "0x0"
+      }]
+    : [];
   return {
     blockHash: "0x2222222222222222222222222222222222222222222222222222222222222222",
     blockNumber: numberToHex(blockNumber),
@@ -980,7 +1131,7 @@ function transactionReceipt(blockNumber: bigint, status: "success" | "reverted")
     effectiveGasPrice: numberToHex(1n),
     from: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
     gasUsed: numberToHex(100_000n),
-    logs: [],
+    logs,
     logsBloom: `0x${"0".repeat(512)}`,
     status: status === "success" ? "0x1" : "0x0",
     to: "0x0165878A594ca255338adfa4d48449f69242Eb8F",
@@ -992,7 +1143,7 @@ function transactionReceipt(blockNumber: bigint, status: "success" | "reverted")
 
 function transactionByHash(blockNumber: bigint, state: MockRpcSnapshot): Record<string, unknown> {
   const simulatedTransaction = state.ethCalls.findLast((call) =>
-    ["addLiquidity", "approve", "approveForAll", "removeLiquidity", "swapExactTokensForTokens"].includes(
+    ["addLiquidity", "approve", "approveForAll", "createLBPair", "removeLiquidity", "swapExactTokensForTokens"].includes(
       call.functionName
     )
   );
