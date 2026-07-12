@@ -55,6 +55,8 @@
     "release:testnet-evidence:check": "node scripts/release/materialize-testnet-evidence.cjs --check && node scripts/release/validate-testnet-launch-packet.cjs",
     "release:testnet-evidence:test": "node scripts/release/test-validate-testnet-launch-packet.cjs",
     "manifests:validate": "node scripts/manifests/validate-manifests.cjs && node scripts/manifests/test-validate-manifests.cjs",
+    "wave4:validate": "node validation/wave-4/validate.mjs --strict --json",
+    "wave4:test": "node validation/wave-4/test.mjs",
     "tokens:validate": "node scripts/tokens/validate-token-lists.cjs",
     "sdk:build": "pnpm --filter @robinhood-lb/sdk build",
     "sdk:test": "pnpm --filter @robinhood-lb/sdk test",

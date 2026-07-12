@@ -48,6 +48,12 @@ jobs:
       - name: Validate deployment manifests
         run: pnpm manifests:validate
 
+      - name: Test Wave 4 matrix validator
+        run: pnpm wave4:test
+
+      - name: Validate Wave 4 matrix foundation
+        run: pnpm wave4:validate
+
       - name: Test Robinhood RPC readiness helper
         run: pnpm robinhood:rpc:test
 

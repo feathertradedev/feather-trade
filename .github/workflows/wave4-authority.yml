@@ -1,0 +1,173 @@
+name: Wave 4 Authority
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  append-only-authority:
+    name: Trusted Wave 4 append-only authority
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Setup trusted Node runtime
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          package-manager-cache: false
+          node-version: 24
+
+      - name: Validate candidate as inert data with the base validator
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.base.sha || github.event.before }}
+          BASE_REPOSITORY: ${{ github.repository }}
+          CURRENT_SHA: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.event.after }}
+          CURRENT_REPOSITORY: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name || github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          FORCED_PUSH: ${{ github.event_name == 'push' && github.event.forced || false }}
+          GIT_NO_LAZY_FETCH: "1"
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          post_pr_status() {
+            state="$1"
+            description="$2"
+            if [ "$EVENT_NAME" = "pull_request_target" ]; then
+              curl --fail --silent --show-error \
+                --request POST \
+                --header "Authorization: Bearer $GH_TOKEN" \
+                --header 'Accept: application/vnd.github+json' \
+                --header 'X-GitHub-Api-Version: 2022-11-28' \
+                "https://api.github.com/repos/$GITHUB_REPOSITORY/statuses/$CURRENT_SHA" \
+                --data "{\"state\":\"$state\",\"context\":\"wave4/append-only-authority\",\"description\":\"$description\"}" \
+                >/dev/null
+            fi
+          }
+          finish_status() {
+            exit_code="$?"
+            trap - EXIT
+            if [ "$exit_code" -eq 0 ]; then
+              post_pr_status success 'Trusted base validator accepted append-only authority'
+            else
+              post_pr_status failure 'Trusted base validator rejected candidate authority'
+            fi
+            exit "$exit_code"
+          }
+          trap finish_status EXIT
+
+          case "$BASE_SHA" in (*[!0-9a-f]*|'') echo 'invalid base event commit' >&2; exit 1;; esac
+          case "$CURRENT_SHA" in (*[!0-9a-f]*|'') echo 'invalid current event commit' >&2; exit 1;; esac
+          case "$BASE_REPOSITORY" in (*[!A-Za-z0-9_.\/-]*|*/*/*|/*|*/|'') echo 'invalid base repository identity' >&2; exit 1;; esac
+          case "$CURRENT_REPOSITORY" in (*[!A-Za-z0-9_.\/-]*|*/*/*|/*|*/|'') echo 'invalid current repository identity' >&2; exit 1;; esac
+          test "${#BASE_SHA}" -eq 40
+          test "${#CURRENT_SHA}" -eq 40
+          post_pr_status pending 'Trusted base validator is checking candidate authority'
+          if [ "$FORCED_PUSH" = "true" ]; then
+            echo 'forced main pushes cannot preserve append-only authority' >&2
+            exit 1
+          fi
+
+          TRUSTED_REPO="$RUNNER_TEMP/wave4-objects.git"
+          BASE_TREE="$GITHUB_WORKSPACE/base-tree"
+          CURRENT_TREE="$GITHUB_WORKSPACE/current-tree"
+          EMPTY_GIT_CONFIG="$RUNNER_TEMP/wave4-empty-gitconfig"
+          EMPTY_HOOKS="$RUNNER_TEMP/wave4-empty-hooks"
+          : >"$EMPTY_GIT_CONFIG"
+          mkdir -p "$EMPTY_HOOKS"
+          export GIT_CONFIG_NOSYSTEM=1
+          export GIT_CONFIG_GLOBAL="$EMPTY_GIT_CONFIG"
+          export GIT_TERMINAL_PROMPT=0
+          umask 077
+          git init --bare "$TRUSTED_REPO"
+          git -C "$TRUSTED_REPO" config core.hooksPath "$EMPTY_HOOKS"
+          mkdir -p "$BASE_TREE/validation/wave-4" "$CURRENT_TREE/validation/wave-4"
+
+          ulimit -f 262144
+          timeout 90 git -C "$TRUSTED_REPO" fetch --no-tags --no-write-fetch-head --depth=1 --filter=blob:limit=1048577 "https://github.com/${BASE_REPOSITORY}.git" "$BASE_SHA"
+          timeout 90 git -C "$TRUSTED_REPO" fetch --no-tags --no-write-fetch-head --depth=1 --filter=blob:limit=1048577 "https://github.com/${CURRENT_REPOSITORY}.git" "$CURRENT_SHA"
+          git -C "$TRUSTED_REPO" cat-file -e "$BASE_SHA^{commit}"
+          git -C "$TRUSTED_REPO" cat-file -e "$CURRENT_SHA^{commit}"
+          test "$(git -C "$TRUSTED_REPO" rev-parse "$BASE_SHA^{commit}")" = "$BASE_SHA"
+          test "$(git -C "$TRUSTED_REPO" rev-parse "$CURRENT_SHA^{commit}")" = "$CURRENT_SHA"
+          while read -r promisor_key _; do
+            git -C "$TRUSTED_REPO" config --unset-all "$promisor_key"
+          done < <(git -C "$TRUSTED_REPO" config --get-regexp '^remote\..*\.promisor$' || true)
+          git -C "$TRUSTED_REPO" config --unset-all extensions.partialClone || true
+          export GIT_NO_LAZY_FETCH=1
+          test "$(du -sk "$TRUSTED_REPO/objects" | awk '{print $1}')" -le 131072
+
+          materialize_wave4() {
+            commit="$1"
+            destination="$2"
+            count=0
+            aggregate_bytes=0
+            object_ids=()
+            object_sizes=()
+            object_paths=()
+            while IFS= read -r -d '' entry; do
+              case "$entry" in (*$'\t'*) ;; (*) echo 'malformed git tree entry' >&2; exit 1;; esac
+              metadata="${entry%%$'\t'*}"
+              object_path="${entry#*$'\t'}"
+              read -r object_mode object_type object_id object_size extra <<<"$metadata"
+              test -z "${extra:-}"
+              test "$object_mode" = '100644'
+              test "$object_type" = 'blob'
+              case "$object_id" in (*[!0-9a-f]*|'') echo 'invalid git object ID' >&2; exit 1;; esac
+              test "${#object_id}" -eq 40
+              case "$object_size" in (*[!0-9]*|'') echo 'invalid git object size' >&2; exit 1;; esac
+              test "$object_size" -le 1048576
+              case "$object_path" in
+                validation/wave-4/README.md|validation/wave-4/test.mjs|validation/wave-4/validate.mjs|validation/wave-4/registry/events.jsonl) ;;
+                validation/wave-4/cases/[a-z][a-z0-9-]*.jsonl) ;;
+                validation/wave-4/runs/[0-9][0-9][0-9][0-9]/A-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9].json) ;;
+                *) echo 'unexpected path in Wave 4 git tree' >&2; exit 1;;
+              esac
+              case "$object_path" in (*[[:cntrl:]]*) echo 'control character in git path' >&2; exit 1;; esac
+              count=$((count + 1))
+              aggregate_bytes=$((aggregate_bytes + object_size))
+              test "$count" -le 10000
+              test "$aggregate_bytes" -le 4194304
+              object_ids+=("$object_id")
+              object_sizes+=("$object_size")
+              object_paths+=("$object_path")
+            done < <(git -C "$TRUSTED_REPO" ls-tree -rz --full-tree --long \
+              "$commit" -- validation/wave-4)
+
+            for index in "${!object_ids[@]}"; do
+              output_path="$destination/${object_paths[$index]}"
+              mkdir -p "$(dirname "$output_path")"
+              temporary_path="$output_path.tmp"
+              test ! -e "$temporary_path"
+              (set -o noclobber; GIT_NO_LAZY_FETCH=1 git -C "$TRUSTED_REPO" cat-file blob "${object_ids[$index]}" >"$temporary_path")
+              test "$(wc -c <"$temporary_path" | tr -d ' ')" = "${object_sizes[$index]}"
+              chmod 0644 "$temporary_path"
+              mv -n "$temporary_path" "$output_path"
+              test -f "$output_path"
+              test ! -e "$temporary_path"
+            done
+          }
+          materialize_wave4 "$BASE_SHA" "$BASE_TREE"
+          materialize_wave4 "$CURRENT_SHA" "$CURRENT_TREE"
+
+          BASE_VALIDATOR="$BASE_TREE/validation/wave-4/validate.mjs"
+          if [ ! -f "$BASE_VALIDATOR" ]; then
+            echo 'trusted base validator is absent; one-time bootstrap requires explicit external audit and cannot self-attest' >&2
+            exit 1
+          fi
+
+          if ! git -C "$TRUSTED_REPO" diff --quiet "$BASE_SHA" "$CURRENT_SHA" -- \
+            .github/workflows/wave4-authority.yml \
+            validation/wave-4/validate.mjs; then
+            echo 'trusted authority workflow and base validator are frozen under the normal authority context' >&2
+            exit 1
+          fi
+
+          validator_args=(--strict --json --repository "$TRUSTED_REPO" --base "$BASE_TREE/validation/wave-4" --expected-subject-commit "$BASE_SHA" --candidate-commit "$CURRENT_SHA")
+          node "$BASE_VALIDATOR" "${validator_args[@]}" "$CURRENT_TREE/validation/wave-4"
