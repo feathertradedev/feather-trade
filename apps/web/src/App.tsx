@@ -193,6 +193,7 @@ import {
   deterministicTokenFallback,
   poolChoiceIdentityLabel,
   maxAmountInput,
+  safeMaxAmount,
   parseTokenAmount,
   tokenAmountErrorMessage
 } from "./token-safety";
@@ -1287,6 +1288,10 @@ function SwapView({
   const swapOperationGeneration = useRef(0);
   const approvalSubmitInFlight = useRef(false);
   const swapSubmitInFlight = useRef(false);
+  const nativeSwapMaxProbeRef = useRef(false);
+  const nativeSwapMaxBindingRef = useRef<{ context: string; value: bigint } | null>(null);
+  const latestSwapGasObservationRef = useRef<{ balance: bigint; context: string; reserve: bigint } | null>(null);
+  const [nativeSwapMaxPending, setNativeSwapMaxPending] = useState(false);
   const [handledApprovalHash, setHandledApprovalHash] = useState<Address | null>(null);
   const [handledSwapHash, setHandledSwapHash] = useState<Address | null>(null);
   const [submittedApprovalReceiptContext, setSubmittedApprovalReceiptContext] = useState<string | null>(null);
@@ -1372,6 +1377,7 @@ function SwapView({
     walletChainId: activeWalletChainId
   };
   const swapContextFingerprint = swapExecutionContextFingerprint(swapExecutionContext);
+  const swapMaxContextFingerprint = swapExecutionContextFingerprint({ ...swapExecutionContext, amountIn: null });
   const swapOperationContext = useRef(swapContextFingerprint);
   if (swapOperationContext.current !== swapContextFingerprint) {
     swapOperationContext.current = swapContextFingerprint;
@@ -2053,6 +2059,7 @@ function SwapView({
 
   const handleSwap = async () => {
     if (swapSubmitInFlight.current || !canSwap || !account.address || !exactQuote || parsedAmount === null || amountOutMin === null || deadlineMinutes === null) return;
+    const nativeMaxProbe = nativeSwapMaxProbeRef.current;
     swapSubmitInFlight.current = true;
     swapWrite.reset();
     setSubmittedSwapReceiptContext(null);
@@ -2110,6 +2117,7 @@ function SwapView({
       latestSwapContextFingerprint.current === simulatedContextFingerprint &&
       latestSwapQuoteIdentity.current === simulatedQuoteIdentity &&
       !quoteIsStale(quoteUpdatedAt, Date.now());
+    const gasObservation: { value: { balance: bigint; review: ExactGasReview } | null } = { value: null };
     const gasApproved = await reviewExactGas({
       action: "swap",
       currentReview: gasReview,
@@ -2120,8 +2128,30 @@ function SwapView({
       isCurrent: gasReviewIsCurrent,
       setError: setGasReviewError,
       setReview: setGasReview,
+      onReview: (review, nativeBalance) => {
+        gasObservation.value = { balance: nativeBalance, review };
+        latestSwapGasObservationRef.current = { balance: nativeBalance, context: swapMaxContextFingerprint, reserve: review.bufferedWei };
+        if (!nativeMaxProbe) return;
+        const max = safeMaxAmount({ asset: "native", balance: nativeBalance, gasReserveWei: review.bufferedWei });
+        if (max === 0n) {
+          setGasReviewError("Native Max is unavailable because the wallet balance does not exceed the reviewed gas reserve");
+          return;
+        }
+        nativeSwapMaxBindingRef.current = { context: swapMaxContextFingerprint, value: max };
+        setAmount(maxAmountInput({ asset: "native", balance: nativeBalance, decimals: 18, gasReserveWei: review.bufferedWei }));
+      },
       transactionValue: transaction.value
     });
+    if (nativeMaxProbe) return;
+    const finalGasObservation = gasObservation.value;
+    if (nativeInput && nativeSwapMaxBindingRef.current !== null && finalGasObservation !== null) {
+      const binding = nativeSwapMaxBindingRef.current;
+      const exactMax = safeMaxAmount({ asset: "native", balance: finalGasObservation.balance, gasReserveWei: finalGasObservation.review.bufferedWei });
+      if (binding.context !== swapMaxContextFingerprint || parsedAmount !== binding.value || parsedAmount !== exactMax) {
+        setGasReviewError("Native Max changed with the latest balance or buffered gas; press Max again before wallet confirmation");
+        return;
+      }
+    }
     if (!gasApproved || !gasReviewIsCurrent()) return;
     try {
       await attestCurrentSwapRoute();
@@ -2186,7 +2216,31 @@ function SwapView({
     }
     } finally {
       swapSubmitInFlight.current = false;
+      if (nativeMaxProbe) {
+        nativeSwapMaxProbeRef.current = false;
+        setNativeSwapMaxPending(false);
+      }
     }
+  };
+
+  const canReuseNativeSwapMaxObservation = nativeSwapMaxBindingRef.current?.context === swapMaxContextFingerprint && latestSwapGasObservationRef.current?.context === swapMaxContextFingerprint && parsedAmount !== null && parsedAmount > 0n;
+  const handleNativeSwapMax = () => {
+    if (!nativeInput || nativeSwapMaxPending) return;
+    const observation = latestSwapGasObservationRef.current;
+    if (gasReview?.action === "swap" && observation !== null && canReuseNativeSwapMaxObservation) {
+      const max = safeMaxAmount({ asset: "native", balance: observation.balance, gasReserveWei: observation.reserve });
+      if (max === 0n) {
+        setGasReviewError("Native Max is unavailable because the wallet balance does not exceed the reviewed gas reserve");
+        return;
+      }
+      setAmount(maxAmountInput({ asset: "native", balance: observation.balance, decimals: 18, gasReserveWei: observation.reserve }));
+      nativeSwapMaxBindingRef.current = { context: swapMaxContextFingerprint, value: max };
+      return;
+    }
+    if (!canSwap) return;
+    nativeSwapMaxProbeRef.current = true;
+    setNativeSwapMaxPending(true);
+    void handleSwap();
   };
 
   return (
@@ -2222,10 +2276,10 @@ function SwapView({
           <fieldset className="routing-mode-control" data-testid="swap-native-mode">
             <legend>Wrapped-native asset mode</legend>
             <div className="segmented" role="group" aria-label="Wrapped-native asset mode">
-              <button aria-pressed={useNativeWrapper} className={useNativeWrapper ? "segment active" : "segment"} onClick={() => { setUseNativeWrapper(true); setApprovalConfirmation(null); setNativeReceiptReview(null); setNativeReceiptError(null); }} type="button">ETH · native</button>
-              <button aria-pressed={!useNativeWrapper} className={!useNativeWrapper ? "segment active" : "segment"} onClick={() => { setUseNativeWrapper(false); setApprovalConfirmation(null); setNativeReceiptReview(null); setNativeReceiptError(null); }} type="button">{wrappedNativeToken.symbol} · ERC-20</button>
+              <button aria-pressed={useNativeWrapper} className={useNativeWrapper ? "segment active" : "segment"} onClick={() => { nativeSwapMaxBindingRef.current = null; setUseNativeWrapper(true); setApprovalConfirmation(null); setNativeReceiptReview(null); setNativeReceiptError(null); }} type="button">ETH · native</button>
+              <button aria-pressed={!useNativeWrapper} className={!useNativeWrapper ? "segment active" : "segment"} onClick={() => { nativeSwapMaxBindingRef.current = null; setUseNativeWrapper(false); setApprovalConfirmation(null); setNativeReceiptReview(null); setNativeReceiptError(null); }} type="button">{wrappedNativeToken.symbol} · ERC-20</button>
             </div>
-            <p data-testid="swap-wrapper-disclosure">ETH uses router native calldata and transaction value. {wrappedNativeToken.symbol} remains ERC-20 {wrappedNativeToken.address} and requires allowance when sold.</p>
+            <p data-testid="swap-wrapper-disclosure">ETH uses router native calldata and transaction value. {wrappedNativeToken.symbol} remains ERC-20 {wrappedNativeToken.address} and requires allowance when sold. Native Max requires a current positive probe amount so Feather can review buffered gas before computing spendable ETH.</p>
           </fieldset>
         ) : null}
 
@@ -2250,25 +2304,27 @@ function SwapView({
           Sell
         </label>
         <div className="amount-box">
-          <input id="swap-amount" inputMode="decimal" onChange={(event) => setAmount(event.target.value)} value={amount} />
+          <input id="swap-amount" inputMode="decimal" onChange={(event) => { nativeSwapMaxBindingRef.current = null; setAmount(event.target.value); }} value={amount} />
           <span>{inputSymbol}</span>
           <button
             className="token-max-button"
             data-testid="swap-max-button"
-            disabled={walletBalance === null || tokenIn === null || nativeInput}
+            disabled={walletBalance === null || tokenIn === null || (nativeInput && ((!canSwap && !canReuseNativeSwapMaxObservation) || nativeSwapMaxPending))}
             onClick={() => {
-              if (walletBalance !== null && tokenIn !== null) setAmount(maxAmountInput({ asset: "token", balance: walletBalance, decimals: tokenIn.decimals }));
+              if (nativeInput) handleNativeSwapMax();
+              else if (walletBalance !== null && tokenIn !== null) setAmount(maxAmountInput({ asset: "token", balance: walletBalance, decimals: tokenIn.decimals }));
             }}
             type="button"
           >Max</button>
         </div>
+        {nativeInput && (parsedAmount === null || parsedAmount <= 0n) ? <div className="state-row warning" data-testid="swap-native-max-guidance"><AlertTriangle size={16} /><span>Enter a valid positive ETH probe amount before using Native Max; no wallet request is opened for the gas probe.</span></div> : null}
         {nativeInput ? <div className="state-row" data-testid="swap-token-in-identity">ETH native asset · router wrapper {wrappedNativeToken?.symbol} {wrappedNativeToken?.address}</div> : <TokenIdentity token={tokenIn} networkName={registry.chain.name} testId="swap-token-in-identity" />}
         <div className="balance-line">
           <span>Balance</span>
           <strong data-testid="swap-balance-value">{walletQuery.data ? nativeInput ? `${formatUnits(BigInt(walletQuery.data.balance), 18)} ETH` : formatTokenAmount(walletQuery.data.balance, tokenIn) : connected ? "loading" : "connect wallet"}</strong>
         </div>
 
-        <button className="flip-button" type="button" title="Flip tokens" onClick={() => setSwapForY((value) => !value)}>
+        <button className="flip-button" type="button" title="Flip tokens" onClick={() => { nativeSwapMaxBindingRef.current = null; setSwapForY((value) => !value); }}>
           <ArrowLeftRight size={18} />
         </button>
 
@@ -3147,6 +3203,7 @@ async function reviewExactGas(input: {
   getBalance: () => Promise<bigint>;
   getGasPrice: () => Promise<bigint>;
   isCurrent: () => boolean;
+  onReview?: (review: ExactGasReview, nativeBalance: bigint) => void;
   setError: (message: string | null) => void;
   setReview: (review: ExactGasReview | null) => void;
   transactionValue?: bigint;
@@ -3158,6 +3215,7 @@ async function reviewExactGas(input: {
     const transactionValue = input.transactionValue ?? 0n;
     const requiredWei = bufferedWei + transactionValue;
     const review = { action: input.action, bufferedWei, executionFingerprint: input.executionFingerprint, gasLimit, gasPrice, requiredWei, transactionValue };
+    input.onReview?.(review, nativeBalance);
     if (nativeBalance < requiredWei) {
       input.setReview(review);
       input.setError(`Insufficient ETH for gas and value: exact buffered requirement is ${formatUnits(requiredWei, 18)} ETH, but this wallet has ${formatUnits(nativeBalance, 18)} ETH`);
@@ -4908,6 +4966,10 @@ function LiquidityView({
   const approveYSubmitInFlightRef = useRef<number | null>(null);
   const approveLbSubmitInFlightRef = useRef<number | null>(null);
   const addSubmitInFlightRef = useRef<number | null>(null);
+  const nativeAddMaxProbeRef = useRef<"x" | "y" | null>(null);
+  const nativeAddMaxBindingRef = useRef<{ context: string; side: "x" | "y"; value: bigint } | null>(null);
+  const latestAddGasObservationRef = useRef<{ balance: bigint; context: string; reserve: bigint } | null>(null);
+  const [nativeAddMaxPending, setNativeAddMaxPending] = useState(false);
   const latestLiquidityAddReviewRef = useRef<LiquidityAddReviewState | null>(null);
   const removeSubmitInFlightRef = useRef<number | null>(null);
   const [handledApproveXHash, setHandledApproveXHash] = useState<Address | null>(null);
@@ -5259,6 +5321,30 @@ function LiquidityView({
     distributionResult.distribution?.distributionX.join(",") ?? "",
     distributionResult.distribution?.distributionY.join(",") ?? "",
     addAssetFingerprint
+  ].join("|");
+  const addMaxContextFingerprint = [
+    environmentKey,
+    registry.chainId.toString(),
+    activeWalletChainId?.toString() ?? "",
+    registry.endpoints.rpcUrl,
+    registry.contracts.lbRouter,
+    account.address ?? "",
+    pool?.pair ?? "",
+    pool?.tokenX ?? "",
+    pool?.tokenY ?? "",
+    pool?.binStep.toString() ?? "",
+    activeBin?.toString() ?? "",
+    slippageBps?.toString() ?? "",
+    idSlippage?.toString() ?? "",
+    deadlineMinutes?.toString() ?? "",
+    liquidityStrategy,
+    distributionResult.distribution?.deltaIds.join(",") ?? "",
+    distributionResult.distribution?.distributionX.join(",") ?? "",
+    distributionResult.distribution?.distributionY.join(",") ?? "",
+    liquidityWrappedNativeSide === "x" ? amountY?.toString() ?? "" : amountX?.toString() ?? "",
+    liquidityAssetMode,
+    liquidityWrappedNative?.address ?? "",
+    liquidityWrappedNativeSide ?? ""
   ].join("|");
   const addRetrySettingsFingerprint = [
     environmentKey,
@@ -6805,6 +6891,7 @@ function LiquidityView({
   const handleAddLiquidity = async () => {
     if (addSubmitInFlightRef.current !== null || !addReady || !pool || !account.address || amountX === null || amountY === null || slippageBps === null || idSlippage === null || deadlineMinutes === null || distributionResult.distribution === null || activeBin === null) return;
 
+    const nativeMaxProbeSide = nativeAddMaxProbeRef.current;
     const submittedOperationGeneration = liquidityOperationGenerationRef.current;
     const submittedExecutionFingerprint = addExecutionFingerprint;
     const previousReview = latestLiquidityAddReviewRef.current?.executionFingerprint === submittedExecutionFingerprint
@@ -6899,6 +6986,7 @@ function LiquidityView({
         operationIsCurrent() &&
         latestAddExecutionFingerprint.current === submittedExecutionFingerprint &&
         latestLiquidityAddReviewRef.current?.review.block.hash.toLowerCase() === exactReview.block.hash.toLowerCase();
+      const gasObservation: { value: { balance: bigint; review: ExactGasReview } | null } = { value: null };
       const gasApproved = await reviewExactGas({
         action: "add liquidity",
         currentReview: gasReview,
@@ -6909,8 +6997,33 @@ function LiquidityView({
         isCurrent: gasReviewIsCurrent,
         setError: setGasReviewError,
         setReview: setGasReview,
+        onReview: (review, latestNativeBalance) => {
+          gasObservation.value = { balance: latestNativeBalance, review };
+          latestAddGasObservationRef.current = { balance: latestNativeBalance, context: addMaxContextFingerprint, reserve: review.bufferedWei };
+          if (nativeMaxProbeSide === null) return;
+          const max = safeMaxAmount({ asset: "native", balance: latestNativeBalance, gasReserveWei: review.bufferedWei });
+          if (max === 0n) {
+            setGasReviewError("Native Max is unavailable because the wallet balance does not exceed the reviewed gas reserve");
+            return;
+          }
+          const value = maxAmountInput({ asset: "native", balance: latestNativeBalance, decimals: 18, gasReserveWei: review.bufferedWei });
+          nativeAddMaxBindingRef.current = { context: addMaxContextFingerprint, side: nativeMaxProbeSide, value: max };
+          if (nativeMaxProbeSide === "x") setAmountXInput(value);
+          else setAmountYInput(value);
+        },
         transactionValue: transaction.value
       });
+      if (nativeMaxProbeSide !== null) return;
+      const finalGasObservation = gasObservation.value;
+      if (effectiveAddAssetMode === "native" && nativeAddMaxBindingRef.current !== null && finalGasObservation !== null) {
+        const binding = nativeAddMaxBindingRef.current;
+        const submittedNativeAmount = binding.side === "x" ? amountX : amountY;
+        const exactMax = safeMaxAmount({ asset: "native", balance: finalGasObservation.balance, gasReserveWei: finalGasObservation.review.bufferedWei });
+        if (binding.side !== liquidityWrappedNativeSide || binding.context !== addMaxContextFingerprint || submittedNativeAmount !== binding.value || submittedNativeAmount !== exactMax) {
+          setGasReviewError("Native Max changed with the latest balance or buffered gas; press Max again before wallet confirmation");
+          return;
+        }
+      }
       if (!reviewUnchanged || !gasApproved || !gasReviewIsCurrent()) return;
       const submittedContext = {
         account: account.address,
@@ -6971,7 +7084,39 @@ function LiquidityView({
       if (!submitted && addSubmitInFlightRef.current === submittedOperationGeneration) {
         addSubmitInFlightRef.current = null;
       }
+      if (nativeMaxProbeSide !== null) {
+        nativeAddMaxProbeRef.current = null;
+        setNativeAddMaxPending(false);
+      }
     }
+  };
+
+  const handleNativeAddMax = (side: "x" | "y") => {
+    if (nativeAddMaxPending || liquidityWrappedNativeSide !== side || nativeBalance === null) return;
+    const observation = latestAddGasObservationRef.current;
+    const binding = nativeAddMaxBindingRef.current;
+    const canReuseObservation = binding?.side === side && binding.context === addMaxContextFingerprint && observation?.context === addMaxContextFingerprint && nativeSideAmount !== null && nativeSideAmount > 0n;
+    if (gasReview?.action === "add liquidity" && observation !== null && canReuseObservation) {
+      const max = safeMaxAmount({ asset: "native", balance: observation.balance, gasReserveWei: observation.reserve });
+      if (max === 0n) {
+        setGasReviewError("Native Max is unavailable because the wallet balance does not exceed the reviewed gas reserve");
+        return;
+      }
+      const value = maxAmountInput({ asset: "native", balance: observation.balance, decimals: 18, gasReserveWei: observation.reserve });
+      nativeAddMaxBindingRef.current = { context: addMaxContextFingerprint, side, value: max };
+      if (side === "x") setAmountXInput(value);
+      else setAmountYInput(value);
+      return;
+    }
+    if (!nativeAdd || !addReady) return;
+    nativeAddMaxProbeRef.current = side;
+    setNativeAddMaxPending(true);
+    void handleAddLiquidity();
+  };
+  const canReuseNativeAddMaxObservation = (side: "x" | "y") => {
+    const binding = nativeAddMaxBindingRef.current;
+    const observation = latestAddGasObservationRef.current;
+    return binding?.side === side && binding.context === addMaxContextFingerprint && observation?.context === addMaxContextFingerprint && nativeSideAmount !== null && nativeSideAmount > 0n;
   };
 
   const handleFullExitBatch = async (workflowKeyOverride: string | null = null) => {
@@ -7854,10 +7999,10 @@ function LiquidityView({
           <fieldset className="routing-mode-control" data-testid="liquidity-native-mode">
             <legend>Wrapped-native deposit mode</legend>
             <div className="segmented" role="group" aria-label="Wrapped-native deposit mode">
-              <button aria-pressed={liquidityAssetMode === "native"} className={liquidityAssetMode === "native" ? "segment active" : "segment"} onClick={() => setLiquidityAssetMode("native")} type="button">ETH · native</button>
-              <button aria-pressed={liquidityAssetMode === "erc20"} className={liquidityAssetMode === "erc20" ? "segment active" : "segment"} onClick={() => setLiquidityAssetMode("erc20")} type="button">{liquidityWrappedNative.symbol} · ERC-20</button>
+              <button aria-pressed={liquidityAssetMode === "native"} className={liquidityAssetMode === "native" ? "segment active" : "segment"} onClick={() => { nativeAddMaxBindingRef.current = null; setLiquidityAssetMode("native"); }} type="button">ETH · native</button>
+              <button aria-pressed={liquidityAssetMode === "erc20"} className={liquidityAssetMode === "erc20" ? "segment active" : "segment"} onClick={() => { nativeAddMaxBindingRef.current = null; setLiquidityAssetMode("erc20"); }} type="button">{liquidityWrappedNative.symbol} · ERC-20</button>
             </div>
-            <p data-testid="liquidity-wrapper-disclosure">ETH deposits use exact router transaction value and never approve {liquidityWrappedNative.symbol}. Unused native-side input is refunded as {liquidityWrappedNative.symbol} ERC-20 at {liquidityWrappedNative.address}. Native Max is unavailable.</p>
+            <p data-testid="liquidity-wrapper-disclosure">ETH deposits use exact router transaction value and never approve {liquidityWrappedNative.symbol}. Unused native-side input is refunded as {liquidityWrappedNative.symbol} ERC-20 at {liquidityWrappedNative.address}. Native Max reserves a freshly reviewed 25%-buffered gas estimate and the final value is revalidated before wallet confirmation.</p>
           </fieldset>
         ) : null}
 
@@ -7868,11 +8013,12 @@ function LiquidityView({
               disabled={liquidityMode === "token-y"}
               inputMode="decimal"
               value={liquidityMode === "token-y" ? "0" : amountXInput}
-              onChange={(event) => setAmountXInput(event.target.value)}
+              onChange={(event) => { nativeAddMaxBindingRef.current = null; setAmountXInput(event.target.value); }}
             />
             <span>{nativeModeX ? "ETH" : tokenSymbol(tokenX)}</span>
-            <button className="token-max-button" data-testid="liquidity-max-x" disabled={nativeModeX || walletBalanceX === null || tokenX === null || liquidityMode === "token-y"} onClick={() => {
-              if (walletBalanceX !== null && tokenX !== null) setAmountXInput(maxAmountInput({ asset: "token", balance: walletBalanceX, decimals: tokenX.decimals }));
+            <button className="token-max-button" data-testid="liquidity-max-x" disabled={nativeModeX ? ((!nativeAdd || !addReady) && !canReuseNativeAddMaxObservation("x")) || nativeAddMaxPending : walletBalanceX === null || tokenX === null || liquidityMode === "token-y"} onClick={() => {
+              if (nativeModeX) handleNativeAddMax("x");
+              else if (walletBalanceX !== null && tokenX !== null) { nativeAddMaxBindingRef.current = null; setAmountXInput(maxAmountInput({ asset: "token", balance: walletBalanceX, decimals: tokenX.decimals })); }
             }} type="button">Max</button>
           </div>
           <div className="amount-box compact">
@@ -7881,11 +8027,12 @@ function LiquidityView({
               disabled={liquidityMode === "token-x"}
               inputMode="decimal"
               value={liquidityMode === "token-x" ? "0" : amountYInput}
-              onChange={(event) => setAmountYInput(event.target.value)}
+              onChange={(event) => { nativeAddMaxBindingRef.current = null; setAmountYInput(event.target.value); }}
             />
             <span>{nativeModeY ? "ETH" : tokenSymbol(tokenY)}</span>
-            <button className="token-max-button" data-testid="liquidity-max-y" disabled={nativeModeY || walletBalanceY === null || tokenY === null || liquidityMode === "token-x"} onClick={() => {
-              if (walletBalanceY !== null && tokenY !== null) setAmountYInput(maxAmountInput({ asset: "token", balance: walletBalanceY, decimals: tokenY.decimals }));
+            <button className="token-max-button" data-testid="liquidity-max-y" disabled={nativeModeY ? ((!nativeAdd || !addReady) && !canReuseNativeAddMaxObservation("y")) || nativeAddMaxPending : walletBalanceY === null || tokenY === null || liquidityMode === "token-x"} onClick={() => {
+              if (nativeModeY) handleNativeAddMax("y");
+              else if (walletBalanceY !== null && tokenY !== null) { nativeAddMaxBindingRef.current = null; setAmountYInput(maxAmountInput({ asset: "token", balance: walletBalanceY, decimals: tokenY.decimals })); }
             }} type="button">Max</button>
           </div>
         </div>
@@ -7903,6 +8050,9 @@ function LiquidityView({
         ) : null}
         {liquidityAssetMode === "native" && !nativeAdd ? (
           <div className="state-row" data-testid="liquidity-native-unused-range"><CircleDollarSign size={16} /><span>This range uses only the non-wrapper token. Submission remains ERC-20 addLiquidity with 0 ETH value.</span></div>
+        ) : null}
+        {liquidityAssetMode === "native" && liquidityWrappedNativeSide !== null && (nativeSideAmount === null || nativeSideAmount <= 0n) && ((liquidityWrappedNativeSide === "x" && liquidityMode !== "token-y") || (liquidityWrappedNativeSide === "y" && liquidityMode !== "token-x")) ? (
+          <div className="state-row warning" data-testid="liquidity-native-max-guidance"><AlertTriangle size={16} /><span>Enter a valid positive ETH probe amount before using Native Max; no wallet request is opened for the gas probe.</span></div>
         ) : null}
         {liquidityMode === "balanced" ? (
           <div className="state-row" data-testid="liquidity-composition-guidance">

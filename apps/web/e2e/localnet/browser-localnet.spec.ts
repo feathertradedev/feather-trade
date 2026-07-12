@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 
 import { expect, test, type Page, type Route } from "@playwright/test";
-import { createPublicClient, decodeFunctionData, encodeFunctionData, http, type Address, type Hex } from "viem";
+import { createPublicClient, decodeFunctionData, encodeFunctionData, formatUnits, http, parseUnits, type Address, type Hex } from "viem";
 
 import { erc20Abi, lbPairAbi, lbRouterAbi } from "../../../../packages/sdk/src/abi";
 import { installUnlockedRpcWallet, readUnlockedRpcWallet } from "./fixtures/unlocked-rpc-wallet";
@@ -118,20 +118,35 @@ test("a real quote ages stale and remains handler-guarded when refresh fails", a
 
 test("actual localnet executes native-input swap with exact value and no approval", async ({ page }) => {
   await installBrowserStack(page, rpcUrl);
+  await client.request({ method: "anvil_setBalance", params: [browserAccount, `0x${(1_010_000_000_000_000_000n).toString(16)}`] });
   const ethBeforeIn = await client.getBalance({ address: browserAccount });
   const tokenBeforeIn = await readTokenBalance(pool.tokenY);
   await page.goto("/#/swap");
   await connectWallet(page);
   await page.getByRole("button", { name: "ETH · native" }).click();
   await expect(page.getByTestId("swap-approve-button")).toHaveCount(0);
-  await clickReviewedAction(page, "swap-submit-button");
+  await page.getByTestId("swap-max-button").click();
+  await expect(page.locator("#swap-amount")).not.toHaveValue("1.0");
+  await page.getByTestId("swap-submit-button").click();
+  if (!(await page.getByTestId("gas-review").textContent())?.includes(`= ${formatUnits(ethBeforeIn, 18)} ETH required`)) {
+    expect((await readUnlockedRpcWallet(page)).sentTransactions).toEqual([]);
+    const priorMax = await page.locator("#swap-amount").inputValue();
+    await page.getByTestId("swap-max-button").click();
+    await expect(page.locator("#swap-amount")).not.toHaveValue(priorMax);
+    await page.getByTestId("swap-submit-button").click();
+  }
+  await expect(page.getByTestId("gas-review")).toContainText(`= ${formatUnits(ethBeforeIn, 18)} ETH required`);
+  const swapGasReviewText = await page.getByTestId("gas-review").innerText();
+  await page.getByTestId("swap-submit-button").click();
   await expect(page.getByTestId("native-swap-receipt-review")).toContainText("ETH spent", { timeout: 15_000 });
   const walletAfterIn = await readUnlockedRpcWallet(page);
   const nativeInTransaction = decodeSubmittedTransaction(walletAfterIn.sentTransactions[0]!);
   expect(nativeInTransaction.functionName).toBe("swapExactNATIVEForTokens");
-  expect(BigInt((walletAfterIn.sentTransactions[0] as { value?: string }).value ?? "0x0")).toBe(1_000_000_000_000_000_000n);
+  const nativeInputValue = BigInt((walletAfterIn.sentTransactions[0] as { value?: string }).value ?? "0x0");
+  expect(nativeInputValue).toBe(ethBeforeIn - bufferedReserveFromGasReview(swapGasReviewText));
   expect(await readTokenBalance(pool.tokenY)).toBeGreaterThan(tokenBeforeIn);
   expect(await client.getBalance({ address: browserAccount })).toBeLessThan(ethBeforeIn);
+  await client.request({ method: "anvil_setBalance", params: [browserAccount, `0x${(100n * 10n ** 18n).toString(16)}`] });
 });
 
 test("actual localnet executes native-output swap with ERC input approval and zero value", async ({ page }) => {
@@ -410,7 +425,19 @@ test("actual UI deposits one-sided native liquidity with exact ETH value and can
   await page.locator("#range-lower").fill("1");
   await page.locator("#range-upper").fill("2");
   await expect(page.getByTestId("liquidity-approve-x-button")).toHaveCount(0);
-  await clickReviewedAction(page, "liquidity-add-button");
+  await page.getByTestId("liquidity-max-x").click();
+  await expect(page.getByTestId("liquidity-amount-x")).not.toHaveValue("0.01");
+  await page.getByTestId("liquidity-add-button").click();
+  if (!(await page.getByTestId("gas-review").textContent())?.includes(`= ${formatUnits(nativeBefore, 18)} ETH required`)) {
+    expect((await readUnlockedRpcWallet(page)).sentTransactions).toEqual([]);
+    const priorMax = await page.getByTestId("liquidity-amount-x").inputValue();
+    await page.getByTestId("liquidity-max-x").click();
+    await expect(page.getByTestId("liquidity-amount-x")).not.toHaveValue(priorMax);
+    await page.getByTestId("liquidity-add-button").click();
+  }
+  await expect(page.getByTestId("gas-review")).toContainText(`= ${formatUnits(nativeBefore, 18)} ETH required`);
+  const addGasReviewText = await page.getByTestId("gas-review").innerText();
+  await page.getByTestId("liquidity-add-button").click();
   await expect.poll(async () => (await readUnlockedRpcWallet(page)).transactionHashes.length).toBe(1);
   const wallet = await readUnlockedRpcWallet(page);
   const submitted = wallet.sentTransactions[0]!;
@@ -419,6 +446,7 @@ test("actual UI deposits one-sided native liquidity with exact ETH value and can
   const parameters = (decoded.args as readonly [DecodedLiquidityParameters])[0];
   const value = normalizeTransactionValue(submitted.value);
   expect(value).toBe(parameters.amountX);
+  expect(value).toBe(nativeBefore - bufferedReserveFromGasReview(addGasReviewText));
   expect(parameters.amountY).toBe(0n);
   const receipt = await client.getTransactionReceipt({ hash: wallet.transactionHashes[0]! });
   const [nativeAfter, wrapperAfter, lpAfter] = await Promise.all([
@@ -431,6 +459,7 @@ test("actual UI deposits one-sided native liquidity with exact ETH value and can
   expect(lpAfter).toBeGreaterThan(lpBefore);
   await mineBlocks(3);
   await expect(page.getByTestId("liquidity-receipt-review")).toContainText("Exact native value", { timeout: 20_000 });
+  await client.request({ method: "anvil_setBalance", params: [browserAccount, `0x${(100n * 10n ** 18n).toString(16)}`] });
 });
 
 test("actual UI deposits balanced native liquidity after approving only the positive non-wrapper side", async ({ page }) => {
@@ -812,6 +841,14 @@ function normalizeTransactionValue(value: unknown): bigint {
     throw new Error("Transaction value is not numeric");
   }
   return BigInt(value);
+}
+
+function bufferedReserveFromGasReview(text: string): bigint {
+  const match = text.match(/limit (\d+) × ([0-9.]+) gwei \+ 25% gas buffer/);
+  if (!match) throw new Error(`Exact gas review is not parseable: ${text}`);
+  const gasLimit = BigInt(match[1]!);
+  const gasPrice = parseUnits(match[2]!, 9);
+  return (gasLimit * gasPrice * 12_500n + 9_999n) / 10_000n;
 }
 
 function normalizeAddress(value: unknown): string {
