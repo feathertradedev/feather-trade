@@ -10,6 +10,12 @@ export const MAX_TOKEN_DECIMALS = 36;
 const MAX_UINT24 = (1n << 24n) - 1n;
 const MAX_UINT256 = (1n << 256n) - 1n;
 const MAX_DECIMAL_DIGITS = 256;
+const REAL_ID_SHIFT = 1n << 23n;
+const BASIS_POINT_MAX = 10_000n;
+const LOG_SCALE_OFFSET = 127n;
+const LOG_SCALE = 1n << LOG_SCALE_OFFSET;
+const LOG_SCALE_SQUARED = LOG_SCALE * LOG_SCALE;
+const MAX_PRICE_EXPONENT = 1n << 20n;
 
 export interface ExactPriceFraction {
   numerator: bigint;
@@ -58,6 +64,35 @@ export function decimalPriceToQ128(
   if (priceQ128 === 0n) throw new Error("decimal price is below the representable Q128 range");
   assertUint256(priceQ128, "priceQ128");
   return priceQ128;
+}
+
+/**
+ * Reproduces LB PriceHelper.getPriceFromId using uint256-wrapped bigint math.
+ * The returned value is the raw token-Y-per-token-X price in Q128 form.
+ */
+export function priceQ128FromActiveId(
+  activeId: bigint | number,
+  binStep: bigint | number
+): bigint {
+  const normalizedId = normalizeUint24(activeId, "activeId");
+  const normalizedBinStep = normalizeUint16(binStep, "binStep");
+  const baseQ128 = Q128 + (normalizedBinStep * Q128) / BASIS_POINT_MAX;
+  return powQ128(baseQ128, normalizedId - REAL_ID_SHIFT);
+}
+
+/**
+ * Reproduces LB PriceHelper.getIdFromPrice using its signed fixed-point log2
+ * truncation. Consumers can compose this raw conversion with
+ * decimalPriceToQ128/normalizeQ128Price for quote-per-base token decimals.
+ */
+export function activeIdFromPriceQ128(priceQ128: bigint, binStep: bigint | number): bigint {
+  assertUint256(priceQ128, "priceQ128");
+  if (priceQ128 === 0n) throw new Error("priceQ128 must be nonzero");
+  const normalizedBinStep = normalizeUint16(binStep, "binStep");
+  if (normalizedBinStep === 0n) throw new Error("binStep must be greater than zero");
+  const baseQ128 = Q128 + (normalizedBinStep * Q128) / BASIS_POINT_MAX;
+  const realId = log2Q128(priceQ128) / log2Q128(baseQ128);
+  return normalizeUint24(REAL_ID_SHIFT + realId, "activeId");
 }
 
 export function formatExactPriceFraction(
@@ -166,6 +201,15 @@ function normalizeUint24(value: bigint | number, label: string): bigint {
   return normalized;
 }
 
+function normalizeUint16(value: bigint | number, label: string): bigint {
+  if (typeof value === "number" && !Number.isSafeInteger(value)) {
+    throw new Error(`${label} must fit uint16`);
+  }
+  const normalized = BigInt(value);
+  if (normalized < 0n || normalized > 65_535n) throw new Error(`${label} must fit uint16`);
+  return normalized;
+}
+
 function assertUint256(value: bigint, label: string): void {
   if (typeof value !== "bigint" || value < 0n || value > MAX_UINT256) {
     throw new Error(`${label} must fit uint256`);
@@ -186,4 +230,66 @@ function greatestCommonDivisor(left: bigint, right: bigint): bigint {
     b = remainder;
   }
   return a;
+}
+
+function log2Q128(value: bigint): bigint {
+  if (value === 0n) throw new Error("Q128 logarithm underflow");
+  if (value === 1n) return -128n;
+
+  let x = value >> 1n;
+  let sign: bigint;
+  if (x >= LOG_SCALE) {
+    sign = 1n;
+  } else {
+    sign = -1n;
+    x = LOG_SCALE_SQUARED / x;
+  }
+
+  const integerPart = BigInt(mostSignificantBit(x >> LOG_SCALE_OFFSET));
+  let result = integerPart << LOG_SCALE_OFFSET;
+  let y = x >> integerPart;
+  if (y !== LOG_SCALE) {
+    for (let delta = 1n << (LOG_SCALE_OFFSET - 1n); delta > 0n; delta >>= 1n) {
+      y = (y * y) >> LOG_SCALE_OFFSET;
+      if (y >= 1n << (LOG_SCALE_OFFSET + 1n)) {
+        result += delta;
+        y >>= 1n;
+      }
+    }
+  }
+  return (result * sign) << 1n;
+}
+
+function powQ128(baseQ128: bigint, exponent: bigint): bigint {
+  if (exponent === 0n) return Q128;
+  const absoluteExponent = exponent < 0n ? -exponent : exponent;
+  if (absoluteExponent >= MAX_PRICE_EXPONENT) {
+    throw new Error("Q128 power underflow");
+  }
+
+  let invert = exponent < 0n;
+  let squared = baseQ128;
+  if (squared > Q128 - 1n) {
+    squared = MAX_UINT256 / squared;
+    invert = !invert;
+  }
+
+  let result = Q128;
+  for (let bit = 1n; bit < MAX_PRICE_EXPONENT; bit <<= 1n) {
+    if ((absoluteExponent & bit) !== 0n) {
+      result = uint256(result * squared) >> 128n;
+    }
+    squared = uint256(squared * squared) >> 128n;
+  }
+  if (result === 0n) throw new Error("Q128 power underflow");
+  return invert ? MAX_UINT256 / result : result;
+}
+
+function uint256(value: bigint): bigint {
+  return value & MAX_UINT256;
+}
+
+function mostSignificantBit(value: bigint): number {
+  if (value === 0n) return 0;
+  return value.toString(2).length - 1;
 }
