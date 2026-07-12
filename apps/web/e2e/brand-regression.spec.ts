@@ -67,6 +67,7 @@ test("canonical Feather pools mobile", async ({ page }, testInfo) => {
 
 test("canonical Feather pool detail desktop", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium");
+  await page.clock.setFixedTime("2026-07-12T14:00:00Z");
   await installMockRpc(page, { includePairs: true });
   await page.goto("/#/pools");
   await page.locator(".discovery-table .pair-name").first().click();
@@ -76,6 +77,7 @@ test("canonical Feather pool detail desktop", async ({ page }, testInfo) => {
 
 test("canonical Feather pool detail mobile", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile-chromium");
+  await page.clock.setFixedTime("2026-07-12T14:00:00Z");
   await installMockRpc(page, { includePairs: true });
   await page.goto("/#/pools");
   await page.locator(".discovery-table .pair-name").first().click();
