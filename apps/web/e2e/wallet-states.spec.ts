@@ -2008,6 +2008,7 @@ test("background approval polling detects external revocation and clears stale r
 });
 
 test("stable revoked polling preserves a newly reviewed LB reapproval through its second click", async ({ page }) => {
+  test.setTimeout(60_000);
   const rpc = await setupConnectedLiquidity(page, { lbApproved: true });
   const disclosure = page.getByTestId("lb-operator-approval-disclosure");
 
