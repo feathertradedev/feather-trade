@@ -1,6 +1,7 @@
 import { encodeFunctionData, isAddressEqual, zeroAddress, type Address, type Hex, type PublicClient } from "viem";
 
-import { lbQuoterAbi, lbRouterAbi } from "./abi.js";
+import { lbPairAbi, lbQuoterAbi, lbRouterAbi } from "./abi.js";
+import { Q128, readPriceFromId } from "./liquidity-price.js";
 import type { DexRegistry } from "./registry.js";
 import { assertTokenActionAllowed, tokenAllowsAction, type TokenMetadataMap } from "./tokens.js";
 
@@ -31,6 +32,14 @@ export interface ExactInQuoteRequest {
   tokenIn: Address;
   tokenOut: Address;
   amountIn: bigint;
+}
+
+export interface SelectedPairExactInQuoteRequest extends ExactInQuoteRequest {
+  pair: Address;
+  tokenX: Address;
+  tokenY: Address;
+  binStep: bigint;
+  blockNumber?: bigint;
 }
 
 export interface ExactInRouteStep {
@@ -95,6 +104,79 @@ export async function getBestExactInQuote(
   });
 
   return usable[0].quote;
+}
+
+export async function getSelectedPairExactInQuote(
+  client: PublicClient,
+  registry: Pick<DexRegistry, "contracts" | "tokens">,
+  request: SelectedPairExactInQuoteRequest
+): Promise<ExactInQuote> {
+  if (request.amountIn <= 0n) {
+    throw new Error("Amount in must be greater than zero");
+  }
+  if (request.amountIn > UINT128_MAX) {
+    throw new Error("Amount in exceeds the LBRouter uint128 limit");
+  }
+  if (isAddressEqual(request.pair, zeroAddress)) {
+    throw new Error("Selected pair must be nonzero");
+  }
+  if (request.binStep <= 0n || request.binStep > 65_535n) {
+    throw new Error("Selected pair bin step must fit a nonzero uint16");
+  }
+
+  const swapForY = isAddressEqual(request.tokenIn, request.tokenX) && isAddressEqual(request.tokenOut, request.tokenY);
+  const swapForX = isAddressEqual(request.tokenIn, request.tokenY) && isAddressEqual(request.tokenOut, request.tokenX);
+  if (!swapForY && !swapForX) {
+    throw new Error("Exact selected-pair quote token direction does not match the selected pair");
+  }
+  assertTokenActionAllowed(registry.tokens, [request.tokenIn, request.tokenOut], "swap");
+
+  const readOptions = request.blockNumber === undefined ? {} : { blockNumber: request.blockNumber };
+  const [amountInLeft, amountOut, fee] = (await client.readContract({
+    address: registry.contracts.lbRouter,
+    abi: lbRouterAbi,
+    functionName: "getSwapOut",
+    args: [request.pair, request.amountIn, swapForY],
+    ...readOptions
+  })) as readonly [bigint, bigint, bigint];
+
+  if (amountInLeft !== 0n) {
+    throw new Error("Exact selected pair cannot consume the full input amount");
+  }
+  if (amountOut <= 0n) {
+    throw new Error("Exact selected pair has insufficient liquidity");
+  }
+  if (fee < 0n || fee >= request.amountIn) {
+    throw new Error("Exact selected-pair fee is invalid for the input amount");
+  }
+
+  const activeId = await client.readContract({
+    address: request.pair,
+    abi: lbPairAbi,
+    functionName: "getActiveId",
+    ...readOptions
+  });
+  const priceQ128 = await readPriceFromId(client, request.pair, activeId, readOptions);
+  const amountInAfterFee = request.amountIn - fee;
+  const feeScaled = (fee * FEE_SCALE) / request.amountIn;
+  const virtualAmountOut = swapForY
+    ? (amountInAfterFee * priceQ128) / Q128
+    : (amountInAfterFee * Q128) / priceQ128;
+  if (virtualAmountOut <= 0n) {
+    throw new Error("Exact selected-pair spot output is below the representable amount");
+  }
+
+  const quote: ExactInQuote = {
+    route: [request.tokenIn, request.tokenOut],
+    pairs: [request.pair],
+    binSteps: [request.binStep],
+    versions: [LB_ROUTER_VERSION_V2_2],
+    amounts: [request.amountIn, amountOut],
+    virtualAmountsWithoutSlippage: [request.amountIn, virtualAmountOut],
+    fees: [feeScaled]
+  };
+  assertQuoteMatchesExactInRequest(quote, request);
+  return quote;
 }
 
 export function buildExactInCandidatePaths(tokens: TokenMetadataMap, tokenIn: Address, tokenOut: Address): Address[][] {
