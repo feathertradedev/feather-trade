@@ -66,7 +66,7 @@ import {
   Server,
   Wallet
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type ComponentType } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { decodeEventLog, encodeFunctionData, isAddress, isAddressEqual, keccak256, zeroAddress, type Address, type Chain, type Hex, type PublicClient, formatUnits } from "viem";
 import {
   useAccount,
@@ -2470,13 +2470,15 @@ function SwapView({
         <SwapStateRows
           amountError={inputError}
           actionError={actionError}
-          approvalHash={approvalWrite.data}
+          approvalHash={approvalReceiptMatchesCurrentIntent ? approvalWrite.data : undefined}
+          approvalPending={approvalWrite.isPending || (approvalReceiptMatchesCurrentIntent && approvalReceipt.isLoading)}
           approvalReverted={approvalReverted}
           approvalSuccess={approvalSuccess}
           insufficientBalance={insufficientBalance}
           insufficientGas={actionError?.startsWith("Insufficient ETH for gas") === true}
           quoteError={quoteQuery.error}
-          swapHash={swapWrite.data}
+          swapHash={swapReceiptMatchesCurrentIntent ? swapWrite.data : undefined}
+          swapPending={swapWrite.isPending || (swapReceiptMatchesCurrentIntent && swapReceipt.isLoading)}
           swapReverted={swapReverted}
           swapSuccess={swapSuccess}
           walletError={walletError}
@@ -2876,12 +2878,14 @@ function SwapStateRows({
   actionError,
   amountError,
   approvalHash,
+  approvalPending,
   approvalReverted,
   approvalSuccess,
   insufficientBalance,
   insufficientGas,
   quoteError,
   swapHash,
+  swapPending,
   swapReverted,
   swapSuccess,
   walletError
@@ -2889,12 +2893,14 @@ function SwapStateRows({
   actionError: string | null;
   amountError: string | null;
   approvalHash: Address | undefined;
+  approvalPending: boolean;
   approvalReverted: boolean;
   approvalSuccess: boolean;
   insufficientBalance: boolean;
   insufficientGas: boolean;
   quoteError: Error | null;
   swapHash: Address | undefined;
+  swapPending: boolean;
   swapReverted: boolean;
   swapSuccess: boolean;
   walletError: string | null;
@@ -2908,22 +2914,29 @@ function SwapStateRows({
     (quoteError ? quoteError.message : null) ??
     walletError ??
     actionError;
+  const state = failure
+    ? { icon: <AlertTriangle size={16} />, message: failure, tone: "failure" }
+    : swapSuccess
+      ? { icon: <CheckCircle2 size={16} />, message: "Swap confirmed", tone: "success" }
+      : swapPending || swapHash
+        ? { icon: <LoaderCircle className="spin" size={16} />, message: swapHash ? `Swap pending ${formatCompactAddress(swapHash)}` : "Awaiting swap wallet confirmation", tone: "pending" }
+        : approvalSuccess
+          ? { icon: <CheckCircle2 size={16} />, message: "Approval confirmed", tone: "success" }
+          : approvalPending || approvalHash
+            ? { icon: <LoaderCircle className="spin" size={16} />, message: approvalHash ? `Approval pending ${formatCompactAddress(approvalHash)}` : "Awaiting approval wallet confirmation", tone: "pending" }
+            : { icon: <CheckCircle2 size={16} />, message: "Ready for wallet confirmation", tone: "ready" };
 
   return (
-    <>
-      <div className="state-row pending">
-        <LoaderCircle size={16} />
-        <span>{swapHash ? `Swap pending ${formatCompactAddress(swapHash)}` : approvalHash ? `Approval pending ${formatCompactAddress(approvalHash)}` : "Ready for wallet confirmation"}</span>
-      </div>
-      <div className="state-row success">
-        <CheckCircle2 size={16} />
-        <span>{swapSuccess ? "Swap confirmed" : approvalSuccess ? "Approval confirmed" : "Receipt state will appear here"}</span>
-      </div>
-      <div className="state-row failure" data-testid="swap-failure-state">
-        <AlertTriangle size={16} />
-        <span>{failure ?? "Rejected, reverted, and no-route errors appear here"}</span>
-      </div>
-    </>
+    <div
+      aria-atomic="true"
+      aria-live={state.tone === "failure" ? "assertive" : "polite"}
+      className={`state-row transaction-status ${state.tone}`}
+      data-testid="swap-failure-state"
+      role={state.tone === "failure" ? "alert" : "status"}
+    >
+      {state.icon}
+      <span>{state.message}</span>
+    </div>
   );
 }
 
@@ -3534,6 +3547,7 @@ function PoolsView({
     typeof window === "undefined" ? { ...DEFAULT_POOL_DISCOVERY_STATE } : parsePoolDiscoveryState(window.location.hash)
   );
   const [creationOpen, setCreationOpen] = useState(false);
+  const creationLaunchRef = useRef<HTMLButtonElement>(null);
   const pageSize = 10;
   const analyticsBaseEndpoint = analyticsEndpointForRegistry(registry);
   const ownerEndpoint = analyticsBaseEndpoint === null ? null : `${analyticsBaseEndpoint}/graphql`;
@@ -3614,6 +3628,10 @@ function PoolsView({
   };
   const ownerFilterLoading = discoveryState.hasLiquidity && account.address !== undefined && ownerEndpoint !== null &&
     (ownerPortfolioQuery.isPending || ownerPortfolioQuery.isFetching);
+  const closeCreation = useCallback(() => {
+    setCreationOpen(false);
+    requestAnimationFrame(() => creationLaunchRef.current?.focus());
+  }, []);
 
   return (
     <div className="view-grid">
@@ -3621,7 +3639,7 @@ function PoolsView({
         <PoolCreationWizard
           environmentKey={environmentKey}
           indexedPools={pools}
-          onClose={() => setCreationOpen(false)}
+          onClose={closeCreation}
           onConfirmedPool={onConfirmedPool}
           onRefresh={onRefresh}
           snapshot={snapshot}
@@ -3635,7 +3653,7 @@ function PoolsView({
               state={poolState}
               label={snapshot?.indexer.pagination.pools ? paginationBadgeLabel(pools.length, snapshot.indexer.pagination.pools, "pools") : snapshotState}
             />
-            <button className="primary-button" data-testid="pool-create-launch" onClick={() => setCreationOpen(true)} type="button">Create pool</button>
+            <button className="primary-button" data-testid="pool-create-launch" onClick={() => setCreationOpen(true)} ref={creationLaunchRef} type="button">Create pool</button>
           </div>
         </div>
         {rpcOverlay ? (
@@ -3818,6 +3836,18 @@ function PoolCreationWizard({
   const canonicalReconciliationHash = useRef<Hex | null>(null);
   const handledRevertedHash = useRef<Hex | null>(null);
   const submitInFlight = useRef(false);
+  const tokenXInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    tokenXInputRef.current?.focus();
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      onClose();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
   const operationGeneration = useRef(0);
   const contextIdentity = [
     environmentKey,
@@ -4467,7 +4497,7 @@ function PoolCreationWizard({
       </div>
       {step === "tokens" ? (
         <div className="pool-creation-grid">
-          <label><span className="field-label">Token X · semantic base</span><input data-testid="pool-create-token-x" value={tokenXInput} onChange={(event) => setTokenXInput(event.target.value)} placeholder="ERC-20 address" /></label>
+          <label><span className="field-label">Token X · semantic base</span><input data-testid="pool-create-token-x" ref={tokenXInputRef} value={tokenXInput} onChange={(event) => setTokenXInput(event.target.value)} placeholder="ERC-20 address" /></label>
           <label><span className="field-label">Token Y · factory quote asset</span><select data-testid="pool-create-token-y" value={tokenYAddress} onChange={(event) => setTokenYAddress(event.target.value)}>
             <option value="">Select quote asset</option>
             {(discovery?.quoteAssets ?? []).map((address) => {
@@ -8369,6 +8399,7 @@ function LiquidityView({
         <div className="liquidity-rows">
           <div className="amount-box compact">
             <input
+              aria-label={`${nativeModeX ? "ETH" : tokenSymbol(tokenX)} liquidity amount`}
               data-testid="liquidity-amount-x"
               disabled={liquidityMode === "token-y"}
               inputMode="decimal"
@@ -8376,13 +8407,14 @@ function LiquidityView({
               onChange={(event) => { nativeAddMaxBindingRef.current = null; setAmountXInput(event.target.value); }}
             />
             <span>{nativeModeX ? "ETH" : tokenSymbol(tokenX)}</span>
-            <button className="token-max-button" data-testid="liquidity-max-x" disabled={nativeModeX ? ((!nativeAdd || !addReady) && !canReuseNativeAddMaxObservation("x")) || nativeAddMaxPending : walletBalanceX === null || tokenX === null || liquidityMode === "token-y"} onClick={() => {
+            <button aria-label={`Use maximum ${nativeModeX ? "ETH" : tokenSymbol(tokenX)} balance`} className="token-max-button" data-testid="liquidity-max-x" disabled={nativeModeX ? ((!nativeAdd || !addReady) && !canReuseNativeAddMaxObservation("x")) || nativeAddMaxPending : walletBalanceX === null || tokenX === null || liquidityMode === "token-y"} onClick={() => {
               if (nativeModeX) handleNativeAddMax("x");
               else if (walletBalanceX !== null && tokenX !== null) { nativeAddMaxBindingRef.current = null; setAmountXInput(maxAmountInput({ asset: "token", balance: walletBalanceX, decimals: tokenX.decimals })); }
             }} type="button">Max</button>
           </div>
           <div className="amount-box compact">
             <input
+              aria-label={`${nativeModeY ? "ETH" : tokenSymbol(tokenY)} liquidity amount`}
               data-testid="liquidity-amount-y"
               disabled={liquidityMode === "token-x"}
               inputMode="decimal"
@@ -8390,7 +8422,7 @@ function LiquidityView({
               onChange={(event) => { nativeAddMaxBindingRef.current = null; setAmountYInput(event.target.value); }}
             />
             <span>{nativeModeY ? "ETH" : tokenSymbol(tokenY)}</span>
-            <button className="token-max-button" data-testid="liquidity-max-y" disabled={nativeModeY ? ((!nativeAdd || !addReady) && !canReuseNativeAddMaxObservation("y")) || nativeAddMaxPending : walletBalanceY === null || tokenY === null || liquidityMode === "token-x"} onClick={() => {
+            <button aria-label={`Use maximum ${nativeModeY ? "ETH" : tokenSymbol(tokenY)} balance`} className="token-max-button" data-testid="liquidity-max-y" disabled={nativeModeY ? ((!nativeAdd || !addReady) && !canReuseNativeAddMaxObservation("y")) || nativeAddMaxPending : walletBalanceY === null || tokenY === null || liquidityMode === "token-x"} onClick={() => {
               if (nativeModeY) handleNativeAddMax("y");
               else if (walletBalanceY !== null && tokenY !== null) { nativeAddMaxBindingRef.current = null; setAmountYInput(maxAmountInput({ asset: "token", balance: walletBalanceY, decimals: tokenY.decimals })); }
             }} type="button">Max</button>
@@ -8647,11 +8679,28 @@ function LiquidityView({
 
         <LiquidityStateRows
           actionError={liquidityActionError}
+          finalActionPending={addWrite.isPending || (
+            submittedAddReceiptContext === addExecutionFingerprint &&
+            addWrite.data !== undefined &&
+            !addSuccessReconciled &&
+            !addReverted
+          )}
+          finalSuccessText={addSuccessReconciled ? "Liquidity added" : null}
           inputError={addInputError}
           insufficientBalance={insufficientX || insufficientY}
-          pendingHash={addWrite.data ?? approveXWrite.data ?? approveYWrite.data}
-          successText={addSuccessReconciled ? "Liquidity added" : approveXSuccess || approveYSuccess ? "Token approval confirmed" : null}
+          pendingHash={submittedAddReceiptContext === addExecutionFingerprint
+            ? addWrite.data
+            : submittedApproveXReceiptContext === approveXExecutionFingerprint
+              ? approveXWrite.data
+              : submittedApproveYReceiptContext === approveYExecutionFingerprint
+                ? approveYWrite.data
+                : undefined}
+          prerequisitePending={approveXWrite.isPending || approveYWrite.isPending ||
+            (submittedApproveXReceiptContext === approveXExecutionFingerprint && approveXReceipt.isLoading) ||
+            (submittedApproveYReceiptContext === approveYExecutionFingerprint && approveYReceipt.isLoading)}
+          prerequisiteSuccessText={approveXSuccess || approveYSuccess ? "Token approval confirmed" : null}
           revertedText={addReverted ? "Add liquidity reverted" : approveXReverted ? `${tokenSymbol(tokenX)} approval reverted` : approveYReverted ? `${tokenSymbol(tokenY)} approval reverted` : null}
+          testId="liquidity-add-status"
         />
       </section>
 
@@ -8801,15 +8850,28 @@ function LiquidityView({
 
         <LiquidityStateRows
           actionError={currentRemoveOrphaned ? "Native withdrawal receipt was reorganized; canonical accounting was removed and retry remains journal-blocked." : nativeRemoveOrphanNotice ?? removeQuoteReviewRequired ?? liquidityActionError}
-          inputError={removeInputError}
-          insufficientBalance={false}
-          pendingHash={liquidityReceiptPhase === "remove" ? removeWrite.data : liquidityReceiptPhase === "lb-approval" ? approveLbWrite.data : undefined}
-          successText={currentRemoveSuccess
+          finalActionPending={liquidityReceiptPhase === "remove" && (
+            removeWrite.isPending || (
+              removeWrite.data !== undefined &&
+              !currentRemoveSuccess &&
+              !currentRemoveReverted &&
+              !currentRemoveOrphaned
+            )
+          )}
+          finalSuccessText={currentRemoveSuccess
             ? submittedFullExitHash !== null && submittedFullExitHash === removeWrite.data
               ? "Full-exit batch mined; the full exit is not complete until 12-confirmation finality and a fresh zero-bin verification"
               : "Liquidity removed"
-            : currentLbApprovalSuccess ? "LB approval confirmed" : null}
+            : null}
+          inputError={liquidityReceiptPhase === "remove" && removeInputError?.startsWith("A prior withdrawal is ")
+            ? null
+            : removeInputError}
+          insufficientBalance={false}
+          pendingHash={liquidityReceiptPhase === "remove" ? removeWrite.data : liquidityReceiptPhase === "lb-approval" ? approveLbWrite.data : undefined}
+          prerequisitePending={liquidityReceiptPhase === "lb-approval" && (approveLbWrite.isPending || approveLbReceipt.isLoading)}
+          prerequisiteSuccessText={currentLbApprovalSuccess ? "LB approval confirmed" : null}
           revertedText={currentRemoveReverted ? "Remove liquidity reverted" : currentLbApprovalReverted ? "LB approval reverted" : null}
+          testId="liquidity-remove-status"
         />
         <NativeRemoveReceiptReview
           error={nativeRemoveReceiptReconciliationQuery.error}
@@ -8956,45 +9018,51 @@ function LiquidityDistributionPreview({
 
 function LiquidityStateRows({
   actionError,
+  finalActionPending,
+  finalSuccessText,
   inputError,
   insufficientBalance,
   pendingHash,
+  prerequisitePending,
+  prerequisiteSuccessText,
   revertedText,
-  successText
+  testId
 }: {
   actionError: string | null;
+  finalActionPending: boolean;
+  finalSuccessText: string | null;
   inputError: string | null;
   insufficientBalance: boolean;
   pendingHash: Address | undefined;
+  prerequisitePending: boolean;
+  prerequisiteSuccessText: string | null;
   revertedText: string | null;
-  successText: string | null;
+  testId: string;
 }) {
   const failure = revertedText ?? inputError ?? (insufficientBalance ? "Insufficient token balance" : null) ?? actionError;
-  const transactionState = revertedText
-    ? "Transaction failed"
-    : successText
-      ? "Transaction finalized"
-      : actionError
-        ? "Transaction not submitted"
-        : pendingHash
-          ? `Pending ${formatCompactAddress(pendingHash)}`
-          : "Ready for wallet confirmation";
+  const state = failure
+    ? { icon: <AlertTriangle size={16} />, message: failure, tone: "failure" }
+    : finalSuccessText
+      ? { icon: <CheckCircle2 size={16} />, message: finalSuccessText, tone: "success" }
+      : finalActionPending
+        ? { icon: <LoaderCircle className="spin" size={16} />, message: pendingHash ? `Pending ${formatCompactAddress(pendingHash)}` : "Awaiting action wallet confirmation", tone: "pending" }
+        : prerequisiteSuccessText
+          ? { icon: <CheckCircle2 size={16} />, message: prerequisiteSuccessText, tone: "success" }
+          : prerequisitePending || pendingHash
+            ? { icon: <LoaderCircle className="spin" size={16} />, message: pendingHash ? `Pending ${formatCompactAddress(pendingHash)}` : "Awaiting approval wallet confirmation", tone: "pending" }
+          : { icon: <CheckCircle2 size={16} />, message: "Ready for wallet confirmation", tone: "ready" };
 
   return (
-    <>
-      <div className="state-row pending">
-        <LoaderCircle size={16} />
-        <span>{transactionState}</span>
-      </div>
-      <div className="state-row success">
-        <CheckCircle2 size={16} />
-        <span>{successText ?? "Receipt state will appear here"}</span>
-      </div>
-      <div className="state-row failure">
-        <AlertTriangle size={16} />
-        <span>{failure ?? "Rejected, reverted, and range errors appear here"}</span>
-      </div>
-    </>
+    <div
+      aria-atomic="true"
+      aria-live={state.tone === "failure" ? "assertive" : "polite"}
+      className={`state-row transaction-status ${state.tone}`}
+      data-testid={testId}
+      role={state.tone === "failure" ? "alert" : "status"}
+    >
+      {state.icon}
+      <span>{state.message}</span>
+    </div>
   );
 }
 
