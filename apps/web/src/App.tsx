@@ -23,6 +23,8 @@ import { createDexPublicClient } from "@robinhood-lb/sdk/client";
 import {
   applyBurnQuoteSlippage,
   applyLiquiditySlippageMin,
+  buildAddLiquidityNativeTransaction,
+  buildAddLiquidityTransaction,
   buildLiquidityDistribution,
   buildRemoveLiquidityTransaction,
   MAX_LIQUIDITY_BINS,
@@ -151,6 +153,7 @@ import {
   burnQuoteExecutionFingerprint,
   evaluateTransactionSafety,
   idSlippageInputError,
+  liquidityAddAssetFingerprint,
   nativeSwapSubmissionFingerprint,
   parseDeadlineMinutes,
   parseIdSlippage,
@@ -176,8 +179,10 @@ import {
   getPinnedBlockIdentity,
   loadPinnedAddLiquidityReview,
   reconcileAddLiquidityReceipt,
+  reconcileNativeAddLiquidityReceipt,
   samePinnedLiquidityReview,
   type AddLiquidityReceiptReconciliation,
+  type NativeAddLiquidityReceiptReconciliation,
   type PinnedAddLiquidityReview
 } from "./liquidity-review";
 import {
@@ -3211,7 +3216,7 @@ function LiquidityAddReviewPanel({
           <div><dt>Position recipient</dt><dd><code className="approval-address">{parameters.to}</code></dd></div>
           <div><dt>Refund recipient</dt><dd><code className="approval-address">{parameters.refundTo}</code></dd></div>
           <div><dt>Unix deadline</dt><dd>{parameters.deadline.toString()}</dd></div>
-          <div><dt>Native value</dt><dd>0 ETH · ERC-20 addLiquidity</dd></div>
+          <div><dt>Native value</dt><dd>{reviewState.review.assetMode === "native" ? `${formatUnits(reviewState.review.transaction.value, 18)} ETH · addLiquidityNATIVE` : "0 ETH · ERC-20 addLiquidity"}</dd></div>
         </dl>
       </section>
       <details className="review-details" data-testid="liquidity-review-bin-shares">
@@ -3232,7 +3237,7 @@ function LiquidityAddReviewPanel({
       </div>
       <div className="state-row" data-testid="liquidity-review-native-scope">
         <CircleDollarSign size={16} />
-        <span>This path deposits ERC-20 tokens only. Wrapped native assets remain ERC-20; ETH is used only for gas. Native add-liquidity reconciliation is unavailable until the dedicated native flow lands.</span>
+        <span>{reviewState.review.assetMode === "native" ? "ETH is wrapped by the router and sent to the pair. Any unused native-side amount is refunded as wrapped-native ERC-20, not ETH." : "This review uses ERC-20 addLiquidity with zero transaction value; ETH is used only for gas."}</span>
       </div>
     </div>
   );
@@ -3259,6 +3264,7 @@ function LiquidityReceiptReview({
     return <div className="state-row" data-testid="liquidity-receipt-review-loading"><LoaderCircle className="spin" size={16} /><span>Reconciling canonical receipt {formatCompactAddress(hash)}</span></div>;
   }
   const reconciliation = deserializeBigintState<AddLiquidityReceiptReconciliation>(reconciliationJson);
+  const nativeReconciliation = "nativeValueWei" in reconciliation ? reconciliation as NativeAddLiquidityReceiptReconciliation : null;
   return (
     <div className="review-card" data-testid="liquidity-receipt-review">
       <div className="panel-heading"><span>Canonical receipt accounting</span><StatusBadge state={reconciliation.estimateMatchedActual ? "ready" : "partial"} label={reconciliation.estimateMatchedActual ? "estimate matched" : "execution drift"} /></div>
@@ -3277,6 +3283,9 @@ function LiquidityReceiptReview({
         <MiniMetric label="Actual LB shares" value={reconciliation.mintedShares.reduce((total, shares) => total + shares, 0n).toString()} />
         <MiniMetric label="Actual gas used" value={reconciliation.actualGasUsed.toString()} />
         <MiniMetric label="Actual gas cost" value={`${formatUnits(reconciliation.actualGasCostWei, 18)} ETH`} />
+        {nativeReconciliation ? <MiniMetric label="Exact native value" value={`${formatUnits(nativeReconciliation.nativeValueWei, 18)} ETH`} /> : null}
+        {nativeReconciliation ? <MiniMetric label="Wrapped-native refund" value={formatTokenAmount(nativeReconciliation.wrapperRefund.toString(), tokenX?.tags.includes("wrapped-native") ? tokenX : tokenY)} /> : null}
+        {nativeReconciliation ? <MiniMetric label="LP balance deltas" value={nativeReconciliation.lpBalanceDeltas.map((row) => `${row.binId.toString()}:${row.delta.toString()}`).join(", ")} /> : null}
       </div>
       <details className="review-details" data-testid="liquidity-receipt-bin-shares">
         <summary>Actual per-bin claims</summary>
@@ -4804,6 +4813,7 @@ function LiquidityView({
   const [narrowPresetInput, setNarrowPresetInput] = useState("3");
   const [widePresetInput, setWidePresetInput] = useState("21");
   const [liquidityStrategy, setLiquidityStrategy] = useState<LiquidityStrategy>("spot");
+  const [liquidityAssetMode, setLiquidityAssetMode] = useState<"erc20" | "native">("erc20");
   const [slippageInput, setSlippageInput] = useState("0.5");
   const [idSlippageInput, setIdSlippageInput] = useState("2");
   const [deadlineInput, setDeadlineInput] = useState("20");
@@ -4853,7 +4863,7 @@ function LiquidityView({
   const approveXWrite = useWriteContract();
   const approveYWrite = useWriteContract();
   const approveLbWrite = useWriteContract();
-  const addWrite = useWriteContract();
+  const addWrite = useSendTransaction();
   const removeWrite = useSendTransaction();
   const approveXReceipt = useWaitForTransactionReceipt({ hash: approveXWrite.data });
   const approveYReceipt = useWaitForTransactionReceipt({ hash: approveYWrite.data });
@@ -4893,6 +4903,18 @@ function LiquidityView({
   const pool = executionPoolFromDescriptor(selectedPool) ?? executionPoolFromDescriptor(removeSelectedPool);
   const tokenX = selectedPool.tokenX ?? removeSelectedPool.tokenX;
   const tokenY = selectedPool.tokenY ?? removeSelectedPool.tokenY;
+  const liquidityWrappedNativeCandidates = [tokenX, tokenY].filter((token): token is TokenMetadata =>
+    token !== null && token.tags.includes("wrapped-native") && tokenAllowsAction(token, "add-liquidity")
+  );
+  const liquidityWrappedNative = liquidityWrappedNativeCandidates.length === 1 ? liquidityWrappedNativeCandidates[0] : null;
+  const liquidityWrappedNativeSide: "x" | "y" | null =
+    liquidityWrappedNative === null || pool === null
+      ? null
+      : isAddressEqual(liquidityWrappedNative.address, pool.tokenX)
+        ? "x"
+        : isAddressEqual(liquidityWrappedNative.address, pool.tokenY)
+          ? "y"
+          : null;
   const connected = account.status === "connected" && account.address !== undefined;
   const onWrongChain = connected && activeWalletChainId !== registry.chainId;
   const liquidityLifecycleKey = [
@@ -5046,6 +5068,17 @@ function LiquidityView({
   const liquidityMode = distributionResult.distribution?.mode ?? null;
   const amountX = liquidityMode === "token-y" ? 0n : parsedAmountX;
   const amountY = liquidityMode === "token-x" ? 0n : parsedAmountY;
+  const nativeSideAmount = liquidityWrappedNativeSide === "x" ? amountX : liquidityWrappedNativeSide === "y" ? amountY : null;
+  const nativeAdd = liquidityAssetMode === "native" && nativeSideAmount !== null && nativeSideAmount > 0n;
+  const effectiveAddAssetMode: "erc20" | "native" = nativeAdd ? "native" : "erc20";
+  const addTransactionValue = nativeAdd ? nativeSideAmount : 0n;
+  const addAssetFingerprint = liquidityAddAssetFingerprint({
+    assetMode: effectiveAddAssetMode,
+    selectedMode: liquidityAssetMode,
+    transactionValue: addTransactionValue.toString(),
+    wrappedNative: liquidityWrappedNative?.address ?? null,
+    wrappedNativeSide: liquidityWrappedNativeSide
+  });
   const rangeControlError =
     rangeEditError ??
     (rangePriceQuery.error ? `Range price read failed: ${getWriteError(rangePriceQuery.error) ?? "price unavailable"}` : null) ??
@@ -5146,7 +5179,8 @@ function LiquidityView({
     liquidityStrategy,
     distributionResult.distribution?.deltaIds.join(",") ?? "",
     distributionResult.distribution?.distributionX.join(",") ?? "",
-    distributionResult.distribution?.distributionY.join(",") ?? ""
+    distributionResult.distribution?.distributionY.join(",") ?? "",
+    addAssetFingerprint
   ].join("|");
   const addRetrySettingsFingerprint = [
     environmentKey,
@@ -5161,7 +5195,8 @@ function LiquidityView({
     deadlineMinutes?.toString() ?? "",
     liquidityStrategy,
     lowerDelta?.toString() ?? "",
-    upperDelta?.toString() ?? ""
+    upperDelta?.toString() ?? "",
+    addAssetFingerprint
   ].join("|");
   const latestAddExecutionFingerprint = useRef(addExecutionFingerprint);
   latestAddExecutionFingerprint.current = addExecutionFingerprint;
@@ -5184,11 +5219,7 @@ function LiquidityView({
       !isAddressEqual(submittedLiquidityAddReview.review.pair, pool.pair) ||
       !isAddressEqual(submittedLiquidityAddReview.review.router, registry.contracts.lbRouter)
     ) return null;
-    const exactCalldataFingerprint = keccak256(encodeFunctionData({
-      abi: lbRouterAbi,
-      functionName: "addLiquidity",
-      args: [submittedLiquidityAddReview.review.parameters]
-    }));
+    const exactCalldataFingerprint = keccak256(submittedLiquidityAddReview.review.transaction.data);
     return transactionJournal.records
       .filter((record) =>
         record.reviewed.intent === "add-liquidity" &&
@@ -5207,17 +5238,84 @@ function LiquidityView({
       .sort((left, right) => right.createdAt - left.createdAt)[0] ?? null;
   }, [account.address, environmentKey, pool, registry.chainId, registry.contracts.lbRouter, submittedLiquidityAddReview, transactionJournal.records]);
   const canonicalAddHash = canonicalAddRecord?.canonicalReceipt?.hash ?? null;
-  const addReceiptReconciliationQuery = useQuery<AddLiquidityReceiptReconciliation>({
+  const activeAddJournalRecord = addWrite.data
+    ? transactionJournal.records.find((record) => record.reviewed.intent === "add-liquidity" && record.activeHash?.toLowerCase() === addWrite.data!.toLowerCase()) ?? null
+    : null;
+  useEffect(() => {
+    if (activeAddJournalRecord?.status === "orphaned") {
+      setLiquidityReviewNotice("Add-liquidity receipt was reorganized; canonical accounting was removed and retry remains journal-blocked.");
+    }
+  }, [activeAddJournalRecord?.status]);
+  const addReceiptReconciliationQuery = useQuery<AddLiquidityReceiptReconciliation | NativeAddLiquidityReceiptReconciliation>({
     queryKey: ["canonicalAddLiquidityReceipt", registry.chainId, canonicalAddHash],
     queryFn: async () => {
       if (canonicalAddHash === null || submittedLiquidityAddReview === null || account.address === undefined) {
         throw new Error("Canonical add-liquidity receipt is unavailable");
       }
+      const owner = account.address;
       const receipt = await publicClient.getTransactionReceipt({ hash: canonicalAddHash });
       if (receipt.status !== "success" || receipt.blockHash.toLowerCase() !== canonicalAddRecord?.canonicalReceipt?.blockHash.toLowerCase()) {
         throw new Error("Canonical add-liquidity receipt changed during reconciliation");
       }
       const parameters = submittedLiquidityAddReview.review.parameters;
+      if (submittedLiquidityAddReview.review.assetMode === "native") {
+        if (receipt.blockNumber === 0n || liquidityWrappedNative === null || liquidityWrappedNativeSide === null) {
+          throw new Error("Canonical native add-liquidity balance evidence is unavailable");
+        }
+        const beforeBlockNumber = receipt.blockNumber - 1n;
+        const otherToken = liquidityWrappedNativeSide === "x" ? parameters.tokenY : parameters.tokenX;
+        const transaction = await publicClient.getTransaction({ hash: canonicalAddHash });
+        if (
+          !isAddressEqual(transaction.from, owner) ||
+          transaction.to === null ||
+          !isAddressEqual(transaction.to, submittedLiquidityAddReview.review.transaction.to) ||
+          transaction.input.toLowerCase() !== submittedLiquidityAddReview.review.transaction.data.toLowerCase() ||
+          transaction.value !== submittedLiquidityAddReview.review.transaction.value
+        ) throw new Error("Canonical native add-liquidity transaction differs from the reviewed request");
+        const canonicalBefore = await publicClient.getBlock({ blockNumber: receipt.blockNumber });
+        if (canonicalBefore.hash?.toLowerCase() !== receipt.blockHash.toLowerCase()) throw new Error("Canonical native add-liquidity receipt block changed before balance reads");
+        const [nativeBalanceBefore, nativeBalanceAfter, wrapperBalanceBefore, wrapperBalanceAfter, otherTokenBalanceBefore, otherTokenBalanceAfter, ...lpValues] = await Promise.all([
+          publicClient.getBalance({ address: owner, blockNumber: beforeBlockNumber }),
+          publicClient.getBalance({ address: owner, blockNumber: receipt.blockNumber }),
+          publicClient.readContract({ address: liquidityWrappedNative.address, abi: erc20Abi, functionName: "balanceOf", args: [owner], blockNumber: beforeBlockNumber }),
+          publicClient.readContract({ address: liquidityWrappedNative.address, abi: erc20Abi, functionName: "balanceOf", args: [owner], blockNumber: receipt.blockNumber }),
+          publicClient.readContract({ address: otherToken, abi: erc20Abi, functionName: "balanceOf", args: [owner], blockNumber: beforeBlockNumber }),
+          publicClient.readContract({ address: otherToken, abi: erc20Abi, functionName: "balanceOf", args: [owner], blockNumber: receipt.blockNumber }),
+          ...submittedLiquidityAddReview.review.simulation.depositIds.flatMap((binId) => [
+            publicClient.readContract({ address: submittedLiquidityAddReview.review.pair, abi: lbPairAbi, functionName: "balanceOf", args: [owner, binId], blockNumber: beforeBlockNumber }),
+            publicClient.readContract({ address: submittedLiquidityAddReview.review.pair, abi: lbPairAbi, functionName: "balanceOf", args: [owner, binId], blockNumber: receipt.blockNumber })
+          ])
+        ]);
+        const canonicalAfter = await publicClient.getBlock({ blockNumber: receipt.blockNumber });
+        if (canonicalAfter.hash?.toLowerCase() !== receipt.blockHash.toLowerCase()) throw new Error("Canonical native add-liquidity receipt block reorganized during accounting");
+        return reconcileNativeAddLiquidityReceipt({
+          account: owner,
+          effectiveGasPrice: receipt.effectiveGasPrice,
+          expectedReview: submittedLiquidityAddReview.review,
+          gasUsed: receipt.gasUsed,
+          logs: receipt.logs,
+          lpBalances: submittedLiquidityAddReview.review.simulation.depositIds.map((binId, index) => {
+            const before = lpValues[index * 2];
+            const after = lpValues[index * 2 + 1];
+            if (before === undefined || after === undefined) throw new Error("Canonical LP balance evidence is incomplete");
+            return { after, before, binId };
+          }),
+          nativeBalanceAfter,
+          nativeBalanceBefore,
+          nativeSide: liquidityWrappedNativeSide,
+          otherTokenBalanceAfter,
+          otherTokenBalanceBefore,
+          pair: submittedLiquidityAddReview.review.pair,
+          recipient: parameters.to,
+          refundRecipient: parameters.refundTo,
+          router: registry.contracts.lbRouter,
+          tokenX: parameters.tokenX,
+          tokenY: parameters.tokenY,
+          transactionValue: submittedLiquidityAddReview.review.transaction.value,
+          wrapperBalanceAfter,
+          wrapperBalanceBefore
+        });
+      }
       return reconcileAddLiquidityReceipt({
         account: account.address,
         effectiveGasPrice: receipt.effectiveGasPrice,
@@ -5397,10 +5495,16 @@ function LiquidityView({
   const walletAllowanceX = walletData ? BigInt(walletData.allowanceX) : null;
   const walletAllowanceY = walletData ? BigInt(walletData.allowanceY) : null;
   const nativeBalance = walletData ? BigInt(walletData.nativeBalance) : null;
-  const needsXApproval = amountX !== null && amountX > 0n && walletAllowanceX !== null && walletAllowanceX < amountX;
-  const needsYApproval = amountY !== null && amountY > 0n && walletAllowanceY !== null && walletAllowanceY < amountY;
-  const insufficientX = amountX !== null && amountX > 0n && walletBalanceX !== null && walletBalanceX < amountX;
-  const insufficientY = amountY !== null && amountY > 0n && walletBalanceY !== null && walletBalanceY < amountY;
+  const nativeModeX = liquidityAssetMode === "native" && liquidityWrappedNativeSide === "x";
+  const nativeModeY = liquidityAssetMode === "native" && liquidityWrappedNativeSide === "y";
+  const nativeX = nativeAdd && liquidityWrappedNativeSide === "x";
+  const nativeY = nativeAdd && liquidityWrappedNativeSide === "y";
+  const spendableBalanceX = nativeX ? nativeBalance : walletBalanceX;
+  const spendableBalanceY = nativeY ? nativeBalance : walletBalanceY;
+  const needsXApproval = !nativeX && amountX !== null && amountX > 0n && walletAllowanceX !== null && walletAllowanceX < amountX;
+  const needsYApproval = !nativeY && amountY !== null && amountY > 0n && walletAllowanceY !== null && walletAllowanceY < amountY;
+  const insufficientX = amountX !== null && amountX > 0n && spendableBalanceX !== null && spendableBalanceX < amountX;
+  const insufficientY = amountY !== null && amountY > 0n && spendableBalanceY !== null && spendableBalanceY < amountY;
   const approveXExecutionFingerprint = [
     addExecutionFingerprint,
     "token-x",
@@ -5756,6 +5860,8 @@ function LiquidityView({
   const approveYSuccess = submittedApproveYReceiptContext === approveYExecutionFingerprint && approveYReceipt.data?.status === "success";
   const approveLbSuccess = submittedLbApprovalReceiptContext === lbApprovalFormFingerprint && approveLbReceipt.data?.status === "success";
   const addSuccess = submittedAddReceiptContext === addExecutionFingerprint && addReceipt.data?.status === "success";
+  const nativeAddAccountingRequired = submittedLiquidityAddReview?.review.assetMode === "native" && submittedLiquidityAddReview.executionFingerprint === submittedAddReceiptContext;
+  const addSuccessReconciled = addSuccess && (!nativeAddAccountingRequired || addReceiptReconciliationQuery.data !== undefined);
   const removeSuccess = removeReceipt.data?.status === "success";
   const approveXReverted = submittedApproveXReceiptContext === approveXExecutionFingerprint && (approveXReceipt.data?.status === "reverted" || isRevertedReceiptError(approveXReceipt.error));
   const approveYReverted = submittedApproveYReceiptContext === approveYExecutionFingerprint && (approveYReceipt.data?.status === "reverted" || isRevertedReceiptError(approveYReceipt.error));
@@ -6524,6 +6630,15 @@ function LiquidityView({
         refundTo: account.address,
         deadline: deadlineFromNow(deadlineMinutes)
       };
+    const builderParameters = {
+      ...parameters,
+      deltaIds: [...parameters.deltaIds],
+      distributionX: [...parameters.distributionX],
+      distributionY: [...parameters.distributionY]
+    };
+    const transaction = effectiveAddAssetMode === "native"
+      ? buildAddLiquidityNativeTransaction(registry, builderParameters)
+      : buildAddLiquidityTransaction(registry, builderParameters);
     addSubmitInFlightRef.current = submittedOperationGeneration;
     addWrite.reset();
     setSubmittedAddReceiptContext(null);
@@ -6554,10 +6669,12 @@ function LiquidityView({
           }
           return loadPinnedAddLiquidityReview(publicClient, {
             account: account.address,
+            assetMode: effectiveAddAssetMode,
             block,
             pair: pool.pair,
             parameters,
-            router: registry.contracts.lbRouter
+            router: registry.contracts.lbRouter,
+            transaction
           });
         },
         setLiquiditySimulationError,
@@ -6588,25 +6705,19 @@ function LiquidityView({
       const gasApproved = await reviewExactGas({
         action: "add liquidity",
         currentReview: gasReview,
-        estimateGas: () => publicClient.estimateContractGas({
-          account: account.address,
-          address: registry.contracts.lbRouter,
-          abi: lbRouterAbi,
-          functionName: "addLiquidity",
-          args: [parameters],
-          blockNumber: exactReview.block.number
-        }),
+        estimateGas: () => publicClient.estimateGas({ account: account.address, blockNumber: exactReview.block.number, ...transaction }),
         executionFingerprint: pinnedExecutionFingerprint,
         getBalance: () => publicClient.getBalance({ address: account.address }),
         getGasPrice: () => publicClient.getGasPrice(),
         isCurrent: gasReviewIsCurrent,
         setError: setGasReviewError,
-        setReview: setGasReview
+        setReview: setGasReview,
+        transactionValue: transaction.value
       });
       if (!reviewUnchanged || !gasApproved || !gasReviewIsCurrent()) return;
       const submittedContext = {
         account: account.address,
-        calldataFingerprint: keccak256(encodeFunctionData({ abi: lbRouterAbi, functionName: "addLiquidity", args: [parameters] })),
+        calldataFingerprint: keccak256(transaction.data),
         chainId: activeWalletChainId,
         deploymentEpoch: deploymentEpoch(registry),
         environment: environmentKey,
@@ -6616,7 +6727,7 @@ function LiquidityView({
         providerUid: account.connector?.uid ?? "unknown",
         submittedAt: Date.now(),
         target: registry.contracts.lbRouter,
-        value: 0n
+        value: transaction.value
       };
       try {
         setSubmittedAddReceiptContext(submittedExecutionFingerprint);
@@ -6643,13 +6754,7 @@ function LiquidityView({
             await attestLiquidityPair("add-liquidity", finalBlock.number);
             if (!gasReviewIsCurrent()) throw new PairAttestationError("context-changed", "Liquidity context changed during final pair attestation");
           },
-          send: () => addWrite.writeContractAsync({
-            account: account.address,
-            address: registry.contracts.lbRouter,
-            abi: lbRouterAbi,
-            functionName: "addLiquidity",
-            args: [parameters]
-          })
+          send: () => addWrite.sendTransactionAsync({ account: account.address, ...transaction })
         });
         submitted = hash !== null;
       } catch (error) {
@@ -7500,6 +7605,17 @@ function LiquidityView({
           selectedPoolId={selectedPoolId}
         />
 
+        {connected && liquidityWrappedNative !== null && liquidityWrappedNativeSide !== null ? (
+          <fieldset className="routing-mode-control" data-testid="liquidity-native-mode">
+            <legend>Wrapped-native deposit mode</legend>
+            <div className="segmented" role="group" aria-label="Wrapped-native deposit mode">
+              <button aria-pressed={liquidityAssetMode === "native"} className={liquidityAssetMode === "native" ? "segment active" : "segment"} onClick={() => setLiquidityAssetMode("native")} type="button">ETH · native</button>
+              <button aria-pressed={liquidityAssetMode === "erc20"} className={liquidityAssetMode === "erc20" ? "segment active" : "segment"} onClick={() => setLiquidityAssetMode("erc20")} type="button">{liquidityWrappedNative.symbol} · ERC-20</button>
+            </div>
+            <p data-testid="liquidity-wrapper-disclosure">ETH deposits use exact router transaction value and never approve {liquidityWrappedNative.symbol}. Unused native-side input is refunded as {liquidityWrappedNative.symbol} ERC-20 at {liquidityWrappedNative.address}. Native Max is unavailable.</p>
+          </fieldset>
+        ) : null}
+
         <div className="liquidity-rows">
           <div className="amount-box compact">
             <input
@@ -7509,8 +7625,8 @@ function LiquidityView({
               value={liquidityMode === "token-y" ? "0" : amountXInput}
               onChange={(event) => setAmountXInput(event.target.value)}
             />
-            <span>{tokenSymbol(tokenX)}</span>
-            <button className="token-max-button" data-testid="liquidity-max-x" disabled={walletBalanceX === null || tokenX === null || liquidityMode === "token-y"} onClick={() => {
+            <span>{nativeModeX ? "ETH" : tokenSymbol(tokenX)}</span>
+            <button className="token-max-button" data-testid="liquidity-max-x" disabled={nativeModeX || walletBalanceX === null || tokenX === null || liquidityMode === "token-y"} onClick={() => {
               if (walletBalanceX !== null && tokenX !== null) setAmountXInput(maxAmountInput({ asset: "token", balance: walletBalanceX, decimals: tokenX.decimals }));
             }} type="button">Max</button>
           </div>
@@ -7522,14 +7638,14 @@ function LiquidityView({
               value={liquidityMode === "token-x" ? "0" : amountYInput}
               onChange={(event) => setAmountYInput(event.target.value)}
             />
-            <span>{tokenSymbol(tokenY)}</span>
-            <button className="token-max-button" data-testid="liquidity-max-y" disabled={walletBalanceY === null || tokenY === null || liquidityMode === "token-x"} onClick={() => {
+            <span>{nativeModeY ? "ETH" : tokenSymbol(tokenY)}</span>
+            <button className="token-max-button" data-testid="liquidity-max-y" disabled={nativeModeY || walletBalanceY === null || tokenY === null || liquidityMode === "token-x"} onClick={() => {
               if (walletBalanceY !== null && tokenY !== null) setAmountYInput(maxAmountInput({ asset: "token", balance: walletBalanceY, decimals: tokenY.decimals }));
             }} type="button">Max</button>
           </div>
         </div>
-        <TokenIdentity token={tokenX} networkName={registry.chain.name} testId="liquidity-token-x-identity" />
-        <TokenIdentity token={tokenY} networkName={registry.chain.name} testId="liquidity-token-y-identity" />
+        {nativeModeX ? <div className="state-row" data-testid="liquidity-token-x-identity">ETH native asset · router wrapper {liquidityWrappedNative?.symbol} {liquidityWrappedNative?.address}</div> : <TokenIdentity token={tokenX} networkName={registry.chain.name} testId="liquidity-token-x-identity" />}
+        {nativeModeY ? <div className="state-row" data-testid="liquidity-token-y-identity">ETH native asset · router wrapper {liquidityWrappedNative?.symbol} {liquidityWrappedNative?.address}</div> : <TokenIdentity token={tokenY} networkName={registry.chain.name} testId="liquidity-token-y-identity" />}
         <div className="state-row" data-testid="liquidity-range-mode">
           <Droplets size={16} />
           <span>{liquidityModeDescription(liquidityMode, tokenSymbol(tokenX), tokenSymbol(tokenY))}</span>
@@ -7540,6 +7656,9 @@ function LiquidityView({
             <span>One-sided liquidity deposits one token directly into the selected bins. It does not perform a swap; use the Swap screen separately if you want to rebalance first.</span>
           </div>
         ) : null}
+        {liquidityAssetMode === "native" && !nativeAdd ? (
+          <div className="state-row" data-testid="liquidity-native-unused-range"><CircleDollarSign size={16} /><span>This range uses only the non-wrapper token. Submission remains ERC-20 addLiquidity with 0 ETH value.</span></div>
+        ) : null}
         {liquidityMode === "balanced" ? (
           <div className="state-row" data-testid="liquidity-composition-guidance">
             <CircleDollarSign size={16} />
@@ -7547,9 +7666,9 @@ function LiquidityView({
           </div>
         ) : null}
         <div className="quote-grid">
-          <MiniMetric label={`${tokenSymbol(tokenX)} balance`} value={walletData ? formatTokenAmount(walletData.balanceX, tokenX) : connected ? "loading" : "connect"} />
-          <MiniMetric label={`${tokenSymbol(tokenY)} balance`} value={walletData ? formatTokenAmount(walletData.balanceY, tokenY) : connected ? "loading" : "connect"} />
-          <MiniMetric data-testid="liquidity-native-balance" label="ETH for gas" value={nativeBalance !== null ? `${formatUnits(nativeBalance, 18)} ETH` : connected ? "loading" : "connect"} />
+          <MiniMetric label={`${nativeModeX ? "ETH" : tokenSymbol(tokenX)} balance`} value={nativeModeX ? nativeBalance !== null ? `${formatUnits(nativeBalance, 18)} ETH` : connected ? "loading" : "connect" : walletData ? formatTokenAmount(walletData.balanceX, tokenX) : connected ? "loading" : "connect"} />
+          <MiniMetric label={`${nativeModeY ? "ETH" : tokenSymbol(tokenY)} balance`} value={nativeModeY ? nativeBalance !== null ? `${formatUnits(nativeBalance, 18)} ETH` : connected ? "loading" : "connect" : walletData ? formatTokenAmount(walletData.balanceY, tokenY) : connected ? "loading" : "connect"} />
+          <MiniMetric data-testid="liquidity-native-balance" label={nativeAdd ? "ETH for value and gas" : "ETH for gas"} value={nativeBalance !== null ? `${formatUnits(nativeBalance, 18)} ETH` : connected ? "loading" : "connect"} />
         </div>
 
         <GasReview review={gasReview} />
@@ -7704,13 +7823,13 @@ function LiquidityView({
           <MiniMetric label="Max Bin" value={activeBin !== null && upperDelta !== null ? String(activeBin + upperDelta) : "n/a"} />
           <MiniMetric label="Liquidity Mode" value={liquidityMode ?? "n/a"} />
           <MiniMetric label="Bin Step" value={pool?.binStep.toString() ?? primaryPool?.binStep ?? "n/a"} />
-          <MiniMetric label={`${tokenSymbol(tokenX)} allowance`} value={walletData ? formatTokenAmount(walletData.allowanceX, tokenX) : "n/a"} />
-          <MiniMetric label={`${tokenSymbol(tokenY)} allowance`} value={walletData ? formatTokenAmount(walletData.allowanceY, tokenY) : "n/a"} />
+          <MiniMetric label={`${nativeModeX ? "ETH" : tokenSymbol(tokenX)} allowance`} value={nativeModeX ? "not required for ETH" : walletData ? formatTokenAmount(walletData.allowanceX, tokenX) : "n/a"} />
+          <MiniMetric label={`${nativeModeY ? "ETH" : tokenSymbol(tokenY)} allowance`} value={nativeModeY ? "not required for ETH" : walletData ? formatTokenAmount(walletData.allowanceY, tokenY) : "n/a"} />
           <MiniMetric label={`${tokenSymbol(tokenX)} approve`} value={needsXApproval && amountX !== null ? formatTokenAmount(amountX.toString(), tokenX) : "none"} />
           <MiniMetric label={`${tokenSymbol(tokenY)} approve`} value={needsYApproval && amountY !== null ? formatTokenAmount(amountY.toString(), tokenY) : "none"} />
         </div>
 
-        <ApprovalDetails
+        {!nativeModeX ? <ApprovalDetails
           amount={amountX}
           asset={tokenSymbol(tokenX)}
           currentState={walletData ? `${formatTokenAmount(walletData.allowanceX, tokenX)} allowance${needsXApproval ? " (approval needed)" : " (sufficient)"}` : "unavailable"}
@@ -7719,8 +7838,8 @@ function LiquidityView({
           scope="Exact token amount for this add-liquidity action"
           spender={registry.contracts.lbRouter}
           token={tokenX}
-        />
-        <ApprovalDetails
+        /> : <div className="state-row success" data-testid="liquidity-native-no-approval">ETH uses exact transaction value and never requests wrapper approval.</div>}
+        {!nativeModeY ? <ApprovalDetails
           amount={amountY}
           asset={tokenSymbol(tokenY)}
           currentState={walletData ? `${formatTokenAmount(walletData.allowanceY, tokenY)} allowance${needsYApproval ? " (approval needed)" : " (sufficient)"}` : "unavailable"}
@@ -7729,7 +7848,7 @@ function LiquidityView({
           scope="Exact token amount for this add-liquidity action"
           spender={registry.contracts.lbRouter}
           token={tokenY}
-        />
+        /> : <div className="state-row success" data-testid="liquidity-native-no-approval">ETH uses exact transaction value and never requests wrapper approval.</div>}
 
         <LiquidityDistributionPreview
           activeBin={activeBin}
@@ -7741,7 +7860,7 @@ function LiquidityView({
         />
 
         <div className="action-stack">
-          <button
+          {!nativeModeX ? <button
             className="secondary-button wide"
             data-testid="liquidity-approve-x-button"
             type="button"
@@ -7752,8 +7871,8 @@ function LiquidityView({
           >
             {liquiditySimulationPending || approveXWrite.isPending || approveXReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <CheckCircle2 size={18} />}
             <span>{needsXApproval ? `Approve ${tokenSymbol(tokenX)}` : `${tokenSymbol(tokenX)} approved`}</span>
-          </button>
-          <button
+          </button> : null}
+          {!nativeModeY ? <button
             className="secondary-button wide"
             data-testid="liquidity-approve-y-button"
             type="button"
@@ -7764,7 +7883,7 @@ function LiquidityView({
           >
             {liquiditySimulationPending || approveYWrite.isPending || approveYReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <CheckCircle2 size={18} />}
             <span>{needsYApproval ? `Approve ${tokenSymbol(tokenY)}` : `${tokenSymbol(tokenY)} approved`}</span>
-          </button>
+          </button> : null}
           <button className="primary-button wide" data-testid="liquidity-add-button" type="button" disabled={!addReady} onClick={handleAddLiquidity}>
             {liquiditySimulationPending || addWrite.isPending || addReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <Droplets size={18} />}
             <span>{addButtonLabel === "Add liquidity" ? (liquidityAddReview?.executionFingerprint === addExecutionFingerprint ? "Confirm add liquidity" : "Review add liquidity") : addButtonLabel}</span>
@@ -7776,7 +7895,7 @@ function LiquidityView({
           inputError={addInputError}
           insufficientBalance={insufficientX || insufficientY}
           pendingHash={addWrite.data ?? approveXWrite.data ?? approveYWrite.data}
-          successText={addSuccess ? "Liquidity added" : approveXSuccess || approveYSuccess ? "Token approval confirmed" : null}
+          successText={addSuccessReconciled ? "Liquidity added" : approveXSuccess || approveYSuccess ? "Token approval confirmed" : null}
           revertedText={addReverted ? "Add liquidity reverted" : approveXReverted ? `${tokenSymbol(tokenX)} approval reverted` : approveYReverted ? `${tokenSymbol(tokenY)} approval reverted` : null}
         />
       </section>

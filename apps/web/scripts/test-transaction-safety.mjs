@@ -19,6 +19,7 @@ try {
     burnQuoteExecutionFingerprint,
     evaluateTransactionSafety,
     idSlippageInputError,
+    liquidityAddAssetFingerprint,
     nativeSwapSubmissionFingerprint,
     parseDeadlineMinutes,
     parseIdSlippage,
@@ -124,6 +125,28 @@ try {
   assert.equal(idSlippageInputError("-1"), "Enter an id slippage from 0 to 2 bins");
   assert.equal(idSlippageInputError("invalid"), "Enter an id slippage from 0 to 2 bins");
   assert.equal(idSlippageInputError("2"), null);
+
+  const nativeLiquidityAsset = liquidityAddAssetFingerprint({
+    assetMode: "native",
+    selectedMode: "native",
+    transactionValue: "10000000000000000",
+    wrappedNative: "0x2222222222222222222222222222222222222222",
+    wrappedNativeSide: "x"
+  });
+  assert.notEqual(nativeLiquidityAsset, liquidityAddAssetFingerprint({
+    assetMode: "erc20",
+    selectedMode: "erc20",
+    transactionValue: "0",
+    wrappedNative: "0x2222222222222222222222222222222222222222",
+    wrappedNativeSide: "x"
+  }));
+  assert.notEqual(nativeLiquidityAsset, liquidityAddAssetFingerprint({
+    assetMode: "native",
+    selectedMode: "native",
+    transactionValue: "10000000000000001",
+    wrappedNative: "0x2222222222222222222222222222222222222222",
+    wrappedNativeSide: "x"
+  }));
 
   const executionContext = {
     activeId: 8_388_608,

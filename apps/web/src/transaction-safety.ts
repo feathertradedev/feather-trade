@@ -78,6 +78,14 @@ export interface BurnExecutionContext {
   walletChainId: number;
 }
 
+export interface LiquidityAddAssetContext {
+  assetMode: "erc20" | "native";
+  selectedMode: "erc20" | "native";
+  transactionValue: string;
+  wrappedNative: string | null;
+  wrappedNativeSide: "x" | "y" | null;
+}
+
 export interface BurnQuoteExecutionBinding {
   balances: ReadonlyArray<{ balance: string; binId: string }>;
   binStates: ReadonlyArray<{ binId: string; reserveX: string; reserveY: string; totalSupply: string }>;
@@ -285,6 +293,16 @@ export function burnExecutionContextFingerprint(context: BurnExecutionContext): 
     context.slippageBps,
     context.deadlineMinutes,
     normalizeContextAddress(context.router)
+  ]);
+}
+
+export function liquidityAddAssetFingerprint(context: LiquidityAddAssetContext): string {
+  return JSON.stringify([
+    context.assetMode,
+    context.selectedMode,
+    normalizeContextAddress(context.wrappedNative),
+    context.wrappedNativeSide,
+    context.transactionValue
   ]);
 }
 

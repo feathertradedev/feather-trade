@@ -5,6 +5,8 @@ import {
   type AddLiquiditySimulationResult
 } from "@robinhood-lb/sdk/liquidity-review";
 import {
+  decodeFunctionData,
+  decodeFunctionResult,
   decodeEventLog,
   isAddressEqual,
   zeroAddress,
@@ -41,12 +43,14 @@ export interface PinnedBlockIdentity {
 export interface PinnedAddLiquidityReview {
   account: Address;
   activeId: bigint;
+  assetMode: "erc20" | "native";
   block: PinnedBlockIdentity;
   math: AddLiquidityMathQuote;
   parameters: AddLiquidityParameters;
   pair: Address;
   router: Address;
   simulation: AddLiquiditySimulationResult;
+  transaction: { data: Hex; to: Address; value: bigint };
 }
 
 export interface AddLiquidityReceiptReconciliation {
@@ -75,6 +79,13 @@ export interface AddLiquidityReceiptReconciliation {
   refundedY: bigint | null;
 }
 
+export interface NativeAddLiquidityReceiptReconciliation extends AddLiquidityReceiptReconciliation {
+  nativeValueWei: bigint;
+  otherTokenNetSpend: bigint;
+  wrapperRefund: bigint;
+  lpBalanceDeltas: ReadonlyArray<{ binId: bigint; delta: bigint }>;
+}
+
 export async function getPinnedBlockIdentity(publicClient: PublicClient): Promise<PinnedBlockIdentity> {
   const block = await publicClient.getBlock({ blockTag: "latest" });
   if (block.hash === null) throw new Error("Latest block has no canonical hash");
@@ -85,24 +96,34 @@ export async function loadPinnedAddLiquidityReview(
   publicClient: PublicClient,
   input: {
     account: Address;
+    assetMode: "erc20" | "native";
     block: PinnedBlockIdentity;
     pair: Address;
     parameters: AddLiquidityParameters;
     router: Address;
+    transaction: { data: Hex; to: Address; value: bigint };
   }
 ): Promise<PinnedAddLiquidityReview> {
   const { block, parameters } = input;
+  if (!isAddressEqual(input.transaction.to, input.router)) throw new Error("Reviewed liquidity transaction targets the wrong router");
+  const decodedTransaction = decodeFunctionData({ abi: lbRouterAbi, data: input.transaction.data });
+  const expectedFunction = input.assetMode === "native" ? "addLiquidityNATIVE" : "addLiquidity";
+  if (decodedTransaction.functionName !== expectedFunction || parametersKey(decodedTransaction.args[0]) !== parametersKey(parameters)) {
+    throw new Error("Reviewed liquidity transaction calldata differs from its parameters or asset mode");
+  }
+  if ((input.assetMode === "erc20" && input.transaction.value !== 0n) || (input.assetMode === "native" && input.transaction.value <= 0n)) {
+    throw new Error("Reviewed liquidity transaction value differs from its asset mode");
+  }
   const [activeIdRaw, binStepRaw, staticFeesRaw, variableFeesRaw, simulation] = await Promise.all([
     publicClient.readContract({ address: input.pair, abi: lbPairAbi, functionName: "getActiveId", blockNumber: block.number }),
     publicClient.readContract({ address: input.pair, abi: lbPairAbi, functionName: "getBinStep", blockNumber: block.number }),
     publicClient.readContract({ address: input.pair, abi: lbPairAbi, functionName: "getStaticFeeParameters", blockNumber: block.number }),
     publicClient.readContract({ address: input.pair, abi: lbPairAbi, functionName: "getVariableFeeParameters", blockNumber: block.number }),
-    publicClient.simulateContract({
+    publicClient.call({
       account: input.account,
-      address: input.router,
-      abi: lbRouterAbi,
-      functionName: "addLiquidity",
-      args: [parameters],
+      to: input.transaction.to,
+      data: input.transaction.data,
+      value: input.transaction.value,
       blockNumber: block.number
     })
   ]);
@@ -129,7 +150,8 @@ export async function loadPinnedAddLiquidityReview(
   if (canonicalBlock.hash === null || canonicalBlock.hash.toLowerCase() !== block.hash.toLowerCase() || canonicalBlock.timestamp !== block.timestamp) {
     throw new Error("Pinned liquidity review block changed during RPC reads");
   }
-  const simulationTuple = simulation.result;
+  if (simulation.data === undefined) throw new Error("Pinned liquidity simulation returned no result data");
+  const simulationTuple = decodeFunctionResult({ abi: lbRouterAbi, functionName: expectedFunction, data: simulation.data });
   const math = quoteAddLiquidityMathFromSimulation({
     activeId,
     binStep,
@@ -157,6 +179,7 @@ export async function loadPinnedAddLiquidityReview(
   return {
     account: input.account,
     activeId,
+    assetMode: input.assetMode,
     block,
     math,
     pair: input.pair,
@@ -169,7 +192,8 @@ export async function loadPinnedAddLiquidityReview(
       depositIds: [...simulationTuple[4]],
       liquidityMinted: [...simulationTuple[5]]
     },
-    router: input.router
+    router: input.router,
+    transaction: { ...input.transaction }
   };
 }
 
@@ -181,6 +205,10 @@ export function samePinnedLiquidityReview(
     isAddressEqual(left.account, right.account) &&
     isAddressEqual(left.pair, right.pair) &&
     isAddressEqual(left.router, right.router) &&
+    left.assetMode === right.assetMode &&
+    isAddressEqual(left.transaction.to, right.transaction.to) &&
+    left.transaction.data.toLowerCase() === right.transaction.data.toLowerCase() &&
+    left.transaction.value === right.transaction.value &&
     parametersKey(left.parameters) === parametersKey(right.parameters) &&
     left.block.number === right.block.number &&
     left.block.hash.toLowerCase() === right.block.hash.toLowerCase() &&
@@ -200,6 +228,7 @@ export function reconcileAddLiquidityReceipt(input: {
   gasUsed: bigint;
   tokenX: Address;
   tokenY: Address;
+  nativeSide?: "x" | "y" | null;
 }): AddLiquidityReceiptReconciliation {
   let compositionFeeX = 0n;
   let compositionFeeY = 0n;
@@ -272,13 +301,13 @@ export function reconcileAddLiquidityReceipt(input: {
       continue;
     }
     if (isAddressEqual(log.address, input.tokenX)) {
-      const transfer = decodeRelevantTransfer(log, input.account, input.pair, input.refundRecipient);
+      const transfer = decodeRelevantTransfer(log, input.account, input.pair, input.refundRecipient, input.nativeSide === "x" ? input.router : input.account);
       if (transfer?.kind === "gross") grossX = (grossX ?? 0n) + transfer.value;
       if (transfer?.kind === "refund") refundX = (refundX ?? 0n) + transfer.value;
       walletIncomingX += transfer?.walletIncoming ?? 0n;
       walletOutgoingX += transfer?.walletOutgoing ?? 0n;
     } else if (isAddressEqual(log.address, input.tokenY)) {
-      const transfer = decodeRelevantTransfer(log, input.account, input.pair, input.refundRecipient);
+      const transfer = decodeRelevantTransfer(log, input.account, input.pair, input.refundRecipient, input.nativeSide === "y" ? input.router : input.account);
       if (transfer?.kind === "gross") grossY = (grossY ?? 0n) + transfer.value;
       if (transfer?.kind === "refund") refundY = (refundY ?? 0n) + transfer.value;
       walletIncomingY += transfer?.walletIncoming ?? 0n;
@@ -342,6 +371,65 @@ export function reconcileAddLiquidityReceipt(input: {
   };
 }
 
+export function reconcileNativeAddLiquidityReceipt(input: {
+  account: Address;
+  effectiveGasPrice: bigint;
+  expectedReview: PinnedAddLiquidityReview;
+  gasUsed: bigint;
+  logs: readonly Log[];
+  lpBalances: ReadonlyArray<{ after: bigint; before: bigint; binId: bigint }>;
+  nativeBalanceAfter: bigint;
+  nativeBalanceBefore: bigint;
+  nativeSide: "x" | "y";
+  otherTokenBalanceAfter: bigint;
+  otherTokenBalanceBefore: bigint;
+  pair: Address;
+  recipient: Address;
+  refundRecipient: Address;
+  router: Address;
+  tokenX: Address;
+  tokenY: Address;
+  transactionValue: bigint;
+  wrapperBalanceAfter: bigint;
+  wrapperBalanceBefore: bigint;
+}): NativeAddLiquidityReceiptReconciliation {
+  if (!isAddressEqual(input.account, input.recipient) || !isAddressEqual(input.account, input.refundRecipient)) {
+    throw new Error("Native liquidity reconciliation requires the wallet as position and refund recipient");
+  }
+  const base = reconcileAddLiquidityReceipt({ ...input, nativeSide: input.nativeSide });
+  if (input.transactionValue <= 0n || input.expectedReview.assetMode !== "native" || input.expectedReview.transaction.value !== input.transactionValue) {
+    throw new Error("Native liquidity receipt value differs from the reviewed transaction");
+  }
+  const gasCost = input.gasUsed * input.effectiveGasPrice;
+  if (input.nativeBalanceBefore < input.nativeBalanceAfter + gasCost) throw new Error("Canonical ETH balance delta cannot fund native value and gas");
+  const nativeSpend = input.nativeBalanceBefore - input.nativeBalanceAfter - gasCost;
+  if (nativeSpend !== input.transactionValue) throw new Error("Canonical gas-adjusted ETH spend differs from transaction value");
+  const wrapperRefund = input.nativeSide === "x" ? base.refundedX : base.refundedY;
+  const wrapperGross = input.nativeSide === "x" ? base.eventObservedGrossX : base.eventObservedGrossY;
+  if (wrapperRefund === null || wrapperGross !== input.transactionValue) {
+    throw new Error("Canonical WNATIVE funding or refund evidence differs from native value");
+  }
+  if (input.wrapperBalanceAfter < input.wrapperBalanceBefore || input.wrapperBalanceAfter - input.wrapperBalanceBefore !== wrapperRefund) {
+    throw new Error("Canonical wallet WNATIVE delta differs from the pair refund");
+  }
+  const observedOtherTokenNetSpend = input.nativeSide === "x" ? base.eventObservedNetSpendY : base.eventObservedNetSpendX;
+  const requestedOtherTokenAmount = input.nativeSide === "x" ? input.expectedReview.parameters.amountY : input.expectedReview.parameters.amountX;
+  const otherTokenNetSpend = requestedOtherTokenAmount === 0n ? 0n : observedOtherTokenNetSpend;
+  if (
+    otherTokenNetSpend === null ||
+    input.otherTokenBalanceBefore < input.otherTokenBalanceAfter ||
+    input.otherTokenBalanceBefore - input.otherTokenBalanceAfter !== otherTokenNetSpend
+  ) throw new Error("Canonical other-token balance delta differs from transfer evidence");
+  if (input.lpBalances.length !== base.mintedIds.length) throw new Error("Canonical LP balance evidence does not cover every minted bin");
+  const lpBalanceDeltas = input.lpBalances.map((balance, index) => {
+    if (balance.binId !== base.mintedIds[index] || balance.after < balance.before) throw new Error("Canonical LP balance evidence differs from minted bin order");
+    const delta = balance.after - balance.before;
+    if (delta !== base.mintedShares[index]) throw new Error("Canonical LP balance delta differs from minted shares");
+    return { binId: balance.binId, delta };
+  });
+  return { ...base, nativeValueWei: input.transactionValue, otherTokenNetSpend, wrapperRefund, lpBalanceDeltas };
+}
+
 function reviewOutcomeKey(review: PinnedAddLiquidityReview): string {
   return [
     review.activeId,
@@ -388,12 +476,13 @@ function decodeRelevantTransfer(
   log: Log,
   account: Address,
   pair: Address,
-  refundRecipient: Address
+  refundRecipient: Address,
+  grossSender: Address
 ): { kind: "gross" | "refund" | null; value: bigint; walletIncoming: bigint; walletOutgoing: bigint } | null {
   try {
     const event = decodeEventLog({ abi: erc20Abi, data: log.data, topics: log.topics, strict: true });
     if (event.eventName !== "Transfer") return null;
-    const kind = isAddressEqual(event.args.from, account) && isAddressEqual(event.args.to, pair)
+    const kind = isAddressEqual(event.args.from, grossSender) && isAddressEqual(event.args.to, pair)
       ? "gross"
       : isAddressEqual(event.args.from, pair) && isAddressEqual(event.args.to, refundRecipient)
         ? "refund"

@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 
 import { expect, test, type Page, type Route } from "@playwright/test";
-import { createPublicClient, decodeFunctionData, http, type Address, type Hex } from "viem";
+import { createPublicClient, decodeFunctionData, encodeFunctionData, http, type Address, type Hex } from "viem";
 
 import { erc20Abi, lbPairAbi, lbRouterAbi } from "../../../../packages/sdk/src/abi";
 import { installUnlockedRpcWallet, readUnlockedRpcWallet } from "./fixtures/unlocked-rpc-wallet";
@@ -396,6 +396,76 @@ test("actual UI deposits one-sided liquidity above and below the active bin with
   });
 });
 
+test("actual UI deposits one-sided native liquidity with exact ETH value and canonical wrapper and LP accounting", async ({ page }) => {
+  await installBrowserStack(page, rpcUrl);
+  const binIds = [pool.activeId + 1, pool.activeId + 2];
+  const [nativeBefore, wrapperBefore, lpBefore] = await Promise.all([
+    client.getBalance({ address: browserAccount }),
+    readTokenBalance(manifest.tokens.wnative),
+    readLbBalanceAcross(binIds)
+  ]);
+  await page.goto("/#/liquidity");
+  await connectWallet(page);
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await page.locator("#range-lower").fill("1");
+  await page.locator("#range-upper").fill("2");
+  await expect(page.getByTestId("liquidity-approve-x-button")).toHaveCount(0);
+  await clickReviewedAction(page, "liquidity-add-button");
+  await expect.poll(async () => (await readUnlockedRpcWallet(page)).transactionHashes.length).toBe(1);
+  const wallet = await readUnlockedRpcWallet(page);
+  const submitted = wallet.sentTransactions[0]!;
+  const decoded = decodeSubmittedTransaction(submitted);
+  expect(decoded.functionName).toBe("addLiquidityNATIVE");
+  const parameters = (decoded.args as readonly [DecodedLiquidityParameters])[0];
+  const value = normalizeTransactionValue(submitted.value);
+  expect(value).toBe(parameters.amountX);
+  expect(parameters.amountY).toBe(0n);
+  const receipt = await client.getTransactionReceipt({ hash: wallet.transactionHashes[0]! });
+  const [nativeAfter, wrapperAfter, lpAfter] = await Promise.all([
+    client.getBalance({ address: browserAccount }),
+    readTokenBalance(manifest.tokens.wnative),
+    readLbBalanceAcross(binIds)
+  ]);
+  expect(nativeBefore - nativeAfter - receipt.gasUsed * receipt.effectiveGasPrice).toBe(value);
+  expect(wrapperAfter).toBeGreaterThanOrEqual(wrapperBefore);
+  expect(lpAfter).toBeGreaterThan(lpBefore);
+  await mineBlocks(3);
+  await expect(page.getByTestId("liquidity-receipt-review")).toContainText("Exact native value", { timeout: 20_000 });
+});
+
+test("actual UI deposits balanced native liquidity after approving only the positive non-wrapper side", async ({ page }) => {
+  await sendUnlockedTransaction({
+    data: encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [manifest.contracts.lbRouter, 0n] }),
+    to: manifest.tokens.usdc,
+    value: 0n
+  });
+  await installBrowserStack(page, rpcUrl);
+  await page.goto("/#/liquidity");
+  await connectWallet(page);
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await expect(page.getByTestId("liquidity-approve-x-button")).toHaveCount(0);
+  await expect(page.getByTestId("liquidity-approve-y-button")).toContainText("Approve USDC");
+  await clickReviewedAction(page, "liquidity-approve-y-button");
+  await expect.poll(async () => (await readUnlockedRpcWallet(page)).transactionHashes.length).toBe(1);
+  const nativeBeforeAdd = await client.getBalance({ address: browserAccount });
+  await clickReviewedAction(page, "liquidity-add-button");
+  await expect.poll(async () => (await readUnlockedRpcWallet(page)).transactionHashes.length).toBe(2);
+  const wallet = await readUnlockedRpcWallet(page);
+  const submitted = wallet.sentTransactions[1]!;
+  const decoded = decodeSubmittedTransaction(submitted);
+  expect(wallet.sentTransactions.map(decodeSubmittedTransaction).map((transaction) => transaction.functionName)).toEqual(["approve", "addLiquidityNATIVE"]);
+  const parameters = (decoded.args as readonly [DecodedLiquidityParameters])[0];
+  expect(parameters.amountX).toBeGreaterThan(0n);
+  expect(parameters.amountY).toBeGreaterThan(0n);
+  const value = normalizeTransactionValue(submitted.value);
+  expect(value).toBe(parameters.amountX);
+  const receipt = await client.getTransactionReceipt({ hash: wallet.transactionHashes[1]! });
+  const nativeAfterAdd = await client.getBalance({ address: browserAccount });
+  expect(nativeBeforeAdd - nativeAfterAdd - receipt.gasUsed * receipt.effectiveGasPrice).toBe(value);
+  await mineBlocks(3);
+  await expect(page.getByTestId("liquidity-receipt-review")).toContainText("Exact native value", { timeout: 20_000 });
+});
+
 async function installBrowserStack(page: Page, runtimeRpcUrl: string): Promise<RpcControl> {
   const rpcControl: RpcControl = { failExactQuoteCalls: false, simulations: [], simulationTransactions: [] };
   await installRpcProxy(page, runtimeRpcUrl, rpcControl);
@@ -455,6 +525,7 @@ function recordTransactionSimulation(request: JsonRpcRequest, control: RpcContro
         "approveForAll",
         "swapExactTokensForTokens",
         "addLiquidity",
+        "addLiquidityNATIVE",
         "removeLiquidity"
       ].includes(decoded.functionName)
     ) {
@@ -632,6 +703,31 @@ async function readLbBalanceAcross(binIds: number[]): Promise<bigint> {
     )
   );
   return balances.reduce((total, balance) => total + balance, 0n);
+}
+
+async function mineBlocks(count: number): Promise<void> {
+  await rawRpc("anvil_mine", [`0x${count.toString(16)}`]);
+}
+
+async function sendUnlockedTransaction(input: { data: Hex; to: Address; value: bigint }): Promise<void> {
+  const hash = await rawRpc("eth_sendTransaction", [{
+    data: input.data,
+    from: browserAccount,
+    to: input.to,
+    value: `0x${input.value.toString(16)}`
+  }]) as Hex;
+  await client.waitForTransactionReceipt({ hash });
+}
+
+async function rawRpc(method: string, params: unknown[]): Promise<unknown> {
+  const response = await fetch(rpcUrl, {
+    body: JSON.stringify({ id: 1, jsonrpc: "2.0", method, params }),
+    headers: { "content-type": "application/json" },
+    method: "POST"
+  });
+  const payload = await response.json() as { error?: { message?: string }; result?: unknown };
+  if (payload.error) throw new Error(payload.error.message ?? `${method} failed`);
+  return payload.result;
 }
 
 function decodeSubmittedTransaction(transaction: Record<string, unknown>) {
