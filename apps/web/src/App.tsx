@@ -3616,16 +3616,16 @@ function LiquidityView({
   });
   useEffect(() => {
     if (rangePriceQuery.data === undefined || rangePriceOptions === null) return;
-    setLowerPriceInput(formatExactPriceFraction(normalizeQ128Price(rangePriceQuery.data.lowerPriceQ128, rangePriceOptions), 24));
-    setUpperPriceInput(formatExactPriceFraction(normalizeQ128Price(rangePriceQuery.data.upperPriceQ128, rangePriceOptions), 24));
+    setLowerPriceInput(formatExactPriceFraction(normalizeQ128Price(rangePriceQuery.data.lowerPriceQ128, rangePriceOptions)));
+    setUpperPriceInput(formatExactPriceFraction(normalizeQ128Price(rangePriceQuery.data.upperPriceQ128, rangePriceOptions)));
   }, [rangePriceOptions?.baseDecimals, rangePriceOptions?.quoteDecimals, rangePriceQuery.data]);
   const lowerInversePrice =
     rangePriceQuery.data !== undefined && rangePriceOptions !== null
-      ? formatExactPriceFraction(normalizeQ128Price(rangePriceQuery.data.lowerPriceQ128, { ...rangePriceOptions, inverse: true }), 24)
+      ? formatExactPriceFraction(normalizeQ128Price(rangePriceQuery.data.upperPriceQ128, { ...rangePriceOptions, inverse: true }))
       : "n/a";
   const upperInversePrice =
     rangePriceQuery.data !== undefined && rangePriceOptions !== null
-      ? formatExactPriceFraction(normalizeQ128Price(rangePriceQuery.data.upperPriceQ128, { ...rangePriceOptions, inverse: true }), 24)
+      ? formatExactPriceFraction(normalizeQ128Price(rangePriceQuery.data.lowerPriceQ128, { ...rangePriceOptions, inverse: true }))
       : "n/a";
   const slippageBps = parseSlippageToBps(slippageInput);
   const idSlippage = parseIdSlippage(idSlippageInput);
@@ -3699,7 +3699,7 @@ function LiquidityView({
         ? commitAbsoluteRange(mappedBin, upperBinId)
         : commitAbsoluteRange(lowerBinId, mappedBin);
       if (!committed) return;
-      const mappedPrice = formatExactPriceFraction(normalizeQ128Price(mappedPriceQ128, rangePriceOptions), 24);
+      const mappedPrice = formatExactPriceFraction(normalizeQ128Price(mappedPriceQ128, rangePriceOptions));
       if (boundary === "lower") setLowerPriceInput(mappedPrice);
       else setUpperPriceInput(mappedPrice);
     } catch (error) {
