@@ -11,7 +11,7 @@ const webRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const server = await createServer({ configFile: resolve(webRoot, "vite.config.ts"), logLevel: "error", server: { middlewareMode: true } });
 
 try {
-  const { reconcileAddLiquidityReceipt, reconcileNativeAddLiquidityReceipt, samePinnedLiquidityReview } = await server.ssrLoadModule("/src/liquidity-review.ts");
+  const { reconcileAddLiquidityReceipt, reconcileNativeAddLiquidityReceipt, reconcileNativeRemoveLiquidityReceipt, samePinnedLiquidityReview } = await server.ssrLoadModule("/src/liquidity-review.ts");
   const A = {
     account: getAddress("0x1000000000000000000000000000000000000001"),
     router: getAddress("0x2000000000000000000000000000000000000002"),
@@ -100,6 +100,39 @@ try {
     wrapperBalanceAfter: 30n,
     wrapperBalanceBefore: 20n
   }), /LP balance delta differs/);
+
+  const nativeRemoveInput = {
+    account: A.account,
+    burnAmounts: [7n],
+    effectiveGasPrice: 2n,
+    expectedAmountX: 100n,
+    expectedAmountY: 50n,
+    gasUsed: 100n,
+    ids: [100n],
+    logs: nativeRemoveLogs(A, 100n, 50n, 7n),
+    lpBalances: [{ after: 3n, before: 10n, binId: 100n }],
+    minimumAmountX: 99n,
+    minimumAmountY: 49n,
+    nativeBalanceAfter: 900n,
+    nativeBalanceBefore: 1_000n,
+    nativeSide: "x",
+    otherTokenBalanceAfter: 550n,
+    otherTokenBalanceBefore: 500n,
+    pair: A.pair,
+    router: A.router,
+    tokenX: A.tokenX,
+    tokenY: A.tokenY,
+    transactionValue: 0n
+  };
+  const nativeRemove = reconcileNativeRemoveLiquidityReceipt(nativeRemoveInput);
+  assert.equal(nativeRemove.nativeAmount, 100n);
+  assert.equal(nativeRemove.otherTokenAmount, 50n);
+  assert.equal(nativeRemove.actualGasCostWei, 200n);
+  assert.deepEqual(nativeRemove.burnedBalances, [{ binId: 100n, delta: 7n }]);
+  assert.throws(() => reconcileNativeRemoveLiquidityReceipt({ ...nativeRemoveInput, transactionValue: 1n }), /value must be zero/);
+  assert.throws(() => reconcileNativeRemoveLiquidityReceipt({ ...nativeRemoveInput, gasUsed: -1n }), /gas fields must be non-negative/);
+  assert.throws(() => reconcileNativeRemoveLiquidityReceipt({ ...nativeRemoveInput, lpBalances: [{ after: 4n, before: 10n, binId: 100n }] }), /LP balance delta differs/);
+  assert.throws(() => reconcileNativeRemoveLiquidityReceipt({ ...nativeRemoveInput, nativeBalanceAfter: 899n }), /below the reviewed minimum|differ from the simulated outputs/);
 
   const thirdParty = reconcileAddLiquidityReceipt({
     account: A.account,
@@ -252,6 +285,18 @@ function canonicalLogs(A, options) {
   );
   if (options.extraOwnerFee) logs.push(transferLog(A.tokenX, A.account, A.other, options.extraOwnerFee));
   return logs;
+}
+
+function nativeRemoveLogs(A, amountX, amountY, burnAmount) {
+  return [
+    eventLog(A.pair, lbPairAbi, "WithdrawnFromBins", { sender: A.router, to: A.router }, [
+      { type: "uint256[]" }, { type: "bytes32[]" }
+    ], [[100n], [packed(amountX, amountY)]]),
+    eventLog(A.pair, lbPairAbi, "TransferBatch", { sender: A.router, from: A.account, to: zeroAddress }, [
+      { type: "uint256[]" }, { type: "uint256[]" }
+    ], [[100n], [burnAmount]]),
+    transferLog(A.tokenY, A.router, A.account, amountY)
+  ];
 }
 
 function eventLog(address, abi, eventName, indexedArgs, dataTypes, dataValues) {

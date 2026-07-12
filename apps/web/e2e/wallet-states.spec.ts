@@ -2235,8 +2235,90 @@ test("one-sided live burn quotes keep only the truly zero output minimum at zero
   expect(args[4] as bigint).toBeGreaterThan(0n);
 });
 
+test("native partial withdrawal uses the exact zero-value native router transaction", async ({ page }) => {
+  const rpc = await setupConnectedLiquidity(page, {
+    allowance: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    blockNumber: 45n,
+    lbApproved: true,
+    receiptBlockNumber: 43n
+  });
+  await page.getByRole("group", { name: "Wrapped-native withdrawal mode" }).getByRole("button", { name: "ETH · native output" }).click();
+  await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "50%" }).click();
+  await expect(page.getByTestId("withdraw-asset-mode")).toContainText("delivered as ETH");
+  await clickReviewedAction(page, "liquidity-remove-button");
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+
+  const submitted = (await readMockWallet(page)).sentTransactions[0]!;
+  const decoded = decodeSubmittedTransaction(submitted);
+  expect(decoded.functionName).toBe("removeLiquidityNATIVE");
+  expect(BigInt(submitted.value ?? "0x0")).toBe(0n);
+  const args = decoded.args as readonly unknown[];
+  expect(String(args[0]).toLowerCase()).toBe(USDC.toLowerCase());
+  expect(args[2] as bigint).toBeGreaterThan(0n);
+  expect(args[3] as bigint).toBeGreaterThan(0n);
+  assertTransactionMatchesSimulation(submitted, rpc, "removeLiquidityNATIVE");
+  await expect(page.getByTestId("remove-receipt-review")).toContainText("exactly reconciled", { timeout: 15_000 });
+  rpc.update({ blockHash: `0x${"66".repeat(32)}` as Hex, blockNumber: 46n });
+  await expect(page.getByTestId("remove-receipt-review")).toHaveCount(0, { timeout: 15_000 });
+  await expect(page.getByText(/prior withdrawal is orphaned/i).first()).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText("Liquidity removed")).toHaveCount(0);
+  await expect(page.getByText("Transaction finalized")).toHaveCount(0);
+});
+
+test("native withdrawal canonical other-token mismatch fails closed without success", async ({ page }) => {
+  await setupConnectedLiquidity(page, {
+    allowance: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    blockNumber: 45n,
+    lbApproved: true,
+    nativeRemoveReceiptMismatch: "other-token-transfer",
+    receiptBlockNumber: 43n
+  });
+  await page.getByRole("group", { name: "Wrapped-native withdrawal mode" }).getByRole("button", { name: "ETH · native output" }).click();
+  await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "50%" }).click();
+  await clickReviewedAction(page, "liquidity-remove-button");
+  await expect(page.getByTestId("remove-receipt-review-error")).toContainText("Transfer evidence differs", { timeout: 15_000 });
+  await expect(page.getByText("Liquidity removed")).toHaveCount(0);
+});
+
+test("native all-bin full exit uses removeLiquidityNATIVE without changing LB approval scope", async ({ page }) => {
+  const rpc = await setupConnectedLiquidity(page, {
+    allowance: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    lbApproved: true
+  });
+  await page.getByRole("group", { name: "Wrapped-native withdrawal mode" }).getByRole("button", { name: "ETH · native output" }).click();
+  await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "Max" }).click();
+  await expect(page.getByTestId("withdraw-transaction-review")).toContainText("Full exit");
+  await clickReviewedAction(page, "liquidity-remove-button");
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+  const submitted = (await readMockWallet(page)).sentTransactions[0]!;
+  expect(decodeSubmittedTransaction(submitted).functionName).toBe("removeLiquidityNATIVE");
+  expect(BigInt(submitted.value ?? "0x0")).toBe(0n);
+  expect(simulatedFunctions(rpc)).not.toContain("approve");
+  assertTransactionMatchesSimulation(submitted, rpc, "removeLiquidityNATIVE");
+});
+
+test("changing native withdrawal mode during delayed preflight cancels the wallet handoff", async ({ page }) => {
+  const rpc = await setupConnectedLiquidity(page, {
+    allowance: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    lbApproved: true,
+    simulationDelayMs: 600
+  });
+  const mode = page.getByRole("group", { name: "Wrapped-native withdrawal mode" });
+  await mode.getByRole("button", { name: "ETH · native output" }).click();
+  await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled();
+  await page.getByTestId("liquidity-remove-button").click();
+  await page.waitForTimeout(100);
+  await mode.getByRole("button", { name: "WNATIVE · ERC-20 output" }).click();
+  await page.waitForTimeout(700);
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
 test("withdrawal wallet rejection and reverted receipts remain retryable without false success", async ({ page }) => {
-  const rpc = await installMockRpc(page, { includePairs: true, includePositions: true, lbApproved: false, lbApprovedAfterReceipt: true });
+  const rpc = await installMockRpc(page, { blockNumber: 45n, includePairs: true, includePositions: true, lbApproved: false, lbApprovedAfterReceipt: true, receiptBlockNumber: 43n });
   await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/liquidity");
   await connectWallet(page);

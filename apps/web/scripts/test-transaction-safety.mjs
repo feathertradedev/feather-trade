@@ -305,6 +305,7 @@ try {
 
   const burnContext = {
     account: "0x1111111111111111111111111111111111111111",
+    assetMode: "erc20",
     binStep: 10,
     burnBps: "10000",
     deadlineMinutes: 20,
@@ -313,15 +314,20 @@ try {
     pair: "0x2222222222222222222222222222222222222222",
     registryChainId: 31_337,
     router: "0x3333333333333333333333333333333333333333",
+    selectedAssetMode: "erc20",
     selectedPositionsKey: "position-1:8388608",
     slippageBps: "50",
     tokenX: "0x4444444444444444444444444444444444444444",
     tokenY: "0x5555555555555555555555555555555555555555",
-    walletChainId: 31_337
+    transactionValue: "0",
+    walletChainId: 31_337,
+    wrappedNative: "0x4444444444444444444444444444444444444444",
+    wrappedNativeSide: "x"
   };
   const burnFingerprint = burnExecutionContextFingerprint(burnContext);
   for (const [field, value] of Object.entries({
     account: "0x6666666666666666666666666666666666666666",
+    assetMode: "native",
     binStep: 25,
     burnBps: "5000",
     deadlineMinutes: 21,
@@ -329,11 +335,15 @@ try {
     pair: "0x7777777777777777777777777777777777777777",
     registryChainId: 46_630,
     router: "0x8888888888888888888888888888888888888888",
+    selectedAssetMode: "native",
     selectedPositionsKey: "position-2:8388609",
     slippageBps: "51",
     tokenX: "0x9999999999999999999999999999999999999999",
     tokenY: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    walletChainId: 46_630
+    transactionValue: "1",
+    walletChainId: 46_630,
+    wrappedNative: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    wrappedNativeSide: "y"
   })) {
     assert.notEqual(
       burnExecutionContextFingerprint({ ...burnContext, [field]: value }),

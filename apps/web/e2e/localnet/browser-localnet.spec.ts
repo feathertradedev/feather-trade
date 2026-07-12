@@ -406,7 +406,7 @@ test("actual UI deposits one-sided native liquidity with exact ETH value and can
   ]);
   await page.goto("/#/liquidity");
   await connectWallet(page);
-  await page.getByRole("button", { name: "ETH · native" }).click();
+  await page.getByTestId("liquidity-native-mode").getByRole("button", { name: "ETH · native" }).click();
   await page.locator("#range-lower").fill("1");
   await page.locator("#range-upper").fill("2");
   await expect(page.getByTestId("liquidity-approve-x-button")).toHaveCount(0);
@@ -442,7 +442,7 @@ test("actual UI deposits balanced native liquidity after approving only the posi
   await installBrowserStack(page, rpcUrl);
   await page.goto("/#/liquidity");
   await connectWallet(page);
-  await page.getByRole("button", { name: "ETH · native" }).click();
+  await page.getByTestId("liquidity-native-mode").getByRole("button", { name: "ETH · native" }).click();
   await expect(page.getByTestId("liquidity-approve-x-button")).toHaveCount(0);
   await expect(page.getByTestId("liquidity-approve-y-button")).toContainText("Approve USDC");
   await clickReviewedAction(page, "liquidity-approve-y-button");
@@ -464,6 +464,66 @@ test("actual UI deposits balanced native liquidity after approving only the posi
   expect(nativeBeforeAdd - nativeAfterAdd - receipt.gasUsed * receipt.effectiveGasPrice).toBe(value);
   await mineBlocks(3);
   await expect(page.getByTestId("liquidity-receipt-review")).toContainText("Exact native value", { timeout: 20_000 });
+});
+
+test("actual UI performs native partial withdrawal and native full exit with canonical balance accounting", async ({ page }) => {
+  await installBrowserStack(page, rpcUrl);
+  await page.goto("/#/liquidity");
+  await connectWallet(page);
+  if (await page.getByTestId("liquidity-approve-lb-button").isEnabled()) {
+    await clickReviewedAction(page, "liquidity-approve-lb-button");
+    await expect(page.getByText("LB approval confirmed")).toBeVisible();
+  }
+  const walletBefore = await readUnlockedRpcWallet(page);
+  const baselineTransactions = walletBefore.sentTransactions.length;
+  const nativeMode = page.getByRole("group", { name: "Wrapped-native withdrawal mode" });
+  await nativeMode.getByRole("button", { name: "ETH · native output" }).click();
+  await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "50%" }).click();
+  await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled();
+  const [nativeBeforePartial, tokenBeforePartial, lbBeforePartial] = await Promise.all([
+    client.getBalance({ address: browserAccount }),
+    readTokenBalance(manifest.tokens.usdc),
+    readLbBalance()
+  ]);
+  await clickReviewedAction(page, "liquidity-remove-button");
+  await expect.poll(async () => (await readUnlockedRpcWallet(page)).sentTransactions.length).toBe(baselineTransactions + 1);
+  const partialWallet = await readUnlockedRpcWallet(page);
+  const partialSubmitted = partialWallet.sentTransactions.at(-1)!;
+  const partialDecoded = decodeSubmittedTransaction(partialSubmitted);
+  expect(partialDecoded.functionName).toBe("removeLiquidityNATIVE");
+  expect(normalizeTransactionValue(partialSubmitted.value)).toBe(0n);
+  const partialArgs = partialDecoded.args as readonly [Address, bigint, bigint, bigint, readonly bigint[], readonly bigint[], Address, bigint];
+  const partialReceipt = await client.getTransactionReceipt({ hash: partialWallet.transactionHashes.at(-1)! });
+  const [nativeAfterPartial, tokenAfterPartial, lbAfterPartial] = await Promise.all([
+    client.getBalance({ address: browserAccount }),
+    readTokenBalance(manifest.tokens.usdc),
+    readLbBalance()
+  ]);
+  expect(nativeAfterPartial + partialReceipt.gasUsed * partialReceipt.effectiveGasPrice - nativeBeforePartial).toBeGreaterThanOrEqual(partialArgs[3]);
+  expect(tokenAfterPartial - tokenBeforePartial).toBeGreaterThanOrEqual(partialArgs[2]);
+  expect(lbBeforePartial - lbAfterPartial).toBe(partialArgs[5][0]);
+  await mineBlocks(3);
+  await expect(page.getByTestId("remove-receipt-review")).toContainText("exactly reconciled", { timeout: 20_000 });
+
+  await mineBlocks(12);
+  await expect.poll(() => page.evaluate(() => {
+    const raw = window.localStorage.getItem("feather.transaction-journal.v1");
+    if (raw === null) return 0;
+    const records = (JSON.parse(raw) as { records: Array<{ confirmations: number; reviewed: { intent: string } }> }).records;
+    return records.findLast((record) => record.reviewed.intent === "remove-liquidity")?.confirmations ?? 0;
+  }), { timeout: 20_000 }).toBeGreaterThanOrEqual(12);
+  await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "Max" }).click();
+  await expect(page.getByTestId("withdraw-transaction-review")).toContainText("Full exit");
+  const txCountBeforeFull = (await readUnlockedRpcWallet(page)).sentTransactions.length;
+  await clickReviewedAction(page, "liquidity-remove-button");
+  await expect.poll(async () => (await readUnlockedRpcWallet(page)).sentTransactions.length).toBe(txCountBeforeFull + 1);
+  const fullWallet = await readUnlockedRpcWallet(page);
+  const fullSubmitted = fullWallet.sentTransactions.at(-1)!;
+  expect(decodeSubmittedTransaction(fullSubmitted).functionName).toBe("removeLiquidityNATIVE");
+  expect(normalizeTransactionValue(fullSubmitted.value)).toBe(0n);
+  await mineBlocks(3);
+  await expect(page.getByTestId("remove-receipt-review")).toContainText("exactly reconciled", { timeout: 20_000 });
+  expect(await readLbBalance()).toBe(0n);
 });
 
 async function installBrowserStack(page: Page, runtimeRpcUrl: string): Promise<RpcControl> {
@@ -526,7 +586,8 @@ function recordTransactionSimulation(request: JsonRpcRequest, control: RpcContro
         "swapExactTokensForTokens",
         "addLiquidity",
         "addLiquidityNATIVE",
-        "removeLiquidity"
+        "removeLiquidity",
+        "removeLiquidityNATIVE"
       ].includes(decoded.functionName)
     ) {
       return;

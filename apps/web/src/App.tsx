@@ -26,6 +26,7 @@ import {
   buildAddLiquidityNativeTransaction,
   buildAddLiquidityTransaction,
   buildLiquidityDistribution,
+  buildRemoveLiquidityNativeTransaction,
   buildRemoveLiquidityTransaction,
   MAX_LIQUIDITY_BINS,
   quoteLiquidityBurn,
@@ -180,9 +181,11 @@ import {
   loadPinnedAddLiquidityReview,
   reconcileAddLiquidityReceipt,
   reconcileNativeAddLiquidityReceipt,
+  reconcileNativeRemoveLiquidityReceipt,
   samePinnedLiquidityReview,
   type AddLiquidityReceiptReconciliation,
   type NativeAddLiquidityReceiptReconciliation,
+  type NativeRemoveLiquidityReceiptReconciliation,
   type PinnedAddLiquidityReview
 } from "./liquidity-review";
 import {
@@ -237,15 +240,20 @@ interface FullExitUiState {
 }
 
 interface FullExitBatchReviewState {
+  assetMode: "erc20" | "native";
   batchOrdinal: number;
   batchSettings: string;
   binStates: LiveBurnBinState[];
   completedBatches: number;
   estimatedTransactionsRemaining: number;
   estimatedGas: bigint;
+  expectedAmountX: bigint;
+  expectedAmountY: bigint;
   executionContextFingerprint: string;
   executionFingerprint: string;
   liveBins: FullExitLiveBin[];
+  minimumAmountX: bigint;
+  minimumAmountY: bigint;
   positions: PositionRow[];
   remainingBins: number;
   sourceBlockHash: string;
@@ -332,6 +340,25 @@ interface SubmittedLiquidityAddReview extends LiquidityAddReviewState {
   chainId: number;
   environment: EnvironmentKey;
   submittedAt: number;
+}
+
+interface SubmittedNativeRemoveReview {
+  account: Address;
+  amounts: bigint[];
+  chainId: number;
+  environment: EnvironmentKey;
+  executionFingerprint: string;
+  expectedAmountX: bigint;
+  expectedAmountY: bigint;
+  ids: bigint[];
+  minimumAmountX: bigint;
+  minimumAmountY: bigint;
+  nativeSide: "x" | "y";
+  pair: Address;
+  submittedAt: number;
+  tokenX: Address;
+  tokenY: Address;
+  transaction: { data: Hex; to: Address; value: bigint };
 }
 
 interface ConfirmedPoolOverlay {
@@ -3301,6 +3328,36 @@ function LiquidityReceiptReview({
   );
 }
 
+function NativeRemoveReceiptReview({
+  error,
+  hash,
+  reconciliation
+}: {
+  error: unknown;
+  hash: Address | null;
+  reconciliation: NativeRemoveLiquidityReceiptReconciliation | undefined;
+}) {
+  if (hash === null) return null;
+  if (error !== null && error !== undefined) {
+    return <div className="state-row failure" data-testid="remove-receipt-review-error"><AlertTriangle size={16} /><span>Canonical native withdrawal accounting failed closed: {getWriteError(error)}</span></div>;
+  }
+  if (reconciliation === undefined) {
+    return <div className="state-row" data-testid="remove-receipt-review-loading"><LoaderCircle className="spin" size={16} /><span>Reconciling canonical native withdrawal {formatCompactAddress(hash)}</span></div>;
+  }
+  return (
+    <div className="review-card" data-testid="remove-receipt-review">
+      <div className="panel-heading"><span>Canonical native withdrawal</span><StatusBadge state="ready" label="exactly reconciled" /></div>
+      <div className="quote-grid">
+        <MiniMetric label="ETH received" value={`${formatUnits(reconciliation.nativeAmount, 18)} ETH`} />
+        <MiniMetric label="Other token received" value={reconciliation.otherTokenAmount.toString()} />
+        <MiniMetric label="Actual gas cost" value={`${formatUnits(reconciliation.actualGasCostWei, 18)} ETH`} />
+        <MiniMetric label="Burned bins" value={reconciliation.burnedBalances.map((row) => `${row.binId.toString()}:${row.delta.toString()}`).join(", ")} />
+      </div>
+      <div className="state-row"><CheckCircle2 size={16} /><span>Gas-adjusted ETH, the other-token receipt, withdrawal events, burn events, and every per-bin LB decrease match the immutable reviewed transaction.</span></div>
+    </div>
+  );
+}
+
 function serializeBigintState(value: unknown): string | null {
   if (value === null || value === undefined) return null;
   return JSON.stringify(value, (_key, candidate) => typeof candidate === "bigint" ? { __featherBigint: candidate.toString() } : candidate);
@@ -4814,6 +4871,7 @@ function LiquidityView({
   const [widePresetInput, setWidePresetInput] = useState("21");
   const [liquidityStrategy, setLiquidityStrategy] = useState<LiquidityStrategy>("spot");
   const [liquidityAssetMode, setLiquidityAssetMode] = useState<"erc20" | "native">("erc20");
+  const [removeAssetMode, setRemoveAssetMode] = useState<"erc20" | "native">("erc20");
   const [slippageInput, setSlippageInput] = useState("0.5");
   const [idSlippageInput, setIdSlippageInput] = useState("2");
   const [deadlineInput, setDeadlineInput] = useState("20");
@@ -4823,6 +4881,8 @@ function LiquidityView({
   const [gasReview, setGasReview] = useState<ExactGasReview | null>(null);
   const [liquidityAddReview, setLiquidityAddReview] = useState<LiquidityAddReviewState | null>(null);
   const [submittedLiquidityAddReview, setSubmittedLiquidityAddReview] = useState<SubmittedLiquidityAddReview | null>(null);
+  const [submittedNativeRemoveReview, setSubmittedNativeRemoveReview] = useState<SubmittedNativeRemoveReview | null>(null);
+  const [nativeRemoveOrphanNotice, setNativeRemoveOrphanNotice] = useState<string | null>(null);
   const [liquidityReviewNotice, setLiquidityReviewNotice] = useState<string | null>(null);
   const [removeQuoteReviewRequired, setRemoveQuoteReviewRequired] = useState<string | null>(null);
   const [fullExitUi, setFullExitUi] = useState<FullExitUiState | null>(null);
@@ -4913,6 +4973,18 @@ function LiquidityView({
       : isAddressEqual(liquidityWrappedNative.address, pool.tokenX)
         ? "x"
         : isAddressEqual(liquidityWrappedNative.address, pool.tokenY)
+          ? "y"
+          : null;
+  const removeWrappedNativeCandidates = [tokenX, tokenY].filter((token): token is TokenMetadata =>
+    token !== null && token.tags.includes("wrapped-native") && tokenAllowsAction(token, "remove-liquidity")
+  );
+  const removeWrappedNative = removeWrappedNativeCandidates.length === 1 ? removeWrappedNativeCandidates[0] : null;
+  const removeWrappedNativeSide: "x" | "y" | null =
+    removeWrappedNative === null || pool === null
+      ? null
+      : isAddressEqual(removeWrappedNative.address, pool.tokenX)
+        ? "x"
+        : isAddressEqual(removeWrappedNative.address, pool.tokenY)
           ? "y"
           : null;
   const connected = account.status === "connected" && account.address !== undefined;
@@ -5079,6 +5151,12 @@ function LiquidityView({
     wrappedNative: liquidityWrappedNative?.address ?? null,
     wrappedNativeSide: liquidityWrappedNativeSide
   });
+  const nativeRemove = removeAssetMode === "native" && removeWrappedNative !== null && removeWrappedNativeSide !== null;
+  const effectiveRemoveAssetMode: "erc20" | "native" = nativeRemove ? "native" : "erc20";
+  const buildExactRemoveTransaction = (input: Parameters<typeof buildRemoveLiquidityTransaction>[1]) =>
+    nativeRemove
+      ? buildRemoveLiquidityNativeTransaction(registry, input)
+      : buildRemoveLiquidityTransaction(registry, input);
   const rangeControlError =
     rangeEditError ??
     (rangePriceQuery.error ? `Range price read failed: ${getWriteError(rangePriceQuery.error) ?? "price unavailable"}` : null) ??
@@ -5333,6 +5411,116 @@ function LiquidityView({
     enabled: canonicalAddHash !== null && submittedLiquidityAddReview !== null && account.address !== undefined,
     retry: false
   });
+  const canonicalNativeRemoveRecord = useMemo(() => {
+    if (
+      submittedNativeRemoveReview === null ||
+      submittedNativeRemoveReview.chainId !== registry.chainId ||
+      submittedNativeRemoveReview.environment !== environmentKey
+    ) return null;
+    const calldataFingerprint = keccak256(submittedNativeRemoveReview.transaction.data);
+    return transactionJournal.records
+      .filter((record) =>
+        record.reviewed.intent === "remove-liquidity" &&
+        record.reviewed.calldataFingerprint.toLowerCase() === calldataFingerprint.toLowerCase() &&
+        record.reviewed.executionFingerprint === submittedNativeRemoveReview.executionFingerprint &&
+        record.reviewed.chainId === submittedNativeRemoveReview.chainId &&
+        record.reviewed.environment === submittedNativeRemoveReview.environment &&
+        isAddressEqual(record.reviewed.target, submittedNativeRemoveReview.transaction.to) &&
+        record.reviewed.value === submittedNativeRemoveReview.transaction.value.toString() &&
+        isAddressEqual(record.reviewed.account, submittedNativeRemoveReview.account) &&
+        record.reviewed.poolId !== null && isAddressEqual(record.reviewed.poolId as Address, submittedNativeRemoveReview.pair) &&
+        record.createdAt >= submittedNativeRemoveReview.submittedAt &&
+        record.status === "canonical" &&
+        record.activeHash !== null &&
+        record.canonicalReceipt?.status === "success" &&
+        record.canonicalReceipt.hash.toLowerCase() === record.activeHash.toLowerCase() &&
+        record.replacementCompatibility !== "incompatible"
+      )
+      .sort((left, right) => right.createdAt - left.createdAt)[0] ?? null;
+  }, [environmentKey, registry.chainId, submittedNativeRemoveReview, transactionJournal.records]);
+  const canonicalNativeRemoveHash = canonicalNativeRemoveRecord?.canonicalReceipt?.hash ?? null;
+  const activeNativeRemoveRecord = useMemo(() => {
+    if (submittedNativeRemoveReview === null) return null;
+    const calldataFingerprint = keccak256(submittedNativeRemoveReview.transaction.data);
+    return transactionJournal.records
+      .filter((record) =>
+        record.reviewed.intent === "remove-liquidity" &&
+        record.reviewed.calldataFingerprint.toLowerCase() === calldataFingerprint.toLowerCase() &&
+        record.reviewed.executionFingerprint === submittedNativeRemoveReview.executionFingerprint
+      )
+      .sort((left, right) => right.createdAt - left.createdAt)[0] ?? null;
+  }, [submittedNativeRemoveReview, transactionJournal.records]);
+  useEffect(() => {
+    if (activeNativeRemoveRecord?.status !== "orphaned") return;
+    setSubmittedNativeRemoveReview(null);
+    setLiquidityReceiptPhase("idle");
+    setSubmittedRemoveReceiptContext(null);
+    setNativeRemoveOrphanNotice("Native withdrawal receipt was reorganized; canonical accounting was removed and retry remains journal-blocked.");
+  }, [activeNativeRemoveRecord?.status]);
+  const nativeRemoveReceiptReconciliationQuery = useQuery<NativeRemoveLiquidityReceiptReconciliation>({
+    queryKey: ["canonicalNativeRemoveLiquidityReceipt", registry.chainId, canonicalNativeRemoveHash],
+    queryFn: async () => {
+      if (canonicalNativeRemoveHash === null || submittedNativeRemoveReview === null) throw new Error("Canonical native removal receipt is unavailable");
+      const review = submittedNativeRemoveReview;
+      const receipt = await publicClient.getTransactionReceipt({ hash: canonicalNativeRemoveHash });
+      if (receipt.status !== "success" || receipt.blockNumber === 0n || receipt.blockHash.toLowerCase() !== canonicalNativeRemoveRecord?.canonicalReceipt?.blockHash.toLowerCase()) {
+        throw new Error("Canonical native removal receipt changed during reconciliation");
+      }
+      const transaction = await publicClient.getTransaction({ hash: canonicalNativeRemoveHash });
+      if (
+        !isAddressEqual(transaction.from, review.account) || transaction.to === null ||
+        !isAddressEqual(transaction.to, review.transaction.to) ||
+        transaction.input.toLowerCase() !== review.transaction.data.toLowerCase() ||
+        transaction.value !== review.transaction.value
+      ) throw new Error("Canonical native removal transaction differs from the reviewed request");
+      const receiptBlock = await publicClient.getBlock({ blockNumber: receipt.blockNumber });
+      if (receiptBlock.hash?.toLowerCase() !== receipt.blockHash.toLowerCase()) throw new Error("Canonical native removal block changed before balance reads");
+      const beforeBlockNumber = receipt.blockNumber - 1n;
+      const otherToken = review.nativeSide === "x" ? review.tokenY : review.tokenX;
+      const [nativeBalanceBefore, nativeBalanceAfter, otherTokenBalanceBefore, otherTokenBalanceAfter, ...lpValues] = await Promise.all([
+        publicClient.getBalance({ address: review.account, blockNumber: beforeBlockNumber }),
+        publicClient.getBalance({ address: review.account, blockNumber: receipt.blockNumber }),
+        publicClient.readContract({ address: otherToken, abi: erc20Abi, functionName: "balanceOf", args: [review.account], blockNumber: beforeBlockNumber }),
+        publicClient.readContract({ address: otherToken, abi: erc20Abi, functionName: "balanceOf", args: [review.account], blockNumber: receipt.blockNumber }),
+        ...review.ids.flatMap((binId) => [
+          publicClient.readContract({ address: review.pair, abi: lbPairAbi, functionName: "balanceOf", args: [review.account, binId], blockNumber: beforeBlockNumber }),
+          publicClient.readContract({ address: review.pair, abi: lbPairAbi, functionName: "balanceOf", args: [review.account, binId], blockNumber: receipt.blockNumber })
+        ])
+      ]);
+      const canonicalAfter = await publicClient.getBlock({ blockNumber: receipt.blockNumber });
+      if (canonicalAfter.hash?.toLowerCase() !== receipt.blockHash.toLowerCase()) throw new Error("Canonical native removal block reorganized during accounting");
+      return reconcileNativeRemoveLiquidityReceipt({
+        account: review.account,
+        burnAmounts: review.amounts,
+        effectiveGasPrice: receipt.effectiveGasPrice,
+        expectedAmountX: review.expectedAmountX,
+        expectedAmountY: review.expectedAmountY,
+        gasUsed: receipt.gasUsed,
+        ids: review.ids,
+        logs: receipt.logs,
+        lpBalances: review.ids.map((binId, index) => {
+          const before = lpValues[index * 2];
+          const after = lpValues[index * 2 + 1];
+          if (before === undefined || after === undefined) throw new Error("Canonical native removal LP evidence is incomplete");
+          return { after, before, binId };
+        }),
+        minimumAmountX: review.minimumAmountX,
+        minimumAmountY: review.minimumAmountY,
+        nativeBalanceAfter,
+        nativeBalanceBefore,
+        nativeSide: review.nativeSide,
+        otherTokenBalanceAfter,
+        otherTokenBalanceBefore,
+        pair: review.pair,
+        router: registry.contracts.lbRouter,
+        tokenX: review.tokenX,
+        tokenY: review.tokenY,
+        transactionValue: review.transaction.value
+      });
+    },
+    enabled: canonicalNativeRemoveHash !== null && submittedNativeRemoveReview !== null,
+    retry: false
+  });
   const rangeSliderMin = Math.min(-MAX_LIQUIDITY_BINS, lowerDelta ?? 0, (upperDelta ?? 0) - MAX_LIQUIDITY_BINS + 1);
   const rangeSliderMax = Math.max(MAX_LIQUIDITY_BINS, upperDelta ?? 0, (lowerDelta ?? 0) + MAX_LIQUIDITY_BINS - 1);
   const walletQuery = useQuery({
@@ -5579,6 +5767,7 @@ function LiquidityView({
   latestLbApprovalExecutionFingerprint.current = lbApprovalExecutionFingerprint;
   const removeExecutionContextFingerprint = burnExecutionContextFingerprint({
     account: account.address ?? null,
+    assetMode: effectiveRemoveAssetMode,
     binStep: pool?.binStep ?? null,
     burnBps: removePercentBps?.toString() ?? null,
     deadlineMinutes,
@@ -5587,11 +5776,15 @@ function LiquidityView({
     pair: pool?.pair ?? null,
     registryChainId: registry.chainId,
     router: registry.contracts.lbRouter,
+    selectedAssetMode: removeAssetMode,
     selectedPositionsKey,
     slippageBps: slippageBps?.toString() ?? null,
     tokenX: pool?.tokenX ?? null,
     tokenY: pool?.tokenY ?? null,
-    walletChainId: activeWalletChainId
+    transactionValue: "0",
+    walletChainId: activeWalletChainId,
+    wrappedNative: removeWrappedNative?.address ?? null,
+    wrappedNativeSide: removeWrappedNativeSide
   });
   const latestRemoveExecutionContextFingerprint = useRef(removeExecutionContextFingerprint);
   latestRemoveExecutionContextFingerprint.current = removeExecutionContextFingerprint;
@@ -5870,7 +6063,9 @@ function LiquidityView({
   const removeReverted = removeReceipt.data?.status === "reverted" || isRevertedReceiptError(removeReceipt.error);
   const removeReceiptMatchesCurrentIntent =
     liquidityReceiptPhase === "remove" && submittedRemoveReceiptContext === liquidityLifecycleKey;
-  const currentRemoveSuccess = removeReceiptMatchesCurrentIntent && removeSuccess;
+  const nativeRemoveAccountingRequired = submittedNativeRemoveReview !== null && removeReceiptMatchesCurrentIntent;
+  const currentRemoveOrphaned = currentRemoveFamilyConflict?.status === "orphaned";
+  const currentRemoveSuccess = removeReceiptMatchesCurrentIntent && removeSuccess && !currentRemoveOrphaned && (!nativeRemoveAccountingRequired || nativeRemoveReceiptReconciliationQuery.data !== undefined);
   const currentRemoveReverted = removeReceiptMatchesCurrentIntent && removeReverted;
   const currentLbApprovalSuccess = liquidityReceiptPhase === "lb-approval" && approveLbSuccess;
   const currentLbApprovalReverted = liquidityReceiptPhase === "lb-approval" && approveLbReverted;
@@ -6027,6 +6222,8 @@ function LiquidityView({
   useEffect(() => {
     setLiquidityReceiptPhase("idle");
     setSubmittedRemoveReceiptContext(null);
+    setSubmittedNativeRemoveReview(null);
+    setNativeRemoveOrphanNotice(null);
     setSubmittedFullExitHash(null);
     setFullExitUi((current) => current !== null && current.workflowKey === currentFullExitWorkflowKey ? current : null);
     setFullExitBatchReview((current) => current !== null && current.workflowKey === currentFullExitWorkflowKey ? current : null);
@@ -6816,6 +7013,7 @@ function LiquidityView({
     setLiquidityReceiptPhase("idle");
     setSubmittedRemoveReceiptContext(null);
     setSubmittedFullExitHash(null);
+    setNativeRemoveOrphanNotice(null);
     setLiquiditySimulationError(null);
     setGasReviewError(null);
     setRemoveQuoteReviewRequired(null);
@@ -6944,6 +7142,26 @@ function LiquidityView({
           });
           submitted = hash !== null;
           if (submitted) {
+            if (prepared.assetMode === "native" && removeWrappedNativeSide !== null) {
+              setSubmittedNativeRemoveReview({
+                account: account.address!,
+                amounts: prepared.liveBins.map((bin) => bin.liveBalance),
+                chainId: registry.chainId,
+                environment: environmentKey,
+                executionFingerprint: prepared.executionFingerprint,
+                expectedAmountX: prepared.expectedAmountX,
+                expectedAmountY: prepared.expectedAmountY,
+                ids: prepared.liveBins.map((bin) => bin.binId),
+                minimumAmountX: prepared.minimumAmountX,
+                minimumAmountY: prepared.minimumAmountY,
+                nativeSide: removeWrappedNativeSide,
+                pair: pool.pair,
+                submittedAt: submittedContext.submittedAt,
+                tokenX: pool.tokenX,
+                tokenY: pool.tokenY,
+                transaction: { ...prepared.transaction }
+              });
+            }
             setSubmittedFullExitHash(hash);
             latestFullExitBatchReviewRef.current = null;
             setFullExitBatchReview(null);
@@ -7089,7 +7307,7 @@ function LiquidityView({
             if (quoteView.error !== null || quoteView.minimums === null) {
               return { diagnostic: quoteView.error ?? "burn minimums unavailable", status: "semantic-failure" as const };
             }
-            const candidate = buildRemoveLiquidityTransaction(registry, {
+            const candidate = buildExactRemoveTransaction({
               tokenX: pool.tokenX,
               tokenY: pool.tokenY,
               binStep: pool.binStep,
@@ -7129,7 +7347,7 @@ function LiquidityView({
         if (batchQuote.error !== null || batchQuote.minimums === null || batchQuote.quote === null) {
           throw new Error(`Full-exit batch quote failed: ${batchQuote.error ?? "minimums unavailable"}`);
         }
-        const transaction = buildRemoveLiquidityTransaction(registry, {
+        const transaction = buildExactRemoveTransaction({
           tokenX: pool.tokenX,
           tokenY: pool.tokenY,
           binStep: pool.binStep,
@@ -7154,15 +7372,20 @@ function LiquidityView({
         ]);
         const firstBatchIds = new Set(firstBatch.bins.map((bin) => bin.binId.toString()));
         const prepared: FullExitBatchReviewState = {
+          assetMode: effectiveRemoveAssetMode,
           batchOrdinal,
           batchSettings,
           binStates: burnSnapshot.binStates.filter((state) => firstBatchIds.has(BigInt(state.binId).toString())),
           completedBatches,
           estimatedTransactionsRemaining: plan.batches.length,
           estimatedGas: firstBatch.estimatedGas,
+          expectedAmountX: batchQuote.quote.amountXOut,
+          expectedAmountY: batchQuote.quote.amountYOut,
           executionContextFingerprint: submittedExecutionContextFingerprint,
           executionFingerprint: batchReviewFingerprint,
           liveBins: firstBatch.bins.map((bin) => ({ ...bin })),
+          minimumAmountX: batchQuote.minimums.amountXMin,
+          minimumAmountY: batchQuote.minimums.amountYMin,
           positions: livePositivePositions.filter((position) => firstBatchIds.has(BigInt(position.binId).toString())),
           remainingBins: stateSnapshot.bins.length,
           sourceBlockHash: pinnedBlockHash,
@@ -7241,6 +7464,7 @@ function LiquidityView({
     setLiquidityReceiptPhase("idle");
     setSubmittedRemoveReceiptContext(null);
     setSubmittedFullExitHash(null);
+    setNativeRemoveOrphanNotice(null);
     setLiquiditySimulationError(null);
     setGasReviewError(null);
     setRemoveQuoteReviewRequired(null);
@@ -7411,7 +7635,7 @@ function LiquidityView({
         return;
       }
 
-      const transaction = buildRemoveLiquidityTransaction(registry, {
+      const transaction = buildExactRemoveTransaction({
         tokenX: pool.tokenX,
         tokenY: pool.tokenY,
         binStep: pool.binStep,
@@ -7530,6 +7754,26 @@ function LiquidityView({
           send: () => removeWrite.sendTransactionAsync(transaction)
         });
         submitted = hash !== null;
+        if (submitted && effectiveRemoveAssetMode === "native" && removeWrappedNativeSide !== null) {
+          setSubmittedNativeRemoveReview({
+            account: account.address,
+            amounts: [...freshPlan.amounts],
+            chainId: registry.chainId,
+            environment: environmentKey,
+            executionFingerprint: submittedExecutionContextFingerprint,
+            expectedAmountX: freshBurnQuote.quote.amountXOut,
+            expectedAmountY: freshBurnQuote.quote.amountYOut,
+            ids: [...freshPlan.ids],
+            minimumAmountX: freshBurnQuote.minimums.amountXMin,
+            minimumAmountY: freshBurnQuote.minimums.amountYMin,
+            nativeSide: removeWrappedNativeSide,
+            pair: pool.pair,
+            submittedAt: submittedContext.submittedAt,
+            tokenX: pool.tokenX,
+            tokenY: pool.tokenY,
+            transaction: { ...transaction }
+          });
+        }
       } catch (error) {
         if (error instanceof PairAttestationError && error.message.includes("LB operator access was revoked")) {
           setLiquiditySimulationError(null);
@@ -7552,6 +7796,7 @@ function LiquidityView({
     setLiquidityReceiptPhase((currentPhase) => currentPhase === "remove" ? "idle" : currentPhase);
     setSubmittedRemoveReceiptContext(null);
     setSubmittedFullExitHash(null);
+    setSubmittedNativeRemoveReview(null);
   };
   const updateRemovePercentInput = (value: string, requestFullExit = false) => {
     clearSubmittedRemoveReceipt();
@@ -7919,6 +8164,17 @@ function LiquidityView({
           />
         </div>
 
+        {connected && removeWrappedNative !== null && removeWrappedNativeSide !== null ? (
+          <fieldset className="routing-mode-control" data-testid="liquidity-remove-native-mode">
+            <legend>Wrapped-native withdrawal mode</legend>
+            <div className="segmented" role="group" aria-label="Wrapped-native withdrawal mode">
+              <button aria-pressed={removeAssetMode === "native"} className={removeAssetMode === "native" ? "segment active" : "segment"} onClick={() => { clearSubmittedRemoveReceipt(); setRemoveAssetMode("native"); }} type="button">ETH · native output</button>
+              <button aria-pressed={removeAssetMode === "erc20"} className={removeAssetMode === "erc20" ? "segment active" : "segment"} onClick={() => { clearSubmittedRemoveReceipt(); setRemoveAssetMode("erc20"); }} type="button">{removeWrappedNative.symbol} · ERC-20 output</button>
+            </div>
+            <p data-testid="liquidity-remove-wrapper-disclosure">ETH withdrawals use router-native unwrapping with zero transaction value. The other pool token remains an ERC-20 receipt. Pair-wide LB approval scope is unchanged.</p>
+          </fieldset>
+        ) : null}
+
         <span className="field-label" id="position-select-label">
           Positions
         </span>
@@ -7991,6 +8247,7 @@ function LiquidityView({
           <span>{selectedRangeStatus}; same-block claims at {selectedBurnSnapshotQuery.data ? `block ${selectedBurnSnapshotQuery.data.blockNumber.toString()}` : "a pending head"}.</span>
           <span>Expected receipts include proportional principal and accrued fee growth. There is no separate fee claim or rent refund.</span>
           <span>Minimum receipts apply {slippageInput}% slippage protection before wallet confirmation.</span>
+          <span data-testid="withdraw-asset-mode">{nativeRemove ? `Native receipt: the ${removeWrappedNativeSide === "x" ? tokenSymbol(tokenX) : tokenSymbol(tokenY)} side is delivered as ETH; transaction value is 0 ETH.` : `ERC-20 receipt: ${tokenSymbol(tokenX)} and ${tokenSymbol(tokenY)} remain token transfers; ETH is used only for gas.`}</span>
           {fullExitUi?.workflowKey === currentFullExitWorkflowKey ? <span>{fullExitUi.message}</span> : null}
         </section>
 
@@ -8033,7 +8290,7 @@ function LiquidityView({
         </div>
 
         <LiquidityStateRows
-          actionError={removeQuoteReviewRequired ?? liquidityActionError}
+          actionError={currentRemoveOrphaned ? "Native withdrawal receipt was reorganized; canonical accounting was removed and retry remains journal-blocked." : nativeRemoveOrphanNotice ?? removeQuoteReviewRequired ?? liquidityActionError}
           inputError={removeInputError}
           insufficientBalance={false}
           pendingHash={liquidityReceiptPhase === "remove" ? removeWrite.data : liquidityReceiptPhase === "lb-approval" ? approveLbWrite.data : undefined}
@@ -8043,6 +8300,11 @@ function LiquidityView({
               : "Liquidity removed"
             : currentLbApprovalSuccess ? "LB approval confirmed" : null}
           revertedText={currentRemoveReverted ? "Remove liquidity reverted" : currentLbApprovalReverted ? "LB approval reverted" : null}
+        />
+        <NativeRemoveReceiptReview
+          error={nativeRemoveReceiptReconciliationQuery.error}
+          hash={canonicalNativeRemoveHash}
+          reconciliation={nativeRemoveReceiptReconciliationQuery.data}
         />
 
         <dl className="contract-list">

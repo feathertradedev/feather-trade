@@ -63,6 +63,7 @@ export interface SwapExecutionContext {
 
 export interface BurnExecutionContext {
   account: string | null;
+  assetMode: "erc20" | "native";
   binStep: number | null;
   burnBps: string | null;
   deadlineMinutes: number | null;
@@ -71,11 +72,15 @@ export interface BurnExecutionContext {
   pair: string | null;
   registryChainId: number;
   router: string;
+  selectedAssetMode: "erc20" | "native";
   selectedPositionsKey: string;
   slippageBps: string | null;
   tokenX: string | null;
   tokenY: string | null;
+  transactionValue: string;
   walletChainId: number;
+  wrappedNative: string | null;
+  wrappedNativeSide: "x" | "y" | null;
 }
 
 export interface LiquidityAddAssetContext {
@@ -280,6 +285,8 @@ export function reconcileNativeSwapReceipt(input: NativeSwapReceiptAccountingInp
 export function burnExecutionContextFingerprint(context: BurnExecutionContext): string {
   return JSON.stringify([
     context.mode,
+    context.assetMode,
+    context.selectedAssetMode,
     context.environment,
     context.registryChainId,
     context.walletChainId,
@@ -292,7 +299,10 @@ export function burnExecutionContextFingerprint(context: BurnExecutionContext): 
     context.burnBps,
     context.slippageBps,
     context.deadlineMinutes,
-    normalizeContextAddress(context.router)
+    normalizeContextAddress(context.router),
+    normalizeContextAddress(context.wrappedNative),
+    context.wrappedNativeSide,
+    context.transactionValue
   ]);
 }
 

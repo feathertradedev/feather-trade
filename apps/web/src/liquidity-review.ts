@@ -86,6 +86,129 @@ export interface NativeAddLiquidityReceiptReconciliation extends AddLiquidityRec
   lpBalanceDeltas: ReadonlyArray<{ binId: bigint; delta: bigint }>;
 }
 
+export interface NativeRemoveLiquidityReceiptReconciliation {
+  actualGasCostWei: bigint;
+  actualGasPrice: bigint;
+  actualGasUsed: bigint;
+  burnedBalances: ReadonlyArray<{ binId: bigint; delta: bigint }>;
+  nativeAmount: bigint;
+  otherTokenAmount: bigint;
+  withdrawnX: bigint;
+  withdrawnY: bigint;
+}
+
+export function reconcileNativeRemoveLiquidityReceipt(input: {
+  account: Address;
+  effectiveGasPrice: bigint;
+  expectedAmountX: bigint;
+  expectedAmountY: bigint;
+  gasUsed: bigint;
+  ids: readonly bigint[];
+  logs: readonly Log[];
+  minimumAmountX: bigint;
+  minimumAmountY: bigint;
+  nativeBalanceAfter: bigint;
+  nativeBalanceBefore: bigint;
+  nativeSide: "x" | "y";
+  otherTokenBalanceAfter: bigint;
+  otherTokenBalanceBefore: bigint;
+  pair: Address;
+  router: Address;
+  tokenX: Address;
+  tokenY: Address;
+  transactionValue: bigint;
+  burnAmounts: readonly bigint[];
+  lpBalances: ReadonlyArray<{ after: bigint; before: bigint; binId: bigint }>;
+}): NativeRemoveLiquidityReceiptReconciliation {
+  if (input.transactionValue !== 0n) throw new Error("Native liquidity removal transaction value must be zero");
+  if (input.gasUsed < 0n || input.effectiveGasPrice < 0n) throw new Error("Native liquidity removal gas fields must be non-negative");
+  if (input.ids.length === 0 || input.ids.length !== input.burnAmounts.length || input.lpBalances.length !== input.ids.length) {
+    throw new Error("Native liquidity removal burn evidence is incomplete");
+  }
+  const gasCost = input.gasUsed * input.effectiveGasPrice;
+  if (input.nativeBalanceAfter + gasCost < input.nativeBalanceBefore) throw new Error("Native liquidity removal has an impossible ETH balance delta");
+  const nativeAmount = input.nativeBalanceAfter + gasCost - input.nativeBalanceBefore;
+  if (input.otherTokenBalanceAfter < input.otherTokenBalanceBefore) throw new Error("Native liquidity removal other-token balance decreased");
+  const otherTokenAmount = input.otherTokenBalanceAfter - input.otherTokenBalanceBefore;
+  const withdrawnX = input.nativeSide === "x" ? nativeAmount : otherTokenAmount;
+  const withdrawnY = input.nativeSide === "y" ? nativeAmount : otherTokenAmount;
+  if (withdrawnX < input.minimumAmountX || withdrawnY < input.minimumAmountY) {
+    throw new Error("Native liquidity removal receipt is below the reviewed minimum");
+  }
+  if (withdrawnX !== input.expectedAmountX || withdrawnY !== input.expectedAmountY) {
+    throw new Error("Native liquidity removal balances differ from the simulated outputs");
+  }
+
+  let withdrawnEventCount = 0;
+  let burnEventCount = 0;
+  let eventWithdrawnX = 0n;
+  let eventWithdrawnY = 0n;
+  let otherTokenTransferCount = 0;
+  let otherTokenTransferred = 0n;
+  const otherToken = input.nativeSide === "x" ? input.tokenY : input.tokenX;
+  for (const log of input.logs) {
+    if (isAddressEqual(log.address, otherToken)) {
+      try {
+        const transfer = decodeEventLog({ abi: erc20Abi, data: log.data, topics: log.topics, strict: true });
+        if (transfer.eventName === "Transfer" && isAddressEqual(transfer.args.from, input.router) && isAddressEqual(transfer.args.to, input.account)) {
+          otherTokenTransferCount += 1;
+          otherTokenTransferred += transfer.args.value;
+        }
+      } catch {
+        // Non-ERC-20 logs at this address cannot provide canonical transfer evidence.
+      }
+    }
+    if (!isAddressEqual(log.address, input.pair)) continue;
+    try {
+      const event = decodeEventLog({ abi: lbPairAbi, data: log.data, topics: log.topics, strict: true });
+      if (event.eventName === "WithdrawnFromBins") {
+        if (!isAddressEqual(event.args.sender, input.router) || !isAddressEqual(event.args.to, input.router)) {
+          throw new Error("Native removal withdrawal event has the wrong router identity");
+        }
+        withdrawnEventCount += 1;
+        if (event.args.ids.length !== input.ids.length || event.args.amounts.length !== input.ids.length) throw new Error("Native removal withdrawal event shape differs from review");
+        event.args.ids.forEach((id, index) => {
+          if (id !== input.ids[index]) throw new Error("Native removal withdrawal event bin differs from review");
+          const amount = decodePackedAmounts(event.args.amounts[index]!);
+          eventWithdrawnX += amount.x;
+          eventWithdrawnY += amount.y;
+        });
+      } else if (event.eventName === "TransferBatch") {
+        if (!isAddressEqual(event.args.sender, input.router) || !isAddressEqual(event.args.from, input.account) || !isAddressEqual(event.args.to, zeroAddress)) {
+          throw new Error("Native removal burn event has the wrong owner/router identity");
+        }
+        burnEventCount += 1;
+        if (event.args.ids.length !== input.ids.length || event.args.amounts.length !== input.ids.length) throw new Error("Native removal burn event shape differs from review");
+        event.args.ids.forEach((id, index) => {
+          if (id !== input.ids[index] || event.args.amounts[index] !== input.burnAmounts[index]) throw new Error("Native removal burn event differs from reviewed amounts");
+        });
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("Native removal")) throw error;
+    }
+  }
+  if (withdrawnEventCount !== 1 || burnEventCount !== 1) throw new Error("Canonical native removal receipt has ambiguous burn evidence");
+  if (eventWithdrawnX !== withdrawnX || eventWithdrawnY !== withdrawnY) throw new Error("Native removal event outputs differ from wallet balance evidence");
+  if (otherTokenTransferCount !== 1 || otherTokenTransferred !== otherTokenAmount) throw new Error("Native removal other-token Transfer evidence differs from wallet balance evidence");
+
+  const burnedBalances = input.lpBalances.map((row, index) => {
+    if (row.binId !== input.ids[index] || row.before < row.after) throw new Error("Native removal LP balance evidence is invalid");
+    const delta = row.before - row.after;
+    if (delta !== input.burnAmounts[index]) throw new Error("Native removal LP balance delta differs from reviewed burn");
+    return { binId: row.binId, delta };
+  });
+  return {
+    actualGasCostWei: gasCost,
+    actualGasPrice: input.effectiveGasPrice,
+    actualGasUsed: input.gasUsed,
+    burnedBalances,
+    nativeAmount,
+    otherTokenAmount,
+    withdrawnX,
+    withdrawnY
+  };
+}
+
 export async function getPinnedBlockIdentity(publicClient: PublicClient): Promise<PinnedBlockIdentity> {
   const block = await publicClient.getBlock({ blockTag: "latest" });
   if (block.hash === null) throw new Error("Latest block has no canonical hash");
