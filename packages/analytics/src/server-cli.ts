@@ -22,6 +22,10 @@ const engine = new AnalyticsEngine(policies, {
   maxPositionSnapshotAgeSeconds: numberFromEnv("ANALYTICS_MAX_POSITION_SNAPSHOT_AGE_SECONDS", 300)
 });
 const store = new AnalyticsCheckpointStore(process.env.ANALYTICS_STATE_PATH ?? ".local/analytics/checkpoint.json");
+const allowFixedTestPrices = booleanFromEnv("ANALYTICS_ALLOW_FIXED_TEST_PRICES", false);
+if (allowFixedTestPrices && process.env.ANALYTICS_ENVIRONMENT !== "localnet") {
+  throw new Error("ANALYTICS_ALLOW_FIXED_TEST_PRICES requires ANALYTICS_ENVIRONMENT=localnet");
+}
 const priceVerifier = await loadPriceVerifier(process.env.ANALYTICS_PRICE_VERIFIER_MODULE ?? null);
 const positionSnapshotProvider = await loadPositionSnapshotProvider(
   process.env.ANALYTICS_POSITION_SNAPSHOT_MODULE ?? null
@@ -29,7 +33,13 @@ const positionSnapshotProvider = await loadPositionSnapshotProvider(
 if (positionSnapshotProvider === null) {
   throw new Error("ANALYTICS_POSITION_SNAPSHOT_MODULE is required for head-exact wallet accounting");
 }
-const service = await AnalyticsApiService.create({ engine, store, priceVerifier, positionSnapshotProvider });
+const service = await AnalyticsApiService.create({
+  engine,
+  store,
+  allowFixedTestPrices,
+  priceVerifier,
+  positionSnapshotProvider
+});
 const blockSource = await loadBlockSource(process.env.ANALYTICS_BLOCK_SOURCE_MODULE ?? null);
 const initialHealth = service.getHealth();
 const coverageComplete =
@@ -76,6 +86,14 @@ function numberFromEnv(name: string, fallback: number): number {
 
 function commaSeparatedEnv(name: string): string[] {
   return (process.env[name] ?? "").split(",").map((value) => value.trim()).filter(Boolean);
+}
+
+function booleanFromEnv(name: string, fallback: boolean): boolean {
+  const value = process.env[name];
+  if (value === undefined) return fallback;
+  if (value === "1") return true;
+  if (value === "0") return false;
+  throw new Error(`${name} must be 1 or 0`);
 }
 
 async function loadPriceVerifier(modulePath: string | null): Promise<PriceSampleVerifier | null> {
