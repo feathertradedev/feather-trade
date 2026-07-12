@@ -3202,15 +3202,26 @@ test("a later partial receipt never mutates or impersonates durable full-exit pr
   await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "Max" }).click();
   await clickReviewedAction(page, "liquidity-remove-button");
   await expect(page.getByText(/Full-exit batch mined/)).toBeVisible();
-  rpc.update({ blockNumber: 53n, indexerBlockNumber: 53n, receiptBlockNumber: 42n });
+  rpc.update({
+    blockNumber: 53n,
+    indexerBlockNumber: 53n,
+    livePositionBalance: 2n * ONE_TOKEN,
+    positionLiquidity: 2n * ONE_TOKEN,
+    receiptBlockNumber: 42n
+  });
   await expect.poll(() => page.evaluate(() => {
     const raw = window.localStorage.getItem("feather.transaction-journal.v1");
     if (raw === null) return 0;
     return (JSON.parse(raw) as { records: Array<{ confirmations: number; reviewed: { intent: string } }> }).records
       .findLast((record) => record.reviewed.intent === "remove-liquidity")?.confirmations ?? 0;
   }), { timeout: 12_000 }).toBeGreaterThanOrEqual(12);
+  await expect(page.getByTestId("full-exit-workflow-status")).toContainText("Batch 1 reached 12-confirmation finality");
+  await expect(page.locator(".mini-metric").filter({ hasText: "Live Balance" }).locator("strong")).toHaveText("2", { timeout: 12_000 });
+  await expect(page.locator(".mini-metric").filter({ hasText: "Index Freshness" }).locator("strong")).toHaveText("block 53", { timeout: 12_000 });
 
   await page.getByRole("group", { name: "Withdrawal percentage presets" }).getByRole("button", { name: "50%" }).click();
+  await expect(page.locator("#remove-percent")).toHaveValue("50");
+  await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled();
   await clickReviewedAction(page, "liquidity-remove-button");
 
   await expect(page.getByText("Liquidity removed")).toBeVisible();

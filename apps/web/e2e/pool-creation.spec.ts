@@ -84,7 +84,7 @@ test("Discover creates an exact empty pool and preserves an RPC workspace while 
 
   const positionHref = await page.getByTestId("pool-create-position").getAttribute("href");
   await page.getByRole("link", { name: "Open exact pool workspace" }).click();
-  await page.getByRole("link", { name: "Swap" }).click();
+  await page.locator(".pool-actions").getByRole("link", { name: "Swap" }).click();
   await expect(page.getByTestId("swap-market-recovery")).toContainText(/empty|cannot quote|no swap liquidity/i);
   await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
   await page.evaluate((href) => { window.location.hash = href!.slice(1); }, positionHref);
