@@ -50,6 +50,23 @@ test("formats exact fractions as bounded decimal strings without floating point"
   assert.equal(formatExactPriceFraction({ numerator: 1n, denominator: 1_000_000_000_000n }), "0.000000000001");
   assert.equal(formatExactPriceFraction({ numerator: 1n, denominator: 3n }, 4), "0.3333");
   assert.throws(() => formatExactPriceFraction({ numerator: 0n, denominator: 1n }));
+  assert.throws(
+    () => formatExactPriceFraction({ numerator: 1n, denominator: 10n ** 255n }, 40),
+    /below the bounded decimal display range/
+  );
+  assert.throws(() => formatExactPriceFraction({ numerator: 1n, denominator: 2n }, 255));
+});
+
+test("formats and round-trips extreme representable Q128 prices across 6-to-18 decimals", () => {
+  for (const options of [
+    { baseDecimals: 6, quoteDecimals: 18 },
+    { baseDecimals: 18, quoteDecimals: 6 }
+  ]) {
+    const minimum = formatExactPriceFraction(normalizeQ128Price(1n, options));
+    assert.notEqual(minimum, "0");
+    assert.notEqual(minimum, "0.");
+    assert.equal(decimalPriceToQ128(minimum, options), 1n);
+  }
 });
 
 test("rejects invalid decimal strings, decimal metadata, underflow, and uint256 overflow", () => {

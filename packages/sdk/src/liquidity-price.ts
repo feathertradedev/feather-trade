@@ -60,27 +60,43 @@ export function decimalPriceToQ128(
 
 export function formatExactPriceFraction(
   price: ExactPriceFraction,
-  maximumFractionDigits = 40
+  maximumFractionDigits = MAX_DECIMAL_DIGITS - 2
 ): string {
   if (price.numerator <= 0n || price.denominator <= 0n) {
     throw new Error("price fraction must be positive");
   }
-  if (!Number.isSafeInteger(maximumFractionDigits) || maximumFractionDigits < 0 || maximumFractionDigits > 255) {
-    throw new Error("maximumFractionDigits must be an integer from 0 to 255");
+  if (!Number.isSafeInteger(maximumFractionDigits) || maximumFractionDigits < 0 || maximumFractionDigits > MAX_DECIMAL_DIGITS - 2) {
+    throw new Error(`maximumFractionDigits must be an integer from 0 to ${MAX_DECIMAL_DIGITS - 2}`);
   }
 
   const whole = price.numerator / price.denominator;
+  const wholeString = whole.toString();
+  if (wholeString.length > MAX_DECIMAL_DIGITS) {
+    throw new Error("price exceeds the decimal input length limit");
+  }
   let remainder = price.numerator % price.denominator;
-  if (remainder === 0n || maximumFractionDigits === 0) return whole.toString();
+  if (remainder === 0n) return wholeString;
+
+  const availableFractionDigits = Math.max(0, MAX_DECIMAL_DIGITS - wholeString.length - 1);
+  const fractionDigitLimit = Math.min(maximumFractionDigits, availableFractionDigits);
+  if (fractionDigitLimit === 0) {
+    if (whole === 0n) throw new Error("positive price is below the bounded decimal display range");
+    return wholeString;
+  }
 
   let fraction = "";
-  for (let index = 0; index < maximumFractionDigits && remainder !== 0n; index += 1) {
+  for (let index = 0; index < fractionDigitLimit && remainder !== 0n; index += 1) {
     remainder *= 10n;
     fraction += (remainder / price.denominator).toString();
     remainder %= price.denominator;
   }
 
-  return `${whole.toString()}.${fraction.replace(/0+$/, "")}`;
+  const trimmedFraction = fraction.replace(/0+$/, "");
+  if (trimmedFraction.length === 0) {
+    if (whole === 0n) throw new Error("positive price is below the bounded decimal display range");
+    return wholeString;
+  }
+  return `${wholeString}.${trimmedFraction}`;
 }
 
 export async function readPriceFromId(
