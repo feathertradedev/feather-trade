@@ -572,9 +572,10 @@ test("LP selection changes during second-click gas review discard stale review a
   await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled();
   await page.getByTestId("liquidity-remove-button").click();
   await expect(page.getByTestId("gas-review")).toBeVisible();
-  rpc.update({ gasEstimateDelayMs: 500 });
+  rpc.update({ gasEstimateDelayMs: 5_000 });
   await page.getByTestId("liquidity-remove-button").click();
   await expect.poll(() => rpc.snapshot().methods.filter((method) => method === "eth_estimateGas").length).toBe(2);
+  expect(rpc.snapshot().gasEstimatesCompleted).toBe(1);
 
   await page.getByRole("group", { name: "Positions" }).getByRole("checkbox").first().uncheck();
   await expect(page.getByTestId("gas-review")).toHaveCount(0);
