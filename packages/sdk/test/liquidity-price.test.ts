@@ -4,10 +4,12 @@ import type { Address, PublicClient } from "viem";
 
 import { buildLiquidityDistribution } from "../src/liquidity.js";
 import {
+  activeIdFromPriceQ128,
   decimalPriceToQ128,
   formatExactPriceFraction,
   MAX_TOKEN_DECIMALS,
   normalizeQ128Price,
+  priceQ128FromActiveId,
   Q128,
   readIdFromPrice,
   readPriceFromId
@@ -15,6 +17,93 @@ import {
 
 const PAIR = "0x00000000000000000000000000000000000000aa" as Address;
 const MAX_UINT256 = (1n << 256n) - 1n;
+const REAL_ID_SHIFT = 1n << 23n;
+
+test("matches contract PriceHelper Q128 vectors exactly without a deployed pair", () => {
+  const vectors = [
+    [8_388_607n, 1n, 340248342086729790484326174814286782777n],
+    [8_388_608n, 1n, 340282366920938463463374607431768211456n],
+    [8_388_609n, 1n, 340316395157630557309720944892511388277n],
+    [8_574_931n, 1n, 42008768657166552252904831246223292524636112144n],
+    [8_252_553n, 1n, 420088982319583379821932983567232n],
+    [8_392_773n, 100n, 339126126731289471075644077531136921680510789538376204951n],
+    [8_389_042n, 1_000n, 313519677444565270666918640639723648753369823551741149971n]
+  ] as const;
+
+  for (const [activeId, binStep, expectedPriceQ128] of vectors) {
+    assert.equal(priceQ128FromActiveId(activeId, binStep), expectedPriceQ128);
+  }
+});
+
+test("matches upstream PriceHelper decimal vectors and their bracketing bins", () => {
+  const vectors = [
+    ["123456789", 1n, 8_574_931n],
+    ["0.00000123456789", 1n, 8_252_554n],
+    ["1000000000000000000", 100n, 8_392_773n],
+    ["1000000000000000000", 1_000n, 8_389_042n]
+  ] as const;
+
+  for (const [decimalPrice, binStep, expectedId] of vectors) {
+    const priceQ128 = decimalPriceToQ128(decimalPrice, { baseDecimals: 18, quoteDecimals: 18 });
+    const activeId = activeIdFromPriceQ128(priceQ128, binStep);
+    assert.equal(activeId, expectedId);
+    assert.ok(priceQ128FromActiveId(activeId - 1n, binStep) <= priceQ128);
+    assert.ok(priceQ128FromActiveId(activeId + 1n, binStep) >= priceQ128);
+  }
+});
+
+test("round-trips active IDs across protocol bin steps within the contract rounding tolerance", () => {
+  const vectors = [
+    [REAL_ID_SHIFT - 800_000n, 1n],
+    [REAL_ID_SHIFT - 8_000n, 100n],
+    [REAL_ID_SHIFT - 800n, 1_000n],
+    [REAL_ID_SHIFT - 1n, 25n],
+    [REAL_ID_SHIFT, 65_535n],
+    [REAL_ID_SHIFT + 1n, 25n],
+    [REAL_ID_SHIFT + 800n, 1_000n],
+    [REAL_ID_SHIFT + 8_000n, 100n],
+    [REAL_ID_SHIFT + 800_000n, 1n]
+  ] as const;
+
+  for (const [activeId, binStep] of vectors) {
+    const roundTrippedId = activeIdFromPriceQ128(priceQ128FromActiveId(activeId, binStep), binStep);
+    const delta = roundTrippedId > activeId ? roundTrippedId - activeId : activeId - roundTrippedId;
+    assert.ok(delta <= 1n, `id ${activeId} at bin step ${binStep} round-tripped with delta ${delta}`);
+  }
+});
+
+test("reviews quote-per-base and inverse prices with exact unequal-decimal normalization", () => {
+  const options = { baseDecimals: 18, quoteDecimals: 6 };
+  const requestedPriceQ128 = decimalPriceToQ128("2500.125", options);
+  const activeId = activeIdFromPriceQ128(requestedPriceQ128, 25n);
+  const representedPriceQ128 = priceQ128FromActiveId(activeId, 25n);
+  const quotePerBase = normalizeQ128Price(representedPriceQ128, options);
+  const basePerQuote = normalizeQ128Price(representedPriceQ128, { ...options, inverse: true });
+
+  assert.equal(quotePerBase.numerator * basePerQuote.numerator, quotePerBase.denominator * basePerQuote.denominator);
+  assert.equal(decimalPriceToQ128(formatExactPriceFraction(quotePerBase), options), representedPriceQ128);
+  assert.equal(
+    decimalPriceToQ128(formatExactPriceFraction(basePerQuote), { ...options, inverse: true }),
+    representedPriceQ128
+  );
+  const roundTrippedId = activeIdFromPriceQ128(representedPriceQ128, 25n);
+  assert.ok(roundTrippedId === activeId || roundTrippedId === activeId - 1n || roundTrippedId === activeId + 1n);
+});
+
+test("preserves PriceHelper boundaries, special cases, and strict integer domains", () => {
+  assert.equal(priceQ128FromActiveId(REAL_ID_SHIFT, 0n), Q128);
+  assert.equal(activeIdFromPriceQ128(1n, 1n), REAL_ID_SHIFT);
+  assert.equal(activeIdFromPriceQ128(MAX_UINT256, 1n), 9_275_880n);
+
+  assert.throws(() => activeIdFromPriceQ128(0n, 1n), /priceQ128 must be nonzero/);
+  assert.throws(() => activeIdFromPriceQ128(Q128, 0n), /binStep must be greater than zero/);
+  assert.throws(() => priceQ128FromActiveId(-1n, 1n), /activeId must fit uint24/);
+  assert.throws(() => priceQ128FromActiveId(1n << 24n, 1n), /activeId must fit uint24/);
+  assert.throws(() => priceQ128FromActiveId(REAL_ID_SHIFT, -1n), /binStep must fit uint16/);
+  assert.throws(() => priceQ128FromActiveId(REAL_ID_SHIFT, 65_536n), /binStep must fit uint16/);
+  assert.throws(() => priceQ128FromActiveId(REAL_ID_SHIFT + (1n << 20n), 1n), /Q128 power underflow/);
+  assert.throws(() => priceQ128FromActiveId(REAL_ID_SHIFT - (1n << 20n), 1n), /Q128 power underflow/);
+});
 
 test("normalizes equal-decimal Q128 prices as exact reduced fractions", () => {
   assert.deepEqual(normalizeQ128Price(Q128 * 3n, { baseDecimals: 18, quoteDecimals: 18 }), {
