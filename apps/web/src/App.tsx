@@ -216,13 +216,35 @@ import {
 } from "./pool-creation";
 import {
   DEFAULT_POOL_DISCOVERY_STATE,
+  actionHref,
   buildOwnerLiquidityIndex,
   discoveryHref,
   filterPoolPage,
   parsePoolDiscoveryState,
   poolDetailHref,
+  returnHrefFromAction,
+  samePairPools,
   type PoolDiscoveryState
 } from "./pool-discovery";
+import {
+  loadAnalyticsHealth,
+  loadPairCandles,
+  loadPoolMetrics,
+  type AnalyticsPage,
+  type AnalyticsStatus,
+  type PoolAnalyticsMetric
+} from "./analytics-data";
+import {
+  buildBinDistribution,
+  buildCandleChartModel,
+  joinPoolWorkspaceRows,
+  sortPoolWorkspaceRows,
+  workspaceAnalyticsState,
+  workspaceMetricTiles,
+  type CandleChartModel,
+  type PoolEconomicSort,
+  type PoolWorkspaceRow
+} from "./pool-workspace";
 
 const queryClient = new QueryClient();
 const SNAPSHOT_REFRESH_INTERVAL_MS = 10_000;
@@ -1137,15 +1159,18 @@ function ContentView({
 
   if (routeKey === "swap") {
     return (
-      <SwapView
-        environmentKey={environmentKey}
-        onRefresh={onRefresh}
-        onSelectedPoolChange={handleSelectedPoolChange}
-        poolOptions={actionPoolOptions}
-        primaryPool={selectedPool}
-        selectedPoolId={selectedPool?.id ?? ""}
-        snapshot={snapshot}
-      />
+      <>
+        <ActionReturnLink />
+        <SwapView
+          environmentKey={environmentKey}
+          onRefresh={onRefresh}
+          onSelectedPoolChange={handleSelectedPoolChange}
+          poolOptions={actionPoolOptions}
+          primaryPool={selectedPool}
+          selectedPoolId={selectedPool?.id ?? ""}
+          snapshot={snapshot}
+        />
+      </>
     );
   }
 
@@ -1167,6 +1192,7 @@ function ContentView({
           onSelectPool={setSelectedPoolId}
           pool={detailPool ?? null}
           poolDetailId={poolDetailId}
+          pools={pools}
           snapshotState={detailState}
         />
       );
@@ -1187,18 +1213,21 @@ function ContentView({
 
   if (routeKey === "liquidity") {
     return (
-      <LiquidityView
-        environmentKey={environmentKey}
-        initialSection={liquiditySection}
-        onRefresh={onRefresh}
-        onSelectedPoolChange={handleSelectedPoolChange}
-        poolOptions={actionPoolOptions}
-        portfolioAction={portfolioAction}
-        primaryPool={selectedPool}
-        selectedPoolId={selectedPool?.id ?? ""}
-        snapshot={snapshot}
-        snapshotQueryErrored={snapshotState === "error"}
-      />
+      <>
+        <ActionReturnLink />
+        <LiquidityView
+          environmentKey={environmentKey}
+          initialSection={liquiditySection}
+          onRefresh={onRefresh}
+          onSelectedPoolChange={handleSelectedPoolChange}
+          poolOptions={actionPoolOptions}
+          portfolioAction={portfolioAction}
+          primaryPool={selectedPool}
+          selectedPoolId={selectedPool?.id ?? ""}
+          snapshot={snapshot}
+          snapshotQueryErrored={snapshotState === "error"}
+        />
+      </>
     );
   }
 
@@ -1207,6 +1236,12 @@ function ContentView({
   }
 
   return <ActivityView snapshot={snapshot} />;
+}
+
+function ActionReturnLink() {
+  const returnHref = returnHrefFromAction(window.location.hash);
+  if (returnHref === null) return null;
+  return <a className="back-link action-return-link" data-testid="pool-action-back" href={returnHref}>← Back to pool workspace</a>;
 }
 
 function RequestedPoolState({ error, poolId, state }: { error: Error | null; poolId: string; state: LoadState }) {
@@ -3503,9 +3538,13 @@ function PoolsView({
   const ownerEndpoint = analyticsEndpointForRegistry(registry);
   const ownerPortfolioQuery = useQuery({
     queryKey: ["poolDiscoveryOwner", environmentKey, account.address, ownerEndpoint],
-    queryFn: () => {
+    queryFn: async () => {
       if (!account.address || ownerEndpoint === null) throw new Error("Wallet analytics are unavailable");
-      return loadWalletPortfolio(ownerEndpoint, account.address);
+      const page = await loadWalletPortfolio(ownerEndpoint, account.address);
+      if (page.positions.some((position) => position.owner.toLowerCase() !== account.address!.toLowerCase())) {
+        throw new Error("Wallet analytics returned a position for another owner");
+      }
+      return page;
     },
     enabled: discoveryState.hasLiquidity && account.address !== undefined && ownerEndpoint !== null,
     refetchInterval: discoveryState.hasLiquidity ? SNAPSHOT_REFRESH_INTERVAL_MS : false,
@@ -3515,7 +3554,7 @@ function PoolsView({
   const ownerLiquidity = ownerPortfolioQuery.data
     ? buildOwnerLiquidityIndex(ownerPortfolioQuery.data.positions, {
         capped: ownerPortfolioQuery.data.pageInfo.hasNextPage,
-        failed: ownerPortfolioQuery.data.pageInfo.partial
+        failed: ownerPortfolioQuery.data.pageInfo.partial || !ownerPortfolioQuery.data.health.fresh || ownerPortfolioQuery.data.health.status !== "READY"
       })
     : null;
   const filteredPage = useMemo(
@@ -3532,7 +3571,7 @@ function PoolsView({
   const updateDiscovery = (next: Partial<PoolDiscoveryState>, resetPage = true) => {
     const state = { ...discoveryState, ...next, page: resetPage ? 0 : next.page ?? discoveryState.page };
     setDiscoveryState(state);
-    window.location.hash = discoveryHref(state);
+    window.history.replaceState(null, "", discoveryHref(state));
   };
 
   return (
@@ -3590,7 +3629,7 @@ function PoolsView({
             <button
               aria-pressed={discoveryState.hasLiquidity}
               className={discoveryState.hasLiquidity ? "filter-chip active" : "filter-chip"}
-              disabled={!account.address}
+              disabled={!account.address && !discoveryState.hasLiquidity}
               onClick={() => updateDiscovery({ hasLiquidity: !discoveryState.hasLiquidity })}
               type="button"
             >
@@ -3646,10 +3685,14 @@ function PoolsView({
             {filteredPage.rows.length === 0 ? <p className="inline-empty">No pools match these filters.</p> : null}
             {discoveryState.hasLiquidity && filteredPage.ownerStatus !== "ready" ? (
               <p className="state-row warning" data-testid="owner-pool-filter-status">
-                {filteredPage.ownerStatus === "partial"
+                {ownerPortfolioQuery.isPending || ownerPortfolioQuery.isFetching
+                  ? "Loading wallet liquidity from application analytics."
+                  : filteredPage.ownerStatus === "partial"
                   ? "Wallet liquidity results are partial; only verified loaded pools are shown."
                   : account.address
-                    ? "Wallet liquidity analytics are unavailable."
+                    ? ownerEndpoint === null
+                      ? "Wallet liquidity analytics are not configured for this environment."
+                      : "Wallet liquidity analytics are unavailable."
                     : "Connect a wallet to filter pools by your liquidity."}
               </p>
             ) : null}
@@ -4720,12 +4763,14 @@ function PoolDetailView({
   onSelectPool,
   pool,
   poolDetailId,
+  pools: _pools,
   snapshotState
 }: {
   environmentKey: EnvironmentKey;
   onSelectPool: (poolId: string) => void;
   pool: PoolRow | null;
   poolDetailId: string;
+  pools: PoolRow[];
   snapshotState: LoadState;
 }) {
   const registry = registries[environmentKey];

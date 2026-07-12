@@ -66,6 +66,15 @@ try {
   const ownerIndex = buildOwnerLiquidityIndex(ownerPage.rows, ownerPage.pageInfo);
   assert.equal(ownerIndex.partial, true);
   assert.deepEqual([...ownerIndex.pairs].sort(), [pairA, pairB]);
+  const currentOwnerIndex = buildOwnerLiquidityIndex([
+    { pair: pairA, bins: [{ liquidity: "0" }, { liquidity: "000" }] },
+    { pair: pairB, bins: [{ liquidity: "1" }] }
+  ], { capped: false, failed: false });
+  assert.deepEqual([...currentOwnerIndex.pairs], [pairB]);
+  assert.throws(
+    () => buildOwnerLiquidityIndex([{ pair: pairA, bins: [{ liquidity: "-1" }] }], { capped: false, failed: false }),
+    /Invalid owner liquidity/
+  );
 
   const pools = [
     pool(pairA, tokenX, tokenY, "25", "10"),
