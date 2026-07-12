@@ -301,6 +301,13 @@ export const lbPairAbi = [
   },
   {
     type: "function",
+    name: "getIdFromPrice",
+    stateMutability: "view",
+    inputs: [{ name: "price", type: "uint256" }],
+    outputs: [{ name: "id", type: "uint24" }]
+  },
+  {
+    type: "function",
     name: "getStaticFeeParameters",
     stateMutability: "view",
     inputs: [],

@@ -33,6 +33,7 @@ const RPC_ABI = [...erc20Abi, ...lbFactoryAbi, ...lbPairAbi, ...lbQuoterAbi, ...
 const ZERO_HOOKS = `0x${"0".repeat(64)}` as Hex;
 
 export interface MockRpcOptions {
+  activeId?: number;
   analyticsIncludeOtherOwner?: boolean;
   analyticsBinCount?: number;
   analyticsAsOfBlock?: bigint;
@@ -99,6 +100,7 @@ export interface MockRpcOptions {
   positionOwner?: Address;
   positionPair?: Address;
   positionLiquidity?: bigint;
+  priceQ128ByBin?: Readonly<Record<string, bigint>>;
   poolCount?: number;
   poolBinCount?: number;
   poolBinsMode?: "ready" | "error";
@@ -246,7 +248,7 @@ function mockAnalyticsResponse(body: GraphRequest, options: MockRpcOptions): Rec
   if (options.analyticsMode === "error") return { errors: [{ message: "Mock analytics failed" }] };
   const owner = body.variables?.owner ?? DEFAULT_ACCOUNT;
   const partial = options.analyticsPartialHistory === true;
-  const binId = options.analyticsOutOfRange === true ? ACTIVE_ID + 10 : ACTIVE_ID;
+  const binId = options.analyticsOutOfRange === true ? activeIdFor(options) + 10 : activeIdFor(options);
   const transferred = options.analyticsTransferred === true;
   const analyticsBins = transferred
     ? []
@@ -334,8 +336,8 @@ function mockGraphResponse(body: GraphRequest, options: MockRpcOptions): Record<
   if (query.includes("PairBinWindow")) {
     if (options.poolBinsMode === "error") return { errors: [{ message: "Mock pool bin window failed" }] };
     const count = options.poolBinCount ?? 5;
-    const bins = Array.from({ length: count }, (_, index) => mockBin(index, count)).filter(
-      (bin) => options.omitActivePoolBin !== true || bin.binId !== ACTIVE_ID.toString()
+    const bins = Array.from({ length: count }, (_, index) => mockBin(options, index, count)).filter(
+      (bin) => options.omitActivePoolBin !== true || bin.binId !== activeIdFor(options).toString()
     );
     return { data: { bins } };
   }
@@ -344,7 +346,7 @@ function mockGraphResponse(body: GraphRequest, options: MockRpcOptions): Record<
     const count = options.poolBinCount ?? 5;
     const first = body.variables?.first ?? count;
     const bins = Array.from({ length: Math.max(0, Math.min(first, count - skip)) }, (_, index) =>
-      mockBin(skip + index, count)
+      mockBin(options, skip + index, count)
     );
     return { data: { bins } };
   }
@@ -364,7 +366,7 @@ function mockGraphResponse(body: GraphRequest, options: MockRpcOptions): Record<
                 timestamp: "1720000000",
                 amountX: "10000000000000000000",
                 amountY: "20000000000000000000",
-                ids: [String(ACTIVE_ID)],
+                ids: [String(activeIdFor(options))],
                 sender: owner,
                 to: owner
               },
@@ -376,7 +378,7 @@ function mockGraphResponse(body: GraphRequest, options: MockRpcOptions): Record<
                 timestamp: "1720000100",
                 amountX: "1000000000000000000",
                 amountY: "2000000000000000000",
-                ids: [String(ACTIVE_ID)],
+                ids: [String(activeIdFor(options))],
                 sender: owner,
                 to: owner
               }
@@ -391,7 +393,7 @@ function mockGraphResponse(body: GraphRequest, options: MockRpcOptions): Record<
               sender: owner,
               from: owner,
               to: "0x0000000000000000000000000000000000000002",
-              ids: [String(ACTIVE_ID)]
+              ids: [String(activeIdFor(options))]
             }]
           : []
       }
@@ -586,11 +588,23 @@ async function handleEthCall(
   }
 
   if (functionName === "getActiveId") {
-    return encodeFunctionResult({ abi: lbPairAbi, functionName, result: ACTIVE_ID });
+    return encodeFunctionResult({ abi: lbPairAbi, functionName, result: activeIdFor(options) });
   }
 
   if (functionName === "getPriceFromId") {
-    return encodeFunctionResult({ abi: lbPairAbi, functionName, result: LB_Q128 });
+    const [requestedId] = decoded.args as readonly [bigint];
+    return encodeFunctionResult({
+      abi: lbPairAbi,
+      functionName,
+      result: options.priceQ128ByBin?.[requestedId.toString()] ?? LB_Q128
+    });
+  }
+
+  if (functionName === "getIdFromPrice") {
+    const [requestedPrice] = decoded.args as readonly [bigint];
+    const match = Object.entries(options.priceQ128ByBin ?? {}).find(([, price]) => price === requestedPrice);
+    if (match === undefined) throw new Error("Mock price does not map to a configured LB bin");
+    return encodeFunctionResult({ abi: lbPairAbi, functionName, result: Number(match[0]) });
   }
 
   if (functionName === "getStaticFeeParameters") {
@@ -605,7 +619,7 @@ async function handleEthCall(
     return encodeFunctionResult({
       abi: lbPairAbi,
       functionName,
-      result: [0, 0, ACTIVE_ID, 1_720_000_000]
+      result: [0, 0, activeIdFor(options), 1_720_000_000]
     });
   }
 
@@ -719,7 +733,7 @@ async function handleEthCall(
       distributionY: readonly bigint[];
     };
     const quote = quoteAddLiquidityMath({
-      activeId: BigInt(ACTIVE_ID),
+      activeId: BigInt(activeIdFor(options)),
       amountXReceived: params.amountX,
       amountYReceived: params.amountY,
       binStep: params.binStep,
@@ -728,8 +742,8 @@ async function handleEthCall(
       distributionX: params.distributionX,
       distributionY: params.distributionY,
       bins: params.deltaIds.map((deltaId) => ({
-        binId: BigInt(ACTIVE_ID) + deltaId,
-        priceQ128: LB_Q128,
+        binId: BigInt(activeIdFor(options)) + deltaId,
+        priceQ128: options.priceQ128ByBin?.[(BigInt(activeIdFor(options)) + deltaId).toString()] ?? LB_Q128,
         reserveX: options.binReserveX ?? 4n * DEFAULT_POSITION_LIQUIDITY,
         reserveY: options.binReserveY ?? 2n * DEFAULT_POSITION_LIQUIDITY,
         totalSupply: options.binTotalSupply ?? options.positionLiquidity ?? DEFAULT_POSITION_LIQUIDITY
@@ -746,7 +760,7 @@ async function handleEthCall(
       variableFees: {
         volatilityAccumulator: 0n,
         volatilityReference: 0n,
-        idReference: BigInt(ACTIVE_ID),
+        idReference: BigInt(activeIdFor(options)),
         timeOfLastUpdate: 1_720_000_000n
       }
     });
@@ -833,7 +847,7 @@ function tokenPairKey(left: Address, right: Address): string {
 function mockPair(options: MockRpcOptions, index = 0): Record<string, unknown> {
   const address = index === 0 ? WNATIVE_USDC_PAIR : SECOND_WNATIVE_USDC_PAIR;
   return {
-    activeId: (ACTIVE_ID + index).toString(),
+    activeId: (activeIdFor(options) + index).toString(),
     address: index === 0 ? options.pairAddress ?? address : address,
     binStep: index === 0 ? options.pairBinStep ?? String(10 + index) : String(10 + index),
     depositCount: "1",
@@ -858,7 +872,7 @@ function mockPairByAddress(options: MockRpcOptions, requested: string): Record<s
   const metadata = allPairMetadata(options).find((item) => item.pair.toLowerCase() === requested.toLowerCase());
   if (!metadata) return null;
   return {
-    activeId: ACTIVE_ID.toString(),
+    activeId: activeIdFor(options).toString(),
     address: metadata.pair,
     binStep: metadata.binStep.toString(),
     depositCount: "1",
@@ -895,8 +909,8 @@ function allPairMetadata(options: MockRpcOptions) {
   ];
 }
 
-function mockBin(index: number, count: number): Record<string, unknown> {
-  const binId = ACTIVE_ID - Math.floor(count / 2) + index;
+function mockBin(options: MockRpcOptions, index: number, count: number): Record<string, unknown> {
+  const binId = activeIdFor(options) - Math.floor(count / 2) + index;
   const scale = BigInt(index + 1);
   return {
     id: `${WNATIVE_USDC_PAIR.toLowerCase()}-${binId}`,
@@ -910,7 +924,7 @@ function mockBin(index: number, count: number): Record<string, unknown> {
 
 function mockPosition(options: MockRpcOptions, index = 0): Record<string, unknown> {
   const pair = options.positionPair ?? WNATIVE_USDC_PAIR;
-  const binId = ACTIVE_ID + (options.analyticsOutOfRange === true ? 10 : 0) + index;
+  const binId = activeIdFor(options) + (options.analyticsOutOfRange === true ? 10 : 0) + index;
 
   return {
     bin: { binId: binId.toString() },
@@ -920,6 +934,10 @@ function mockPosition(options: MockRpcOptions, index = 0): Record<string, unknow
     pair: { id: pair.toLowerCase() },
     updatedAtBlock: (options.indexerBlockNumber ?? DEFAULT_BLOCK_NUMBER).toString()
   };
+}
+
+function activeIdFor(options: MockRpcOptions): number {
+  return options.activeId ?? ACTIVE_ID;
 }
 
 function shouldIncludeOwnerPairPosition(body: GraphRequest, options: MockRpcOptions): boolean {

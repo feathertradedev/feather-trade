@@ -3,6 +3,7 @@ import { decodeFunctionData, type Hex } from "viem";
 
 import { erc20Abi, lbPairAbi, lbRouterAbi } from "../../../packages/sdk/src/abi";
 import { buildLiquidityDistribution } from "../../../packages/sdk/src/liquidity";
+import { formatExactPriceFraction, normalizeQ128Price } from "../../../packages/sdk/src/liquidity-price";
 import {
   installMockRpc,
   LB_ROUTER,
@@ -2114,12 +2115,24 @@ test("one-sided ranges submit direct add-liquidity transactions with the unused 
   expect(simulatedFunctions(rpc)).not.toContain("swapExactTokensForTokens");
 });
 
-test("strategy selection submits SDK-exact Curve distributions through the 69-bin product envelope", async ({ page }) => {
-  await setupConnectedLiquidity(page, {
+test("strategy and synchronized range controls enforce the 69-bin product envelope", async ({ page }) => {
+  const rpc = await setupConnectedLiquidity(page, {
     allowance: 5n * ONE_TOKEN,
     balance: 5n * ONE_TOKEN,
-    lbApproved: true
+    lbApproved: true,
+    priceQ128ByBin: {
+      "8388607": (1n << 128n) / 2n,
+      "8388609": (1n << 128n) * 2n
+    }
   });
+  await expect(page.locator("#range-lower")).toHaveValue("-1");
+  await expect(page.locator("#range-upper")).toHaveValue("1");
+  await expect(page.locator("#range-lower-bin")).toHaveValue("8388607");
+  await expect(page.locator("#range-upper-bin")).toHaveValue("8388609");
+  await expect(page.getByLabel("Min USDC per WNATIVE")).toHaveValue("0.5");
+  await expect(page.getByLabel("Max USDC per WNATIVE")).toHaveValue("2");
+  await expect(page.getByTestId("liquidity-min-price-inverse")).toContainText("0.5 WNATIVE per USDC");
+  await expect(page.getByTestId("liquidity-max-price-inverse")).toContainText("2 WNATIVE per USDC");
   await page.getByTestId("liquidity-strategy-curve").click();
   await expect(page.getByTestId("liquidity-strategy-curve")).toHaveAttribute("aria-pressed", "true");
   await expect(page.getByTestId("liquidity-composition-guidance")).toContainText("does not silently swap");
@@ -2135,26 +2148,84 @@ test("strategy selection submits SDK-exact Curve distributions through the 69-bi
 
   await page.getByLabel("Lower range handle").fill("-10");
   await expect(page.locator("#range-lower")).toHaveValue("-10");
+  await expect(page.locator("#range-lower-bin")).toHaveValue("8388598");
   await page.locator("#range-upper").fill("10");
   await expect(page.getByLabel("Upper range handle")).toHaveValue("10");
-  await page.locator("#range-lower").fill("1");
-  await page.locator("#range-upper").fill("69");
-  await expect(page.getByLabel("Lower range handle")).toHaveValue("1");
-  await expect(page.getByLabel("Upper range handle")).toHaveValue("69");
+  await expect(page.locator("#range-upper-bin")).toHaveValue("8388618");
+  await page.getByLabel("Lower range handle").focus();
+  await page.keyboard.press("ArrowRight");
+  await expect(page.getByLabel("Lower range handle")).toBeFocused();
+  await expect(page.locator("#range-lower")).toHaveValue("-9");
+  await page.getByLabel("Narrow preset bin count").fill("1");
+  await page.getByTestId("liquidity-preset-narrow").click();
+  await expect(page.locator("#range-lower-bin")).toHaveValue("8388608");
+  await expect(page.locator("#range-upper-bin")).toHaveValue("8388608");
+  await expect(page.locator('[aria-label="Liquidity bin distribution"] [role="img"]')).toHaveCount(1);
+  await page.getByLabel("Wide preset bin count").fill("69");
+  await page.getByTestId("liquidity-preset-wide").click();
+  await expect(page.locator("#range-lower-bin")).toHaveValue("8388574");
+  await expect(page.locator("#range-upper-bin")).toHaveValue("8388642");
+  await expect(page.getByLabel("Lower range handle")).toHaveValue("-34");
+  await expect(page.getByLabel("Upper range handle")).toHaveValue("34");
   await expect(page.getByTestId("liquidity-range-sliders")).toContainText("69 bins · max 69");
-  await expect(page.getByTestId("liquidity-range-mode")).toContainText("One-sided WNATIVE");
+  await expect(page.locator('[aria-label="Liquidity bin distribution"] [role="img"]')).toHaveCount(69);
   await clickReviewedAction(page, "liquidity-add-button");
   await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(2);
   const maximum = decodeSubmittedTransaction((await readMockWallet(page)).sentTransactions[1]);
   expect(((maximum.args as readonly [LiquidityParams])[0]).deltaIds).toHaveLength(69);
 
-  await page.locator("#range-lower").fill("100");
-  await page.locator("#range-upper").fill("168");
-  await expect(page.getByLabel("Lower range handle")).toHaveValue("100");
-  await expect(page.getByLabel("Upper range handle")).toHaveValue("168");
-  await page.locator("#range-upper").fill("169");
-  await expect(page.getByText("Liquidity range must include between 1 and 69 bins").first()).toBeVisible();
+  const simulationsBeforeInvalid = simulatedFunctions(rpc).filter((name) => name === "addLiquidity").length;
+  await page.getByLabel("Wide preset bin count").fill("70");
+  await page.getByTestId("liquidity-preset-wide").click();
+  await expect(page.getByText("Preset width must include between 1 and 69 bins").first()).toBeVisible();
   await expect(page.getByTestId("liquidity-add-button")).toBeDisabled();
+  await bypassDisabledButtonAndClick(page, "liquidity-add-button");
+  expect(simulatedFunctions(rpc).filter((name) => name === "addLiquidity")).toHaveLength(simulationsBeforeInvalid);
+  expect((await readMockWallet(page)).sentTransactions).toHaveLength(2);
+});
+
+test("extreme prices render exactly while active-bin movement preserves absolute bounds", async ({ page }) => {
+  const activeBin = 8_388_608;
+  const lowerBin = activeBin - 1;
+  const upperBin = activeBin + 1;
+  const maximumQ128 = (1n << 256n) - 1n;
+  const rpc = await setupConnectedLiquidity(page, {
+    priceQ128ByBin: {
+      [String(lowerBin)]: 1n,
+      [String(upperBin)]: maximumQ128
+    }
+  });
+  const priceOptions = { baseDecimals: 18, quoteDecimals: 18 };
+  const forwardMinimum = formatExactPriceFraction(normalizeQ128Price(1n, priceOptions));
+  const forwardMaximum = formatExactPriceFraction(normalizeQ128Price(maximumQ128, priceOptions));
+  const inverseMinimum = formatExactPriceFraction(normalizeQ128Price(maximumQ128, { ...priceOptions, inverse: true }));
+  const inverseMaximum = formatExactPriceFraction(normalizeQ128Price(1n, { ...priceOptions, inverse: true }));
+  const minimumInput = page.getByLabel("Min USDC per WNATIVE");
+  const maximumInput = page.getByLabel("Max USDC per WNATIVE");
+
+  await expect(minimumInput).toHaveValue(forwardMinimum);
+  await expect(maximumInput).toHaveValue(forwardMaximum);
+  await expect(page.getByTestId("liquidity-min-price-inverse").locator("output")).toHaveText(`${inverseMinimum} WNATIVE per USDC`);
+  await expect(page.getByTestId("liquidity-max-price-inverse").locator("output")).toHaveText(`${inverseMaximum} WNATIVE per USDC`);
+  for (const value of [forwardMinimum, forwardMaximum, inverseMinimum, inverseMaximum]) {
+    expect(value).not.toMatch(/^0(?:\.0*)?$/);
+  }
+  await minimumInput.fill(forwardMinimum);
+  await minimumInput.blur();
+  await maximumInput.fill(forwardMaximum);
+  await maximumInput.blur();
+  await expect(page.locator("#range-lower-bin")).toHaveValue(String(lowerBin));
+  await expect(page.locator("#range-upper-bin")).toHaveValue(String(upperBin));
+  await expect(page.getByText(/bounded decimal display range|below the representable Q128 range/)).toHaveCount(0);
+
+  rpc.update({ activeId: activeBin + 2, blockNumber: 43n, indexerBlockNumber: 43n });
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(page.locator(".mini-metric").filter({ hasText: "Active Bin" }).locator("strong")).toHaveText(String(activeBin + 2), { timeout: 15_000 });
+  await expect(page.locator("#range-lower-bin")).toHaveValue(String(lowerBin));
+  await expect(page.locator("#range-upper-bin")).toHaveValue(String(upperBin));
+  await expect(page.locator("#range-lower")).toHaveValue("-3");
+  await expect(page.locator("#range-upper")).toHaveValue("-1");
+  await expect(page.getByTestId("liquidity-range-mode")).toContainText("One-sided USDC");
 });
 
 test("safety-setting changes during simulation cancel stale strategy calldata", async ({ page }) => {
