@@ -12,7 +12,7 @@ const tokenX = "0x00000000000000000000000000000000000000c3";
 const tokenY = "0x00000000000000000000000000000000000000d4";
 let mode = "normal";
 
-const server = await createServer({ configFile: resolve(webRoot, "vite.config.ts"), root: webRoot, logLevel: "error", server: { middlewareMode: true } });
+const server = await createServer({ configFile: resolve(webRoot, "vite.config.ts"), root: webRoot, logLevel: "error", server: { hmr: false, middlewareMode: true } });
 
 try {
   const originalFetch = globalThis.fetch;
@@ -58,6 +58,9 @@ try {
   assert.equal(unavailable.rows.length, 0);
 
   await assert.rejects(() => loadPoolMetrics(endpoint, [pairA, pairA.toUpperCase().replace("0X", "0x")]), /Duplicate requested pool/);
+  await assert.rejects(() => loadPoolMetrics(endpoint, [pairA], undefined, { pageSize: 101 }), /pageSize must be between 1 and 100/);
+  await assert.rejects(() => loadPoolMetrics(endpoint, [pairA], undefined, { maxPages: 6 }), /maxPages must be between 1 and 5/);
+  await assert.rejects(() => loadAnalyticsHealth(endpoint, { timeoutMs: 60_001 }), /timeoutMs must be between 1 and 60000/);
   globalThis.fetch = originalFetch;
   console.log("Analytics data fixture passed: canonical joins, bounded cursors, LP-net taxonomy, null/zero, candles, and health semantics.");
 } finally {

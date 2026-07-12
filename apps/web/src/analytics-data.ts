@@ -98,6 +98,7 @@ export interface AnalyticsLoadOptions {
 const DEFAULT_PAGE_SIZE = 100;
 const DEFAULT_MAX_PAGES = 5;
 const DEFAULT_TIMEOUT_MS = 10_000;
+const MAX_TIMEOUT_MS = 60_000;
 
 const POOL_METRICS_QUERY = `
   query WebPoolMetrics($first: Int!, $after: String, $asOfTimestamp: Int) {
@@ -190,8 +191,9 @@ export async function loadAnalyticsHealth(
   options: Pick<AnalyticsLoadOptions, "timeoutMs"> = {}
 ): Promise<AnalyticsValue<AnalyticsHealth>> {
   if (endpoint === null) return { value: null, status: "UNAVAILABLE", error: "Analytics endpoint is not configured" };
+  const timeoutMs = normalizeBoundedPositive(options.timeoutMs, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, "timeoutMs");
   try {
-    const data = await fetchGraph(endpoint, ANALYTICS_HEALTH_QUERY, {}, normalizePositive(options.timeoutMs, DEFAULT_TIMEOUT_MS, "timeoutMs"));
+    const data = await fetchGraph(endpoint, ANALYTICS_HEALTH_QUERY, {}, timeoutMs);
     const health = parseHealth(asRecord(data).analyticsHealth);
     health.status = truthfulHealthStatus(health);
     return { value: health, status: health.status, error: null };
@@ -209,9 +211,9 @@ async function loadConnection<T>(
   stableKey: (row: T) => string,
   options: AnalyticsLoadOptions
 ): Promise<AnalyticsPage<T>> {
-  const pageSize = normalizePositive(options.pageSize, DEFAULT_PAGE_SIZE, "pageSize");
-  const maxPages = normalizePositive(options.maxPages, DEFAULT_MAX_PAGES, "maxPages");
-  const timeoutMs = normalizePositive(options.timeoutMs, DEFAULT_TIMEOUT_MS, "timeoutMs");
+  const pageSize = normalizeBoundedPositive(options.pageSize, DEFAULT_PAGE_SIZE, DEFAULT_PAGE_SIZE, "pageSize");
+  const maxPages = normalizeBoundedPositive(options.maxPages, DEFAULT_MAX_PAGES, DEFAULT_MAX_PAGES, "maxPages");
+  const timeoutMs = normalizeBoundedPositive(options.timeoutMs, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, "timeoutMs");
   const rows: T[] = [];
   const keys = new Set<string>();
   let after: string | null = null;
@@ -365,6 +367,11 @@ function parseNullableString(value: unknown, label: string): string | null { ret
 function parseBoolean(value: unknown, label: string): boolean { if (typeof value !== "boolean") throw new Error(`Invalid ${label}`); return value; }
 function asRecord(value: unknown): Record<string, unknown> { if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("Expected analytics object"); return value as Record<string, unknown>; }
 function asArray(value: unknown, label: string): unknown[] { if (!Array.isArray(value)) throw new Error(`Invalid ${label}`); return value; }
-function normalizePositive(value: number | undefined, fallback: number, label: string): number { return value === undefined ? fallback : parseSafeInteger(value, label) || (() => { throw new Error(`${label} must be positive`); })(); }
+function normalizeBoundedPositive(value: number | undefined, fallback: number, maximum: number, label: string): number {
+  if (value === undefined) return fallback;
+  const parsed = parseSafeInteger(value, label);
+  if (parsed === 0 || parsed > maximum) throw new Error(`${label} must be between 1 and ${maximum}`);
+  return parsed;
+}
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : "Analytics request failed"; }
 function joinErrors(left: string | null, right: string): string { return left === null ? right : `${left}; ${right}`; }
