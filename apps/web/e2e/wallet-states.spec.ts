@@ -854,7 +854,7 @@ test("remove status advances from LB approval through current remove pending to 
     balance: 5n * ONE_TOKEN,
     lbApproved: false,
     lbApprovedAfterReceipt: true,
-    receiptDelayMs: 1_200
+    receiptDelayMs: 5_000
   }, { transactionDelayMs: 1_200 });
 
   await clickReviewedAction(page, "liquidity-approve-lb-button");
@@ -868,6 +868,8 @@ test("remove status advances from LB approval through current remove pending to 
   await expect(status).toContainText(/Awaiting action wallet confirmation|Pending/);
   await expect(status).not.toContainText("LB approval confirmed");
   await expect(status).toContainText("Liquidity removed", { timeout: 12_000 });
+  await expect(page.locator("#liquidity-withdraw .mini-metric").filter({ hasText: "Live Balance" }).locator("strong")).toHaveText("0", { timeout: 12_000 });
+  await expect(status).toContainText("Liquidity removed");
 });
 
 test("revoked allowance returns an approved swap to exact approval-required state", async ({ page }) => {
