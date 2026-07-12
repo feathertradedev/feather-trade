@@ -72,6 +72,47 @@ test("native ETH input suppresses approval, sends exact value, and reconciles ca
   await expect(page.getByTestId("native-swap-receipt-review")).toHaveCount(0);
 });
 
+test("native ETH input gas review requires exact value plus buffered gas and opens no wallet", async ({ page }) => {
+  const amountIn = ONE_TOKEN;
+  const bufferedGas = 2_500_000_000_000_000n;
+  await setupConnectedSwap(page, {
+    estimatedGas: 2_000_000n,
+    includePairs: true,
+    nativeBalance: amountIn + bufferedGas - 1n
+  });
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await page.getByTestId("swap-submit-button").click();
+  await expect(page.getByTestId("gas-review")).toContainText("+ 1 ETH value");
+  await expect(page.getByTestId("gas-review")).toContainText("1.0025 ETH required");
+  await expect(page.getByTestId("swap-failure-state")).toContainText("Insufficient ETH for gas");
+  expect((await readMockWallet(page)).sentTransactions).toHaveLength(0);
+});
+
+test("delayed native receipt reconciles against submitted quote after live quote refresh", async ({ page }) => {
+  const nativeBefore = 10n * ONE_TOKEN;
+  const tokenBefore = 5n * ONE_TOKEN;
+  const submittedTokenOut = 999n * ONE_TOKEN / 1_000n;
+  const rpc = await setupConnectedSwap(page, {
+    balance: tokenBefore,
+    balanceAfterReceipt: tokenBefore + submittedTokenOut,
+    includePairs: true,
+    nativeBalance: nativeBefore,
+    nativeBalanceAfterReceipt: nativeBefore - ONE_TOKEN - 100_000n,
+    quoteRate: 999n,
+    receiptBlockNumber: 43n,
+    receiptDelayMs: 1_500
+  });
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  const submittedOutput = await page.locator("#swap-output").inputValue();
+  await clickReviewedAction(page, "swap-submit-button");
+  rpc.update({ blockNumber: 44n, indexerBlockNumber: 44n, quoteRate: 2_000n });
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect.poll(() => page.locator("#swap-output").inputValue()).not.toBe(submittedOutput);
+  await expect(page.getByTestId("native-swap-receipt-review")).toContainText("ETH spent", { timeout: 15_000 });
+  await expect(page.getByTestId("native-swap-receipt-error")).toHaveCount(0);
+  expect((await readMockWallet(page)).sentTransactions).toHaveLength(1);
+});
+
 test("native ETH output keeps ERC input approval, sends zero value, and reconciles canonical balances", async ({ page }) => {
   const nativeBefore = 10n * ONE_TOKEN;
   const tokenBefore = 5n * ONE_TOKEN;

@@ -151,12 +151,14 @@ import {
   burnQuoteExecutionFingerprint,
   evaluateTransactionSafety,
   idSlippageInputError,
+  nativeSwapSubmissionFingerprint,
   parseDeadlineMinutes,
   parseIdSlippage,
   quoteIsStale,
   reconcileNativeSwapReceipt,
   swapExecutionContextFingerprint,
   type BurnQuoteExecutionBinding,
+  type NativeSwapSubmissionBinding,
   type SwapExecutionContext
 } from "./transaction-safety";
 import { wagmiConfig } from "./wagmi";
@@ -1208,6 +1210,15 @@ interface NativeSwapReceiptReview {
   hash: Address;
 }
 
+interface SubmittedNativeSwapReceiptContext extends Omit<NativeSwapSubmissionBinding, "account" | "calldataFingerprint" | "hash" | "target" | "token"> {
+  account: Address;
+  calldataFingerprint: Hex;
+  data: Hex;
+  hash: Address;
+  target: Address;
+  token: Address;
+}
+
 function SwapView({
   environmentKey,
   onSelectedPoolChange,
@@ -1250,6 +1261,7 @@ function SwapView({
   const [submittedSwapReceiptContext, setSubmittedSwapReceiptContext] = useState<string | null>(null);
   const [nativeReceiptReview, setNativeReceiptReview] = useState<NativeSwapReceiptReview | null>(null);
   const [nativeReceiptError, setNativeReceiptError] = useState<string | null>(null);
+  const [submittedNativeSwapReceiptContext, setSubmittedNativeSwapReceiptContext] = useState<SubmittedNativeSwapReceiptContext | null>(null);
   const transactionJournal = useTransactionJournal();
   const registry = registries[environmentKey];
   const localnetRegistry = isLocalnetRegistry(registry) ? registry : null;
@@ -1734,49 +1746,82 @@ function SwapView({
   const nativeReceiptIdentity = swapReceipt.data
     ? [swapReceipt.data.transactionHash, swapReceipt.data.blockHash, swapReceipt.data.blockNumber.toString(), swapReceipt.data.status].join(":")
     : null;
+  const submittedNativeSwapFingerprint = submittedNativeSwapReceiptContext === null
+    ? null
+    : nativeSwapSubmissionFingerprint(submittedNativeSwapReceiptContext);
+  const activeSwapJournalRecord = submittedNativeSwapReceiptContext === null
+    ? null
+    : transactionJournal.records.find((record) =>
+        record.reviewed.intent === "swap" &&
+        (
+          record.activeHash?.toLowerCase() === submittedNativeSwapReceiptContext.hash.toLowerCase() ||
+          record.hashes.some((candidate) => candidate.hash.toLowerCase() === submittedNativeSwapReceiptContext.hash.toLowerCase())
+        )
+      ) ?? null;
   useEffect(() => {
-    if (!swapSuccess || !swapReceipt.data || !swapWrite.data || (!nativeInput && !nativeOutput) || !account.address || parsedAmount === null || amountOutMin === null) return;
+    if (submittedNativeSwapReceiptContext === null || !swapReceipt.data || activeSwapJournalRecord === null) return;
     let cancelled = false;
     const receipt = swapReceipt.data;
-    const tokenAddress = nativeInput ? tokenOutAddress : tokenInAddress;
-    if (tokenAddress === null || receipt.blockNumber === 0n) return;
+    const submitted = submittedNativeSwapReceiptContext;
+    if (receipt.blockNumber === 0n) return;
     void (async () => {
       try {
+        if (receipt.transactionHash.toLowerCase() !== submitted.hash.toLowerCase()) throw new Error("Native swap receipt hash differs from the submitted context");
+        if (receipt.status !== "success") throw new Error("Native swap receipt did not succeed");
+        if (
+          !isAddressEqual(activeSwapJournalRecord.reviewed.account, submitted.account) ||
+          !isAddressEqual(activeSwapJournalRecord.reviewed.target, submitted.target) ||
+          activeSwapJournalRecord.reviewed.calldataFingerprint.toLowerCase() !== submitted.calldataFingerprint.toLowerCase() ||
+          activeSwapJournalRecord.reviewed.executionFingerprint !== submitted.executionFingerprint ||
+          activeSwapJournalRecord.reviewed.value.toString() !== submitted.transactionValue
+        ) throw new Error("Native swap journal context differs from the immutable submitted context");
         const beforeBlockNumber = receipt.blockNumber - 1n;
         const canonical = await publicClient.getBlock({ blockNumber: receipt.blockNumber });
         if (canonical.hash?.toLowerCase() !== receipt.blockHash.toLowerCase()) throw new Error("Native swap receipt block is not canonical");
+        const canonicalTransaction = await publicClient.getTransaction({ hash: submitted.hash as Address });
+        if (
+          !isAddressEqual(canonicalTransaction.from, submitted.account) ||
+          canonicalTransaction.to === null ||
+          !isAddressEqual(canonicalTransaction.to, submitted.target) ||
+          canonicalTransaction.input.toLowerCase() !== submitted.data.toLowerCase() ||
+          keccak256(canonicalTransaction.input).toLowerCase() !== submitted.calldataFingerprint.toLowerCase() ||
+          canonicalTransaction.value.toString() !== submitted.transactionValue
+        ) throw new Error("Canonical native swap transaction differs from the immutable submitted context");
         const [nativeBalanceBefore, nativeBalanceAfter, tokenBalanceBefore, tokenBalanceAfter] = await Promise.all([
-          publicClient.getBalance({ address: account.address!, blockNumber: beforeBlockNumber }),
-          publicClient.getBalance({ address: account.address!, blockNumber: receipt.blockNumber }),
-          publicClient.readContract({ address: tokenAddress, abi: erc20Abi, functionName: "balanceOf", args: [account.address!], blockNumber: beforeBlockNumber }),
-          publicClient.readContract({ address: tokenAddress, abi: erc20Abi, functionName: "balanceOf", args: [account.address!], blockNumber: receipt.blockNumber })
+          publicClient.getBalance({ address: submitted.account as Address, blockNumber: beforeBlockNumber }),
+          publicClient.getBalance({ address: submitted.account as Address, blockNumber: receipt.blockNumber }),
+          publicClient.readContract({ address: submitted.token as Address, abi: erc20Abi, functionName: "balanceOf", args: [submitted.account as Address], blockNumber: beforeBlockNumber }),
+          publicClient.readContract({ address: submitted.token as Address, abi: erc20Abi, functionName: "balanceOf", args: [submitted.account as Address], blockNumber: receipt.blockNumber })
         ]);
         let loggedTokenAmount = 0n;
         for (const log of receipt.logs) {
-          if (!isAddressEqual(log.address, tokenAddress)) continue;
+          if (!isAddressEqual(log.address, submitted.token)) continue;
           try {
             const decoded = decodeEventLog({ abi: erc20Abi, data: log.data, topics: log.topics });
             if (decoded.eventName !== "Transfer") continue;
             const args = decoded.args as { from: Address; to: Address; value: bigint };
-            if (nativeInput && isAddressEqual(args.to, account.address!)) loggedTokenAmount += args.value;
-            if (nativeOutput && isAddressEqual(args.from, account.address!)) loggedTokenAmount += args.value;
+            if (submitted.direction === "native-in" && isAddressEqual(args.to, submitted.account)) loggedTokenAmount += args.value;
+            if (submitted.direction === "native-out" && isAddressEqual(args.from, submitted.account)) loggedTokenAmount += args.value;
           } catch {
             // Non-Transfer logs from the token do not contribute to received/spent accounting.
           }
         }
-        if (nativeInput && loggedTokenAmount < amountOutMin) throw new Error("Native-input receipt transfer logs are below the reviewed minimum");
-        if (nativeOutput && loggedTokenAmount !== parsedAmount) throw new Error("Native-output receipt transfer logs differ from the reviewed input");
+        const submittedAmountIn = BigInt(submitted.amountIn);
+        const submittedAmountOutMin = BigInt(submitted.amountOutMin);
+        const submittedValue = BigInt(submitted.transactionValue);
+        if (submitted.direction === "native-in" && loggedTokenAmount < submittedAmountOutMin) throw new Error("Native-input receipt transfer logs are below the reviewed minimum");
+        if (submitted.direction === "native-out" && loggedTokenAmount !== submittedAmountIn) throw new Error("Native-output receipt transfer logs differ from the reviewed input");
         const accounting = reconcileNativeSwapReceipt({
-          amountIn: parsedAmount,
-          amountOutMin,
-          direction: nativeInput ? "native-in" : "native-out",
+          amountIn: submittedAmountIn,
+          amountOutMin: submittedAmountOutMin,
+          direction: submitted.direction,
           effectiveGasPrice: receipt.effectiveGasPrice,
           gasUsed: receipt.gasUsed,
           nativeBalanceAfter,
           nativeBalanceBefore,
           tokenBalanceAfter,
           tokenBalanceBefore,
-          transactionValue: nativeInput ? parsedAmount : 0n
+          transactionValue: submittedValue
         });
         const postRead = await publicClient.getBlock({ blockNumber: receipt.blockNumber });
         if (postRead.hash?.toLowerCase() !== receipt.blockHash.toLowerCase()) throw new Error("Native swap receipt block reorganized during accounting");
@@ -1786,29 +1831,33 @@ function SwapView({
             gasCost: accounting.gasCost.toString(),
             nativeAmount: accounting.nativeAmount.toString(),
             tokenAmount: accounting.tokenAmount.toString(),
-            hash: swapWrite.data!
+            hash: submitted.hash as Address
           });
           setNativeReceiptError(null);
         }
       } catch (error) {
         if (!cancelled) {
+          const message = getWriteError(error) ?? "unknown accounting error";
           setNativeReceiptReview(null);
-          setNativeReceiptError(`Native swap receipt reconciliation failed closed: ${getWriteError(error) ?? "unknown accounting error"}`);
+          setNativeReceiptError(`Native swap receipt reconciliation failed closed: ${message}`);
+          if (/differs from the (?:immutable )?submitted context|journal context differs/i.test(message)) {
+            setSubmittedNativeSwapReceiptContext(null);
+          }
         }
       }
     })();
     return () => { cancelled = true; };
-  }, [swapSuccess, nativeReceiptIdentity, swapWrite.data, nativeInput, nativeOutput, account.address, parsedAmount?.toString(), amountOutMin?.toString(), tokenInAddress, tokenOutAddress]);
+  }, [activeSwapJournalRecord, nativeReceiptIdentity, submittedNativeSwapFingerprint]);
 
-  const activeSwapJournalRecord = swapWrite.data
-    ? transactionJournal.records.find((record) => record.activeHash?.toLowerCase() === swapWrite.data!.toLowerCase() && record.reviewed.intent === "swap") ?? null
-    : null;
   useEffect(() => {
-    if (activeSwapJournalRecord?.status === "orphaned") {
+    if (activeSwapJournalRecord?.status === "orphaned" || activeSwapJournalRecord?.replacementCompatibility === "incompatible") {
       setNativeReceiptReview(null);
-      setNativeReceiptError("Native swap receipt was reorganized; canonical accounting was removed and retry remains journal-blocked");
+      setNativeReceiptError(activeSwapJournalRecord.status === "orphaned"
+        ? "Native swap receipt was reorganized; canonical accounting was removed and retry remains journal-blocked"
+        : "Native swap replacement differs from the submitted calldata or value; canonical accounting was cleared");
+      setSubmittedNativeSwapReceiptContext(null);
     }
-  }, [activeSwapJournalRecord?.status]);
+  }, [activeSwapJournalRecord?.replacementCompatibility, activeSwapJournalRecord?.status]);
 
   useEffect(() => {
     if (approvalRefresh?.status !== "awaiting-render") return;
@@ -1978,6 +2027,7 @@ function SwapView({
     setGasReviewError(null);
     setNativeReceiptReview(null);
     setNativeReceiptError(null);
+    setSubmittedNativeSwapReceiptContext(null);
     try {
 
     try {
@@ -2037,7 +2087,8 @@ function SwapView({
       getGasPrice: () => publicClient.getGasPrice(),
       isCurrent: gasReviewIsCurrent,
       setError: setGasReviewError,
-      setReview: setGasReview
+      setReview: setGasReview,
+      transactionValue: transaction.value
     });
     if (!gasApproved || !gasReviewIsCurrent()) return;
     try {
@@ -2062,7 +2113,7 @@ function SwapView({
     };
     try {
       setSubmittedSwapReceiptContext(approvalIntentFingerprint);
-      await submitJournaledTransaction({
+      const hash = await submitJournaledTransaction({
         isCurrent: gasReviewIsCurrent,
         journal: transactionJournal,
         reviewed: reviewedTransactionIntent(submittedContext, {
@@ -2077,6 +2128,26 @@ function SwapView({
         },
         send: () => swapWrite.sendTransactionAsync(transaction)
       });
+      if (hash !== null && (nativeInput || nativeOutput)) {
+        const token = nativeInput ? tokenOutAddress : tokenInAddress;
+        if (token === null || simulatedQuoteIdentity === null) throw new Error("Submitted native swap context is incomplete");
+        setSubmittedNativeSwapReceiptContext({
+          account: account.address,
+          amountIn: parsedAmount.toString(),
+          amountOutMin: amountOutMin.toString(),
+          calldataFingerprint: keccak256(transaction.data),
+          data: transaction.data,
+          direction: nativeInput ? "native-in" : "native-out",
+          executionFingerprint: simulatedContextFingerprint,
+          hash,
+          inputAssetMode,
+          outputAssetMode,
+          quoteIdentity: simulatedQuoteIdentity,
+          target: transaction.to,
+          token,
+          transactionValue: transaction.value.toString()
+        });
+      }
     } catch (error) {
       if (!isUserRejectedSubmission(error)) setSwapSimulationError(getWriteError(error) ?? "Transaction journal blocked swap submission");
       // The wagmi mutation retains the rejection for the originating mounted session.

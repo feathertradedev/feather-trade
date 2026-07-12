@@ -130,6 +130,7 @@ export interface MockRpcOptions {
   quoteVersion?: number;
   receiptStatus?: "success" | "reverted";
   receiptBlockNumber?: bigint;
+  receiptDelayMs?: number;
   simulationDelayMs?: number;
   simulationMode?: "success" | "error";
   walletReadMode?: "ready" | "error";
@@ -478,6 +479,7 @@ async function handleRpc(request: RpcRequest, options: MockRpcOptions, state: Mo
       case "eth_gasPrice":
         return rpcResult(request, numberToHex(options.gasPrice ?? 1_000_000_000n));
       case "eth_getTransactionReceipt":
+        if (options.receiptDelayMs !== undefined) await delay(options.receiptDelayMs);
         const receiptBlockNumber = options.receiptBlockNumber ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER;
         if ((options.receiptStatus ?? "success") === "success") {
           if (options.clearPositionsAfterReceipt === true) options.includePositions = false;

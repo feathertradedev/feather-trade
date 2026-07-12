@@ -210,6 +210,40 @@ export interface NativeSwapReceiptAccounting {
   tokenAmount: bigint;
 }
 
+export interface NativeSwapSubmissionBinding {
+  account: string;
+  amountIn: string;
+  amountOutMin: string;
+  calldataFingerprint: string;
+  direction: "native-in" | "native-out";
+  executionFingerprint: string;
+  hash: string;
+  inputAssetMode: "erc20" | "native";
+  outputAssetMode: "erc20" | "native";
+  quoteIdentity: string;
+  target: string;
+  token: string;
+  transactionValue: string;
+}
+
+export function nativeSwapSubmissionFingerprint(binding: NativeSwapSubmissionBinding): string {
+  return JSON.stringify([
+    normalizeContextAddress(binding.account),
+    binding.hash.toLowerCase(),
+    normalizeContextAddress(binding.target),
+    binding.calldataFingerprint.toLowerCase(),
+    binding.executionFingerprint,
+    binding.quoteIdentity,
+    binding.direction,
+    binding.inputAssetMode,
+    binding.outputAssetMode,
+    normalizeContextAddress(binding.token),
+    binding.amountIn,
+    binding.amountOutMin,
+    binding.transactionValue
+  ]);
+}
+
 export function reconcileNativeSwapReceipt(input: NativeSwapReceiptAccountingInput): NativeSwapReceiptAccounting {
   if (input.amountIn <= 0n || input.amountOutMin <= 0n || input.gasUsed < 0n || input.effectiveGasPrice < 0n) {
     throw new Error("Native swap receipt accounting inputs must be positive and bounded");

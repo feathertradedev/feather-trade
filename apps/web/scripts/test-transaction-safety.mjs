@@ -19,6 +19,7 @@ try {
     burnQuoteExecutionFingerprint,
     evaluateTransactionSafety,
     idSlippageInputError,
+    nativeSwapSubmissionFingerprint,
     parseDeadlineMinutes,
     parseIdSlippage,
     quoteIsStale,
@@ -174,6 +175,40 @@ try {
       executionFingerprint,
       `${field} must invalidate the swap execution context`
     );
+  }
+
+  const nativeSubmission = {
+    account: "0x4444444444444444444444444444444444444444",
+    amountIn: "1000",
+    amountOutMin: "800",
+    calldataFingerprint: `0x${"11".repeat(32)}`,
+    direction: "native-in",
+    executionFingerprint,
+    hash: `0x${"22".repeat(32)}`,
+    inputAssetMode: "native",
+    outputAssetMode: "erc20",
+    quoteIdentity: "quote-1",
+    target: "0x5555555555555555555555555555555555555555",
+    token: "0x6666666666666666666666666666666666666666",
+    transactionValue: "1000"
+  };
+  const nativeSubmissionIdentity = nativeSwapSubmissionFingerprint(nativeSubmission);
+  for (const [field, value] of Object.entries({
+    account: "0x7777777777777777777777777777777777777777",
+    amountIn: "1001",
+    amountOutMin: "801",
+    calldataFingerprint: `0x${"33".repeat(32)}`,
+    direction: "native-out",
+    executionFingerprint: `${executionFingerprint}:changed`,
+    hash: `0x${"44".repeat(32)}`,
+    inputAssetMode: "erc20",
+    outputAssetMode: "native",
+    quoteIdentity: "quote-2",
+    target: "0x8888888888888888888888888888888888888888",
+    token: "0x9999999999999999999999999999999999999999",
+    transactionValue: "0"
+  })) {
+    assert.notEqual(nativeSwapSubmissionFingerprint({ ...nativeSubmission, [field]: value }), nativeSubmissionIdentity, `${field} must bind native receipt accounting`);
   }
 
   assert.deepEqual(reconcileNativeSwapReceipt({
