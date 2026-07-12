@@ -1732,6 +1732,40 @@ a {
   grid-template-columns: 1fr 1fr;
 }
 
+.routing-mode-control {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding: 0;
+  border: 0;
+}
+
+.routing-mode-control legend {
+  margin-bottom: 6px;
+  color: var(--ink-45);
+  font-size: 0.72rem;
+  font-weight: 850;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.routing-mode-control .segmented {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.routing-mode-control .segment {
+  justify-content: center;
+  width: 100%;
+}
+
+.routing-mode-control p {
+  margin: 0;
+  color: var(--ink-45);
+  font-size: 0.74rem;
+  line-height: 1.45;
+}
+
 .swap-settings label,
 .mini-metric {
   min-width: 0;

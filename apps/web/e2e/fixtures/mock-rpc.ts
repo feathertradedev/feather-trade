@@ -660,6 +660,23 @@ async function handleEthCall(
     });
   }
 
+  if (functionName === "getSwapOut") {
+    if (options.quoteDelayMs !== undefined) await delay(options.quoteDelayMs);
+    if (options.quoteMode === "error") throw new Error("Mock quote failed");
+
+    const [, amountIn] = decoded.args as readonly [Address, bigint, boolean];
+    const fee = amountIn / 1_000n;
+    const amountOut = options.quoteMode === "no-route"
+      ? 0n
+      : (amountIn * (options.quoteRate ?? 999n)) / 1_000n;
+
+    return encodeFunctionResult({
+      abi: lbRouterAbi,
+      functionName,
+      result: options.quoteMode === "no-route" ? [amountIn, 0n, 0n] : [0n, amountOut, fee]
+    });
+  }
+
   if (functionName === "getBin") {
     return encodeFunctionResult({
       abi: lbPairAbi,
