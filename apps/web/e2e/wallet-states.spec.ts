@@ -332,6 +332,7 @@ test("repeated clicks during delayed gas estimation cannot launch duplicate wall
     balance: 5n * ONE_TOKEN,
     gasEstimateDelayMs: 500
   });
+  await expect(page.getByTestId("swap-submit-button")).toBeEnabled();
 
   await page.evaluate(() => {
     const button = document.querySelector<HTMLButtonElement>('[data-testid="swap-submit-button"]');
@@ -854,13 +855,18 @@ test("two same-origin tabs serialize identical intents before either wallet can 
   await installMockRpc(secondPage, { allowance: 5n * ONE_TOKEN, balance: 5n * ONE_TOKEN });
   await installMockWallet(secondPage, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
   await secondPage.goto("/#/swap");
+  await secondPage.evaluate(() => window.dispatchEvent(new Event("eip6963:requestProvider")));
+  const secondAccountButton = secondPage.getByTestId("wallet-account-button");
+  const secondConnectButton = secondPage.getByTestId("wallet-connect-button");
   await expect.poll(async () =>
-    await secondPage.getByTestId("wallet-account-button").isVisible() ||
-    await secondPage.getByTestId("wallet-connect-button").isEnabled()).toBe(true);
-  if (!await secondPage.getByTestId("wallet-account-button").isVisible()) {
-    await secondPage.getByTestId("wallet-connect-button").click();
+    await secondAccountButton.isVisible() ||
+    await secondConnectButton.isVisible(), { timeout: 15_000 }).toBe(true);
+  if (!await secondAccountButton.isVisible()) {
+    await secondConnectButton.evaluate((button) => button.click()).catch(() => {
+      // Auto-reconnect may replace the connect control between readiness and click.
+    });
   }
-  await expect(secondPage.getByTestId("wallet-account-button")).toContainText("0xf39F...2266");
+  await expect(secondAccountButton).toContainText("0xf39F...2266", { timeout: 15_000 });
   await clickReviewedAction(secondPage, "swap-submit-button");
 
   await expect(secondPage.getByTestId("swap-failure-state")).toContainText(/still unresolved/i);
