@@ -15,6 +15,7 @@ import {
   applyBurnQuoteSlippage,
   applyLiquiditySlippageMin,
   assertQuoteMatchesExactInRequest,
+  buildAddLiquidityNativeTransaction,
   buildAddLiquidityTransaction,
   buildExactInCandidatePaths,
   buildExactInSwapTransaction,
@@ -22,6 +23,7 @@ import {
   buildExactTokensForNativeSwapTransaction,
   buildLiquidityDistribution,
   buildProtectedBurnMinimums,
+  buildRemoveLiquidityNativeTransaction,
   buildRemoveLiquidityTransaction,
   calculateAmountOutMin,
   deadlineFromNow,
@@ -30,6 +32,7 @@ import {
   getTotalFeeBps,
   getTokens,
   findTokenBySymbol,
+  lbPairAbi,
   lbRouterAbi,
   quoteLiquidityBurn,
   readDeploymentManifest,
@@ -955,6 +958,239 @@ test("builds liquidity calldata against a manifest-driven production router", ()
       deadline
     }),
     /idSlippage must be from 0 to 2 bins/
+  );
+});
+
+test("builds canonical native liquidity calldata with derived value and orientation-safe minimums", () => {
+  const registry = fixtureRegistry(readManifestFixture());
+  const deadline = 1_700_000_600n;
+  const distribution = buildLiquidityDistribution(8_388_608, -1, 1);
+  const amountX = 10_000_000_000_000_000n;
+  const amountY = 20_000_000n;
+  const nativeX = buildAddLiquidityNativeTransaction(registry, {
+    tokenX: addresses.weth,
+    tokenY: addresses.usdc,
+    binStep: 25,
+    amountX,
+    amountY,
+    amountXMin: applyLiquiditySlippageMin(amountX, 100n),
+    amountYMin: applyLiquiditySlippageMin(amountY, 100n),
+    activeIdDesired: 8_388_608,
+    idSlippage: 2,
+    ...distribution,
+    to: addresses.recipient,
+    refundTo: addresses.refund,
+    deadline
+  });
+  const nativeXDecoded = decodeFunctionData({ abi: lbRouterAbi, data: nativeX.data });
+
+  assert.equal(nativeX.to, addresses.router);
+  assert.equal(nativeX.value, amountX);
+  assert.equal(nativeXDecoded.functionName, "addLiquidityNATIVE");
+  assert.deepEqual(nativeXDecoded.args[0], {
+    tokenX: addresses.weth,
+    tokenY: addresses.usdc,
+    binStep: 25n,
+    amountX,
+    amountY,
+    amountXMin: 9_900_000_000_000_000n,
+    amountYMin: 19_800_000n,
+    activeIdDesired: 8_388_608n,
+    idSlippage: 2n,
+    deltaIds: [-1n, 0n, 1n],
+    distributionX: [0n, DISTRIBUTION_PRECISION / 2n, DISTRIBUTION_PRECISION / 2n],
+    distributionY: [DISTRIBUTION_PRECISION / 2n, DISTRIBUTION_PRECISION / 2n, 0n],
+    to: addresses.recipient,
+    refundTo: addresses.refund,
+    deadline
+  });
+
+  const nativeY = buildAddLiquidityNativeTransaction(registry, {
+    tokenX: addresses.usdc,
+    tokenY: addresses.weth,
+    binStep: 25,
+    amountX: amountY,
+    amountY: amountX,
+    activeIdDesired: 8_388_608,
+    deltaIds: [0n],
+    distributionX: [DISTRIBUTION_PRECISION],
+    distributionY: [DISTRIBUTION_PRECISION],
+    to: addresses.recipient,
+    deadline
+  });
+  const nativeYDecoded = decodeFunctionData({ abi: lbRouterAbi, data: nativeY.data });
+  assert.equal(nativeY.value, amountX);
+  assert.equal(nativeYDecoded.functionName, "addLiquidityNATIVE");
+
+  const oneSidedNative = buildAddLiquidityNativeTransaction(registry, {
+    tokenX: addresses.weth,
+    tokenY: addresses.usdc,
+    binStep: 25,
+    amountX,
+    amountY: 0n,
+    activeIdDesired: 8_388_608,
+    deltaIds: [1n],
+    distributionX: [DISTRIBUTION_PRECISION],
+    distributionY: [0n],
+    to: addresses.recipient,
+    deadline
+  });
+  assert.equal(oneSidedNative.value, amountX);
+
+  const minimums = buildProtectedBurnMinimums(100n, 200n, 0n);
+  const removeNativeX = buildRemoveLiquidityNativeTransaction(registry, {
+    tokenX: addresses.weth,
+    tokenY: addresses.usdc,
+    binStep: 25,
+    minimums,
+    ids: [8_388_607n, 8_388_608n],
+    amounts: [3n, 4n],
+    to: addresses.recipient,
+    deadline
+  });
+  const removeNativeXDecoded = decodeFunctionData({ abi: lbRouterAbi, data: removeNativeX.data });
+  assert.equal(removeNativeX.value, 0n);
+  assert.equal(removeNativeXDecoded.functionName, "removeLiquidityNATIVE");
+  assert.deepEqual(removeNativeXDecoded.args, [
+    addresses.usdc,
+    25,
+    200n,
+    100n,
+    [8_388_607n, 8_388_608n],
+    [3n, 4n],
+    addresses.recipient,
+    deadline
+  ]);
+
+  const removeNativeY = buildRemoveLiquidityNativeTransaction(registry, {
+    tokenX: addresses.usdc,
+    tokenY: addresses.weth,
+    binStep: 25,
+    minimums,
+    ids: [8_388_608n],
+    amounts: [4n],
+    to: addresses.recipient,
+    deadline
+  });
+  const removeNativeYDecoded = decodeFunctionData({ abi: lbRouterAbi, data: removeNativeY.data });
+  assert.deepEqual(removeNativeYDecoded.args, [
+    addresses.usdc,
+    25,
+    100n,
+    200n,
+    [8_388_608n],
+    [4n],
+    addresses.recipient,
+    deadline
+  ]);
+
+  assert.ok(lbPairAbi.some((item) => item.type === "event" && item.name === "WithdrawnFromBins"));
+});
+
+test("native liquidity builders reject ERC-only, ambiguous, disabled, forged, and fee-on-transfer inputs", () => {
+  const deadline = 1_700_000_600n;
+  const baseAdd = {
+    tokenX: addresses.weth,
+    tokenY: addresses.usdc,
+    binStep: 25,
+    amountX: 1n,
+    amountY: 1n,
+    activeIdDesired: 8_388_608,
+    deltaIds: [0n],
+    distributionX: [DISTRIBUTION_PRECISION],
+    distributionY: [DISTRIBUTION_PRECISION],
+    to: addresses.recipient,
+    deadline
+  };
+  const registry = fixtureRegistry(readManifestFixture());
+
+  assert.throws(
+    () => buildAddLiquidityNativeTransaction(registry, { ...baseAdd, amountX: 0n }),
+    /Native add-liquidity amount must be positive/
+  );
+  assert.throws(
+    () => buildAddLiquidityNativeTransaction(registry, {
+      ...baseAdd,
+      tokenX: addresses.usdc,
+      tokenY: addresses.recipient
+    }),
+    /exactly one action-enabled wrapped-native endpoint/
+  );
+
+  const ambiguousRegistry = fixtureRegistry(readManifestFixture());
+  const ambiguousToken = ambiguousRegistry.tokens[addresses.recipient.toLowerCase()];
+  assert.ok(ambiguousToken);
+  ambiguousRegistry.tokens[addresses.recipient.toLowerCase()] = {
+    ...ambiguousToken,
+    tags: [...ambiguousToken.tags, "wrapped-native"]
+  };
+  assert.throws(
+    () => buildAddLiquidityNativeTransaction(ambiguousRegistry, {
+      ...baseAdd,
+      tokenY: addresses.recipient
+    }),
+    /exactly one action-enabled wrapped-native endpoint/
+  );
+
+  const disabledRegistry = fixtureRegistry(readManifestFixture());
+  const wrapper = disabledRegistry.tokens[addresses.weth.toLowerCase()];
+  assert.ok(wrapper);
+  disabledRegistry.tokens[addresses.weth.toLowerCase()] = {
+    ...wrapper,
+    risk: { ...wrapper.risk, disabledActions: [...wrapper.risk.disabledActions, "add-liquidity"] }
+  };
+  assert.throws(
+    () => buildAddLiquidityNativeTransaction(disabledRegistry, baseAdd),
+    /disabled for add-liquidity/
+  );
+
+  const forgedMinimums = { ...buildProtectedBurnMinimums(1n, 1n, 0n), amountXMin: 0n };
+  assert.throws(
+    () => buildRemoveLiquidityNativeTransaction(registry, {
+      tokenX: addresses.weth,
+      tokenY: addresses.usdc,
+      binStep: 25,
+      minimums: forgedMinimums,
+      ids: [8_388_608n],
+      amounts: [1n],
+      to: addresses.recipient,
+      deadline
+    }),
+    /must be created by buildProtectedBurnMinimums/
+  );
+  assert.throws(
+    () => buildRemoveLiquidityNativeTransaction(registry, {
+      tokenX: addresses.weth,
+      tokenY: addresses.usdc,
+      binStep: 25,
+      minimums: buildProtectedBurnMinimums(1n, 1n, 0n),
+      ids: [8_388_608n],
+      amounts: [],
+      to: addresses.recipient,
+      deadline
+    }),
+    /non-empty and have matching lengths/
+  );
+
+  const feeOnTransferRegistry = fixtureRegistry(readManifestFixture());
+  const nonNative = feeOnTransferRegistry.tokens[addresses.usdc.toLowerCase()];
+  assert.ok(nonNative);
+  feeOnTransferRegistry.tokens[addresses.usdc.toLowerCase()] = {
+    ...nonNative,
+    risk: { ...nonNative.risk, flags: [...nonNative.risk.flags, "fee-on-transfer"] }
+  };
+  assert.throws(
+    () => buildRemoveLiquidityNativeTransaction(feeOnTransferRegistry, {
+      tokenX: addresses.weth,
+      tokenY: addresses.usdc,
+      binStep: 25,
+      minimums: buildProtectedBurnMinimums(1n, 1n, 0n),
+      ids: [8_388_608n],
+      amounts: [1n],
+      to: addresses.recipient,
+      deadline
+    }),
+    /does not support fee-on-transfer tokens/
   );
 });
 
