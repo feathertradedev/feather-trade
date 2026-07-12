@@ -271,6 +271,109 @@ export function buildExactInSwapTransaction(
   };
 }
 
+export function buildExactNativeForTokensSwapTransaction(
+  registry: Pick<DexRegistry, "contracts" | "tokens">,
+  wrappedNative: Address,
+  quote: ExactInQuote,
+  amountIn: bigint,
+  amountOutMin: bigint,
+  to: Address,
+  deadline: bigint
+): BuiltSwapTransaction {
+  const path = validateExactNativeSwapTransaction(
+    registry,
+    wrappedNative,
+    quote,
+    amountIn,
+    amountOutMin,
+    to,
+    deadline,
+    "native-in"
+  );
+  const data = encodeFunctionData({
+    abi: lbRouterAbi,
+    functionName: "swapExactNATIVEForTokens",
+    args: [amountOutMin, path, to, deadline]
+  });
+
+  return {
+    to: registry.contracts.lbRouter,
+    data,
+    value: amountIn
+  };
+}
+
+export function buildExactTokensForNativeSwapTransaction(
+  registry: Pick<DexRegistry, "contracts" | "tokens">,
+  wrappedNative: Address,
+  quote: ExactInQuote,
+  amountIn: bigint,
+  amountOutMinNative: bigint,
+  to: Address,
+  deadline: bigint
+): BuiltSwapTransaction {
+  const path = validateExactNativeSwapTransaction(
+    registry,
+    wrappedNative,
+    quote,
+    amountIn,
+    amountOutMinNative,
+    to,
+    deadline,
+    "native-out"
+  );
+  const data = encodeFunctionData({
+    abi: lbRouterAbi,
+    functionName: "swapExactTokensForNATIVE",
+    args: [amountIn, amountOutMinNative, path, to, deadline]
+  });
+
+  return {
+    to: registry.contracts.lbRouter,
+    data,
+    value: 0n
+  };
+}
+
+function validateExactNativeSwapTransaction(
+  registry: Pick<DexRegistry, "contracts" | "tokens">,
+  wrappedNative: Address,
+  quote: ExactInQuote,
+  amountIn: bigint,
+  amountOutMin: bigint,
+  to: Address,
+  deadline: bigint,
+  direction: "native-in" | "native-out"
+): ExactInPath {
+  assertTokenActionAllowed(registry.tokens, quote.route, "swap");
+  const path = buildExactInSwapPath(quote);
+  if (isAddressEqual(wrappedNative, zeroAddress)) throw new Error("Wrapped-native router identity must be nonzero");
+  const wrappedNativeToken = registry.tokens[wrappedNative.toLowerCase()];
+  if (!wrappedNativeToken?.tags.includes("wrapped-native")) {
+    throw new Error("Wrapped-native router identity must reference a registered wrapped-native token");
+  }
+  if (isAddressEqual(to, zeroAddress)) throw new Error("Native swap recipient must be nonzero");
+  if (deadline <= 0n) throw new Error("Native swap deadline must be greater than zero");
+  if (quote.amounts[0] !== amountIn) throw new Error("Exact native swap amount does not match the quote input amount");
+  const quotedAmountOut = getQuoteAmountOut(quote);
+  if (amountOutMin <= 0n || amountOutMin > quotedAmountOut) {
+    throw new Error("Native swap minimum output must be positive and no greater than the quoted output");
+  }
+
+  const endpointIndex = direction === "native-in" ? 0 : quote.route.length - 1;
+  if (!isAddressEqual(quote.route[endpointIndex], wrappedNative)) {
+    throw new Error(direction === "native-in"
+      ? "Native-input swap route must start with the router wrapped-native token"
+      : "Native-output swap route must end with the router wrapped-native token");
+  }
+  const nonNativeSide = direction === "native-in" ? quote.route.slice(1) : quote.route.slice(0, -1);
+  if (nonNativeSide.some((token) => isAddressEqual(token, wrappedNative))) {
+    throw new Error("Native swap route may use the wrapped-native token only at its native endpoint");
+  }
+
+  return path;
+}
+
 export function getQuoteAmountOut(quote: ExactInQuote): bigint {
   return quote.amounts[quote.amounts.length - 1] ?? 0n;
 }
