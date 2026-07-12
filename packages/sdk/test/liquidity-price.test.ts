@@ -6,6 +6,7 @@ import { buildLiquidityDistribution } from "../src/liquidity.js";
 import {
   decimalPriceToQ128,
   formatExactPriceFraction,
+  MAX_TOKEN_DECIMALS,
   normalizeQ128Price,
   Q128,
   readIdFromPrice,
@@ -69,12 +70,43 @@ test("formats and round-trips extreme representable Q128 prices across 6-to-18 d
   }
 });
 
+test("bounds token decimal normalization to the exact 0-to-36 domain", () => {
+  for (const options of [
+    { baseDecimals: MAX_TOKEN_DECIMALS, quoteDecimals: 0 },
+    { baseDecimals: 0, quoteDecimals: MAX_TOKEN_DECIMALS }
+  ]) {
+    const display = formatExactPriceFraction(normalizeQ128Price(Q128, options));
+    assert.equal(decimalPriceToQ128(display, options), Q128);
+  }
+
+  assert.throws(
+    () => normalizeQ128Price(Q128, { baseDecimals: MAX_TOKEN_DECIMALS + 1, quoteDecimals: 18 }),
+    /baseDecimals must be an integer from 0 to 36/
+  );
+  assert.throws(
+    () => decimalPriceToQ128("1", { baseDecimals: 18, quoteDecimals: MAX_TOKEN_DECIMALS + 1 }),
+    /quoteDecimals must be an integer from 0 to 36/
+  );
+});
+
+test("handles maximum uint256 forward and inverse normalization without silent zero or overflow", () => {
+  const forwardOptions = { baseDecimals: 18, quoteDecimals: 6 };
+  const forward = formatExactPriceFraction(normalizeQ128Price(MAX_UINT256, forwardOptions));
+  assert.equal(decimalPriceToQ128(forward, forwardOptions), MAX_UINT256);
+
+  const inverseOptions = { ...forwardOptions, inverse: true };
+  const inverse = formatExactPriceFraction(normalizeQ128Price(MAX_UINT256, inverseOptions));
+  assert.notEqual(inverse, "0");
+  assert.notEqual(inverse, "0.");
+  assert.equal(decimalPriceToQ128(inverse, inverseOptions), MAX_UINT256);
+});
+
 test("rejects invalid decimal strings, decimal metadata, underflow, and uint256 overflow", () => {
   for (const value of ["", " 1", "1 ", "-1", "+1", "1e3", ".5", "01", "0", "1."]) {
     assert.throws(() => decimalPriceToQ128(value, { baseDecimals: 18, quoteDecimals: 18 }));
   }
   assert.throws(() => decimalPriceToQ128("1", { baseDecimals: -1, quoteDecimals: 18 }));
-  assert.throws(() => decimalPriceToQ128("1", { baseDecimals: 18, quoteDecimals: 256 }));
+  assert.throws(() => decimalPriceToQ128("1", { baseDecimals: 18, quoteDecimals: MAX_TOKEN_DECIMALS + 1 }));
   assert.throws(() => decimalPriceToQ128("0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000", { baseDecimals: 18, quoteDecimals: 18 }));
   assert.throws(() => decimalPriceToQ128(MAX_UINT256.toString(), { baseDecimals: 0, quoteDecimals: 0 }));
   assert.throws(() => normalizeQ128Price(0n, { baseDecimals: 18, quoteDecimals: 18 }));

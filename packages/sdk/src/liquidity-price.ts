@@ -4,9 +4,11 @@ import { lbPairAbi } from "./abi.js";
 
 export const Q128 = 1n << 128n;
 
+/** Largest token-decimal value supported by exact price normalization and its bounded decimal grammar. */
+export const MAX_TOKEN_DECIMALS = 36;
+
 const MAX_UINT24 = (1n << 24n) - 1n;
 const MAX_UINT256 = (1n << 256n) - 1n;
-const MAX_DECIMALS = 255;
 const MAX_DECIMAL_DIGITS = 256;
 
 export interface ExactPriceFraction {
@@ -149,8 +151,8 @@ function parseDecimalFraction(value: string): ExactPriceFraction {
 }
 
 function decimalScale(value: number, label: string): bigint {
-  if (!Number.isSafeInteger(value) || value < 0 || value > MAX_DECIMALS) {
-    throw new Error(`${label} must be an integer from 0 to ${MAX_DECIMALS}`);
+  if (!Number.isSafeInteger(value) || value < 0 || value > MAX_TOKEN_DECIMALS) {
+    throw new Error(`${label} must be an integer from 0 to ${MAX_TOKEN_DECIMALS}`);
   }
   return 10n ** BigInt(value);
 }
