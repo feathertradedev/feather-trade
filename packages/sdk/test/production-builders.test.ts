@@ -9,7 +9,9 @@ import { decodeFunctionData, zeroAddress, type Address, type PublicClient } from
 import {
   DISTRIBUTION_PRECISION,
   LB_ROUTER_VERSION_V2_2,
+  Q128,
   ROBINHOOD_TESTNET_CHAIN_ID,
+  UINT128_MAX,
   applyBurnQuoteSlippage,
   applyLiquiditySlippageMin,
   assertQuoteMatchesExactInRequest,
@@ -22,6 +24,8 @@ import {
   calculateAmountOutMin,
   deadlineFromNow,
   getBestExactInQuote,
+  getSelectedPairExactInQuote,
+  getTotalFeeBps,
   getTokens,
   findTokenBySymbol,
   lbRouterAbi,
@@ -355,6 +359,139 @@ test("ranks direct and one-intermediary V2.2 quotes without binding to a selecte
   const best = await getBestExactInQuote(client, routingRegistry, addresses.weth, addresses.usdc, amountIn);
   assert.deepEqual(best.route, [addresses.weth, addresses.recipient, addresses.usdc]);
   assert.equal(best.amounts.at(-1), 950n);
+});
+
+test("quotes exact input against only the selected V2.2 pair and bin step", async () => {
+  const registry = fixtureRegistry(readManifestFixture());
+  const calls: Array<{ address: Address; functionName: string; args?: readonly unknown[] }> = [];
+  const client = {
+    readContract: async (request: { address: Address; functionName: string; args?: readonly unknown[] }) => {
+      calls.push(request);
+      if (request.functionName === "getSwapOut") return [0n, 900n, 10n] as const;
+      if (request.functionName === "getActiveId") return 8_388_608;
+      if (request.functionName === "getPriceFromId") return Q128;
+      throw new Error(`Unexpected read ${request.functionName}`);
+    }
+  } as unknown as PublicClient;
+
+  const quote = await getSelectedPairExactInQuote(client, registry, {
+    amountIn: 1_000n,
+    binStep: 25n,
+    blockNumber: 42n,
+    pair: addresses.pair,
+    tokenIn: addresses.weth,
+    tokenOut: addresses.usdc,
+    tokenX: addresses.weth,
+    tokenY: addresses.usdc
+  });
+
+  assert.deepEqual(quote, {
+    route: [addresses.weth, addresses.usdc],
+    pairs: [addresses.pair],
+    binSteps: [25n],
+    versions: [LB_ROUTER_VERSION_V2_2],
+    amounts: [1_000n, 900n],
+    virtualAmountsWithoutSlippage: [1_000n, 990n],
+    fees: [10_000_000_000_000_000n]
+  });
+  assert.equal(getTotalFeeBps(quote), 100n);
+  assert.equal(calls[0]?.address, registry.contracts.lbRouter);
+  assert.equal(calls[0]?.functionName, "getSwapOut");
+  assert.deepEqual(calls[0]?.args, [addresses.pair, 1_000n, true]);
+  assert.equal((calls[0] as { blockNumber?: bigint }).blockNumber, 42n);
+  assert.deepEqual(calls.map((call) => call.functionName), ["getSwapOut", "getActiveId", "getPriceFromId"]);
+  assert.equal(calls.every((call) => (call as { blockNumber?: bigint }).blockNumber === 42n), true);
+  assert.equal(calls.some((call) => call.functionName === "findBestPathFromAmountIn"), false);
+});
+
+test("quotes the inverse selected-pair direction with exact Q128 spot math", async () => {
+  const registry = fixtureRegistry(readManifestFixture());
+  const calls: Array<{ functionName: string; args?: readonly unknown[] }> = [];
+  const client = {
+    readContract: async (request: { functionName: string; args?: readonly unknown[] }) => {
+      calls.push(request);
+      if (request.functionName === "getSwapOut") return [0n, 450n, 10n] as const;
+      if (request.functionName === "getActiveId") return 8_388_608;
+      if (request.functionName === "getPriceFromId") return 2n * Q128;
+      throw new Error(`Unexpected read ${request.functionName}`);
+    }
+  } as unknown as PublicClient;
+
+  const quote = await getSelectedPairExactInQuote(client, registry, {
+    amountIn: 1_000n,
+    binStep: 25n,
+    pair: addresses.pair,
+    tokenIn: addresses.usdc,
+    tokenOut: addresses.weth,
+    tokenX: addresses.weth,
+    tokenY: addresses.usdc
+  });
+
+  assert.deepEqual(calls[0]?.args, [addresses.pair, 1_000n, false]);
+  assert.deepEqual(quote.route, [addresses.usdc, addresses.weth]);
+  assert.deepEqual(quote.amounts, [1_000n, 450n]);
+  assert.deepEqual(quote.virtualAmountsWithoutSlippage, [1_000n, 495n]);
+  assert.equal(getTotalFeeBps(quote), 100n);
+});
+
+test("rejects selected-pair quotes that leave input unconsumed", async () => {
+  const registry = fixtureRegistry(readManifestFixture());
+  const client = {
+    readContract: async () => [1n, 900n, 10n] as const
+  } as unknown as PublicClient;
+
+  await assert.rejects(
+    getSelectedPairExactInQuote(client, registry, {
+      amountIn: 1_000n,
+      binStep: 25n,
+      pair: addresses.pair,
+      tokenIn: addresses.weth,
+      tokenOut: addresses.usdc,
+      tokenX: addresses.weth,
+      tokenY: addresses.usdc
+    }),
+    /cannot consume the full input amount/
+  );
+});
+
+test("rejects selected-pair token direction and uint128 violations before RPC reads", async () => {
+  const registry = fixtureRegistry(readManifestFixture());
+  let reads = 0;
+  const client = {
+    readContract: async () => {
+      reads += 1;
+      throw new Error("unexpected read");
+    }
+  } as unknown as PublicClient;
+  const request = {
+    amountIn: 1_000n,
+    binStep: 25n,
+    pair: addresses.pair,
+    tokenIn: addresses.weth,
+    tokenOut: addresses.recipient,
+    tokenX: addresses.weth,
+    tokenY: addresses.usdc
+  } as const;
+
+  await assert.rejects(getSelectedPairExactInQuote(client, registry, request), /token direction does not match/);
+  await assert.rejects(
+    getSelectedPairExactInQuote(client, registry, {
+      ...request,
+      amountIn: UINT128_MAX + 1n,
+      tokenOut: addresses.usdc
+    }),
+    /uint128 limit/
+  );
+  await assert.rejects(
+    getSelectedPairExactInQuote(client, registry, {
+      ...request,
+      tokenIn: zeroAddress,
+      tokenOut: addresses.usdc,
+      tokenX: zeroAddress
+    }),
+    /configured Feather token allowlist/
+  );
+  assert.equal(reads, 0);
 });
 
 test("rejects quoter responses that do not match the exact-in request context", async () => {
