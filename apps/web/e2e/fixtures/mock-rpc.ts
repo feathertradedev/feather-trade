@@ -66,6 +66,7 @@ export interface MockRpcOptions {
   clearPositionsAfterReceipt?: boolean;
   dashboardPoolLimit?: number;
   estimatedGas?: bigint;
+  estimatedGasByValue?: Record<string, bigint>;
   gasEstimateMode?: "ready" | "error";
   gasEstimateDelayMs?: number;
   gasLimit?: bigint;
@@ -588,7 +589,11 @@ async function handleRpc(request: RpcRequest, options: MockRpcOptions, state: Mo
           options.maxRemoveLiquidityBinsForEstimate !== undefined &&
           removeLiquidityBinCount((request.params?.[0] as RpcCall | undefined)?.data) > options.maxRemoveLiquidityBinsForEstimate
         ) return rpcError(request, -32_000, "Mock remove-liquidity batch exceeds the gas-safe bin bound");
-        return rpcResult(request, numberToHex(options.estimatedGas ?? 500_000n));
+        {
+          const transactionValue = BigInt((request.params?.[0] as RpcCall | undefined)?.value ?? "0x0");
+          const valueSensitiveEstimate = options.estimatedGasByValue?.[transactionValue.toString()];
+          return rpcResult(request, numberToHex(valueSensitiveEstimate ?? options.estimatedGas ?? 500_000n));
+        }
       case "eth_gasPrice":
         return rpcResult(request, numberToHex(options.gasPrice ?? 1_000_000_000n));
       case "eth_getTransactionReceipt": {
