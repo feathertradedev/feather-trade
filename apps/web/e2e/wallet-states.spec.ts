@@ -854,8 +854,8 @@ test("remove status advances from LB approval through current remove pending to 
     balance: 5n * ONE_TOKEN,
     lbApproved: false,
     lbApprovedAfterReceipt: true,
-    receiptDelayMs: 5_000
-  }, { transactionDelayMs: 1_200 });
+    receiptDelayMs: 1_200
+  }, { transactionDelayMs: 5_000 });
 
   await clickReviewedAction(page, "liquidity-approve-lb-button");
   const status = page.getByTestId("liquidity-remove-status");
