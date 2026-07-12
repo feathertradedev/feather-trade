@@ -3706,7 +3706,7 @@ function PoolsView({
                 <span>TVL</span>
                 <span>24h volume</span>
                 <span>24h LP fees</span>
-                <span>LP fee / TVL</span>
+                <span>24h LP fee / TVL</span>
                 <span>Action</span>
               </div>
               {filteredPage.rows.map((pool) => {
@@ -3766,6 +3766,7 @@ function isPoolEconomicSort(sort: PoolDiscoveryState["sort"]): sort is PoolEcono
 function WorkspaceTableMetric({ tile }: { tile: ReturnType<typeof workspaceMetricTiles>[number] }) {
   return (
     <span className="workspace-table-metric" data-analytics-status={tile.status}>
+      <small className="workspace-table-label">{tile.label}</small>
       <strong>{tile.value}</strong>
       <small>{tile.status === "READY" ? "ready" : tile.status.toLowerCase()}</small>
     </span>

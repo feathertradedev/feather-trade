@@ -2161,6 +2161,10 @@ a {
   text-transform: uppercase;
 }
 
+.workspace-table-metric .workspace-table-label {
+  display: none;
+}
+
 .workspace-row-issue {
   grid-column: 1 / -1;
   color: var(--warning);
@@ -3151,6 +3155,11 @@ a {
 
   .discovery-table .table-row {
     grid-template-columns: 1fr;
+  }
+
+  .workspace-table-metric .workspace-table-label {
+    display: block;
+    margin-bottom: 2px;
   }
 
   .pool-controls,

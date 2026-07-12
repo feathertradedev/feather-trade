@@ -27,6 +27,16 @@ test("unified pool workspace preserves URL filters, analytics, actions, and acce
   await expect(page).toHaveURL(/mine=1/);
   await expect(page.getByTestId("pool-analytics-state")).toContainText("Current through block 42");
   await expect(page.locator(".workspace-table-metric").filter({ hasText: "$500,000" })).toBeVisible();
+  const discoveryMetrics = page.locator(".discovery-table .table-row:not(.header)").first().locator(".workspace-table-metric");
+  for (const [index, label, value] of [
+    [0, "TVL", "$500,000"],
+    [1, "24h volume", "$120,000"],
+    [2, "24h LP fees", "$240"],
+    [3, "24h LP fee / TVL", "0.04%"]
+  ] as const) {
+    await expect(discoveryMetrics.nth(index)).toContainText(label);
+    await expect(discoveryMetrics.nth(index)).toContainText(value);
+  }
 
   const poolLink = page.locator(".discovery-table .pair-name").first();
   await expect(poolLink).toHaveAttribute("href", /q=WNATIVE/);
@@ -38,6 +48,7 @@ test("unified pool workspace preserves URL filters, analytics, actions, and acce
   await expect(page.getByTestId("pool-candle-table").locator("tbody tr")).toHaveCount(24);
   await expect(page.getByTestId("pool-bin-distribution-table").locator("tbody tr")).toHaveCount(5);
   await expect(page.getByTestId("pool-candle-workspace")).toContainText("Hourly OHLCV and LP-net fee data");
+  await expect(page.getByTestId("same-pair-pools")).toBeVisible();
   const normalizedGeometry = await page.evaluate(() => ({
     binHeights: [...document.querySelectorAll<HTMLElement>(".pool-bin-stack i")].map((element) => Number.parseFloat(element.style.height)),
     candleYs: [...document.querySelectorAll(".candle-chart polyline")].flatMap((line) => (line.getAttribute("points") ?? "").split(" ").filter(Boolean).map((point) => Number(point.split(",")[1])))
