@@ -803,9 +803,7 @@ function BrandLockup({ compact = false }: { compact?: boolean }) {
   );
 }
 
-function LandingView({ networkName, snapshot }: { networkName: string; snapshot: AppSnapshot | undefined }) {
-  const poolCount = snapshot?.indexer.pairCount;
-
+function LandingView(_: { networkName: string; snapshot: AppSnapshot | undefined }) {
   return (
     <main className="landing-shell">
       <header className="landing-header">
@@ -821,46 +819,42 @@ function LandingView({ networkName, snapshot }: { networkName: string; snapshot:
       </header>
 
       <section className="landing-hero" aria-labelledby="landing-title">
-        <p className="eyebrow">The featherweight DEX · Built for Robinhood Chain</p>
-        <h1 id="landing-title">Weightless<br />liquidity.</h1>
-        <p>Concentrated DLMM liquidity with dynamic fees that rise when markets move. Engineered without the weight.</p>
-        <div className="hero-actions">
-          <a className="primary-button" href="#/swap">Launch app</a>
-          {brandLinks.filter((link) => link.label === "Docs").map((link) => (
-            <a className="secondary-button" href={link.href} key={link.label} rel="noreferrer" target="_blank">Read the docs</a>
-          ))}
+        <div className="hero-copy">
+          <p className="eyebrow">Built for Robinhood Chain</p>
+          <h1 id="landing-title">Weightless liquidity.</h1>
+          <p>Trade and deploy concentrated liquidity through a DLMM with dynamic fees built for fast-moving markets.</p>
+          <div className="hero-actions">
+            <a className="primary-button" href="#/swap">Launch app</a>
+            <a className="hero-text-link" href="#/pools">Explore pools <span aria-hidden="true">↗</span></a>
+          </div>
         </div>
-        <dl className="landing-stats" aria-label="Protocol overview">
-          <div><dt>Network</dt><dd>{networkName}</dd></div>
-          <div><dt>Indexed pools</dt><dd>{poolCount ?? "—"}</dd></div>
-          <div><dt>Liquidity model</dt><dd>DLMM</dd></div>
-          <div><dt>LP fees</dt><dd className="positive">Dynamic</dd></div>
-        </dl>
+
+        <LiquidityBookSimulation />
       </section>
 
-      <section className="landing-pillars" aria-label="Product pillars">
-        <article>
-          <BinGlyph mode="spot" />
-          <h2>Liquidity in bins</h2>
-          <p>Place capital exactly where trading happens. Zero slippage inside the active bin; nothing wasted outside your range.</p>
-        </article>
-        <article>
-          <p className="fee-surge">0.20% → <span>2.41%</span></p>
-          <h2>Fees that surge with volatility</h2>
-          <p>Dynamic fees climb when price moves fast, paying LPs for the risk they take and settling back when it is quiet.</p>
-        </article>
-        <article>
-          <div className="chain-glyph"><span /></div>
-          <h2>Built for Robinhood Chain</h2>
-          <p>Built for fast finality, small network fees, and a first-class onchain trading experience.</p>
-        </article>
+      <section className="landing-pillars" aria-labelledby="liquidity-title">
+        <div className="pillar-intro">
+          <h2 id="liquidity-title">Capital that works where the market moves.</h2>
+          <p>Liquidity Book places capital into discrete price bins, giving LPs precise control without adding complexity for traders.</p>
+        </div>
+        <div className="pillar-list">
+          <article>
+            <div><h3>Concentrated by design</h3><p>Choose the range. Keep capital close to active trading.</p></div>
+          </article>
+          <article>
+            <div><h3>Fees respond to volatility</h3><p>Dynamic fees increase when markets move and normalize as activity settles.</p></div>
+          </article>
+          <article>
+            <div><h3>Execution stays lightweight</h3><p>Fast finality and low network costs keep every position practical to manage.</p></div>
+          </article>
+        </div>
       </section>
 
       <section className="strategy-band">
         <div>
           <p className="eyebrow">For liquidity providers</p>
           <h2>Three strategies. One slider.</h2>
-          <p>Spot, Curve, or Bid-Ask — shape liquidity to your view, set a range, done.</p>
+          <p>Choose Spot, Curve, or Bid-Ask. Shape the range to match your market view.</p>
         </div>
         <div className="strategy-tiles" aria-label="Liquidity strategies">
           <div className="active"><BinGlyph mode="spot" /><span>Spot</span></div>
@@ -874,10 +868,163 @@ function LandingView({ networkName, snapshot }: { networkName: string; snapshot:
         <nav aria-label="Project links">
           {brandLinks.map((link) => <a href={link.href} key={link.label} rel="noreferrer" target="_blank">{link.label}</a>)}
         </nav>
-        <span>engineered on robinhood chain · 2026</span>
+        <span>Engineered on Robinhood Chain, 2026</span>
       </footer>
     </main>
   );
+}
+
+interface SimulatedLiquidityBin {
+  capacity: number;
+  reserveX: number;
+  reserveY: number;
+}
+
+interface SimulatedLiquidityState {
+  activeIndex: number;
+  bins: SimulatedLiquidityBin[];
+  crossingsRemaining: number;
+  direction: -1 | 1;
+}
+
+const simulationBinHeights = [
+  34, 48, 29, 57, 43, 66, 38, 54, 72, 47, 63, 41, 76, 58, 69, 45,
+  82, 61, 74, 53, 88, 64, 79, 49, 70, 56, 85, 62, 73, 59, 78, 66,
+  87, 55, 75, 63, 80, 51, 68, 72, 46, 77, 60, 83, 52, 69, 44, 71,
+  57, 65, 50, 74, 42, 61, 48, 67, 39, 58, 45, 53, 36
+];
+const simulationCenterIndex = 30;
+const simulationCenterBinId = 8_388_608;
+const simulationBinStep = 10;
+const simulationBinPitch = 27;
+const simulationCenterPrice = 160;
+
+function LiquidityBookSimulation() {
+  const [simulation, setSimulation] = useState<SimulatedLiquidityState>(createLiquiditySimulation);
+
+  useEffect(() => {
+    if (simulation.bins.length !== simulationBinHeights.length) setSimulation(createLiquiditySimulation());
+  }, [simulation.bins.length]);
+
+  useEffect(() => {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return undefined;
+    const interval = window.setInterval(() => setSimulation((current) => advanceLiquiditySimulation(current)), 620);
+    return () => window.clearInterval(interval);
+  }, []);
+
+  const activeBinId = simulationCenterBinId + simulation.activeIndex - simulationCenterIndex;
+  const currentPrice = simulationCenterPrice * Math.pow(1 + simulationBinStep / 10_000, activeBinId - simulationCenterBinId);
+  const activeBin = simulation.bins[simulation.activeIndex];
+  const activeTotal = Math.max(activeBin.reserveX + activeBin.reserveY, 0.001);
+  const activeXShare = Math.round((activeBin.reserveX / activeTotal) * 100);
+  const activeYShare = 100 - activeXShare;
+
+  return (
+    <aside className="hero-market" aria-label="Illustrative SPCX and USDC Liquidity Book market simulation">
+      <div className="hero-market-head">
+        <span>Bin liquidity simulation</span>
+        <span className="market-state">Illustrative</span>
+      </div>
+      <div className="hero-pair">
+        <span>SPCX / USDC</span>
+        <strong>{simulationBinStep} bps per bin</strong>
+      </div>
+      <div className="market-price">
+        <span>Current bin price</span>
+        <strong>{currentPrice.toFixed(2)}</strong>
+        <small>USDC per SPCX</small>
+      </div>
+      <div className="hero-bin-field" aria-label="The centered price bin converts one token reserve into the other as the market moves">
+        <div
+          className="hero-bin-track"
+          style={{ transform: `translate3d(-${simulation.activeIndex * simulationBinPitch + 11}px, 0, 0)` }}
+        >
+          {simulation.bins.map((bin, index) => {
+            const total = Math.max(bin.reserveX + bin.reserveY, 0.001);
+            return (
+              <i key={index} style={{ height: `${simulationBinHeights[index]}%` }}>
+                <span className="bin-reserve-x" style={{ height: `${(bin.reserveX / total) * 100}%` }} />
+                <span className="bin-reserve-y" style={{ height: `${(bin.reserveY / total) * 100}%` }} />
+              </i>
+            );
+          })}
+        </div>
+      </div>
+      <div className="bin-legend" aria-hidden="true"><span>SPCX</span><span>USDC</span></div>
+      <dl className="hero-market-data">
+        <div><dt>Bin composition</dt><dd>{activeXShare}% / {activeYShare}%</dd></div>
+        <div><dt>Price step</dt><dd>{simulationBinStep} bps</dd></div>
+        <div><dt>Bin ID</dt><dd>{activeBinId}</dd></div>
+        <div><dt>Trade pressure</dt><dd>{simulation.direction > 0 ? "Buying SPCX" : "Selling SPCX"}</dd></div>
+      </dl>
+      <a className="hero-market-link" href="#/swap">Open swap <span aria-hidden="true">↗</span></a>
+    </aside>
+  );
+}
+
+function createLiquiditySimulation(): SimulatedLiquidityState {
+  return {
+    activeIndex: simulationCenterIndex,
+    crossingsRemaining: 6,
+    direction: 1,
+    bins: simulationBinHeights.map((capacity, index) => ({
+      capacity,
+      reserveX: index > simulationCenterIndex ? capacity : index === simulationCenterIndex ? capacity / 2 : 0,
+      reserveY: index < simulationCenterIndex ? capacity : index === simulationCenterIndex ? capacity / 2 : 0
+    }))
+  };
+}
+
+function advanceLiquiditySimulation(current: SimulatedLiquidityState): SimulatedLiquidityState {
+  let direction = current.direction;
+  let activeIndex = current.activeIndex;
+  let crossingsRemaining = current.crossingsRemaining;
+  const bins = current.bins.map((bin) => ({ ...bin }));
+  let activeBin = bins[activeIndex];
+
+  const convertedShare = direction === 1
+    ? activeBin.reserveY / activeBin.capacity
+    : activeBin.reserveX / activeBin.capacity;
+
+  if (crossingsRemaining === 0 && convertedShare >= 0.42) {
+    direction = direction === 1 ? -1 : 1;
+    crossingsRemaining = 3 + Math.floor(Math.random() * 6);
+  }
+
+  const outputReserve = direction === 1 ? activeBin.reserveX : activeBin.reserveY;
+
+  if (outputReserve <= 0.5) {
+    const nextIndex = activeIndex + direction;
+    const nextOffset = nextIndex - simulationCenterIndex;
+    const resistanceDistance = Math.max(0, Math.abs(nextOffset) - 10);
+    const crossingProbability = resistanceDistance === 0
+      ? 1
+      : Math.exp(-0.35 * resistanceDistance * resistanceDistance);
+    const canCross = Math.abs(nextOffset) <= 15 && Math.random() < crossingProbability;
+
+    if (canCross) {
+      activeIndex = nextIndex;
+      crossingsRemaining = Math.max(0, crossingsRemaining - 1);
+    } else {
+      direction = direction === 1 ? -1 : 1;
+      crossingsRemaining = 3 + Math.floor(Math.random() * 6);
+    }
+    activeBin = bins[activeIndex];
+  }
+
+  const availableOutput = direction === 1 ? activeBin.reserveX : activeBin.reserveY;
+  const amount = Math.min(availableOutput, activeBin.capacity * (0.12 + Math.random() * 0.07));
+  const binPrice = Math.pow(1 + simulationBinStep / 10_000, activeIndex - simulationCenterIndex);
+
+  if (direction === 1) {
+    activeBin.reserveX = Math.max(0, activeBin.reserveX - amount);
+    activeBin.reserveY += amount * binPrice;
+  } else {
+    activeBin.reserveY = Math.max(0, activeBin.reserveY - amount);
+    activeBin.reserveX += amount / binPrice;
+  }
+
+  return { activeIndex, bins, crossingsRemaining, direction };
 }
 
 function BinGlyph({ mode }: { mode: "spot" | "curve" | "bidask" }) {
