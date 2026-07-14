@@ -1,0 +1,34 @@
+---
+title: "Contract integration safety checklist"
+description: "Verify deployment, pair identity, inputs, approvals, simulation, and receipt reconciliation before direct integration."
+slug: "contracts/safety-checklist"
+section: "Contracts for builders"
+order: 9
+audience: "builder"
+lastReviewed: "2026-07-14"
+---
+
+## Before encoding
+
+- Confirm Robinhood Chain mainnet and the current verified deployment.
+- Attest factory, pair code, token order, bin step, and hooks.
+- Reject unsupported tokens, presets, versions, and paths.
+- Distinguish native ETH from WETH.
+
+## Before submission
+
+- Bind sender, recipient, refund destination, target, calldata, and native value.
+- Use explicit minimum outputs and bounded deadlines.
+- Disclose exact ERC-20 allowances and pair-wide operator approvals.
+- Refresh balance, allowance, active state, and quote after every prerequisite.
+- Simulate the exact transaction from the final sender.
+
+## After submission
+
+- Track the hash, replacements, receipt status, and required confirmations.
+- Reconcile token balances, native balance, live bin balances, and expected events.
+- Treat unknown submission, reorganization, revert, and delayed views as distinct states.
+
+<Risk title="Fail closed">
+If identity, completeness, freshness, or simulation cannot be established, do not construct or submit the write.
+</Risk>

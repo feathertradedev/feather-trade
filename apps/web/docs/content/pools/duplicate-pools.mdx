@@ -1,0 +1,27 @@
+---
+title: "Duplicate pools and bin-step selection"
+description: "Compare multiple pools for one token pair without losing exact address or fee context."
+slug: "pools/duplicate-pools"
+section: "Pools and trading"
+order: 8
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+One normalized token pair can have several Liquidity Book pools. Each bin step produces a distinct pool address and can produce different fees, liquidity concentration, price behavior, and execution quality.
+
+## Compare exact pools
+
+Check:
+
+- full pool contract address;
+- semantic token order and price orientation;
+- bin step and current fee parameters;
+- active price and available reserves;
+- recent activity and current transaction quote.
+
+An optimized future route may intentionally leave the selected pool only when the review identifies every leg. Standard pool-context execution must never silently substitute another pool.
+
+<Callout title="Duplicate detection uses live contract state">
+Before creation or execution, Feather verifies the exact pair identity. A visually similar row or stale listing is not sufficient proof.
+</Callout>

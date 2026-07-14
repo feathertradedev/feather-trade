@@ -31,6 +31,7 @@ async function main() {
   if (!options.dist) throw new Error("--dist is required to bind the hosted release to a local artifact");
 
   const baseUrl = parseReleaseUrl(options.url, options.allowHttp);
+  const docsUrl = options.docsUrl ? parseReleaseUrl(options.docsUrl, options.allowHttp) : null;
   const dist = resolveDist(options.dist);
   const timeoutMs = parsePositiveInteger(options.timeoutMs ?? String(DEFAULT_TIMEOUT_MS), "--timeout-ms");
   const errors = [];
@@ -70,8 +71,47 @@ async function main() {
     if (isTextResponse(asset)) fetchedText.push([asset.url.href, asset.body]);
   }
 
+  if (docsUrl) {
+    if (docsUrl.pathname !== "/docs/") errors.push("--docs-url must use the /docs path");
+    const docsRoot = await inspectUrl(docsUrl, { allowHttp: options.allowHttp, timeoutMs }, errors);
+    if (docsRoot) {
+      validateDocument("docs root", docsRoot, docsUrl, errors);
+      validateArtifactDigest("docs root", docsRoot, path.join(dist, "docs/index.html"), errors);
+      if (!docsRoot.body.includes("Welcome to Feather")) errors.push("docs root is missing prerendered documentation content");
+      if (isTextResponse(docsRoot)) fetchedText.push([docsRoot.url.href, docsRoot.body]);
+    }
+    const nestedDocsUrl = new URL("pools/swap/", docsUrl);
+    const nestedDocs = await inspectUrl(nestedDocsUrl, { allowHttp: options.allowHttp, timeoutMs }, errors);
+    if (nestedDocs) {
+      validateDocument("nested docs route", nestedDocs, docsUrl, errors);
+      validateArtifactDigest("nested docs route", nestedDocs, path.join(dist, "docs/pools/swap/index.html"), errors);
+      if (!nestedDocs.body.includes("Swap tokens")) errors.push("nested docs route is missing prerendered article content");
+    }
+    await validateExpectedRedirect(new URL("docs", baseUrl), docsUrl.origin, { allowHttp: options.allowHttp, timeoutMs }, "app docs canonical redirect", errors);
+    await validateExpectedRedirect(new URL("/", docsUrl), baseUrl.origin, { allowHttp: options.allowHttp, timeoutMs }, "apex app redirect", errors);
+  }
+
   for (const [url, body] of fetchedText) scanForLeakage(url, body, errors);
   finish(errors, `Hosted release smoke checks passed for ${baseUrl.href}`);
+}
+
+async function validateExpectedRedirect(url, expectedOrigin, options, label, errors) {
+  let response;
+  try {
+    response = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(options.timeoutMs) });
+  } catch (error) {
+    errors.push(`${label} request failed: ${error.message}`);
+    return;
+  }
+  if (response.status !== 308) errors.push(`${label} must return HTTP 308, got ${response.status}`);
+  const location = response.headers.get("location");
+  if (!location) {
+    errors.push(`${label} is missing Location`);
+    return;
+  }
+  const target = new URL(location, url);
+  if (target.origin !== expectedOrigin) errors.push(`${label} resolved to unexpected origin ${target.origin}`);
+  if (!options.allowHttp && target.protocol !== "https:") errors.push(`${label} must preserve HTTPS`);
 }
 
 async function inspectUrl(url, options, errors) {
@@ -283,9 +323,9 @@ function parseArgs(args) {
     if (arg === "--") continue;
     if (arg === "--help" || arg === "-h") options.help = true;
     else if (arg === "--allow-http") options.allowHttp = true;
-    else if (arg === "--url" || arg === "--timeout-ms" || arg === "--dist") {
+    else if (arg === "--url" || arg === "--docs-url" || arg === "--timeout-ms" || arg === "--dist") {
       if (!args[index + 1] || args[index + 1].startsWith("--")) throw new Error(`Missing value for ${arg}`);
-      options[arg === "--url" ? "url" : arg === "--dist" ? "dist" : "timeoutMs"] = args[++index];
+      options[arg === "--url" ? "url" : arg === "--docs-url" ? "docsUrl" : arg === "--dist" ? "dist" : "timeoutMs"] = args[++index];
     } else throw new Error(`Unexpected argument ${arg}`);
   }
   return options;
@@ -299,5 +339,5 @@ function finish(errors, success) {
 }
 
 function printHelp() {
-  console.log(`Usage: node scripts/web/check-hosted-release.cjs --url <https://release.example/> --dist <apps/web/dist> [--timeout-ms 10000]\n\nChecks URL/TLS policy, redirects, SPA fallback, security and cache headers, local artifact digests, same-origin assets, and local/dry-run leakage.\n--allow-http is intended only for local fixture tests.`);
+  console.log(`Usage: node scripts/web/check-hosted-release.cjs --url <https://release.example/> --dist <apps/web/dist> [--docs-url <https://example/docs>] [--timeout-ms 10000]\n\nChecks URL/TLS policy, redirects, SPA fallback, security and cache headers, local artifact digests, same-origin assets, docs routes, and local/dry-run leakage.\n--allow-http is intended only for local fixture tests.`);
 }

@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /docs/
+Sitemap: https://feather.markets/sitemap.xml

@@ -1,0 +1,28 @@
+---
+title: "Discover pools"
+description: "Find pools by token or address, compare exact pool identities, and distinguish missing data from empty liquidity."
+slug: "pools/discover"
+section: "Pools and trading"
+order: 1
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+Discover lists available Liquidity Book pools and keeps each pool's address and bin step visible.
+
+## Search and compare
+
+Search by token name, symbol, token address, or exact pool address. Same-symbol assets remain distinguishable by their addresses. When several pools use the same token pair, compare bin step, fees, liquidity, current price, and recent activity before opening one.
+
+Sort and filter controls change the visible list, not pool identity. Returning from a pool restores the prior discovery context when possible.
+
+## Read states correctly
+
+- **No results:** the current search or filter matched no pool.
+- **Empty:** no pools are available for the selected environment.
+- **Unavailable:** current pool information could not be loaded.
+- **Partial:** some results are visible, but the list may be incomplete.
+
+<Warning title="Never infer the pool from token symbols alone">
+Open the exact pool and verify its contract address before signing an approval or transaction.
+</Warning>

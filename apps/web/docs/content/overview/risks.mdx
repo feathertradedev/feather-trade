@@ -1,0 +1,27 @@
+---
+title: "Risks and responsibilities"
+description: "Review the financial, token, approval, network, and smart-contract risks of trading and providing liquidity."
+slug: "overview/risks"
+section: "Overview"
+order: 4
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+Every Feather action is an onchain transaction controlled by your wallet. Review the complete transaction request and understand the risks before signing.
+
+## Market and liquidity risk
+
+Prices can move between review and confirmation. Swaps may receive less than the expected amount, subject to the selected minimum. Liquidity positions can become one-sided, move out of range, or lose value relative to holding the tokens separately.
+
+## Contract and token risk
+
+Contracts can contain defects. Tokens can have unusual transfer behavior, mutable controls, blacklists, or misleading symbols. Feather restricts unsupported assets, but an allowlisted asset is not a promise of safety or value.
+
+## Approval risk
+
+An ERC-20 allowance lets a spender transfer an approved token amount. A Liquidity Book operator approval can cover every bin balance issued by one pair contract. Verify both addresses and scopes.
+
+<Risk title="Never sign under pressure">
+Reject any request with an unexpected account, chain, token, spender, recipient, value, or calldata target. A legitimate interface will let you stop and review again.
+</Risk>

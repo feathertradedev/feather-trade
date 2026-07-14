@@ -1,0 +1,25 @@
+---
+title: "Supported wallet and Robinhood Chain"
+description: "Use a supported injected wallet and confirm the chain, account, and native gas currency."
+slug: "getting-started/wallet-network"
+section: "Getting started"
+order: 2
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+Feather supports the wallet choices presented by the application. On desktop, this may include MetaMask or Brave Wallet when their browser providers are available and authorized.
+
+## Network identity
+
+Robinhood Chain uses ETH as its native gas currency. The application checks both the wallet network and its own configured network before enabling a transaction.
+
+If the two network identities disagree, Feather blocks execution. Switching the visible wallet chain alone is not enough when the configured runtime reports another chain.
+
+## Account identity
+
+The connected address determines balances, approvals, positions, and transaction context. Changing accounts clears or reloads owner-specific state. A pending transaction remains associated with the account and chain that submitted it.
+
+<Callout title="Read-only access does not require a wallet">
+You can browse documentation and public pool information without connecting. Connect only when an action needs your account or signature.
+</Callout>

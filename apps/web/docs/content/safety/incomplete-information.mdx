@@ -1,0 +1,23 @@
+---
+title: "Incomplete or stale information"
+description: "Distinguish unavailable, partial, stale, loading, and actual zero values without weakening transaction safety."
+slug: "safety/incomplete-information"
+section: "Safety and troubleshooting"
+order: 8
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+Feather treats missing, partial, stale, and zero as different states.
+
+- **Loading:** the requested information has not completed.
+- **Unavailable:** a value cannot currently be obtained.
+- **Partial:** some facts are present, but the complete set is not established.
+- **Stale:** information is older than the allowed execution boundary.
+- **Zero:** the trusted current value is actually zero.
+
+Read-only presentation can remain visible while dependent actions are disabled. For example, missing USD value does not imply zero value, and an incomplete owned-bin set cannot support a full exit.
+
+<Warning title="Do not work around a safety block">
+Refresh or retry the named condition. Switching pages, reconnecting repeatedly, or increasing transaction tolerance does not make untrusted state safe.
+</Warning>

@@ -1,0 +1,29 @@
+---
+title: "Rejected, reverted, replaced, and dropped transactions"
+description: "Recognize failure states and recover without duplicating an uncertain or already submitted action."
+slug: "safety/rejected-reverted"
+section: "Safety and troubleshooting"
+order: 7
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+## Rejected
+
+The wallet did not submit the request. Review current state before trying again.
+
+## Reverted
+
+The transaction was mined but execution failed. Gas was still consumed. Refresh balances, approvals, pool state, and the specific error before rebuilding.
+
+## Replaced or dropped
+
+A replacement uses another hash for the same nonce. A dropped transaction may disappear without a receipt. Feather reconciles the account and known hashes before enabling retry.
+
+## Unknown submission
+
+A provider error can occur after possible broadcast but before the application receives a hash. Do not blindly resubmit. Check wallet activity, account nonce, pending transactions, and explorer history first.
+
+<Risk title="Duplicate submissions can both have effects">
+Another tab or device must independently refresh balance, allowance, and live state. Do not assume application-wide idempotency.
+</Risk>

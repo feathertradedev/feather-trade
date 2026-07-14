@@ -1,0 +1,28 @@
+---
+title: "Manage a position"
+description: "Inspect live bin balances, token claims, range status, history, and actions for one wallet and pool."
+slug: "liquidity/manage"
+section: "Liquidity"
+order: 7
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+Portfolio groups every live balance owned by the connected wallet in each pool. Open a position to inspect individual bins and current claims.
+
+## Position status
+
+- **In range:** the wallet owns a nonzero balance in the active bin.
+- **Out of range:** live balances remain, but none are in the active bin.
+- **Empty:** no positive live bin balance remains.
+- **Partial:** the complete owned-bin set or accounting history is not currently available.
+
+Current token claims include the position's share of reserves and embedded fee value. There is no separate Claim Fees transaction.
+
+## Available actions
+
+Add More returns to the same pool with current context. Withdraw selects a percentage and bins. Full Exit targets every live positive bin owned in that pool.
+
+<Warning title="Viewing is not ownership">
+A shared position URL can display another address, but write actions remain disabled unless the connected wallet owns the live balances.
+</Warning>
