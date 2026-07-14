@@ -824,8 +824,7 @@ function LandingView(_: { networkName: string; snapshot: AppSnapshot | undefined
           <h1 id="landing-title">Weightless liquidity.</h1>
           <p>Trade and deploy concentrated liquidity through a DLMM with dynamic fees built for fast-moving markets.</p>
           <div className="hero-actions">
-            <a className="primary-button" href="#/swap">Launch app</a>
-            <a className="hero-text-link" href="#/pools">Explore pools <span aria-hidden="true">↗</span></a>
+            <a className="primary-button hero-launch" href="#/swap">Launch app <span aria-hidden="true">↗</span></a>
           </div>
         </div>
 
@@ -957,7 +956,6 @@ function LiquidityBookSimulation() {
         <div><dt>Bin ID</dt><dd>{activeBinId}</dd></div>
         <div><dt>Trade pressure</dt><dd>{simulation.direction > 0 ? "Buying SPCX" : "Selling SPCX"}</dd></div>
       </dl>
-      <a className="hero-market-link" href="#/swap">Open swap <span aria-hidden="true">↗</span></a>
     </aside>
   );
 }

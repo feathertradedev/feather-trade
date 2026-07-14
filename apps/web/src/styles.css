@@ -581,6 +581,7 @@ textarea {
   display: flex;
   gap: 24px;
   align-items: center;
+  justify-content: center;
   margin-top: 36px;
 }
 
@@ -590,21 +591,18 @@ textarea {
   border-radius: 999px;
 }
 
-.hero-text-link {
+.hero-launch {
   display: inline-flex;
   gap: 8px;
   align-items: center;
-  color: var(--bone);
-  font-size: 0.9rem;
 }
 
-.hero-text-link span,
-.hero-market-link span {
+.hero-launch span {
+  color: currentColor;
   transition: transform 240ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-.hero-text-link:hover span,
-.hero-market:hover .hero-market-link span {
+.hero-launch:hover span {
   transform: translate(2px, -2px);
 }
 
@@ -652,8 +650,7 @@ textarea {
 }
 
 .hero-market-head,
-.hero-pair,
-.hero-market-link {
+.hero-pair {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -820,14 +817,6 @@ textarea {
   margin: 0;
   font-family: "IBM Plex Mono", ui-monospace, monospace;
   font-size: 0.8rem;
-}
-
-.hero-market-link {
-  margin-top: 28px;
-  padding-top: 20px;
-  color: var(--bone);
-  border-top: 1px solid rgb(233 236 231 / 8%);
-  font-size: 0.78rem;
 }
 
 .landing-pillars {
@@ -1154,7 +1143,7 @@ textarea {
 
   .hero-actions {
     gap: 18px;
-    justify-content: space-between;
+    justify-content: center;
   }
 
   .hero-market {
