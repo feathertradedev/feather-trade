@@ -1,0 +1,31 @@
+---
+title: "Integration recipes"
+description: "Follow guarded direct-contract patterns for pool attestation, swapping, adding, and removing liquidity."
+slug: "contracts/integration-recipes"
+section: "Contracts for builders"
+order: 7
+audience: "builder"
+lastReviewed: "2026-07-14"
+---
+
+Executable recipes will publish after verified mainnet addresses and source links are available.
+
+## Pool attestation
+
+Resolve the pair from LBFactory, then compare factory, token order, bin step, hook configuration, and deployed code before reading executable state.
+
+## Exact-input swap
+
+Quote a supported path, validate every leg, calculate minimum output, bind a deadline, confirm allowance, encode router calldata, and simulate from the final sender.
+
+## Add liquidity
+
+Read the current active bin, construct no more than 69 bin weights, normalize each token side, set protected minima and refund destination, approve only nonzero token sides, and simulate exact value.
+
+## Remove liquidity
+
+Enumerate the complete intended live balances, refresh reserves and supply at one current state, calculate protected outputs, verify operator approval, and simulate the exact burn set.
+
+<Warning title="Examples will use verified addresses only">
+Do not substitute test or placeholder contracts into a mainnet transaction.
+</Warning>

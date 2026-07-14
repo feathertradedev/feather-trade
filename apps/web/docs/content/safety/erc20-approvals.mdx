@@ -1,0 +1,23 @@
+---
+title: "ERC-20 approvals"
+description: "Review token allowances by asset, amount, spender, persistence, and current onchain state."
+slug: "safety/erc20-approvals"
+section: "Safety and troubleshooting"
+order: 1
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+An ERC-20 approval authorizes a spender contract to transfer a token from your wallet up to the allowance limit.
+
+## Review fields
+
+Confirm the token symbol and full address, approval amount or cap, current allowance, full spender address, account, and network. An approval remains active until used, changed, or revoked according to token behavior.
+
+Feather skips approval when the current allowance is sufficient. If the allowance is missing, stale, or revoked, a new approval and refreshed transaction review are required.
+
+<Risk title="Approval expands contract authority">
+Approving the wrong token, spender, network, or amount can expose funds. Compare the wallet request with Feather's disclosure before signing.
+</Risk>
+
+Native ETH never uses an ERC-20 approval. WETH does.

@@ -1,0 +1,25 @@
+---
+title: "Token, hook, and contract warnings"
+description: "Respond to unsupported token behavior, unknown pool hooks, address mismatches, and contract identity failures."
+slug: "safety/token-hook-warnings"
+section: "Safety and troubleshooting"
+order: 9
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+## Token warnings
+
+Known fee-on-transfer, rebasing, blacklistable, upgradeable, or suspicious assets can be restricted. Feather does not claim to detect every unusual behavior at runtime.
+
+## Hook warnings
+
+Pool hooks can change behavior around liquidity and swaps. Writes are enabled only for hookless or explicitly supported configurations. Unknown hook identity or code blocks execution.
+
+## Contract mismatch
+
+Before writes, Feather verifies that the pair belongs to the configured factory and matches expected tokens, order, bin step, hook settings, network, and deployed code.
+
+<Risk title="A familiar interface cannot make a foreign contract safe">
+If an address, owner, factory, token, or code check fails, treat the pool as read-only and do not reproduce the transaction elsewhere.
+</Risk>

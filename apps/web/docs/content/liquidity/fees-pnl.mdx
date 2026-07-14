@@ -1,0 +1,25 @@
+---
+title: "Embedded fees, value, cost basis, and P&L"
+description: "Interpret current claims and accounting estimates without mistaking embedded fees for a claimable balance."
+slug: "liquidity/fees-pnl"
+section: "Liquidity"
+order: 10
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+## Current claims
+
+Current value begins with the position's proportional token claims in each live bin. Trading and eligible composition fees retained by bins increase those reserves over time.
+
+## Cost basis and profit or loss
+
+Feather uses proportional average basis per bin when complete event history and trusted prices are available. Deposits add basis, partial withdrawals release basis in proportion to liquidity burned, and direct balance transfers move the known proportional basis.
+
+Missing prices, incomplete history, or unexplained transfers make affected USD values or P&L partial or unavailable. They are not replaced with zero.
+
+<Warning title="Accounting is informational">
+Displayed basis and P&L are not tax advice and may not match the rules that apply to you. Preserve your own transaction records and consult a qualified professional.
+</Warning>
+
+There is no independent fee-claim balance. Removing liquidity realizes underlying reserves and embedded fee value together.

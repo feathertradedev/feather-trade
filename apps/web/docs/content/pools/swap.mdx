@@ -1,0 +1,30 @@
+---
+title: "Swap tokens"
+description: "Prepare an exact-input swap in one selected pool and review balances, quotes, approvals, and receipts."
+slug: "pools/swap"
+section: "Pools and trading"
+order: 4
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+An exact-input swap spends the amount you enter and protects a minimum amount received.
+
+<Steps>
+1. Open the exact pool and choose **Swap**.
+2. Select the direction and enter the input amount.
+3. Review expected output, minimum received, fees, price impact, execution price, and deadline.
+4. Approve the input token when required.
+5. Review the refreshed quote and exact wallet request.
+6. Submit, then wait for the required confirmation state.
+</Steps>
+
+Reversing direction or changing amount, pool, account, chain, slippage, or deadline invalidates the prior quote.
+
+## Native swaps
+
+ETH input uses native balance and transaction value. It never requires an ERC-20 approval. WETH is a token contract and follows ERC-20 approval rules even when its underlying asset is ETH.
+
+<Warning title="Approval is not swap completion">
+An approval only grants spending permission. Feather refreshes balances, allowance, and quote before preparing the separate swap transaction.
+</Warning>

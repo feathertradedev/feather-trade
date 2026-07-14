@@ -1,0 +1,24 @@
+---
+title: "Native ETH versus WETH"
+description: "Distinguish the chain's gas currency from its wrapped ERC-20 representation in every action."
+slug: "safety/eth-weth"
+section: "Safety and troubleshooting"
+order: 3
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+ETH is Robinhood Chain's native currency. It pays gas and can be supplied as transaction value. WETH is an ERC-20 contract representing wrapped ETH.
+
+| Property | ETH | WETH |
+| --- | --- | --- |
+| Balance source | Native account balance | Token contract balance |
+| Approval | Never | Required when a spender needs it |
+| Transfer mechanism | Transaction value or native transfer | ERC-20 transfer |
+| Gas payment | Yes | No |
+
+A pool can use the wrapped-native contract while the interface offers a native ETH mode. Review must state whether output arrives as ETH or WETH.
+
+<Warning title="Keep gas separate from token spending">
+Using maximum ETH must reserve enough native balance for network fees. A WETH balance cannot pay gas without first becoming native ETH through an explicit action.
+</Warning>

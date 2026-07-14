@@ -1,0 +1,23 @@
+---
+title: "Composition fees and refunds"
+description: "Understand active-bin composition fees, protected placement, and possible native or wrapped refunds."
+slug: "liquidity/composition-fees"
+section: "Liquidity"
+order: 6
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+An imbalanced deposit that touches the active bin can pay a composition fee. This is separate from gas and swap fees.
+
+## Before signing
+
+The review should identify the estimated composition fee, any protocol share, protected net placement, and each expected refund asset. Volatility or active-bin changes invalidate the estimate and require refresh.
+
+## Native-asset refunds
+
+When native ETH is supplied to a wrapped-native pool, unused native-side value can cross the contract boundary as WETH. The receipt view must reconcile both ETH and WETH balances rather than claiming every unused amount returned as ETH.
+
+<Callout title="The receipt is final authority">
+The confirmed transaction events and balance changes determine actual fees and refunds. A preflight value is an estimate based on the reviewed state.
+</Callout>

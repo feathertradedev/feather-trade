@@ -1,0 +1,29 @@
+---
+title: "Transaction lifecycle"
+description: "Follow a transaction from wallet request through hash, receipt, confirmations, replacement, or reorganization."
+slug: "safety/transaction-lifecycle"
+section: "Safety and troubleshooting"
+order: 6
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+## Review to submission
+
+Before wallet handoff, editing a bound field cancels the unsubmitted review. After handoff, the original request remains independent from later edits.
+
+## Submitted
+
+Once a transaction hash exists, Feather tracks it under the submitting account, chain, action, and contract context. Reloading the page should not replay it.
+
+## Receipt and confirmations
+
+A successful receipt proves execution in one block. The application can require additional confirmations before treating it as canonical success. Other views may take longer to reflect the result.
+
+## Replacement or reorganization
+
+A wallet can replace a pending transaction. A chain reorganization can temporarily remove a prior receipt. Feather keeps related hashes linked and reconciles whether the action is re-included, absent, reverted, or confirmed again.
+
+<Callout title="Pending is not success">
+Only the required confirmed receipt state establishes completion. A wallet prompt or broadcast alone does not.
+</Callout>

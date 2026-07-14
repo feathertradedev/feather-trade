@@ -1,0 +1,30 @@
+---
+title: "Glossary"
+description: "Definitions for the core trading, liquidity, approval, and transaction terms used throughout Feather."
+slug: "overview/glossary"
+section: "Overview"
+order: 5
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+## Market terms
+
+<Definition term="Bin">A discrete price point that can hold token reserves and liquidity balances.</Definition>
+<Definition term="Bin step">The configured price interval between neighboring bins in a pool.</Definition>
+<Definition term="Active bin">The bin at the current pool price.</Definition>
+<Definition term="Price impact">The change in execution price caused by a swap consuming available liquidity.</Definition>
+<Definition term="Slippage tolerance">The user-selected difference allowed between the reviewed quote and protected execution boundary.</Definition>
+
+## Position terms
+
+<Definition term="Position">One wallet's complete set of nonzero bin balances in one pool.</Definition>
+<Definition term="In range">The position owns liquidity in the active bin.</Definition>
+<Definition term="Out of range">The position has liquidity, but none in the active bin.</Definition>
+<Definition term="Full exit">A 100% burn of every live positive balance owned by the wallet in the selected pool.</Definition>
+
+## Transaction terms
+
+<Definition term="Approval">Permission granted to a contract to spend a token or operate Liquidity Book balances.</Definition>
+<Definition term="Simulation">A preflight execution against current chain state that checks whether the exact transaction is expected to succeed.</Definition>
+<Definition term="Confirmation">A new block added after the block containing a transaction receipt.</Definition>

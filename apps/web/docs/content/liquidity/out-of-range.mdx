@@ -1,0 +1,24 @@
+---
+title: "Out-of-range and rebalancing risks"
+description: "Understand inactive liquidity, one-sided conversion, and the non-atomic risks of repositioning."
+slug: "liquidity/out-of-range"
+section: "Liquidity"
+order: 11
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+A position is out of range when it has live balances but none in the active bin. It may stop participating in current swaps and can become heavily or fully composed of one token.
+
+## Available choices
+
+- Leave the position in place and accept inactive exposure.
+- Add liquidity to a new range while retaining the old balances.
+- Withdraw selected bins.
+- Exit and create a different position.
+
+Rebalancing normally means remove, wait for confirmation, then add through a new review. Market exposure exists between those transactions, and the final range can differ from the original intent if price moves.
+
+<Risk title="Do not treat repositioning as atomic">
+A successful removal does not guarantee the later add will be approved, simulated, affordable, or confirmed. Keep each step recoverable on its own.
+</Risk>

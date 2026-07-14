@@ -1,0 +1,28 @@
+---
+title: "Create a permissionless pool"
+description: "Choose semantic token order, an open preset, initial price, and review a new pool transaction."
+slug: "pools/create"
+section: "Pools and trading"
+order: 6
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+Pool creation follows Tokens, Configure, Review, and Create.
+
+<Steps>
+1. Choose distinct supported base and quote assets.
+2. Select an available open bin-step preset.
+3. Enter the initial quote-per-base price and inspect its inverse.
+4. Review token order, addresses, bin step, initial active bin, fee parameters, factory, and gas estimate.
+5. Submit the creation transaction.
+6. Open the resulting pool and prepare initial liquidity separately when needed.
+</Steps>
+
+The selected base and quote meaning controls displayed price. Address sorting used for duplicate detection must not silently reverse that meaning.
+
+<Risk title="Initial price can create immediate loss">
+An inaccurate initial price can be arbitraged. Confirm the price orientation, decimals, inverse value, and rounded representable result before signing.
+</Risk>
+
+If another wallet creates the same pair and bin step first, Feather opens the winning pool and requires a fresh review against its live state.

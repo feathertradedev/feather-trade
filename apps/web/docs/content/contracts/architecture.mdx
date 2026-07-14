@@ -1,0 +1,23 @@
+---
+title: "Contract architecture"
+description: "Understand the public Liquidity Book contract roles that Feather will expose for direct mainnet integration."
+slug: "contracts/architecture"
+section: "Contracts for builders"
+order: 1
+audience: "builder"
+lastReviewed: "2026-07-14"
+---
+
+Feather uses Liquidity Book v2.2 contracts on Robinhood Chain. Verified mainnet integration details will publish after deployment validation.
+
+## Contract roles
+
+- **LBFactory** registers pairs, presets, quote assets, and supported implementations.
+- **LBPair** holds reserves, executes bin-level swaps, and mints or burns liquidity balances.
+- **LBToken** defines fungible multi-token balances keyed by bin ID.
+- **LBRouter** prepares user-facing swap and liquidity operations across supported pairs.
+- **LBQuoter** computes candidate exact-input paths without executing them.
+
+<Warning title="Builder reference is not live yet">
+Addresses, verified source links, method examples, and event examples remain withheld until the mainnet deployment passes release validation.
+</Warning>

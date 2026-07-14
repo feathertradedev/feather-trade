@@ -1,0 +1,27 @@
+---
+title: "Charts and liquidity distribution"
+description: "Read price candles, volume context, bin reserves, active-bin markers, and owner-position overlays."
+slug: "pools/charts"
+section: "Pools and trading"
+order: 3
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+Pool charts describe historical trading and current liquidity. They are decision aids, not execution guarantees.
+
+## Price chart
+
+Price candles use a consistent base and quote orientation. Check the axis label before comparing the chart with another market. Volume must state whether it represents base-token, quote-token, or verified USD value.
+
+Gaps can mean no eligible activity or incomplete information. They must not be silently drawn as zero-volume trading.
+
+## Liquidity distribution
+
+The distribution view places reserves across bounded bin IDs and marks the active bin. Each bin can contain token X, token Y, or both. A connected owner's overlay shows where owned balances sit relative to the market.
+
+Keyboard and screen-reader users receive the same values through a table or list representation.
+
+<Risk title="A chart is not a quoted transaction">
+Always rely on the current action review, protected minimum, and wallet request for execution details.
+</Risk>

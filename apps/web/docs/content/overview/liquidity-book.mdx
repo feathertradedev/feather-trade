@@ -1,0 +1,24 @@
+---
+title: "How Liquidity Book works"
+description: "Understand pools, discrete price bins, the active bin, liquidity distributions, and dynamic fees."
+slug: "overview/liquidity-book"
+section: "Overview"
+order: 2
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+Liquidity Book divides a market into discrete price bins. Each bin represents a price and holds reserves supplied by liquidity providers.
+
+## Pools and bin steps
+
+A pool is identified by token X, token Y, and a bin step. The bin step controls the price distance between neighboring bins. The same token pair can have several pools with different bin steps, fees, and liquidity.
+
+<Definition term="Active bin">The bin containing the pool's current trading price. Swaps can move the active bin as liquidity is consumed.</Definition>
+<Definition term="Position">All nonzero Liquidity Book balances owned by one wallet in one pool. It is not an NFT or a separate account.</Definition>
+
+## Fees and movement
+
+Trading fees stay inside pool reserves and increase the claims represented by liquidity balances. There is no separate fee-claim action. Fees are realized together with the underlying assets when liquidity is removed.
+
+Dynamic fees can rise during volatile activity. A higher displayed fee can improve fee collection for active liquidity, but it also changes trading cost and does not guarantee profit.

@@ -1,0 +1,29 @@
+---
+title: "LBRouter"
+description: "Plan protected swaps and liquidity actions through the verified Feather mainnet router."
+slug: "contracts/router"
+section: "Contracts for builders"
+order: 5
+audience: "builder"
+lastReviewed: "2026-07-14"
+---
+
+LBRouter coordinates user-facing swaps, liquidity additions, and liquidity removals.
+
+## Transaction requirements
+
+Bind the exact account, chain, router, pool path, token order, amounts, slippage protection, deadline, recipient, refund destination, and native value. Simulate the final calldata from the sending account immediately before wallet handoff.
+
+<MethodSummary name="swapExactTokensForTokens">
+Use a verified v2.2 path and protect minimum output. Refresh quote and allowance after any bound context changes.
+</MethodSummary>
+
+<MethodSummary name="addLiquidity">
+Supply validated bin IDs and independently normalized token distributions with protected minimum amounts.
+</MethodSummary>
+
+<MethodSummary name="removeLiquidity">
+Burn exact live balances with protected token outputs and current pair-wide operator approval.
+</MethodSummary>
+
+Exact signatures and examples publish after mainnet verification.
