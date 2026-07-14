@@ -38,6 +38,7 @@ export interface MockRpcOptions {
   analyticsPartialHistory?: boolean;
   analyticsTransferred?: boolean;
   allowance?: bigint;
+  allowanceAfterReceipt?: bigint;
   balance?: bigint;
   binReserveX?: bigint;
   binReserveY?: bigint;
@@ -46,10 +47,15 @@ export interface MockRpcOptions {
   blockNumber?: bigint;
   chainId?: number;
   dashboardPoolLimit?: number;
+  estimatedGas?: bigint;
+  gasEstimateMode?: "ready" | "error";
+  gasEstimateDelayMs?: number;
+  gasPrice?: bigint;
   includePairs?: boolean;
   includePositions?: boolean;
   indexerBlockNumber?: bigint;
   indexerDelayMs?: number;
+  indexerDelayMsAfterReceipt?: number;
   indexerHasErrors?: boolean;
   indexerMode?: "ready" | "error";
   lbApproved?: boolean;
@@ -59,7 +65,13 @@ export interface MockRpcOptions {
   ownerPositionCount?: number;
   ownerPositionsFailAtSkip?: number;
   pairReserveX?: bigint;
+  pairReserveXAfterReceipt?: bigint;
   pairReserveY?: bigint;
+  pairAddress?: string;
+  pairBinStep?: string;
+  pairTokenX?: string;
+  pairTokenXAfterReceipt?: string;
+  pairTokenY?: string;
   pairByIdDelayMs?: number;
   pairByIdMode?: "ready" | "error";
   positionOwner?: Address;
@@ -69,7 +81,11 @@ export interface MockRpcOptions {
   poolBinCount?: number;
   poolBinsMode?: "ready" | "error";
   quoteMode?: "ready" | "error" | "no-route";
+  quoteDelayMs?: number;
+  quoteDelayMsAfterReceipt?: number;
   quotePreferMultiHop?: boolean;
+  quoteRate?: bigint;
+  quoteRateAfterReceipt?: bigint;
   quoteUseAlternateDirectPool?: boolean;
   quoteVersion?: number;
   receiptStatus?: "success" | "reverted";
@@ -82,6 +98,7 @@ export interface MockRpcOptions {
 export interface MockRpcSnapshot {
   ethCalls: Array<{ address: string | null; blockTag: string | null; data: Hex; functionName: string; value: string | null }>;
   graphQueries: string[];
+  graphRequests: Array<{ query: string; variables: GraphRequest["variables"] }>;
   methods: string[];
 }
 
@@ -119,6 +136,7 @@ export async function installMockRpc(page: Page, options: MockRpcOptions = {}): 
   const state: MockRpcSnapshot = {
     ethCalls: [],
     graphQueries: [],
+    graphRequests: [],
     methods: []
   };
 
@@ -150,6 +168,7 @@ export async function installMockRpc(page: Page, options: MockRpcOptions = {}): 
 
     const body = JSON.parse(request.postData() ?? "{}") as GraphRequest;
     state.graphQueries.push(body.query ?? "");
+    state.graphRequests.push({ query: body.query ?? "", variables: body.variables });
     if (currentOptions.indexerDelayMs !== undefined) {
       await delay(currentOptions.indexerDelayMs);
     }
@@ -172,6 +191,7 @@ export async function installMockRpc(page: Page, options: MockRpcOptions = {}): 
     }
     const body = JSON.parse(request.postData() ?? "{}") as GraphRequest;
     state.graphQueries.push(body.query ?? "");
+    state.graphRequests.push({ query: body.query ?? "", variables: body.variables });
     await route.fulfill({
       body: JSON.stringify(mockAnalyticsResponse(body, currentOptions)),
       contentType: "application/json",
@@ -184,6 +204,7 @@ export async function installMockRpc(page: Page, options: MockRpcOptions = {}): 
     snapshot: () => ({
       ethCalls: [...state.ethCalls],
       graphQueries: [...state.graphQueries],
+      graphRequests: state.graphRequests.map((request) => ({ query: request.query, variables: request.variables ? { ...request.variables } : undefined })),
       methods: [...state.methods]
     }),
     update: (nextOptions) => Object.assign(currentOptions, nextOptions)
@@ -383,8 +404,20 @@ async function handleRpc(request: RpcRequest, options: MockRpcOptions, state: Mo
           number: request.params?.[0] ?? numberToHex(options.blockNumber ?? DEFAULT_BLOCK_NUMBER)
         });
       case "eth_estimateGas":
-        return rpcResult(request, numberToHex(500_000n));
+        if (options.gasEstimateDelayMs !== undefined) await delay(options.gasEstimateDelayMs);
+        if (options.gasEstimateMode === "error") return rpcError(request, -32_000, "Mock gas estimation failed");
+        return rpcResult(request, numberToHex(options.estimatedGas ?? 500_000n));
+      case "eth_gasPrice":
+        return rpcResult(request, numberToHex(options.gasPrice ?? 1_000_000_000n));
       case "eth_getTransactionReceipt":
+        if ((options.receiptStatus ?? "success") === "success") {
+          if (options.allowanceAfterReceipt !== undefined) options.allowance = options.allowanceAfterReceipt;
+          if (options.indexerDelayMsAfterReceipt !== undefined) options.indexerDelayMs = options.indexerDelayMsAfterReceipt;
+          if (options.pairReserveXAfterReceipt !== undefined) options.pairReserveX = options.pairReserveXAfterReceipt;
+          if (options.pairTokenXAfterReceipt !== undefined) options.pairTokenX = options.pairTokenXAfterReceipt;
+          if (options.quoteDelayMsAfterReceipt !== undefined) options.quoteDelayMs = options.quoteDelayMsAfterReceipt;
+          if (options.quoteRateAfterReceipt !== undefined) options.quoteRate = options.quoteRateAfterReceipt;
+        }
         return rpcResult(request, transactionReceipt(options.blockNumber ?? DEFAULT_BLOCK_NUMBER, options.receiptStatus ?? "success"));
       case "eth_getTransactionByHash":
         return rpcResult(request, transactionByHash(options.blockNumber ?? DEFAULT_BLOCK_NUMBER, state));
@@ -461,12 +494,13 @@ async function handleEthCall(
   }
 
   if (functionName === "findBestPathFromAmountIn") {
+    if (options.quoteDelayMs !== undefined) await delay(options.quoteDelayMs);
     if (options.quoteMode === "error") throw new Error("Mock quote failed");
 
     const requestedRoute = decoded.args[0] as readonly Address[] | undefined;
     const route = requestedRoute !== undefined && requestedRoute.length >= 2 ? [...requestedRoute] : [WNATIVE, USDC];
     const amountIn = (decoded.args[1] as bigint | undefined) ?? 1_000_000_000_000_000_000n;
-    const hopRate = options.quotePreferMultiHop === true && route.length > 2 ? 1_001n : route.length > 2 ? 998n : 999n;
+    const hopRate = options.quoteRate ?? (options.quotePreferMultiHop === true && route.length > 2 ? 1_001n : route.length > 2 ? 998n : 999n);
     const amounts = [amountIn];
     for (let index = 1; index < route.length; index += 1) {
       amounts.push(options.quoteMode === "no-route" ? 0n : (amounts[index - 1] * hopRate) / 1_000n);
@@ -620,15 +654,15 @@ function mockPair(options: MockRpcOptions, index = 0): Record<string, unknown> {
   const address = index === 0 ? WNATIVE_USDC_PAIR : SECOND_WNATIVE_USDC_PAIR;
   return {
     activeId: (ACTIVE_ID + index).toString(),
-    address,
-    binStep: String(10 + index),
+    address: index === 0 ? options.pairAddress ?? address : address,
+    binStep: index === 0 ? options.pairBinStep ?? String(10 + index) : String(10 + index),
     depositCount: "1",
     id: address.toLowerCase(),
     reserveX: (options.pairReserveX ?? 50n * DEFAULT_POSITION_LIQUIDITY).toString(),
     reserveY: (options.pairReserveY ?? 50n * DEFAULT_POSITION_LIQUIDITY).toString(),
     swapCount: "1",
-    tokenX: { address: WNATIVE },
-    tokenY: { address: USDC },
+    tokenX: { address: index === 0 ? options.pairTokenX ?? WNATIVE : WNATIVE },
+    tokenY: { address: index === 0 ? options.pairTokenY ?? USDC : USDC },
     totalFeesX: "0",
     totalFeesY: "0",
     totalVolumeX: "0",

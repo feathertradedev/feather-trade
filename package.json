@@ -4,6 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "packageManager": "pnpm@11.7.0",
+  "devDependencies": {
+    "wrangler": "4.110.0"
+  },
   "scripts": {
     "contracts:build": "forge build",
     "contracts:test": "pnpm contracts:test:core",

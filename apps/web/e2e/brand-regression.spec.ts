@@ -17,10 +17,11 @@ async function connectWallet(page: Parameters<typeof installMockRpc>[0]) {
 test("canonical Feather landing desktop", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium");
   await installMockRpc(page, { includePairs: true });
+  await page.emulateMedia({ reducedMotion: "reduce" });
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Weightless liquidity." })).toBeVisible();
-  await expect(page.locator(".landing-stats div").filter({ hasText: "Network" })).toContainText("Local Anvil");
-  await expect(page.locator(".landing-stats div").filter({ hasText: "Indexed pools" })).toContainText("1");
+  await expect(page.getByLabel("Illustrative WNATIVE and USDC Liquidity Book market simulation")).toBeVisible();
+  await expect(page.getByText("10 bps per bin")).toBeVisible();
   await expect(page.getByRole("link", { name: "Docs" })).toHaveCount(0);
   await expect(page).toHaveScreenshot("feather-landing-desktop.png", screenshotOptions);
 });
@@ -28,6 +29,7 @@ test("canonical Feather landing desktop", async ({ page }, testInfo) => {
 test("canonical Feather landing mobile", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile-chromium");
   await installMockRpc(page, { includePairs: true });
+  await page.emulateMedia({ reducedMotion: "reduce" });
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Weightless liquidity." })).toBeVisible();
   await expect(page).toHaveScreenshot("feather-landing-mobile.png", screenshotOptions);

@@ -2,6 +2,10 @@ packages:
   - "packages/*"
   - "apps/*"
   - "indexer/*"
+allowBuilds:
+  esbuild: true
+  sharp: true
+  workerd: true
 enableGlobalVirtualStore: false
 minimumReleaseAgeExclude:
   - '@wagmi/connectors@8.0.22'

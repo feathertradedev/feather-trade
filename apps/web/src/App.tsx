@@ -40,13 +40,14 @@ import {
   Server,
   Wallet
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type ComponentType } from "react";
-import { isAddressEqual, type Address, type Chain, formatUnits, parseUnits } from "viem";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
+import { encodeFunctionData, isAddressEqual, keccak256, type Address, type Chain, formatUnits, parseUnits } from "viem";
 import {
   useAccount,
   useChainId,
   useConnect,
   useDisconnect,
+  useReconnect,
   useSendTransaction,
   useSwitchChain,
   useWaitForTransactionReceipt,
@@ -110,6 +111,7 @@ import {
   type SwapExecutionContext
 } from "./transaction-safety";
 import { wagmiConfig } from "./wagmi";
+import { SUPPORTED_WALLET_RDNS, walletFailure, walletSessionIdentity, type WalletFailure } from "./wallet-lifecycle";
 
 const queryClient = new QueryClient();
 const SNAPSHOT_REFRESH_INTERVAL_MS = 10_000;
@@ -162,6 +164,59 @@ interface BurnQuoteView {
   quote: LiquidityBurnQuote | null;
 }
 
+interface ApprovalRefreshState {
+  confirmedAt: number;
+  error: string | null;
+  generation: number;
+  hash: Address;
+  intentFingerprint: string;
+  refreshedContextFingerprint: string | null;
+  snapshotIdentity: string | null;
+  status: "refreshing" | "awaiting-render" | "ready" | "error";
+}
+
+interface SubmittedTransactionRecord {
+  account: Address;
+  calldataFingerprint: string;
+  chainId: number;
+  deploymentEpoch: string;
+  environment: EnvironmentKey;
+  executionFingerprint: string;
+  hash: Address;
+  intent: "add-liquidity" | "approval" | "remove-liquidity" | "swap";
+  providerId: string;
+  providerUid: string;
+  submittedAt: number;
+  target: Address;
+  value: bigint;
+}
+
+interface ExactGasReview {
+  action: string;
+  bufferedWei: bigint;
+  executionFingerprint: string;
+  gasLimit: bigint;
+  gasPrice: bigint;
+  requiredWei: bigint;
+  transactionValue: bigint;
+}
+
+const GAS_BUFFER_BPS = 12_500n;
+
+function deploymentEpoch(registry: DexRegistry): string {
+  return [
+    registry.chainId,
+    registry.startBlock,
+    registry.endpoints.rpcUrl,
+    registry.contracts.lbFactory,
+    registry.contracts.lbPairImplementation,
+    registry.contracts.lbQuoter,
+    registry.contracts.lbRouter
+  ].join("|");
+}
+
+const SubmittedTransactionJournalContext = createContext<((record: SubmittedTransactionRecord) => void) | null>(null);
+
 type SnapshotRefetch = () => Promise<QueryObserverResult<AppSnapshot, Error>>;
 
 const routeIcons: Record<RouteKey, ComponentType<{ size?: number }>> = {
@@ -175,18 +230,66 @@ const routeIcons: Record<RouteKey, ComponentType<{ size?: number }>> = {
 
 export function App() {
   return (
-    <WagmiProvider config={wagmiConfig}>
+    <WagmiProvider config={wagmiConfig} reconnectOnMount={false}>
       <QueryClientProvider client={queryClient}>
+        <SafeWalletReconnect />
         <DexShell />
       </QueryClientProvider>
     </WagmiProvider>
   );
 }
 
+function SafeWalletReconnect() {
+  const attempted = useRef(false);
+  const account = useAccount();
+  const { connectors, reconnect } = useReconnect();
+
+  useEffect(() => {
+    if (account.status === "connected") {
+      attempted.current = true;
+      return;
+    }
+    if (attempted.current || connectors.length === 0 || account.status !== "disconnected") return;
+    const timeout = window.setTimeout(() => {
+      if (attempted.current) return;
+      attempted.current = true;
+      void Promise.resolve(wagmiConfig.storage?.getItem("recentConnectorId") ?? null).then((recentConnectorId) => {
+        if (typeof recentConnectorId !== "string" || !SUPPORTED_WALLET_RDNS.has(recentConnectorId)) return;
+        const connector = connectors.find((candidate) => candidate.id === recentConnectorId);
+        if (connector && wagmiConfig.state.status === "disconnected") reconnect({ connectors: [connector] });
+      });
+    }, 100);
+    return () => window.clearTimeout(timeout);
+  }, [account.status, connectors, reconnect]);
+
+  return null;
+}
+
 function DexShell() {
   const [environmentKey, setEnvironmentKey] = useState<EnvironmentKey>(defaultEnvironmentKey);
   const [routeKey, setRouteKey, poolDetailId, liquiditySection, actionPoolId, positionDetailId, portfolioAction] = useHashRoute();
   const registry = registries[environmentKey];
+  const account = useAccount();
+  const walletChainId = useChainId();
+  const walletSessionKey = walletSessionIdentity({
+    address: account.address,
+    chainId: walletChainId,
+    connectorUid: account.connector?.uid,
+    environment: `${environmentKey}|${deploymentEpoch(registry)}`,
+    status: account.status
+  });
+  const walletPanelKey = account.status === "connected" ? walletSessionKey : `${environmentKey}:disconnected`;
+  const previousWalletSessionKey = useRef(walletSessionKey);
+  const [submittedTransactions, setSubmittedTransactions] = useState<SubmittedTransactionRecord[]>([]);
+  const recordSubmittedTransaction = useCallback((record: SubmittedTransactionRecord) => {
+    setSubmittedTransactions((records) => records.some((existing) =>
+      existing.environment === record.environment &&
+      existing.deploymentEpoch === record.deploymentEpoch &&
+      existing.chainId === record.chainId &&
+      existing.account.toLowerCase() === record.account.toLowerCase() &&
+      existing.hash.toLowerCase() === record.hash.toLowerCase()
+    ) ? records : [...records, record]);
+  }, []);
   const snapshotQuery = useQuery({
     queryKey: [
       "dashboard",
@@ -201,6 +304,23 @@ function DexShell() {
     refetchOnWindowFocus: "always"
   });
   const snapshot = snapshotQuery.data;
+
+  useEffect(() => {
+    if (previousWalletSessionKey.current === walletSessionKey) return;
+    previousWalletSessionKey.current = walletSessionKey;
+    const ownerQueryPrefixes = new Set([
+      "liquidityPortfolioIntent",
+      "liquidityPositions",
+      "liquiditySelectedBurnSnapshot",
+      "liquidityWallet",
+      "poolDetailPositions",
+      "positionHistory",
+      "swapWallet",
+      "walletPortfolio"
+    ]);
+    void queryClient.cancelQueries({ predicate: (query) => ownerQueryPrefixes.has(String(query.queryKey[0] ?? "")) });
+    queryClient.removeQueries({ predicate: (query) => ownerQueryPrefixes.has(String(query.queryKey[0] ?? "")) });
+  }, [walletSessionKey]);
 
   useEffect(() => {
     window.scrollTo({ behavior: "auto", left: 0, top: 0 });
@@ -256,7 +376,7 @@ function DexShell() {
               <span>Runtime health is shown beside the environment selector.</span>
             </div>
           </details>
-          <WalletPanel activeChain={registry.chain} />
+          <WalletPanel activeChain={registry.chain} key={walletPanelKey} />
         </div>
       </header>
 
@@ -286,6 +406,18 @@ function DexShell() {
           <MetricTile label="Active Bin" value={formatActiveBin(snapshot)} tone="neutral" />
           <MetricTile label="Indexer Head" value={snapshot?.indexer.blockNumber ?? "offline"} tone={snapshot?.indexer.status === "ready" ? "good" : "warn"} />
         </section>
+        {submittedTransactions.length > 0 ? (
+          <details className="transaction-journal" data-testid="submitted-transaction-journal">
+            <summary>Submitted transactions ({submittedTransactions.length})</summary>
+            <div>
+              {submittedTransactions.map((transaction) => (
+                <span data-transaction-hash={transaction.hash} key={`${transaction.environment}:${transaction.deploymentEpoch}:${transaction.chainId}:${transaction.account}:${transaction.hash}`}>
+                  {transaction.intent} · {formatCompactAddress(transaction.hash)} · {formatCompactAddress(transaction.account)} · {transaction.environment} · chain {transaction.chainId}
+                </span>
+              ))}
+            </div>
+          </details>
+        ) : null}
         {snapshot?.indexer.message ? (
           <p
             className={`snapshot-message ${snapshot.indexer.status}`}
@@ -296,18 +428,21 @@ function DexShell() {
           </p>
         ) : null}
 
-        <ContentView
-          environmentKey={environmentKey}
-          actionPoolId={actionPoolId}
-          liquiditySection={liquiditySection}
-          poolDetailId={poolDetailId}
-          portfolioAction={portfolioAction}
-          positionDetailId={positionDetailId}
-          routeKey={routeKey}
-          snapshot={snapshot}
-          snapshotState={snapshotQuery.isLoading ? "loading" : snapshotQuery.isError ? "error" : snapshot?.indexer.status ?? "loading"}
-          onRefresh={() => snapshotQuery.refetch()}
-        />
+        <SubmittedTransactionJournalContext.Provider value={recordSubmittedTransaction}>
+          <ContentView
+            key={walletSessionKey}
+            environmentKey={environmentKey}
+            actionPoolId={actionPoolId}
+            liquiditySection={liquiditySection}
+            poolDetailId={poolDetailId}
+            portfolioAction={portfolioAction}
+            positionDetailId={positionDetailId}
+            routeKey={routeKey}
+            snapshot={snapshot}
+            snapshotState={snapshotQuery.isLoading ? "loading" : snapshotQuery.isError ? "error" : snapshot?.indexer.status ?? "loading"}
+            onRefresh={() => snapshotQuery.refetch()}
+          />
+        </SubmittedTransactionJournalContext.Provider>
       </section>
     </main>
   );
@@ -322,9 +457,7 @@ function BrandLockup({ compact = false }: { compact?: boolean }) {
   );
 }
 
-function LandingView({ networkName, snapshot }: { networkName: string; snapshot: AppSnapshot | undefined }) {
-  const poolCount = snapshot?.indexer.pairCount;
-
+function LandingView(_: { networkName: string; snapshot: AppSnapshot | undefined }) {
   return (
     <main className="landing-shell">
       <header className="landing-header">
@@ -340,46 +473,42 @@ function LandingView({ networkName, snapshot }: { networkName: string; snapshot:
       </header>
 
       <section className="landing-hero" aria-labelledby="landing-title">
-        <p className="eyebrow">The featherweight DEX · Built for Robinhood Chain</p>
-        <h1 id="landing-title">Weightless<br />liquidity.</h1>
-        <p>Concentrated DLMM liquidity with dynamic fees that rise when markets move. Engineered without the weight.</p>
-        <div className="hero-actions">
-          <a className="primary-button" href="#/swap">Launch app</a>
-          {brandLinks.filter((link) => link.label === "Docs").map((link) => (
-            <a className="secondary-button" href={link.href} key={link.label} rel="noreferrer" target="_blank">Read the docs</a>
-          ))}
+        <div className="hero-copy">
+          <p className="eyebrow">Built for Robinhood Chain</p>
+          <h1 id="landing-title">Weightless liquidity.</h1>
+          <p>Trade and deploy concentrated liquidity through a DLMM with dynamic fees built for fast-moving markets.</p>
+          <div className="hero-actions">
+            <a className="primary-button" href="#/swap">Launch app</a>
+            <a className="hero-text-link" href="#/pools">Explore pools <span aria-hidden="true">↗</span></a>
+          </div>
         </div>
-        <dl className="landing-stats" aria-label="Protocol overview">
-          <div><dt>Network</dt><dd>{networkName}</dd></div>
-          <div><dt>Indexed pools</dt><dd>{poolCount ?? "—"}</dd></div>
-          <div><dt>Liquidity model</dt><dd>DLMM</dd></div>
-          <div><dt>LP fees</dt><dd className="positive">Dynamic</dd></div>
-        </dl>
+
+        <LiquidityBookSimulation />
       </section>
 
-      <section className="landing-pillars" aria-label="Product pillars">
-        <article>
-          <BinGlyph mode="spot" />
-          <h2>Liquidity in bins</h2>
-          <p>Place capital exactly where trading happens. Zero slippage inside the active bin; nothing wasted outside your range.</p>
-        </article>
-        <article>
-          <p className="fee-surge">0.20% → <span>2.41%</span></p>
-          <h2>Fees that surge with volatility</h2>
-          <p>Dynamic fees climb when price moves fast, paying LPs for the risk they take and settling back when it is quiet.</p>
-        </article>
-        <article>
-          <div className="chain-glyph"><span /></div>
-          <h2>Built for Robinhood Chain</h2>
-          <p>Built for fast finality, small network fees, and a first-class onchain trading experience.</p>
-        </article>
+      <section className="landing-pillars" aria-labelledby="liquidity-title">
+        <div className="pillar-intro">
+          <h2 id="liquidity-title">Capital that works where the market moves.</h2>
+          <p>Liquidity Book places capital into discrete price bins, giving LPs precise control without adding complexity for traders.</p>
+        </div>
+        <div className="pillar-list">
+          <article>
+            <div><h3>Concentrated by design</h3><p>Choose the range. Keep capital close to active trading.</p></div>
+          </article>
+          <article>
+            <div><h3>Fees respond to volatility</h3><p>Dynamic fees increase when markets move and normalize as activity settles.</p></div>
+          </article>
+          <article>
+            <div><h3>Execution stays lightweight</h3><p>Fast finality and low network costs keep every position practical to manage.</p></div>
+          </article>
+        </div>
       </section>
 
       <section className="strategy-band">
         <div>
           <p className="eyebrow">For liquidity providers</p>
           <h2>Three strategies. One slider.</h2>
-          <p>Spot, Curve, or Bid-Ask — shape liquidity to your view, set a range, done.</p>
+          <p>Choose Spot, Curve, or Bid-Ask. Shape the range to match your market view.</p>
         </div>
         <div className="strategy-tiles" aria-label="Liquidity strategies">
           <div className="active"><BinGlyph mode="spot" /><span>Spot</span></div>
@@ -393,10 +522,156 @@ function LandingView({ networkName, snapshot }: { networkName: string; snapshot:
         <nav aria-label="Project links">
           {brandLinks.map((link) => <a href={link.href} key={link.label} rel="noreferrer" target="_blank">{link.label}</a>)}
         </nav>
-        <span>engineered on robinhood chain · 2026</span>
+        <span>Engineered on Robinhood Chain, 2026</span>
       </footer>
     </main>
   );
+}
+
+interface SimulatedLiquidityBin {
+  capacity: number;
+  reserveX: number;
+  reserveY: number;
+}
+
+interface SimulatedLiquidityState {
+  activeIndex: number;
+  bins: SimulatedLiquidityBin[];
+  crossingsRemaining: number;
+  direction: -1 | 1;
+}
+
+const simulationBinHeights = [
+  12, 15, 18, 22, 27, 33, 40, 48, 58, 68, 78, 88, 96, 100, 96, 91,
+  86, 80, 73, 65, 57, 49, 42, 36, 31, 27, 23, 20, 17, 15, 13
+];
+const simulationCenterIndex = 15;
+const simulationCenterBinId = 8_388_608;
+const simulationBinStep = 10;
+const simulationBinPitch = 27;
+
+function LiquidityBookSimulation() {
+  const [simulation, setSimulation] = useState<SimulatedLiquidityState>(createLiquiditySimulation);
+
+  useEffect(() => {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return undefined;
+    const interval = window.setInterval(() => setSimulation((current) => advanceLiquiditySimulation(current)), 620);
+    return () => window.clearInterval(interval);
+  }, []);
+
+  const activeBinId = simulationCenterBinId + simulation.activeIndex - simulationCenterIndex;
+  const currentPrice = Math.pow(1 + simulationBinStep / 10_000, activeBinId - simulationCenterBinId);
+  const activeBin = simulation.bins[simulation.activeIndex];
+  const activeTotal = Math.max(activeBin.reserveX + activeBin.reserveY, 0.001);
+  const activeXShare = Math.round((activeBin.reserveX / activeTotal) * 100);
+  const activeYShare = 100 - activeXShare;
+
+  return (
+    <aside className="hero-market" aria-label="Illustrative WNATIVE and USDC Liquidity Book market simulation">
+      <div className="hero-market-head">
+        <span>Bin liquidity simulation</span>
+        <span className="market-state">Illustrative</span>
+      </div>
+      <div className="hero-pair">
+        <span>WNATIVE / USDC</span>
+        <strong>{simulationBinStep} bps per bin</strong>
+      </div>
+      <div className="market-price">
+        <span>Current bin price</span>
+        <strong>{currentPrice.toFixed(4)}</strong>
+        <small>USDC per WNATIVE</small>
+      </div>
+      <div className="hero-bin-field" aria-label="The active bin converts one token reserve into the other, then moves when its output reserve is depleted">
+        <div className="hero-bin-focus" aria-hidden="true"><span>Active</span></div>
+        <div
+          className="hero-bin-track"
+          style={{ transform: `translate3d(-${simulation.activeIndex * simulationBinPitch + 11}px, 0, 0)` }}
+        >
+          {simulation.bins.map((bin, index) => {
+            const total = Math.max(bin.reserveX + bin.reserveY, 0.001);
+            return (
+              <i className={index === simulation.activeIndex ? "active" : undefined} key={index} style={{ height: `${simulationBinHeights[index]}%` }}>
+                <span className="bin-reserve-x" style={{ height: `${(bin.reserveX / total) * 100}%` }} />
+                <span className="bin-reserve-y" style={{ height: `${(bin.reserveY / total) * 100}%` }} />
+              </i>
+            );
+          })}
+        </div>
+      </div>
+      <div className="bin-legend" aria-hidden="true"><span>WNATIVE</span><span>USDC</span></div>
+      <dl className="hero-market-data">
+        <div><dt>Active composition</dt><dd>{activeXShare}% / {activeYShare}%</dd></div>
+        <div><dt>Price step</dt><dd>{simulationBinStep} bps</dd></div>
+        <div><dt>Active bin</dt><dd>{activeBinId}</dd></div>
+        <div><dt>Trade pressure</dt><dd>{simulation.direction > 0 ? "Buying WNATIVE" : "Selling WNATIVE"}</dd></div>
+      </dl>
+      <a className="hero-market-link" href="#/swap">Open swap <span aria-hidden="true">↗</span></a>
+    </aside>
+  );
+}
+
+function createLiquiditySimulation(): SimulatedLiquidityState {
+  return {
+    activeIndex: simulationCenterIndex,
+    crossingsRemaining: 3,
+    direction: 1,
+    bins: simulationBinHeights.map((capacity, index) => ({
+      capacity,
+      reserveX: index > simulationCenterIndex ? capacity : index === simulationCenterIndex ? capacity / 2 : 0,
+      reserveY: index < simulationCenterIndex ? capacity : index === simulationCenterIndex ? capacity / 2 : 0
+    }))
+  };
+}
+
+function advanceLiquiditySimulation(current: SimulatedLiquidityState): SimulatedLiquidityState {
+  let direction = current.direction;
+  let activeIndex = current.activeIndex;
+  let crossingsRemaining = current.crossingsRemaining;
+  const bins = current.bins.map((bin) => ({ ...bin }));
+  let activeBin = bins[activeIndex];
+
+  const convertedShare = direction === 1
+    ? activeBin.reserveY / activeBin.capacity
+    : activeBin.reserveX / activeBin.capacity;
+
+  if (crossingsRemaining === 0 && convertedShare >= 0.42) {
+    direction = direction === 1 ? -1 : 1;
+    crossingsRemaining = 2 + Math.floor(Math.random() * 3);
+  }
+
+  if (activeIndex <= 2) {
+    direction = 1;
+    crossingsRemaining = 3;
+  }
+  if (activeIndex >= bins.length - 3) {
+    direction = -1;
+    crossingsRemaining = 3;
+  }
+
+  const outputReserve = direction === 1 ? activeBin.reserveX : activeBin.reserveY;
+
+  if (outputReserve <= 0.5) {
+    const nextIndex = activeIndex + direction;
+    if (nextIndex >= 0 && nextIndex < bins.length) {
+      activeIndex = nextIndex;
+      crossingsRemaining = Math.max(0, crossingsRemaining - 1);
+    }
+    activeBin = bins[activeIndex];
+  }
+
+  const availableOutput = direction === 1 ? activeBin.reserveX : activeBin.reserveY;
+  const amount = Math.min(availableOutput, activeBin.capacity * (0.12 + Math.random() * 0.07));
+  const binPrice = Math.pow(1 + simulationBinStep / 10_000, activeIndex - simulationCenterIndex);
+
+  if (direction === 1) {
+    activeBin.reserveX = Math.max(0, activeBin.reserveX - amount);
+    activeBin.reserveY += amount * binPrice;
+  } else {
+    activeBin.reserveY = Math.max(0, activeBin.reserveY - amount);
+    activeBin.reserveX += amount / binPrice;
+  }
+
+  return { activeIndex, bins, crossingsRemaining, direction };
 }
 
 function BinGlyph({ mode }: { mode: "spot" | "curve" | "bidask" }) {
@@ -429,29 +704,89 @@ function EnvironmentSwitch({
 }
 
 function WalletPanel({ activeChain }: { activeChain: Chain }) {
+  const [localFailure, setLocalFailure] = useState<WalletFailure | null>(null);
+  const [discoverySettled, setDiscoverySettled] = useState(false);
   const account = useAccount();
   const activeWalletChainId = useChainId();
-  const { connect, connectors, error: connectError, isPending } = useConnect();
+  const { connect, connectors, error: connectError, isPending, reset: resetConnect } = useConnect();
   const { disconnect } = useDisconnect();
-  const { switchChain, isPending: isSwitching } = useSwitchChain();
-  const injectedConnector = connectors[0];
+  const { error: switchError, switchChain, isPending: isSwitching, reset: resetSwitch } = useSwitchChain();
+  const discoveredConnectors = connectors.filter((connector) => connector.id !== "injected");
+  const supportedDiscoveredConnectors = discoveredConnectors.filter(
+    (connector, index, all) => SUPPORTED_WALLET_RDNS.has(connector.id) && all.findIndex((candidate) => candidate.id === connector.id) === index
+  );
+  const availableConnectors = discoveredConnectors.length > 0 ? supportedDiscoveredConnectors : connectors;
+  const injectedConnector = availableConnectors[0];
   const connected = account.status === "connected";
   const onWrongChain = connected && activeWalletChainId !== activeChain.id;
+  const unsupportedProviderFailure: WalletFailure | null =
+    discoveredConnectors.length > 0 && supportedDiscoveredConnectors.length === 0
+      ? { action: "No supported wallet was found. Enable MetaMask or Brave Wallet, then reload this page.", kind: "missing" }
+      : null;
+  const noProviderFailure: WalletFailure | null = discoverySettled && connectors.length === 0
+    ? { action: "No wallet provider was found. Enable MetaMask or Brave Wallet, then reload this page.", kind: "missing" }
+    : null;
+  const connectionFailure = localFailure ?? (connectError ? walletFailure(connectError, "connect") : unsupportedProviderFailure ?? noProviderFailure);
+  const switchingFailure = switchError ? walletFailure(switchError, "switch") : null;
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => setDiscoverySettled(true), 100);
+    return () => window.clearTimeout(timeout);
+  }, []);
+
+  const connectWith = async (connector: (typeof connectors)[number]) => {
+    resetConnect();
+    setLocalFailure(null);
+    const provider = await connector.getProvider().catch(() => undefined) as {
+      _metamask?: { isUnlocked?: () => Promise<boolean> };
+    } | undefined;
+    if (!provider) {
+      setLocalFailure({ action: "Install or enable an EIP-1193 wallet, then reload this page.", kind: "missing" });
+      return;
+    }
+    if (provider._metamask?.isUnlocked && !await provider._metamask.isUnlocked().catch(() => true)) {
+      setLocalFailure({ action: "Unlock the selected wallet, then connect again.", kind: "locked" });
+      return;
+    }
+    connect({ connector });
+  };
 
   if (!connected) {
     return (
-      <div className="wallet-cluster">
-        <button
-          className="primary-button"
-          data-testid="wallet-connect-button"
-          disabled={!injectedConnector || isPending}
-          onClick={() => injectedConnector && connect({ connector: injectedConnector })}
-          type="button"
-        >
-          {isPending ? <LoaderCircle className="spin" size={18} /> : <Wallet size={18} />}
-          <span>{injectedConnector ? "Connect" : "No wallet"}</span>
-        </button>
-        {connectError ? <span className="inline-error">{connectError.message}</span> : null}
+      <div className="wallet-cluster" data-testid="wallet-disconnected-state">
+        {availableConnectors.length > 1 ? (
+          <div className="wallet-provider-choices" data-testid="wallet-provider-choices" role="group" aria-label="Choose wallet provider">
+            {availableConnectors.map((connector) => (
+              <button
+                className="secondary-button"
+                data-provider-id={connector.id}
+                disabled={isPending}
+                key={connector.uid}
+                onClick={() => void connectWith(connector)}
+                type="button"
+              >
+                <Wallet size={18} />
+                <span>{isPending ? "Connecting" : connector.name}</span>
+              </button>
+            ))}
+          </div>
+        ) : (
+          <button
+            className="primary-button"
+            data-testid="wallet-connect-button"
+            disabled={!injectedConnector || isPending}
+            onClick={() => injectedConnector && void connectWith(injectedConnector)}
+            type="button"
+          >
+            {isPending ? <LoaderCircle className="spin" size={18} /> : <Wallet size={18} />}
+            <span>{injectedConnector ? "Connect" : "No wallet"}</span>
+          </button>
+        )}
+        {connectionFailure ? (
+          <span className="inline-error" data-testid="wallet-status" data-wallet-state={connectionFailure.kind} role="alert">
+            {connectionFailure.action}
+          </span>
+        ) : null}
       </div>
     );
   }
@@ -463,17 +798,25 @@ function WalletPanel({ activeChain }: { activeChain: Chain }) {
           className="warn-button"
           data-testid="wallet-switch-button"
           disabled={isSwitching}
-          onClick={() => switchChain({ chainId: activeChain.id })}
+          onClick={() => {
+            resetSwitch();
+            switchChain({ chainId: activeChain.id });
+          }}
           type="button"
         >
           {isSwitching ? <LoaderCircle className="spin" size={18} /> : <Network size={18} />}
-          <span>Switch</span>
+          <span>{isSwitching ? "Adding or switching" : "Switch"}</span>
         </button>
       ) : null}
       <button className="secondary-button" data-testid="wallet-account-button" onClick={() => disconnect()} type="button">
         <Wallet size={18} />
         <span>{formatCompactAddress(account.address)}</span>
       </button>
+      {onWrongChain ? (
+        <span className="wallet-network-state" data-testid="wallet-status" data-wallet-state={switchingFailure?.kind ?? "wrong-chain"} role={switchingFailure ? "alert" : "status"}>
+          {switchingFailure?.action ?? `Wallet is on chain ${activeWalletChainId}. Switch to ${activeChain.name} (${activeChain.id}); the wallet may ask to add it first.`}
+        </span>
+      ) : null}
     </div>
   );
 }
@@ -736,8 +1079,17 @@ function SwapView({
   const [approvalSimulationPending, setApprovalSimulationPending] = useState(false);
   const [swapSimulationError, setSwapSimulationError] = useState<string | null>(null);
   const [swapSimulationPending, setSwapSimulationPending] = useState(false);
+  const [gasReviewError, setGasReviewError] = useState<string | null>(null);
+  const [gasReview, setGasReview] = useState<ExactGasReview | null>(null);
+  const [approvalConfirmation, setApprovalConfirmation] = useState<{ confirmedAt: number; hash: Address } | null>(null);
+  const [approvalRefresh, setApprovalRefresh] = useState<ApprovalRefreshState | null>(null);
+  const approvalRefreshGeneration = useRef(0);
+  const swapOperationGeneration = useRef(0);
+  const approvalSubmitInFlight = useRef(false);
+  const swapSubmitInFlight = useRef(false);
   const [handledApprovalHash, setHandledApprovalHash] = useState<Address | null>(null);
   const [handledSwapHash, setHandledSwapHash] = useState<Address | null>(null);
+  const recordSubmittedTransaction = useContext(SubmittedTransactionJournalContext);
   const registry = registries[environmentKey];
   const localnetRegistry = isLocalnetRegistry(registry) ? registry : null;
   const account = useAccount();
@@ -746,6 +1098,7 @@ function SwapView({
   const swapWrite = useWriteContract();
   const approvalReceipt = useWaitForTransactionReceipt({ hash: approvalWrite.data });
   const swapReceipt = useWaitForTransactionReceipt({ hash: swapWrite.data });
+
   const selectedPool = buildPoolDescriptor({
     action: "swap",
     localnetRegistry,
@@ -788,11 +1141,47 @@ function SwapView({
     walletChainId: activeWalletChainId
   };
   const swapContextFingerprint = swapExecutionContextFingerprint(swapExecutionContext);
+  const swapOperationContext = useRef(swapContextFingerprint);
+  if (swapOperationContext.current !== swapContextFingerprint) {
+    swapOperationContext.current = swapContextFingerprint;
+    swapOperationGeneration.current += 1;
+    approvalSubmitInFlight.current = false;
+    swapSubmitInFlight.current = false;
+  }
   const latestSwapContextFingerprint = useRef(swapContextFingerprint);
   latestSwapContextFingerprint.current = swapContextFingerprint;
-  const canQuote = swapMarketReady && parsedAmount !== null && parsedAmount > 0n;
+  const approvalIntentFingerprint = swapExecutionContextFingerprint({
+    ...swapExecutionContext,
+    activeId: null,
+    reserveX: null,
+    reserveY: null,
+    updatedAtBlock: null
+  });
+  const latestApprovalIntentFingerprint = useRef(approvalIntentFingerprint);
+  latestApprovalIntentFingerprint.current = approvalIntentFingerprint;
+
+  useEffect(() => {
+    return () => {
+      swapOperationGeneration.current += 1;
+      approvalSubmitInFlight.current = false;
+      swapSubmitInFlight.current = false;
+    };
+  }, []);
+
+  const approvalRefreshReady =
+    approvalConfirmation === null ||
+    (approvalRefresh?.status === "ready" &&
+      approvalRefresh.hash === approvalConfirmation.hash &&
+      approvalRefresh.intentFingerprint === approvalIntentFingerprint);
+  const approvalConfirmationKey =
+    approvalConfirmation === null
+      ? "pre-approval"
+      : approvalRefreshReady
+        ? `${approvalConfirmation.hash}:${swapContextFingerprint}`
+        : `${approvalConfirmation.hash}:refreshing`;
+  const canQuote = approvalRefreshReady && swapMarketReady && parsedAmount !== null && parsedAmount > 0n;
   const quoteQuery = useQuery({
-    queryKey: ["swapQuote", swapContextFingerprint],
+    queryKey: ["swapQuote", swapContextFingerprint, approvalConfirmationKey],
     queryFn: async () => {
       if (!swapMarketReady || tokenInAddress === null || tokenOutAddress === null || parsedAmount === null) {
         throw new Error("Swap quote is not available");
@@ -801,8 +1190,10 @@ function SwapView({
       const quote = await getBestExactInQuote(publicClient, registry, tokenInAddress, tokenOutAddress, parsedAmount);
 
       return {
+        approvalHash: approvalConfirmation?.hash ?? null,
         contextFingerprint: swapContextFingerprint,
-        quote: serializeExactInQuote(quote)
+        quote: serializeExactInQuote(quote),
+        reviewedAt: Math.max(Date.now(), (approvalConfirmation?.confirmedAt ?? 0) + 1)
       };
     },
     enabled: canQuote,
@@ -811,13 +1202,13 @@ function SwapView({
     retry: false
   });
   const walletQuery = useQuery({
-    queryKey: ["swapWallet", registry.chainId, tokenInAddress, account.address],
+    queryKey: ["swapWallet", registry.chainId, tokenInAddress, account.address, approvalConfirmationKey],
     queryFn: async () => {
       if (tokenInAddress === null || !account.address) {
         throw new Error("Wallet reads are not available");
       }
 
-      const [balance, allowance] = await Promise.all([
+      const [balance, allowance, nativeBalance] = await Promise.all([
         publicClient.readContract({
           address: tokenInAddress,
           abi: erc20Abi,
@@ -829,30 +1220,42 @@ function SwapView({
           abi: erc20Abi,
           functionName: "allowance",
           args: [account.address, registry.contracts.lbRouter]
-        })
+        }),
+        publicClient.getBalance({ address: account.address })
       ]);
 
-      return { balance: balance.toString(), allowance: allowance.toString() };
+      return {
+        approvalHash: approvalConfirmation?.hash ?? null,
+        balance: balance.toString(),
+        allowance: allowance.toString(),
+        nativeBalance: nativeBalance.toString()
+      };
     },
-    enabled: connected && swapMarketReady && tokenInAddress !== null,
-    refetchInterval: connected && swapMarketReady ? 10_000 : false,
+    enabled: approvalRefreshReady && connected && swapMarketReady && tokenInAddress !== null,
+    refetchInterval: approvalRefreshReady && connected && swapMarketReady ? 10_000 : false,
     retry: false
   });
   const contextualQuote = quoteQuery.data;
-  const quoteContextMatches = contextualQuote?.contextFingerprint === swapContextFingerprint;
+  const quoteContextMatches =
+    approvalRefreshReady &&
+    swapMarketReady &&
+    contextualQuote?.contextFingerprint === swapContextFingerprint &&
+    contextualQuote.approvalHash === (approvalConfirmation?.hash ?? null);
   const quote = quoteContextMatches ? contextualQuote?.quote : undefined;
   const exactQuote = quote ? deserializeExactInQuote(quote) : null;
   const amountOut = exactQuote ? getQuoteAmountOut(exactQuote) : null;
   const amountOutMin = exactQuote && amountOut !== null && slippageBps !== null ? calculateAmountOutMin(amountOut, slippageBps) : null;
   const routeSteps = exactQuote ? quoteToRouteStepViews(exactQuote, tokenIn, tokenOut) : [];
-  const quoteUpdatedAt = quote !== undefined && quoteContextMatches ? quoteQuery.dataUpdatedAt : null;
+  const quoteUpdatedAt = quote !== undefined && quoteContextMatches ? contextualQuote.reviewedAt : null;
   const swapQuoteIdentity = quote !== undefined && quoteUpdatedAt !== null ? `${swapContextFingerprint}:${quoteUpdatedAt}` : null;
   const latestSwapQuoteIdentity = useRef(swapQuoteIdentity);
   latestSwapQuoteIdentity.current = swapQuoteIdentity;
   const priceImpactBps = exactQuote ? estimatePriceImpactBps(exactQuote) ?? 0n : null;
   const walletBalance = walletQuery.data ? BigInt(walletQuery.data.balance) : null;
   const walletAllowance = walletQuery.data ? BigInt(walletQuery.data.allowance) : null;
-  const walletReadsReady = walletBalance !== null && walletAllowance !== null;
+  const nativeBalance = walletQuery.data ? BigInt(walletQuery.data.nativeBalance) : null;
+  const walletReadsMatchApproval = walletQuery.data?.approvalHash === (approvalConfirmation?.hash ?? null);
+  const walletReadsReady = walletReadsMatchApproval && walletBalance !== null && walletAllowance !== null && nativeBalance !== null;
   const walletError = walletQuery.error ? `Wallet read failed: ${getWriteError(walletQuery.error) ?? "balance and allowance unavailable"}` : null;
   const walletReadsPending = connected && swapMarketReady && tokenInAddress !== null && !walletReadsReady && walletError === null;
   const needsApproval = parsedAmount !== null && walletAllowance !== null && walletAllowance < parsedAmount;
@@ -861,12 +1264,37 @@ function SwapView({
   const feeLabel = exactQuote ? formatBps(getTotalFeeBps(exactQuote)) : "n/a";
   const priceImpactLabel = priceImpactBps !== null ? formatBps(priceImpactBps) : "n/a";
   const quoteFreshnessLabel = formatQuoteFreshness(quoteUpdatedAt, safetyNow);
+  const approvalSuccess = approvalReceipt.data?.status === "success";
+  const approvalReverted = approvalReceipt.data?.status === "reverted" || isRevertedReceiptError(approvalReceipt.error);
+  const swapSuccess = swapReceipt.data?.status === "success";
+  const swapReverted = swapReceipt.data?.status === "reverted" || isRevertedReceiptError(swapReceipt.error);
   const quoteRequestMismatch =
     exactQuote !== null &&
     (tokenInAddress === null ||
       tokenOutAddress === null ||
       parsedAmount === null ||
       !quoteMatchesSwapRequest(exactQuote, tokenInAddress, tokenOutAddress, parsedAmount));
+  const approvalReceiptAwaitingRefresh =
+    approvalSuccess && approvalWrite.data !== undefined && approvalWrite.data !== approvalConfirmation?.hash;
+  const postApprovalReviewPending =
+    approvalReceiptAwaitingRefresh ||
+    (approvalConfirmation !== null &&
+      (!approvalRefreshReady || quoteUpdatedAt === null || quoteUpdatedAt <= approvalConfirmation.confirmedAt || !walletReadsReady));
+  const postApprovalRefreshError =
+    approvalConfirmation === null
+      ? null
+      : approvalRefresh?.error ??
+        (approvalRefresh?.intentFingerprint !== approvalIntentFingerprint
+          ? "Swap context changed after approval confirmation; return to the reviewed settings and refresh again"
+          : null) ??
+        walletError ??
+        (quoteQuery.error
+          ? `Post-approval quote refresh failed: ${getWriteError(quoteQuery.error) ?? "quote unavailable"}`
+          : null);
+  const approvalRefreshRetryRequired =
+    approvalConfirmation !== null &&
+    !approvalRefreshReady &&
+    (approvalRefresh?.status === "error" || approvalRefresh?.intentFingerprint !== approvalIntentFingerprint);
   const swapSafety = evaluateTransactionSafety(
     {
       connected,
@@ -906,6 +1334,8 @@ function SwapView({
                     ? "Quoted route does not match the current token pair and amount"
                   : !swapMarketReady
                     ? swapMarketError
+                    : postApprovalReviewPending
+                      ? postApprovalRefreshError ?? "Refreshing balance, allowance, and quote after approval"
                     : null;
   const canApprove =
     swapMarketReady &&
@@ -937,21 +1367,82 @@ function SwapView({
     !swapSafety.blocked &&
     swapSimulationError === null &&
     !swapSimulationPending &&
+    !postApprovalReviewPending &&
     !needsApproval &&
     !insufficientBalance &&
     !swapWrite.isPending &&
     !swapReceipt.isLoading;
-  const approvalSuccess = approvalReceipt.data?.status === "success";
-  const approvalReverted = approvalReceipt.data?.status === "reverted" || isRevertedReceiptError(approvalReceipt.error);
-  const swapSuccess = swapReceipt.data?.status === "success";
-  const swapReverted = swapReceipt.data?.status === "reverted" || isRevertedReceiptError(swapReceipt.error);
   const actionError =
     approvalSimulationError ??
     swapSimulationError ??
+    gasReviewError ??
     getWriteError(approvalWrite.error) ??
     getWriteError(swapWrite.error) ??
     getWriteError(approvalReceipt.error) ??
     getWriteError(swapReceipt.error);
+  const startApprovalRefresh = (hash: Address, confirmedAt: number, intentFingerprint: string) => {
+    const generation = approvalRefreshGeneration.current + 1;
+    approvalRefreshGeneration.current = generation;
+    setApprovalRefresh({
+      confirmedAt,
+      error: null,
+      generation,
+      hash,
+      intentFingerprint,
+      refreshedContextFingerprint: null,
+      snapshotIdentity: null,
+      status: "refreshing"
+    });
+    void onRefresh()
+      .then((result) => {
+        setApprovalRefresh((current) => {
+          if (
+            current?.hash !== hash ||
+            current.intentFingerprint !== intentFingerprint ||
+            current.generation !== generation ||
+            current.status !== "refreshing"
+          ) return current;
+          if (latestApprovalIntentFingerprint.current !== intentFingerprint) {
+            return {
+              ...current,
+              error: "Swap context changed while refreshing the selected market after approval; restore or review the settings, then refresh again",
+              status: "error"
+            };
+          }
+          if (result.isError || result.data === undefined) {
+            return {
+              ...current,
+              error: `Selected-market refresh failed after approval: ${getWriteError(result.error) ?? "snapshot unavailable"}`,
+              status: "error"
+            };
+          }
+
+          return {
+            ...current,
+            snapshotIdentity: swapSnapshotIdentity(result.data, primaryPool?.id ?? selectedPoolId),
+            status: "awaiting-render"
+          };
+        });
+      })
+      .catch((error) => {
+        setApprovalRefresh((current) =>
+          current?.hash === hash &&
+          current.intentFingerprint === intentFingerprint &&
+          current.generation === generation &&
+          current.status === "refreshing"
+            ? {
+                ...current,
+                error: `Selected-market refresh failed after approval: ${getWriteError(error) ?? "snapshot unavailable"}`,
+                status: "error"
+              }
+            : current
+        );
+      });
+  };
+  const retryApprovalRefresh = () => {
+    if (approvalConfirmation === null) return;
+    startApprovalRefresh(approvalConfirmation.hash, approvalConfirmation.confirmedAt, approvalIntentFingerprint);
+  };
 
   useEffect(() => {
     const interval = window.setInterval(() => setSafetyNow(Date.now()), 1_000);
@@ -962,12 +1453,17 @@ function SwapView({
   useEffect(() => {
     setApprovalSimulationError(null);
     setSwapSimulationError(null);
+    setGasReviewError(null);
   }, [swapContextFingerprint, swapQuoteIdentity]);
 
   useEffect(() => {
     if (approvalSuccess && approvalWrite.data && approvalWrite.data !== handledApprovalHash) {
-      void walletQuery.refetch();
-      setHandledApprovalHash(approvalWrite.data);
+      const hash = approvalWrite.data;
+      const confirmedAt = Date.now();
+      const intentFingerprint = approvalIntentFingerprint;
+      setApprovalConfirmation({ confirmedAt, hash });
+      startApprovalRefresh(hash, confirmedAt, intentFingerprint);
+      setHandledApprovalHash(hash);
     }
 
     if (swapSuccess && swapWrite.data && swapWrite.data !== handledSwapHash) {
@@ -977,20 +1473,71 @@ function SwapView({
     }
   }, [
     approvalSuccess,
+    approvalIntentFingerprint,
     approvalWrite.data,
     handledApprovalHash,
     handledSwapHash,
     onRefresh,
+    primaryPool?.id,
+    selectedPoolId,
     swapSuccess,
     swapWrite.data,
     walletQuery
   ]);
 
+  useEffect(() => {
+    if (approvalRefresh?.status !== "awaiting-render") return;
+    if (approvalRefresh.intentFingerprint !== approvalIntentFingerprint) {
+      setApprovalRefresh((current) =>
+        current?.status === "awaiting-render"
+          ? {
+              ...current,
+              error: "Swap context changed while refreshing the selected market after approval; review and try again",
+              status: "error"
+            }
+          : current
+      );
+      return;
+    }
+    if (swapSnapshotIdentity(snapshot, primaryPool?.id ?? selectedPoolId) !== approvalRefresh.snapshotIdentity) return;
+    if (!swapMarketReady) {
+      setApprovalRefresh((current) =>
+        current?.status === "awaiting-render"
+          ? {
+              ...current,
+              error: `Selected market is unsafe after approval refresh: ${swapMarketError ?? "market unavailable"}`,
+              status: "error"
+            }
+          : current
+      );
+      return;
+    }
+
+    setApprovalRefresh((current) =>
+      current?.status === "awaiting-render"
+        ? { ...current, refreshedContextFingerprint: swapContextFingerprint, status: "ready" }
+        : current
+    );
+  }, [
+    approvalIntentFingerprint,
+    approvalRefresh,
+    primaryPool?.id,
+    selectedPoolId,
+    snapshot,
+    swapContextFingerprint,
+    swapMarketError,
+    swapMarketReady
+  ]);
+
   const handleApprove = async () => {
-    if (!canApprove || tokenInAddress === null || !account.address || parsedAmount === null) return;
+    if (approvalSubmitInFlight.current || !canApprove || tokenInAddress === null || !account.address || parsedAmount === null) return;
+    approvalSubmitInFlight.current = true;
+    setGasReviewError(null);
+    try {
 
     const simulatedContextFingerprint = swapContextFingerprint;
     const simulatedQuoteIdentity = swapQuoteIdentity;
+    const operationGeneration = swapOperationGeneration.current;
     const args = [registry.contracts.lbRouter, parsedAmount] as const;
     const simulated = await runPreSubmitSimulation(
       () =>
@@ -1009,25 +1556,58 @@ function SwapView({
     if (
       latestSwapContextFingerprint.current !== simulatedContextFingerprint ||
       latestSwapQuoteIdentity.current !== simulatedQuoteIdentity ||
+      swapOperationGeneration.current !== operationGeneration ||
       quoteIsStale(quoteUpdatedAt, Date.now())
     ) {
       setApprovalSimulationError("Execution context changed during simulation; refresh and try again");
       return;
     }
-
-    approvalWrite.writeContract({
-      address: tokenInAddress,
-      abi: erc20Abi,
-      functionName: "approve",
-      args
+    const gasApproved = await reviewExactGas({
+      action: `${tokenSymbol(tokenIn)} approval`,
+      currentReview: gasReview,
+      estimateGas: () => publicClient.estimateContractGas(simulated.request),
+      executionFingerprint: simulatedContextFingerprint,
+      getBalance: () => publicClient.getBalance({ address: account.address }),
+      getGasPrice: () => publicClient.getGasPrice(),
+      isCurrent: () => swapOperationGeneration.current === operationGeneration,
+      setError: setGasReviewError,
+      setReview: setGasReview
     });
+    if (!gasApproved || swapOperationGeneration.current !== operationGeneration) return;
+    const submittedContext = {
+      account: account.address,
+      calldataFingerprint: keccak256(encodeFunctionData({ abi: erc20Abi, functionName: "approve", args })),
+      chainId: activeWalletChainId,
+      deploymentEpoch: deploymentEpoch(registry),
+      environment: environmentKey,
+      executionFingerprint: simulatedContextFingerprint,
+      intent: "approval" as const,
+      providerId: account.connector?.id ?? "unknown",
+      providerUid: account.connector?.uid ?? "unknown",
+      submittedAt: Date.now(),
+      target: tokenInAddress,
+      value: 0n
+    };
+    try {
+      const hash = await approvalWrite.writeContractAsync(simulated.request);
+      recordSubmittedTransaction?.({ ...submittedContext, hash });
+    } catch {
+      // The wagmi mutation retains the rejection for the originating mounted session.
+    }
+    } finally {
+      approvalSubmitInFlight.current = false;
+    }
   };
 
   const handleSwap = async () => {
-    if (!canSwap || !account.address || !exactQuote || parsedAmount === null || amountOutMin === null || deadlineMinutes === null) return;
+    if (swapSubmitInFlight.current || !canSwap || !account.address || !exactQuote || parsedAmount === null || amountOutMin === null || deadlineMinutes === null) return;
+    swapSubmitInFlight.current = true;
+    setGasReviewError(null);
+    try {
 
     const simulatedContextFingerprint = swapContextFingerprint;
     const simulatedQuoteIdentity = swapQuoteIdentity;
+    const operationGeneration = swapOperationGeneration.current;
     const deadline = deadlineFromNow(deadlineMinutes);
     const args = [
       parsedAmount,
@@ -1053,18 +1633,47 @@ function SwapView({
     if (
       latestSwapContextFingerprint.current !== simulatedContextFingerprint ||
       latestSwapQuoteIdentity.current !== simulatedQuoteIdentity ||
+      swapOperationGeneration.current !== operationGeneration ||
       quoteIsStale(quoteUpdatedAt, Date.now())
     ) {
       setSwapSimulationError("Execution context changed during simulation; refresh the quote and try again");
       return;
     }
-
-    swapWrite.writeContract({
-      address: registry.contracts.lbRouter,
-      abi: lbRouterAbi,
-      functionName: "swapExactTokensForTokens",
-      args
+    const gasApproved = await reviewExactGas({
+      action: "swap",
+      currentReview: gasReview,
+      estimateGas: () => publicClient.estimateContractGas(simulated.request),
+      executionFingerprint: simulatedContextFingerprint,
+      getBalance: () => publicClient.getBalance({ address: account.address }),
+      getGasPrice: () => publicClient.getGasPrice(),
+      isCurrent: () => swapOperationGeneration.current === operationGeneration,
+      setError: setGasReviewError,
+      setReview: setGasReview
     });
+    if (!gasApproved || swapOperationGeneration.current !== operationGeneration) return;
+    const submittedContext = {
+      account: account.address,
+      calldataFingerprint: keccak256(encodeFunctionData({ abi: lbRouterAbi, functionName: "swapExactTokensForTokens", args })),
+      chainId: activeWalletChainId,
+      deploymentEpoch: deploymentEpoch(registry),
+      environment: environmentKey,
+      executionFingerprint: simulatedContextFingerprint,
+      intent: "swap" as const,
+      providerId: account.connector?.id ?? "unknown",
+      providerUid: account.connector?.uid ?? "unknown",
+      submittedAt: Date.now(),
+      target: registry.contracts.lbRouter,
+      value: 0n
+    };
+    try {
+      const hash = await swapWrite.writeContractAsync(simulated.request);
+      recordSubmittedTransaction?.({ ...submittedContext, hash });
+    } catch {
+      // The wagmi mutation retains the rejection for the originating mounted session.
+    }
+    } finally {
+      swapSubmitInFlight.current = false;
+    }
   };
 
   return (
@@ -1077,10 +1686,17 @@ function SwapView({
 
         <PoolSelect
           id="swap-pool"
-          label="Token pair (best V2.2 route)"
+          label="Selected market (Best V2.2 route)"
           onChange={onSelectedPoolChange}
           pools={poolOptions}
           selectedPoolId={selectedPoolId}
+        />
+
+        <SwapMarketRecovery
+          error={swapMarketError}
+          onRefresh={onRefresh}
+          pool={primaryPool}
+          readiness={selectedPool}
         />
 
         <label className="field-label" htmlFor="swap-amount">
@@ -1122,7 +1738,10 @@ function SwapView({
           <MiniMetric label="Minimum received" value={amountOutMin !== null ? formatTokenAmount(amountOutMin.toString(), tokenOut) : "n/a"} />
           <MiniMetric label="Quote freshness" value={quoteFreshnessLabel} />
           <MiniMetric data-testid="swap-allowance-value" label="Allowance" value={walletQuery.data ? formatTokenAmount(walletQuery.data.allowance, tokenIn) : "n/a"} />
+          <MiniMetric data-testid="swap-native-balance" label="ETH for gas" value={nativeBalance !== null ? `${formatUnits(nativeBalance, 18)} ETH` : connected ? "loading" : "connect wallet"} />
         </div>
+
+        <GasReview review={gasReview} />
 
         <ApprovalDetails
           asset={tokenSymbol(tokenIn)}
@@ -1155,6 +1774,7 @@ function SwapView({
                 onWrongChain,
                 needsApproval,
                 insufficientBalance,
+                insufficientGas: actionError?.startsWith("Insufficient ETH for gas") === true,
                 invalidInput: inputError !== null,
                 quoteLoading: quoteQuery.isFetching,
                 quoteReady: quote !== undefined,
@@ -1164,6 +1784,12 @@ function SwapView({
               })}
             </span>
           </button>
+          {approvalRefreshRetryRequired ? (
+            <button className="secondary-button wide" data-testid="swap-approval-refresh-button" onClick={retryApprovalRefresh} type="button">
+              <RefreshCw size={18} />
+              <span>Refresh after approval</span>
+            </button>
+          ) : null}
         </div>
 
         <SwapStateRows
@@ -1173,6 +1799,7 @@ function SwapView({
           approvalReverted={approvalReverted}
           approvalSuccess={approvalSuccess}
           insufficientBalance={insufficientBalance}
+          insufficientGas={actionError?.startsWith("Insufficient ETH for gas") === true}
           quoteError={quoteQuery.error}
           swapHash={swapWrite.data}
           swapReverted={swapReverted}
@@ -1188,9 +1815,44 @@ function SwapView({
         quote={quote}
         priceImpactLabel={priceImpactLabel}
         routeSteps={routeSteps}
+        selectedPool={selectedPool}
+        swapMarketError={swapMarketError}
+        swapMarketReady={swapMarketReady}
         tokenIn={tokenIn}
         tokenOut={tokenOut}
       />
+    </div>
+  );
+}
+
+function SwapMarketRecovery({
+  error,
+  onRefresh,
+  pool,
+  readiness
+}: {
+  error: string | null;
+  onRefresh: SnapshotRefetch;
+  pool: PoolRow | null;
+  readiness: SelectedPoolDescriptor;
+}) {
+  if (readiness.ready) return null;
+
+  const emptyPool = readiness.blockers.some((blocker) => blocker.code === "empty-pool");
+
+  return (
+    <div className="state-row warning" data-testid="swap-market-recovery" role="status">
+      <AlertTriangle size={16} />
+      <span>{error ?? "Selected market is not safe for swaps"}</span>
+      {emptyPool && pool !== null ? (
+        <a className="secondary-button" href={`#/liquidity/add/${encodeURIComponent(pool.id)}`}>
+          Create position
+        </a>
+      ) : (
+        <button className="secondary-button" onClick={() => void onRefresh()} type="button">
+          Refresh market data
+        </button>
+      )}
     </div>
   );
 }
@@ -1202,6 +1864,9 @@ function SwapDetailsCard({
   quote,
   priceImpactLabel,
   routeSteps,
+  selectedPool,
+  swapMarketError,
+  swapMarketReady,
   tokenIn,
   tokenOut
 }: {
@@ -1211,6 +1876,9 @@ function SwapDetailsCard({
   quote: SerializedExactInQuote | undefined;
   priceImpactLabel: string;
   routeSteps: RouteStepView[];
+  selectedPool: SelectedPoolDescriptor;
+  swapMarketError: string | null;
+  swapMarketReady: boolean;
   tokenIn: TokenMetadata | null;
   tokenOut: TokenMetadata | null;
 }) {
@@ -1218,7 +1886,10 @@ function SwapDetailsCard({
     <section className="info-panel">
       <div className="panel-heading">
         <span>Route</span>
-        <StatusBadge state={quote ? "ready" : primaryPool ? "loading" : "empty"} label={quote ? "best V2.2 route" : primaryPool ? "waiting" : "no market"} />
+        <StatusBadge
+          state={!swapMarketReady ? "unavailable" : quote ? "ready" : primaryPool ? "loading" : "empty"}
+          label={!swapMarketReady ? swapMarketError ?? "unavailable" : quote ? "Best V2.2 route" : primaryPool ? "waiting" : "no market"}
+        />
       </div>
 
       <div className="quote-grid">
@@ -1245,10 +1916,27 @@ function SwapDetailsCard({
           ))}
         </div>
       ) : (
-        <EmptyState state={primaryPool ? "loading" : "empty"} />
+        swapMarketReady ? <EmptyState state={primaryPool ? "loading" : "empty"} /> : <p className="state-row warning">{swapMarketError}</p>
       )}
 
       <dl className="contract-list">
+        <div>
+          <dt>Routing mode</dt>
+          <dd>Best V2.2 route</dd>
+        </div>
+        <div>
+          <dt>Selected market</dt>
+          <dd
+            data-reserve-x={selectedPool.reserveX?.toString() ?? "unavailable"}
+            data-testid="swap-selected-market-identity"
+            data-token-x={selectedPool.tokenXAddress ?? "unavailable"}
+            data-token-y={selectedPool.tokenYAddress ?? "unavailable"}
+          >
+            {selectedPool.pair ? (
+              <><code className="approval-address">{selectedPool.pair}</code> · bin step {selectedPool.binStep ?? "unknown"}</>
+            ) : "unavailable"}
+          </dd>
+        </div>
         <div>
           <dt>Input</dt>
           <dd>{tokenSymbol(tokenIn)}</dd>
@@ -1385,6 +2073,38 @@ function runtimeIsReady(snapshot: AppSnapshot | undefined, expectedChainId: numb
   return snapshot?.runtime.status === "ready" && snapshot.runtime.chainId === expectedChainId;
 }
 
+function swapSnapshotIdentity(snapshot: AppSnapshot | undefined, poolId: string): string {
+  const pool = snapshot?.indexer.pools.find(
+    (candidate) => candidate.id.toLowerCase() === poolId.toLowerCase() || candidate.address.toLowerCase() === poolId.toLowerCase()
+  );
+
+  return JSON.stringify({
+    indexerBlockHash: snapshot?.indexer.blockHash ?? null,
+    indexerBlockNumber: snapshot?.indexer.blockNumber ?? null,
+    indexerHasErrors: snapshot?.indexer.hasIndexingErrors ?? null,
+    indexerPoolPagination: snapshot?.indexer.pagination.pools ?? null,
+    indexerStatus: snapshot?.indexer.status ?? null,
+    pool: pool
+      ? {
+          activeId: pool.activeId,
+          address: pool.address,
+          binStep: pool.binStep,
+          id: pool.id,
+          reserveX: pool.reserveX,
+          reserveY: pool.reserveY,
+          tokenX: pool.tokenX,
+          tokenXAddress: pool.tokenXAddress,
+          tokenY: pool.tokenY,
+          tokenYAddress: pool.tokenYAddress,
+          updatedAtBlock: pool.updatedAtBlock
+        }
+      : null,
+    runtimeBlockNumber: snapshot?.runtime.blockNumber ?? null,
+    runtimeChainId: snapshot?.runtime.chainId ?? null,
+    runtimeStatus: snapshot?.runtime.status ?? null
+  });
+}
+
 function runtimeChainLabel(expectedChainId: number, actualChainId: number | null): string {
   if (actualChainId === null || actualChainId === expectedChainId) return `Chain ${expectedChainId}`;
   return `Expected ${expectedChainId}, RPC ${actualChainId}`;
@@ -1428,6 +2148,10 @@ function swapMarketReadinessError(pool: SelectedPoolDescriptor, rpcReady: boolea
     );
   }
 
+  if (!pool.ready) {
+    return poolDescriptorError(pool) ?? "Selected pool is not safe for swaps";
+  }
+
   if (pool.tokenXAddress === null || pool.tokenYAddress === null || pool.tokenX === null || pool.tokenY === null) {
     return (
       pool.blockers.find((blocker) =>
@@ -1459,6 +2183,7 @@ function SwapStateRows({
   approvalReverted,
   approvalSuccess,
   insufficientBalance,
+  insufficientGas,
   quoteError,
   swapHash,
   swapReverted,
@@ -1471,6 +2196,7 @@ function SwapStateRows({
   approvalReverted: boolean;
   approvalSuccess: boolean;
   insufficientBalance: boolean;
+  insufficientGas: boolean;
   quoteError: Error | null;
   swapHash: Address | undefined;
   swapReverted: boolean;
@@ -1482,6 +2208,7 @@ function SwapStateRows({
     receiptFailure ??
     amountError ??
     (insufficientBalance ? "Insufficient token balance" : null) ??
+    (insufficientGas ? "Insufficient ETH for gas" : null) ??
     (quoteError ? quoteError.message : null) ??
     walletError ??
     actionError;
@@ -1718,6 +2445,7 @@ function buttonLabel({
   connected,
   invalidInput,
   insufficientBalance,
+  insufficientGas,
   needsApproval,
   onWrongChain,
   poolReady,
@@ -1730,6 +2458,7 @@ function buttonLabel({
   connected: boolean;
   invalidInput: boolean;
   insufficientBalance: boolean;
+  insufficientGas: boolean;
   needsApproval: boolean;
   onWrongChain: boolean;
   poolReady: boolean;
@@ -1746,6 +2475,7 @@ function buttonLabel({
   if (walletLoading) return "Loading wallet";
   if (invalidInput) return "Check settings";
   if (insufficientBalance) return "Insufficient balance";
+  if (insufficientGas) return "Insufficient ETH for gas";
   if (needsApproval) return "Approve first";
   if (safetyReason) return safetyReason;
   if (quoteLoading) return "Quoting";
@@ -1778,26 +2508,82 @@ function isRevertedReceiptError(error: unknown): boolean {
   return false;
 }
 
-async function runPreSubmitSimulation(
-  simulate: () => Promise<unknown>,
+async function runPreSubmitSimulation<T>(
+  simulate: () => Promise<T>,
   setError: (message: string | null) => void,
   setPending: (pending: boolean) => void,
   isCurrent: () => boolean = () => true
-): Promise<boolean> {
+): Promise<T | null> {
   setError(null);
   setPending(true);
 
   try {
-    await simulate();
-    return isCurrent();
+    const result = await simulate();
+    return isCurrent() ? result : null;
   } catch (error) {
     if (isCurrent()) {
       setError(`Simulation failed: ${getWriteError(error) ?? "Transaction simulation failed"}`);
     }
-    return false;
+    return null;
   } finally {
     if (isCurrent()) setPending(false);
   }
+}
+
+async function reviewExactGas(input: {
+  action: string;
+  currentReview: ExactGasReview | null;
+  estimateGas: () => Promise<bigint>;
+  executionFingerprint: string;
+  getBalance: () => Promise<bigint>;
+  getGasPrice: () => Promise<bigint>;
+  isCurrent: () => boolean;
+  setError: (message: string | null) => void;
+  setReview: (review: ExactGasReview | null) => void;
+  transactionValue?: bigint;
+}): Promise<boolean> {
+  try {
+    const [gasLimit, gasPrice, nativeBalance] = await Promise.all([input.estimateGas(), input.getGasPrice(), input.getBalance()]);
+    if (!input.isCurrent()) return false;
+    const bufferedWei = (gasLimit * gasPrice * GAS_BUFFER_BPS + 9_999n) / 10_000n;
+    const transactionValue = input.transactionValue ?? 0n;
+    const requiredWei = bufferedWei + transactionValue;
+    const review = { action: input.action, bufferedWei, executionFingerprint: input.executionFingerprint, gasLimit, gasPrice, requiredWei, transactionValue };
+    if (nativeBalance < requiredWei) {
+      input.setReview(review);
+      input.setError(`Insufficient ETH for gas and value: exact buffered requirement is ${formatUnits(requiredWei, 18)} ETH, but this wallet has ${formatUnits(nativeBalance, 18)} ETH`);
+      return false;
+    }
+    if (
+      input.currentReview === null ||
+      input.currentReview.action !== input.action ||
+      input.currentReview.executionFingerprint !== input.executionFingerprint ||
+      requiredWei > input.currentReview.requiredWei
+    ) {
+      input.setReview(review);
+      input.setError(null);
+      return false;
+    }
+    input.setReview(review);
+    input.setError(null);
+    return true;
+  } catch (error) {
+    if (input.isCurrent()) {
+      input.setReview(null);
+      input.setError(`Gas estimation failed: ${getWriteError(error) ?? "gas limit or gas price unavailable"}`);
+    }
+    return false;
+  }
+}
+
+function GasReview({ review }: { review: ExactGasReview | null }) {
+  if (review === null) return null;
+  return (
+    <div className="state-row warning" data-testid="gas-review" role="status">
+      <CircleDollarSign size={16} />
+      <span>Gas review for {review.action}: limit {review.gasLimit.toString()} × {formatUnits(review.gasPrice, 9)} gwei + 25% gas buffer{review.transactionValue > 0n ? ` + ${formatUnits(review.transactionValue, 18)} ETH value` : ""} = {formatUnits(review.requiredWei, 18)} ETH required. Submit again to re-estimate and open the wallet.</span>
+    </div>
+  );
 }
 
 type PoolCategory = "all" | "active" | "stables";
@@ -2173,6 +2959,8 @@ function LiquidityView({
   const [deadlineInput, setDeadlineInput] = useState("20");
   const [liquiditySimulationError, setLiquiditySimulationError] = useState<string | null>(null);
   const [liquiditySimulationPending, setLiquiditySimulationPending] = useState(false);
+  const [gasReviewError, setGasReviewError] = useState<string | null>(null);
+  const [gasReview, setGasReview] = useState<ExactGasReview | null>(null);
   const [removeQuoteReviewRequired, setRemoveQuoteReviewRequired] = useState<string | null>(null);
   const [selectedPositionIds, setSelectedPositionIds] = useState<string[]>([]);
   const [removePercentInput, setRemovePercentInput] = useState("100");
@@ -2206,6 +2994,7 @@ function LiquidityView({
   const approveLbReceipt = useWaitForTransactionReceipt({ hash: approveLbWrite.data });
   const addReceipt = useWaitForTransactionReceipt({ hash: addWrite.data });
   const removeReceipt = useWaitForTransactionReceipt({ hash: removeWrite.data });
+  const recordSubmittedTransaction = useContext(SubmittedTransactionJournalContext);
   const publicClient = useMemo(() => createDexPublicClient(registry.chain, registry.endpoints.rpcUrl), [registry]);
 
   useEffect(() => {
@@ -2250,6 +3039,7 @@ function LiquidityView({
     initialSection ?? "",
     portfolioAction ?? ""
   ].join("|");
+
   const rpcReady = runtimeIsReady(snapshot, registry.chainId);
   const activeBin =
     selectedPool.activeId ??
@@ -2305,7 +3095,7 @@ function LiquidityView({
         throw new Error("Liquidity wallet reads are not available");
       }
 
-      const [balanceX, balanceY, allowanceX, allowanceY, lbApproved] = await Promise.all([
+      const [balanceX, balanceY, allowanceX, allowanceY, lbApproved, nativeBalance] = await Promise.all([
         publicClient.readContract({
           address: pool.tokenX,
           abi: erc20Abi,
@@ -2335,7 +3125,8 @@ function LiquidityView({
           abi: lbPairAbi,
           functionName: "isApprovedForAll",
           args: [account.address, registry.contracts.lbRouter]
-        })
+        }),
+        publicClient.getBalance({ address: account.address })
       ]);
 
       return {
@@ -2343,7 +3134,8 @@ function LiquidityView({
         balanceY: balanceY.toString(),
         allowanceX: allowanceX.toString(),
         allowanceY: allowanceY.toString(),
-        lbApproved
+        lbApproved,
+        nativeBalance: nativeBalance.toString()
       };
     },
     enabled: rpcReady && connected && pool !== null && (selectedPool.ready || removeSelectedPool.ready),
@@ -2358,6 +3150,7 @@ function LiquidityView({
   const walletBalanceY = walletData ? BigInt(walletData.balanceY) : null;
   const walletAllowanceX = walletData ? BigInt(walletData.allowanceX) : null;
   const walletAllowanceY = walletData ? BigInt(walletData.allowanceY) : null;
+  const nativeBalance = walletData ? BigInt(walletData.nativeBalance) : null;
   const needsXApproval = amountX !== null && amountX > 0n && walletAllowanceX !== null && walletAllowanceX < amountX;
   const needsYApproval = amountY !== null && amountY > 0n && walletAllowanceY !== null && walletAllowanceY < amountY;
   const insufficientX = amountX !== null && amountX > 0n && walletBalanceX !== null && walletBalanceX < amountX;
@@ -2666,6 +3459,7 @@ function LiquidityView({
   const currentLbApprovalReverted = liquidityReceiptPhase === "lb-approval" && approveLbReverted;
   const liquidityActionError =
     liquiditySimulationError ??
+    gasReviewError ??
     getWriteError(approveXWrite.error) ??
     getWriteError(approveYWrite.error) ??
     getWriteError(approveLbWrite.error) ??
@@ -2852,6 +3646,7 @@ function LiquidityView({
 
   useEffect(() => {
     setLiquiditySimulationError(null);
+    setGasReviewError(null);
     setRemoveQuoteReviewRequired(null);
   }, [
     account.address,
@@ -2931,6 +3726,7 @@ function LiquidityView({
     const token = pool.tokenX;
     const args = [registry.contracts.lbRouter, amountX] as const;
     approveXSubmitInFlightRef.current = submittedOperationGeneration;
+    setGasReviewError(null);
     const operationIsCurrent = () =>
       liquidityOperationGenerationRef.current === submittedOperationGeneration &&
       approveXSubmitInFlightRef.current === submittedOperationGeneration;
@@ -2956,9 +3752,39 @@ function LiquidityView({
         setLiquiditySimulationError("Token X approval context, amount, strategy, range, or composition changed during simulation; review the current approval and try again");
         return;
       }
-
-      approveXWrite.writeContract({ address: token, abi: erc20Abi, functionName: "approve", args });
-      submitted = true;
+      const gasApproved = await reviewExactGas({
+        action: `${tokenSymbol(tokenX)} approval`,
+        currentReview: gasReview,
+        estimateGas: () => publicClient.estimateContractGas(simulated.request),
+        executionFingerprint: submittedExecutionFingerprint,
+        getBalance: () => publicClient.getBalance({ address: account.address }),
+        getGasPrice: () => publicClient.getGasPrice(),
+        isCurrent: operationIsCurrent,
+        setError: setGasReviewError,
+        setReview: setGasReview
+      });
+      if (!gasApproved || !operationIsCurrent()) return;
+      const submittedContext = {
+        account: account.address,
+        calldataFingerprint: keccak256(encodeFunctionData({ abi: erc20Abi, functionName: "approve", args })),
+        chainId: activeWalletChainId,
+        deploymentEpoch: deploymentEpoch(registry),
+        environment: environmentKey,
+        executionFingerprint: submittedExecutionFingerprint,
+        intent: "approval" as const,
+        providerId: account.connector?.id ?? "unknown",
+        providerUid: account.connector?.uid ?? "unknown",
+        submittedAt: Date.now(),
+        target: token,
+        value: 0n
+      };
+      try {
+        const hash = await approveXWrite.writeContractAsync(simulated.request);
+        recordSubmittedTransaction?.({ ...submittedContext, hash });
+        submitted = true;
+      } catch {
+        // The wagmi mutation retains the rejection for the originating mounted session.
+      }
     } finally {
       if (!submitted && approveXSubmitInFlightRef.current === submittedOperationGeneration) {
         approveXSubmitInFlightRef.current = null;
@@ -2974,6 +3800,7 @@ function LiquidityView({
     const token = pool.tokenY;
     const args = [registry.contracts.lbRouter, amountY] as const;
     approveYSubmitInFlightRef.current = submittedOperationGeneration;
+    setGasReviewError(null);
     const operationIsCurrent = () =>
       liquidityOperationGenerationRef.current === submittedOperationGeneration &&
       approveYSubmitInFlightRef.current === submittedOperationGeneration;
@@ -2999,9 +3826,39 @@ function LiquidityView({
         setLiquiditySimulationError("Token Y approval context, amount, strategy, range, or composition changed during simulation; review the current approval and try again");
         return;
       }
-
-      approveYWrite.writeContract({ address: token, abi: erc20Abi, functionName: "approve", args });
-      submitted = true;
+      const gasApproved = await reviewExactGas({
+        action: `${tokenSymbol(tokenY)} approval`,
+        currentReview: gasReview,
+        estimateGas: () => publicClient.estimateContractGas(simulated.request),
+        executionFingerprint: submittedExecutionFingerprint,
+        getBalance: () => publicClient.getBalance({ address: account.address }),
+        getGasPrice: () => publicClient.getGasPrice(),
+        isCurrent: operationIsCurrent,
+        setError: setGasReviewError,
+        setReview: setGasReview
+      });
+      if (!gasApproved || !operationIsCurrent()) return;
+      const submittedContext = {
+        account: account.address,
+        calldataFingerprint: keccak256(encodeFunctionData({ abi: erc20Abi, functionName: "approve", args })),
+        chainId: activeWalletChainId,
+        deploymentEpoch: deploymentEpoch(registry),
+        environment: environmentKey,
+        executionFingerprint: submittedExecutionFingerprint,
+        intent: "approval" as const,
+        providerId: account.connector?.id ?? "unknown",
+        providerUid: account.connector?.uid ?? "unknown",
+        submittedAt: Date.now(),
+        target: token,
+        value: 0n
+      };
+      try {
+        const hash = await approveYWrite.writeContractAsync(simulated.request);
+        recordSubmittedTransaction?.({ ...submittedContext, hash });
+        submitted = true;
+      } catch {
+        // The wagmi mutation retains the rejection for the originating mounted session.
+      }
     } finally {
       if (!submitted && approveYSubmitInFlightRef.current === submittedOperationGeneration) {
         approveYSubmitInFlightRef.current = null;
@@ -3016,6 +3873,7 @@ function LiquidityView({
     const submittedExecutionFingerprint = lbApprovalExecutionFingerprint;
     const args = [registry.contracts.lbRouter, true] as const;
     approveLbSubmitInFlightRef.current = submittedOperationGeneration;
+    setGasReviewError(null);
     const operationIsCurrent = () =>
       liquidityOperationGenerationRef.current === submittedOperationGeneration &&
       approveLbSubmitInFlightRef.current === submittedOperationGeneration;
@@ -3098,14 +3956,40 @@ function LiquidityView({
       }
 
       if (!operationIsCurrent()) return;
-      setLiquidityReceiptPhase("lb-approval");
-      approveLbWrite.writeContract({
-        address: pool.pair,
-        abi: lbPairAbi,
-        functionName: "approveForAll",
-        args
+      const gasApproved = await reviewExactGas({
+        action: "LB operator approval",
+        currentReview: gasReview,
+        estimateGas: () => publicClient.estimateContractGas(simulated.request),
+        executionFingerprint: submittedExecutionFingerprint,
+        getBalance: () => publicClient.getBalance({ address: account.address }),
+        getGasPrice: () => publicClient.getGasPrice(),
+        isCurrent: operationIsCurrent,
+        setError: setGasReviewError,
+        setReview: setGasReview
       });
-      submitted = true;
+      if (!gasApproved || !operationIsCurrent()) return;
+      setLiquidityReceiptPhase("lb-approval");
+      const submittedContext = {
+        account: account.address,
+        calldataFingerprint: keccak256(encodeFunctionData({ abi: lbPairAbi, functionName: "approveForAll", args })),
+        chainId: activeWalletChainId,
+        deploymentEpoch: deploymentEpoch(registry),
+        environment: environmentKey,
+        executionFingerprint: submittedExecutionFingerprint,
+        intent: "approval" as const,
+        providerId: account.connector?.id ?? "unknown",
+        providerUid: account.connector?.uid ?? "unknown",
+        submittedAt: Date.now(),
+        target: pool.pair,
+        value: 0n
+      };
+      try {
+        const hash = await approveLbWrite.writeContractAsync(simulated.request);
+        recordSubmittedTransaction?.({ ...submittedContext, hash });
+        submitted = true;
+      } catch {
+        // The wagmi mutation retains the rejection for the originating mounted session.
+      }
     } finally {
       if (!submitted && approveLbSubmitInFlightRef.current === submittedOperationGeneration) {
         approveLbSubmitInFlightRef.current = null;
@@ -3139,6 +4023,7 @@ function LiquidityView({
       }
     ] as const;
     addSubmitInFlightRef.current = submittedOperationGeneration;
+    setGasReviewError(null);
     const operationIsCurrent = () =>
       liquidityOperationGenerationRef.current === submittedOperationGeneration &&
       addSubmitInFlightRef.current === submittedOperationGeneration;
@@ -3164,14 +4049,39 @@ function LiquidityView({
         setLiquiditySimulationError("Liquidity execution context, safety settings, strategy, range, or composition changed during simulation; review the projected bins and try again");
         return;
       }
-
-      addWrite.writeContract({
-        address: registry.contracts.lbRouter,
-        abi: lbRouterAbi,
-        functionName: "addLiquidity",
-        args
+      const gasApproved = await reviewExactGas({
+        action: "add liquidity",
+        currentReview: gasReview,
+        estimateGas: () => publicClient.estimateContractGas(simulated.request),
+        executionFingerprint: submittedExecutionFingerprint,
+        getBalance: () => publicClient.getBalance({ address: account.address }),
+        getGasPrice: () => publicClient.getGasPrice(),
+        isCurrent: operationIsCurrent,
+        setError: setGasReviewError,
+        setReview: setGasReview
       });
-      submitted = true;
+      if (!gasApproved || !operationIsCurrent()) return;
+      const submittedContext = {
+        account: account.address,
+        calldataFingerprint: keccak256(encodeFunctionData({ abi: lbRouterAbi, functionName: "addLiquidity", args })),
+        chainId: activeWalletChainId,
+        deploymentEpoch: deploymentEpoch(registry),
+        environment: environmentKey,
+        executionFingerprint: submittedExecutionFingerprint,
+        intent: "add-liquidity" as const,
+        providerId: account.connector?.id ?? "unknown",
+        providerUid: account.connector?.uid ?? "unknown",
+        submittedAt: Date.now(),
+        target: registry.contracts.lbRouter,
+        value: 0n
+      };
+      try {
+        const hash = await addWrite.writeContractAsync(simulated.request);
+        recordSubmittedTransaction?.({ ...submittedContext, hash });
+        submitted = true;
+      } catch {
+        // The wagmi mutation retains the rejection for the originating mounted session.
+      }
     } finally {
       if (!submitted && addSubmitInFlightRef.current === submittedOperationGeneration) {
         addSubmitInFlightRef.current = null;
@@ -3201,6 +4111,7 @@ function LiquidityView({
     setLiquidityReceiptPhase("idle");
     setSubmittedRemoveReceiptContext(null);
     setLiquiditySimulationError(null);
+    setGasReviewError(null);
     setRemoveQuoteReviewRequired(null);
     let submitted = false;
     try {
@@ -3405,10 +4316,42 @@ function LiquidityView({
       }
 
       if (!operationIsCurrent()) return;
+      const gasApproved = await reviewExactGas({
+        action: fullExit ? "full liquidity exit" : "liquidity withdrawal",
+        currentReview: gasReview,
+        estimateGas: () => publicClient.estimateGas({ account: account.address, to: transaction.to, data: transaction.data, value: transaction.value }),
+        executionFingerprint: submittedExecutionContextFingerprint,
+        getBalance: () => publicClient.getBalance({ address: account.address }),
+        getGasPrice: () => publicClient.getGasPrice(),
+        isCurrent: operationIsCurrent,
+        setError: setGasReviewError,
+        setReview: setGasReview,
+        transactionValue: transaction.value
+      });
+      if (!gasApproved || !operationIsCurrent()) return;
       setLiquidityReceiptPhase("remove");
       setSubmittedRemoveReceiptContext(removeReviewFingerprint);
-      removeWrite.sendTransaction(transaction);
-      submitted = true;
+      const submittedContext = {
+        account: account.address,
+        calldataFingerprint: keccak256(transaction.data),
+        chainId: activeWalletChainId,
+        deploymentEpoch: deploymentEpoch(registry),
+        environment: environmentKey,
+        executionFingerprint: submittedExecutionContextFingerprint,
+        intent: "remove-liquidity" as const,
+        providerId: account.connector?.id ?? "unknown",
+        providerUid: account.connector?.uid ?? "unknown",
+        submittedAt: Date.now(),
+        target: transaction.to,
+        value: transaction.value
+      };
+      try {
+        const hash = await removeWrite.sendTransactionAsync(transaction);
+        recordSubmittedTransaction?.({ ...submittedContext, hash });
+        submitted = true;
+      } catch {
+        // The wagmi mutation retains the rejection for the originating mounted session.
+      }
     } finally {
       if (!submitted && removeSubmitInFlightRef.current === submittedOperationGeneration) {
         removeSubmitInFlightRef.current = null;
@@ -3513,7 +4456,10 @@ function LiquidityView({
         <div className="quote-grid">
           <MiniMetric label={`${tokenSymbol(tokenX)} balance`} value={walletData ? formatTokenAmount(walletData.balanceX, tokenX) : connected ? "loading" : "connect"} />
           <MiniMetric label={`${tokenSymbol(tokenY)} balance`} value={walletData ? formatTokenAmount(walletData.balanceY, tokenY) : connected ? "loading" : "connect"} />
+          <MiniMetric data-testid="liquidity-native-balance" label="ETH for gas" value={nativeBalance !== null ? `${formatUnits(nativeBalance, 18)} ETH` : connected ? "loading" : "connect"} />
         </div>
+
+        <GasReview review={gasReview} />
 
         <fieldset className="strategy-picker" aria-label="Liquidity strategy">
           <legend>Volatility strategy</legend>
@@ -3633,7 +4579,7 @@ function LiquidityView({
           </button>
           <button className="primary-button wide" data-testid="liquidity-add-button" type="button" disabled={!addReady} onClick={handleAddLiquidity}>
             {liquiditySimulationPending || addWrite.isPending || addReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <Droplets size={18} />}
-            <span>{liquidityButtonLabel({ poolReady: addPoolReady, connected, onWrongChain, walletReadsReady, walletReadErrored: walletQuery.isError, invalidInput: addInputError !== null, needsApproval: needsXApproval || needsYApproval, insufficientBalance: insufficientX || insufficientY, ready: distributionResult.distribution !== null })}</span>
+            <span>{liquidityButtonLabel({ poolReady: addPoolReady, connected, onWrongChain, walletReadsReady, walletReadErrored: walletQuery.isError, invalidInput: addInputError !== null, needsApproval: needsXApproval || needsYApproval, insufficientBalance: insufficientX || insufficientY, insufficientGas: liquiditySimulationError?.startsWith("Insufficient ETH for gas") === true, ready: distributionResult.distribution !== null })}</span>
           </button>
         </div>
 
@@ -3746,7 +4692,7 @@ function LiquidityView({
           </button>
           <button className="primary-button wide" data-testid="liquidity-remove-button" type="button" disabled={!removeReady} onClick={handleRemoveLiquidity}>
             {liquiditySimulationPending || removeWrite.isPending || removeReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <Droplets size={18} />}
-            <span>{removeButtonLabel({ poolReady: removePoolReady, connected, fullExit, onWrongChain, invalidInput: removeInputError !== null, hasPosition: hasSelectedPositions, needsApproval: walletData?.lbApproved === false })}</span>
+            <span>{removeButtonLabel({ poolReady: removePoolReady, connected, fullExit, onWrongChain, invalidInput: removeInputError !== null, hasPosition: hasSelectedPositions, needsApproval: walletData?.lbApproved === false, insufficientGas: liquiditySimulationError?.startsWith("Insufficient ETH for gas") === true })}</span>
           </button>
         </div>
 
@@ -4124,6 +5070,7 @@ function sameStringArray(left: readonly string[], right: readonly string[]): boo
 function liquidityButtonLabel({
   connected,
   insufficientBalance,
+  insufficientGas,
   invalidInput,
   needsApproval,
   onWrongChain,
@@ -4134,6 +5081,7 @@ function liquidityButtonLabel({
 }: {
   connected: boolean;
   insufficientBalance: boolean;
+  insufficientGas: boolean;
   invalidInput: boolean;
   needsApproval: boolean;
   onWrongChain: boolean;
@@ -4149,6 +5097,7 @@ function liquidityButtonLabel({
   if (walletReadErrored) return "Wallet read failed";
   if (!walletReadsReady) return "Loading wallet";
   if (insufficientBalance) return "Insufficient balance";
+  if (insufficientGas) return "Insufficient ETH for gas";
   if (needsApproval) return "Approve first";
   if (!ready) return "Invalid range";
 
@@ -4159,6 +5108,7 @@ function removeButtonLabel({
   connected,
   fullExit,
   hasPosition,
+  insufficientGas,
   invalidInput,
   needsApproval,
   onWrongChain,
@@ -4167,6 +5117,7 @@ function removeButtonLabel({
   connected: boolean;
   fullExit: boolean;
   hasPosition: boolean;
+  insufficientGas: boolean;
   invalidInput: boolean;
   needsApproval: boolean;
   onWrongChain: boolean;
@@ -4178,6 +5129,7 @@ function removeButtonLabel({
   if (!hasPosition) return "No position";
   if (invalidInput) return "Check remove";
   if (needsApproval) return "Approve LB first";
+  if (insufficientGas) return "Insufficient ETH for gas";
 
   return fullExit ? "Full exit" : "Withdraw liquidity";
 }
