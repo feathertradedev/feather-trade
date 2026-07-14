@@ -3,6 +3,11 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import react from "@vitejs/plugin-react";
+import mdx from "@mdx-js/rollup";
+import rehypeSlug from "rehype-slug";
+import remarkFrontmatter from "remark-frontmatter";
+import remarkGfm from "remark-gfm";
+import remarkMdxFrontmatter from "remark-mdx-frontmatter";
 import { defineConfig, loadEnv } from "vite";
 
 const rootDir = dirname(fileURLToPath(import.meta.url));
@@ -60,7 +65,14 @@ export default defineConfig(({ mode }) => {
   validatePublicReleaseEnvironment(publicReleaseEnvironment, env);
 
   return {
-    plugins: [react()],
+    plugins: [
+      mdx({
+        providerImportSource: "@mdx-js/react",
+        rehypePlugins: [rehypeSlug],
+        remarkPlugins: [remarkGfm, remarkFrontmatter, [remarkMdxFrontmatter, { name: "frontmatter" }]]
+      }),
+      react()
+    ],
     define: {
       __LOCALNET_MANIFEST__: localnetManifestDefine(env.VITE_LOCALNET_MANIFEST_PATH),
       __PUBLIC_RELEASE_ENV__: publicReleaseEnvironment === undefined ? "undefined" : JSON.stringify(publicReleaseEnvironment),
