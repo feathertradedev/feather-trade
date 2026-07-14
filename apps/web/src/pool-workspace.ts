@@ -230,6 +230,43 @@ export function buildBinDistribution(
   });
 }
 
+export function buildCenteredBinDistribution(
+  bins: readonly BinRow[],
+  activeId: string,
+  tokenXDecimals: number,
+  tokenYDecimals: number,
+  radius: number
+): BinDistributionPoint[] {
+  if (!Number.isSafeInteger(radius) || radius < 1 || radius > 40) {
+    throw new Error("Bin distribution radius must be an integer from 1 to 40");
+  }
+
+  const active = BigInt(activeId);
+  if (active < 0n || active > 16_777_215n) throw new Error("Active bin is outside the uint24 range");
+  const indexedById = new Map<string, BinRow>();
+  for (const bin of bins) {
+    if (indexedById.has(bin.binId)) throw new Error(`Duplicate pool bin ${bin.binId}`);
+    indexedById.set(bin.binId, bin);
+  }
+
+  const start = active > BigInt(radius) ? active - BigInt(radius) : 0n;
+  const end = active + BigInt(radius) > 16_777_215n ? 16_777_215n : active + BigInt(radius);
+  const centered: BinRow[] = [];
+  for (let binId = start; binId <= end; binId += 1n) {
+    const key = binId.toString();
+    centered.push(indexedById.get(key) ?? {
+      id: `empty-${key}`,
+      binId: key,
+      reserveX: "0",
+      reserveY: "0",
+      totalSupply: "0",
+      updatedAtBlock: "0"
+    });
+  }
+
+  return buildBinDistribution(centered, activeId, tokenXDecimals, tokenYDecimals);
+}
+
 export function formatUsdE18(value: string | null): string {
   if (value === null) return "Unavailable";
   if (BigInt(value) > 0n && BigInt(value) < 10n ** 16n) return "<$0.01";

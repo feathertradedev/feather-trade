@@ -191,16 +191,10 @@
               "required": ["wnativeUsdc"],
               "properties": {
                 "wnativeUsdc": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": ["activeId", "binStep", "pair", "tokenX", "tokenY"],
-                  "properties": {
-                    "activeId": { "type": "integer" },
-                    "binStep": { "type": "integer", "minimum": 1 },
-                    "pair": { "$ref": "#/$defs/nonZeroAddress" },
-                    "tokenX": { "$ref": "#/$defs/nonZeroAddress" },
-                    "tokenY": { "$ref": "#/$defs/nonZeroAddress" }
-                  }
+                  "$ref": "#/$defs/localnetSeededPool"
+                },
+                "wethUsdc": {
+                  "$ref": "#/$defs/localnetSeededPool"
                 }
               }
             },
@@ -215,6 +209,18 @@
           }
         }
       ]
+    },
+    "localnetSeededPool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["activeId", "binStep", "pair", "tokenX", "tokenY"],
+      "properties": {
+        "activeId": { "type": "integer" },
+        "binStep": { "type": "integer", "minimum": 1 },
+        "pair": { "$ref": "#/$defs/nonZeroAddress" },
+        "tokenX": { "$ref": "#/$defs/nonZeroAddress" },
+        "tokenY": { "$ref": "#/$defs/nonZeroAddress" }
+      }
     },
     "robinhoodManifest": {
       "unevaluatedProperties": false,

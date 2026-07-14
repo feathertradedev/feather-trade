@@ -16,6 +16,7 @@
     "contracts:test:exhaustive": "pnpm contracts:test:full && pnpm contracts:test:fork",
     "contracts:fmt": "forge fmt --check",
     "localnet:deploy": "bash scripts/localnet/deploy.sh",
+    "localnet:seed:liquidity": "bash scripts/localnet/seed-liquidity.sh",
     "localnet:up": "bash scripts/localnet/up.sh",
     "localnet:down": "bash scripts/localnet/down.sh",
     "localstack:up": "bash scripts/localnet/stack.sh up --fresh",

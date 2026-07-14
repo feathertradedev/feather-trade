@@ -21,6 +21,7 @@ const server = await createServer({
 try {
   const {
     buildBinDistribution,
+    buildCenteredBinDistribution,
     buildCandleChartModel,
     formatRatioPercentE18,
     formatUsdE18,
@@ -94,6 +95,20 @@ try {
   assert.equal(distribution[1].lbSupplyHeight, 100);
   assert.throws(() => buildBinDistribution([bin("1", "0", "0", "0"), bin("1", "0", "0", "0")], "1", 18, 18), /Duplicate pool bin/);
 
+  const centeredDistribution = buildCenteredBinDistribution([
+    bin("8388606", "5000000", "0", "20"),
+    bin("8388608", "10000000", "2000000000000000000", "10"),
+    bin("8388610", "0", "3000000000000000000", "30")
+  ], "8388608", 6, 18, 2);
+  assert.deepEqual(centeredDistribution.map((point) => point.binId), ["8388606", "8388607", "8388608", "8388609", "8388610"]);
+  assert.equal(centeredDistribution[2].active, true);
+  assert.equal(centeredDistribution[1].tokenX, "0");
+  assert.equal(centeredDistribution[1].tokenY, "0");
+  assert.equal(centeredDistribution[4].tokenY, "3");
+  assert.throws(() => buildCenteredBinDistribution([], "8388608", 18, 18, 0), /radius/);
+  assert.throws(() => buildCenteredBinDistribution([bin("1", "0", "0", "0"), bin("1", "0", "0", "0")], "1", 18, 18, 1), /Duplicate pool bin/);
+  assert.throws(() => buildCenteredBinDistribution([], "16777216", 18, 18, 1), /uint24/);
+
   const healthState = workspaceAnalyticsState("READY", {
     status: "READY", headBlock: "99", headHash: null, headTimestamp: 100, canonicalBlockCount: 1, reorgCount: 0,
     partialEventCount: 2, missingPriceTokens: [tokenX], fresh: false, headLagSeconds: 90, maxHeadLagSeconds: 60,
@@ -107,7 +122,7 @@ try {
   assert.match(healthState.detail, /1 token price unavailable/);
   assert.equal(workspaceAnalyticsState("UNAVAILABLE", null).status, "UNAVAILABLE");
 
-  console.log("Pool workspace fixture passed: economic joins/sorts, null-zero truth, candle gaps/table data, bin distribution, and freshness semantics.");
+  console.log("Pool workspace fixture passed: economic joins/sorts, null-zero truth, candle gaps/table data, centered bin distribution, and freshness semantics.");
 } finally {
   await server.close();
 }

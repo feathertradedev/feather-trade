@@ -1191,7 +1191,11 @@ function ContentView({
     : indexedPools;
   const [selectedPoolId, setSelectedPoolId] = useState("");
   const poolIdsKey = pools.map((pool) => pool.id).join("|");
-  const defaultPool = selectDefaultIndexedPool(pools);
+  const activeRegistry = registries[environmentKey];
+  const preferredPoolAddress = isLocalnetRegistry(activeRegistry)
+    ? activeRegistry.seededPools.wethUsdc?.pair ?? null
+    : null;
+  const defaultPool = selectDefaultIndexedPool(pools, preferredPoolAddress);
   const dashboardActionPool =
     actionPoolId === null
       ? null
@@ -1255,9 +1259,9 @@ function ContentView({
       if (actionPool !== null) return actionPool.id;
       if (pools.some((pool) => pool.id === currentId)) return currentId;
 
-      return selectDefaultIndexedPool(pools)?.id ?? "";
+      return selectDefaultIndexedPool(pools, preferredPoolAddress)?.id ?? "";
     });
-  }, [actionPool, environmentKey, poolIdsKey]);
+  }, [actionPool, environmentKey, poolIdsKey, preferredPoolAddress]);
 
   const handleSelectedPoolChange = (poolId: string) => {
     setSelectedPoolId(poolId);
@@ -1443,8 +1447,11 @@ function RequestedPoolState({ error, poolId, state }: { error: Error | null; poo
   );
 }
 
-function selectDefaultIndexedPool(pools: PoolRow[]): PoolRow | null {
+function selectDefaultIndexedPool(pools: PoolRow[], preferredPoolAddress: Address | null = null): PoolRow | null {
   return (
+    (preferredPoolAddress === null
+      ? null
+      : pools.find((pool) => isAddressEqual(pool.address, preferredPoolAddress) && poolSupportsCoreActions(pool))) ??
     pools.find((pool) => poolHasSwapLiquidity(pool) && poolSupportsCoreActions(pool)) ??
     pools.find((pool) => poolSupportsCoreActions(pool)) ??
     pools.find((pool) => poolHasSwapLiquidity(pool)) ??
@@ -3135,7 +3142,7 @@ function buildPoolDescriptor({
   if (localnetRegistry !== null) {
     return buildSelectedPoolDescriptor({
       action,
-      poolKey: "wnativeUsdc",
+      poolKey: localnetRegistry.seededPools.wethUsdc === undefined ? "wnativeUsdc" : "wethUsdc",
       registry: localnetRegistry,
       runtime,
       source: "localnet-seeded"

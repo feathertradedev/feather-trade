@@ -15,3 +15,8 @@ forge script contracts/joe-v2/script/deploy-local.s.sol:LocalnetDeployScript \
   --rpc-url "$RPC_URL" \
   --broadcast \
   --private-key "$PRIVATE_KEY"
+
+LOCALNET_RPC_URL="$RPC_URL" \
+LOCALNET_MANIFEST_PATH="${LOCALNET_MANIFEST_PATH:-$ROOT_DIR/deployments/localnet/latest.json}" \
+LOCALNET_PRIVATE_KEY="$PRIVATE_KEY" \
+  bash "$ROOT_DIR/scripts/localnet/seed-liquidity.sh"
