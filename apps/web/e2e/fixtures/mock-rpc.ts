@@ -360,7 +360,7 @@ function mockAnalyticsResponse(body: GraphRequest, options: MockRpcOptions): Rec
         firstBlock: String(100 + index),
         lastBlock: String(100 + index)
       };
-    }).filter((_, index) => options.analyticsCandleGap !== true || index !== 1);
+    }).filter((_, index, candles) => options.analyticsCandleGap !== true || index !== Math.max(1, candles.length - 23));
     return { data: { pairCandles: { nodes, pageInfo: { endCursor: null, hasNextPage: false, partial } } } };
   }
   if (query.includes("WebAnalyticsHealth")) {

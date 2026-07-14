@@ -8,6 +8,56 @@ async function connectWallet(page: Parameters<typeof installMockRpc>[0]) {
   await expect(page.getByTestId("wallet-account-button")).toBeVisible();
 }
 
+test("swap workspace renders selected-pool hourly candles with Lightweight Charts", async ({ page }) => {
+  const rpc = await installMockRpc(page, { includePairs: true });
+
+  await page.goto("/#/swap");
+  const chart = page.getByTestId("swap-market-chart");
+  await expect(chart).toContainText("WNATIVE / USDC");
+  await expect(chart.locator(".swap-chart-summary")).toContainText("Vol $");
+  await expect(chart.getByRole("link", { name: "Charting by TradingView" })).toBeVisible();
+  await expect.poll(() => rpc.snapshot().graphQueries.some((query) => query.includes("WebPairCandles"))).toBe(true);
+  const candleRequest = rpc.snapshot().graphRequests.find((request) => request.query.includes("WebPairCandles"));
+  expect(candleRequest?.variables?.interval).toBe("HOUR");
+});
+
+test("canonical pool tasks keep one selected pool while reusing swap and liquidity engines", async ({ page }) => {
+  await installMockRpc(page, { includePairs: true, includePositions: true });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+
+  const workspace = page.getByTestId("canonical-pool-workspace");
+  const rail = page.getByTestId("pool-workspace-rail");
+  const tasks = workspace.getByRole("navigation", { name: "Pool tasks" });
+  await expect(workspace).toHaveAttribute("data-pool-id", WNATIVE_USDC_PAIR.toLowerCase());
+  await expect(rail).toContainText("$500,000");
+  await expect(page.getByTestId("pool-workspace-state")).toContainText("Current through block 42");
+  await expect(rail).not.toContainText("Network");
+  await expect(rail).not.toContainText("Indexer");
+  await expect(page.getByTestId("swap-market-chart")).toContainText("WNATIVE / USDC");
+  await expect(tasks.getByRole("link", { name: "Swap" })).toHaveAttribute("aria-current", "page");
+  await page.locator("#swap-amount").fill("2.75");
+
+  await tasks.getByRole("link", { name: "Create position" }).click();
+  await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/create$`, "i"));
+  await expect(workspace).toHaveAttribute("data-pool-id", WNATIVE_USDC_PAIR.toLowerCase());
+  await expect(page.locator("#liquidity-pair")).toHaveValue(WNATIVE_USDC_PAIR.toLowerCase());
+  await page.getByTestId("liquidity-amount-x").fill("0.345");
+
+  await tasks.getByRole("link", { name: "Manage" }).click();
+  await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/manage$`, "i"));
+  await expect(workspace).toHaveAttribute("data-pool-id", WNATIVE_USDC_PAIR.toLowerCase());
+  await expect(page.locator("#liquidity-withdraw")).toBeVisible();
+
+  await tasks.getByRole("link", { name: "Swap" }).click();
+  await expect(page.locator("#swap-amount")).toHaveValue("2.75");
+  await tasks.getByRole("link", { name: "Create position" }).click();
+  await expect(page.getByTestId("liquidity-amount-x")).toHaveValue("0.345");
+
+  await tasks.getByRole("link", { name: "Market" }).click();
+  await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/market$`, "i"));
+  await expect(page.getByTestId("pool-detail-analytics-state")).toContainText("Current through block 42");
+});
+
 test("unified pool workspace preserves URL filters, analytics, actions, and accessible charts", async ({ page }) => {
   const analyticsUrls: string[] = [];
   page.on("request", (request) => {

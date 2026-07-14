@@ -53,7 +53,7 @@ try {
 
   const detail = poolDetailHref(pairA, parsed);
   const action = actionHref("add", pairA, detail);
-  assert.match(action, new RegExp(`^#/liquidity/add/${pairA}\\?returnTo=`));
+  assert.match(action, new RegExp(`^#/pools/${pairA}/create\\?returnTo=`));
   assert.equal(returnHrefFromAction(action), detail);
   assert.equal(safeReturnHref("https://evil.example/#/pools"), null);
   assert.equal(safeReturnHref("#/swap/anything"), null);

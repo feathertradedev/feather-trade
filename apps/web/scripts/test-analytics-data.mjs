@@ -17,7 +17,16 @@ const server = await createServer({ configFile: resolve(webRoot, "vite.config.ts
 try {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = mockFetch;
+  const { normalizeAnalyticsEndpoint } = await server.ssrLoadModule("/src/analytics-endpoint.ts");
   const { loadAnalyticsHealth, loadPairCandles, loadPoolMetrics } = await server.ssrLoadModule("/src/analytics-data.ts");
+
+  assert.equal(normalizeAnalyticsEndpoint(" https://analytics.example.test/graphql/ "), endpoint);
+  assert.equal(normalizeAnalyticsEndpoint(undefined), null);
+  assert.equal(normalizeAnalyticsEndpoint(""), null);
+  assert.equal(normalizeAnalyticsEndpoint("analytics.example.test/graphql"), null);
+  assert.equal(normalizeAnalyticsEndpoint("ws://analytics.example.test/graphql"), null);
+  assert.equal(normalizeAnalyticsEndpoint("https://user:secret@analytics.example.test/graphql"), null);
+  assert.equal(normalizeAnalyticsEndpoint("https://analytics.example.test/graphql#fragment"), null);
 
   const metrics = await loadPoolMetrics(endpoint, [pairB.toUpperCase().replace("0X", "0x"), pairA], undefined, { pageSize: 1 });
   assert.equal(metrics.status, "PARTIAL");
@@ -62,7 +71,7 @@ try {
   await assert.rejects(() => loadPoolMetrics(endpoint, [pairA], undefined, { maxPages: 6 }), /maxPages must be between 1 and 5/);
   await assert.rejects(() => loadAnalyticsHealth(endpoint, { timeoutMs: 60_001 }), /timeoutMs must be between 1 and 60000/);
   globalThis.fetch = originalFetch;
-  console.log("Analytics data fixture passed: canonical joins, bounded cursors, LP-net taxonomy, null/zero, candles, and health semantics.");
+  console.log("Analytics data fixture passed: full endpoint contract, canonical joins, bounded cursors, LP-net taxonomy, null/zero, candles, and health semantics.");
 } finally {
   await server.close();
 }

@@ -53,6 +53,17 @@ import {
 } from "@robinhood-lb/sdk/swap";
 import { tokenAllowsAction, tokenApprovalCapabilityLabel, type TokenAction, type TokenMetadata } from "@robinhood-lb/sdk/tokens";
 import {
+  CandlestickSeries,
+  ColorType,
+  HistogramSeries,
+  createChart,
+  type CandlestickData,
+  type HistogramData,
+  type IChartApi,
+  type ISeriesApi,
+  type UTCTimestamp
+} from "lightweight-charts";
+import {
   Activity,
   AlertTriangle,
   ArrowLeftRight,
@@ -85,7 +96,6 @@ import {
   analyticsEndpointForRegistry,
   brandLinks,
   defaultEnvironmentKey,
-  environmentOptions,
   isLocalnetRegistry,
   registries,
   routes,
@@ -232,6 +242,7 @@ import {
   loadPoolMetrics,
   type AnalyticsPage,
   type AnalyticsStatus,
+  type PairCandle,
   type PoolAnalyticsMetric
 } from "./analytics-data";
 import {
@@ -245,6 +256,16 @@ import {
   type PoolEconomicSort,
   type PoolWorkspaceRow
 } from "./pool-workspace";
+import {
+  parsePoolWorkspaceRoute,
+  poolWorkspaceHref,
+  type PoolWorkspaceTask
+} from "./pool-workspace-route";
+import {
+  useOptionalPoolWorkspace,
+  usePoolDraftState
+} from "./pool-workspace-context";
+import { PoolWorkspaceShell } from "./pool-workspace-shell";
 
 const queryClient = new QueryClient();
 const SNAPSHOT_REFRESH_INTERVAL_MS = 10_000;
@@ -616,8 +637,8 @@ function SafeWalletReconnect() {
 }
 
 function DexShell() {
-  const [environmentKey, setEnvironmentKey] = useState<EnvironmentKey>(defaultEnvironmentKey);
-  const [routeKey, setRouteKey, poolDetailId, liquiditySection, actionPoolId, positionDetailId, portfolioAction] = useHashRoute();
+  const environmentKey = defaultEnvironmentKey;
+  const [routeKey, setRouteKey, poolDetailId, liquiditySection, actionPoolId, positionDetailId, portfolioAction, workspaceTask] = useHashRoute();
   const registry = registries[environmentKey];
   const account = useAccount();
   const walletChainId = useChainId();
@@ -672,7 +693,7 @@ function DexShell() {
 
   useEffect(() => {
     window.scrollTo({ behavior: "auto", left: 0, top: 0 });
-  }, [actionPoolId, liquiditySection, poolDetailId, portfolioAction, positionDetailId, routeKey]);
+  }, [actionPoolId, liquiditySection, poolDetailId, portfolioAction, positionDetailId, routeKey, workspaceTask]);
 
   if (routeKey === "home") {
     return <LandingView networkName={registry.chain.name} snapshot={snapshot} />;
@@ -721,7 +742,6 @@ function DexShell() {
                 event.currentTarget.closest("details")?.removeAttribute("open");
                 setRouteKey("activity");
               }}>Activity</a>
-              <span>Runtime health is shown beside the environment selector.</span>
             </div>
           </details>
           <WalletPanel activeChain={registry.chain} key={walletPanelKey} />
@@ -729,31 +749,18 @@ function DexShell() {
       </header>
 
       <section className="workspace">
-        <header className="top-bar">
-          <EnvironmentSwitch active={environmentKey} onChange={setEnvironmentKey} />
-          <div className="top-actions">
-            <div className="runtime-statuses" aria-label="Runtime health">
-              <StatusPill icon={Network} label={runtimeChainLabel(registry.chainId, snapshot?.runtime.chainId ?? null)} state={snapshot?.runtime.status ?? "loading"} />
-              <StatusPill icon={Server} label="Indexer" state={snapshot?.indexer.status ?? "loading"} />
-            </div>
-            <button
-              className="icon-button"
-              data-testid="snapshot-refresh-button"
-              type="button"
-              onClick={() => void snapshotQuery.refetch()}
-              title="Refresh state"
-            >
-              <RefreshCw size={18} />
-            </button>
-          </div>
+        <header className="workspace-refresh">
+          <button
+            className="icon-button"
+            data-testid="snapshot-refresh-button"
+            type="button"
+            onClick={() => void snapshotQuery.refetch()}
+            title="Refresh state"
+          >
+            <RefreshCw size={18} />
+          </button>
         </header>
 
-        <section className="status-strip" aria-live="polite">
-          <MetricTile label="Block" value={formatBlock(snapshot)} tone={snapshot?.runtime.status === "ready" ? "good" : "warn"} />
-          <MetricTile label="Pools" value={formatPoolsMetric(snapshot)} tone={isPartialPagination(snapshot?.indexer.pagination.pools) ? "warn" : "neutral"} />
-          <MetricTile label="Active Bin" value={formatActiveBin(snapshot)} tone="neutral" />
-          <MetricTile label="Indexer Head" value={snapshot?.indexer.blockNumber ?? "offline"} tone={snapshot?.indexer.status === "ready" ? "good" : "warn"} />
-        </section>
         {visibleJournalRecords.length > 0 ? (
           <details className="transaction-journal" data-testid="submitted-transaction-journal">
             <summary>Transaction history ({visibleJournalRecords.length})</summary>
@@ -787,6 +794,7 @@ function DexShell() {
             routeKey={routeKey}
             snapshot={snapshot}
             snapshotState={snapshotQuery.isLoading ? "loading" : snapshotQuery.isError ? "error" : snapshot?.indexer.status ?? "loading"}
+            workspaceTask={workspaceTask}
             onRefresh={() => snapshotQuery.refetch()}
           />
       </section>
@@ -1030,30 +1038,6 @@ function BinGlyph({ mode }: { mode: "spot" | "curve" | "bidask" }) {
   return <span className={`bin-glyph ${mode}`} aria-hidden="true">{heights.map((height, index) => <i key={index} style={{ height }} />)}</span>;
 }
 
-function EnvironmentSwitch({
-  active,
-  onChange
-}: {
-  active: EnvironmentKey;
-  onChange: (environment: EnvironmentKey) => void;
-}) {
-  return (
-    <div className="segmented" role="tablist" aria-label="Environment">
-      {environmentOptions.map((option) => (
-        <button
-          className={active === option.key ? "segment active" : "segment"}
-          key={option.key}
-          onClick={() => onChange(option.key)}
-          type="button"
-        >
-          <span>{option.label}</span>
-          <span className={option.tone === "ready" ? "dot ready" : "dot dry"} />
-        </button>
-      ))}
-    </div>
-  );
-}
-
 function WalletPanel({ activeChain }: { activeChain: Chain }) {
   const [localFailure, setLocalFailure] = useState<WalletFailure | null>(null);
   const [discoverySettled, setDiscoverySettled] = useState(false);
@@ -1182,6 +1166,7 @@ function ContentView({
   routeKey,
   snapshot,
   snapshotState,
+  workspaceTask,
   onRefresh
 }: {
   actionPoolId: string | null;
@@ -1193,6 +1178,7 @@ function ContentView({
   routeKey: RouteKey;
   snapshot: AppSnapshot | undefined;
   snapshotState: LoadState;
+  workspaceTask: PoolWorkspaceTask | null;
   onRefresh: SnapshotRefetch;
 }) {
   const indexedPools = snapshot?.indexer.pools ?? [];
@@ -1276,6 +1262,11 @@ function ContentView({
   const handleSelectedPoolChange = (poolId: string) => {
     setSelectedPoolId(poolId);
 
+    if (routeKey === "pools" && workspaceTask !== null) {
+      window.location.hash = poolWorkspaceHref(poolId, workspaceTask);
+      return;
+    }
+
     if (actionPoolId === null) return;
 
     const encodedPoolId = encodeURIComponent(poolId);
@@ -1330,10 +1321,57 @@ function ContentView({
             ? "error"
             : directPoolQuery.data === null
               ? "empty"
-              : snapshotState;
+            : snapshotState;
+
+      if (detailPool !== null) {
+        const resolvedWorkspaceTask = workspaceTask ?? "market";
+        const workspacePoolOptions = pools.some((pool) => pool.id === detailPool.id) ? pools : [detailPool, ...pools];
+        const workspaceContent = resolvedWorkspaceTask === "swap"
+          ? (
+              <SwapView
+                environmentKey={environmentKey}
+                onRefresh={onRefresh}
+                onSelectedPoolChange={handleSelectedPoolChange}
+                poolOptions={workspacePoolOptions}
+                primaryPool={detailPool}
+                selectedPoolId={detailPool.id}
+                snapshot={snapshot}
+              />
+            )
+          : resolvedWorkspaceTask === "create" || resolvedWorkspaceTask === "manage"
+            ? (
+                <LiquidityView
+                  environmentKey={environmentKey}
+                  initialSection={resolvedWorkspaceTask === "create" ? "add" : "withdraw"}
+                  onRefresh={onRefresh}
+                  onSelectedPoolChange={handleSelectedPoolChange}
+                  poolOptions={workspacePoolOptions}
+                  portfolioAction={null}
+                  primaryPool={detailPool}
+                  selectedPoolId={detailPool.id}
+                  snapshot={snapshot}
+                  snapshotQueryErrored={snapshotState === "error"}
+                />
+              )
+            : (
+                <PoolDetailView
+                  onSelectPool={setSelectedPoolId}
+                  pool={detailPool}
+                  poolDetailId={poolDetailId}
+                  pools={pools}
+                  snapshotState={detailState}
+                />
+              );
+
+        return (
+          <PoolWorkspaceShell environmentKey={environmentKey} key={detailPool.id} pool={detailPool} task={resolvedWorkspaceTask}>
+            {workspaceContent}
+          </PoolWorkspaceShell>
+        );
+      }
+
       return (
         <PoolDetailView
-          environmentKey={environmentKey}
           onSelectPool={setSelectedPoolId}
           pool={detailPool ?? null}
           poolDetailId={poolDetailId}
@@ -1468,12 +1506,12 @@ function SwapView({
   snapshot: AppSnapshot | undefined;
   onRefresh: SnapshotRefetch;
 }) {
-  const [amount, setAmount] = useState("1.0");
-  const [routeMode, setRouteMode] = useState<"exact-selected" | "best">("exact-selected");
-  const [swapForY, setSwapForY] = useState(true);
-  const [useNativeWrapper, setUseNativeWrapper] = useState(false);
-  const [slippageInput, setSlippageInput] = useState("0.5");
-  const [deadlineInput, setDeadlineInput] = useState("20");
+  const [amount, setAmount] = usePoolDraftState("swap.amount", "1.0");
+  const [routeMode, setRouteMode] = usePoolDraftState<"exact-selected" | "best">("swap.routeMode", "exact-selected");
+  const [swapForY, setSwapForY] = usePoolDraftState("swap.swapForY", true);
+  const [useNativeWrapper, setUseNativeWrapper] = usePoolDraftState("swap.useNativeWrapper", false);
+  const [slippageInput, setSlippageInput] = usePoolDraftState("swap.slippage", "0.5");
+  const [deadlineInput, setDeadlineInput] = usePoolDraftState("swap.deadline", "20");
   const [safetyNow, setSafetyNow] = useState(() => Date.now());
   const [approvalSimulationError, setApprovalSimulationError] = useState<string | null>(null);
   const [approvalSimulationPending, setApprovalSimulationPending] = useState(false);
@@ -1500,6 +1538,23 @@ function SwapView({
   const [submittedNativeSwapReceiptContext, setSubmittedNativeSwapReceiptContext] = useState<SubmittedNativeSwapReceiptContext | null>(null);
   const transactionJournal = useTransactionJournal();
   const registry = registries[environmentKey];
+  const poolWorkspace = useOptionalPoolWorkspace();
+  const analyticsEndpoint = analyticsEndpointForRegistry(registry);
+  const workspaceMatchesPool = poolWorkspace !== null && primaryPool !== null && isAddressEqual(poolWorkspace.pool.address, primaryPool.address);
+  const currentHourBoundary = Math.floor(Date.now() / 3_600_000) * 3_600;
+  const candleEnd = currentHourBoundary - 3_600;
+  const candleStart = candleEnd - 7 * 24 * 3_600;
+  const swapCandlesQuery = useQuery({
+    queryKey: ["swapCandles", environmentKey, primaryPool?.address, candleStart, candleEnd],
+    queryFn: () => {
+      if (primaryPool === null) throw new Error("Swap candle target is unavailable");
+      return loadPairCandles(analyticsEndpoint, primaryPool.address, "HOUR", candleStart, candleEnd);
+    },
+    enabled: primaryPool !== null && !workspaceMatchesPool,
+    refetchInterval: primaryPool !== null && !workspaceMatchesPool ? SNAPSHOT_REFRESH_INTERVAL_MS : false,
+    refetchOnWindowFocus: "always",
+    retry: false
+  });
   const localnetRegistry = isLocalnetRegistry(registry) ? registry : null;
   const account = useAccount();
   const activeWalletChainId = useChainId();
@@ -2444,8 +2499,42 @@ function SwapView({
     void handleSwap();
   };
 
+  const swapCandlePage: AnalyticsPage<PairCandle> = workspaceMatchesPool
+    ? poolWorkspace.analytics.candles
+    : swapCandlesQuery.data ?? {
+        rows: [],
+        status: swapCandlesQuery.isError ? "UNAVAILABLE" : "PARTIAL",
+        error: swapCandlesQuery.error instanceof Error ? swapCandlesQuery.error.message : null,
+        pageInfo: { endCursor: null, hasNextPage: false, partial: true, pagesLoaded: 0 }
+      };
+  const swapCandlesLoading = workspaceMatchesPool ? poolWorkspace.analytics.candlesLoading : swapCandlesQuery.isLoading;
+
   return (
-    <div className="view-grid two-col">
+    <div className="view-grid swap-workspace">
+      <div className="swap-market-column">
+        <SwapMarketChart
+          candles={swapCandlePage.rows}
+          error={swapCandlePage.error}
+          loading={swapCandlesLoading}
+          pairAddress={primaryPool?.address ?? null}
+          pairLabel={`${tokenSymbol(tokenX)} / ${tokenSymbol(tokenY)}`}
+          status={swapCandlePage.status}
+        />
+        <SwapDetailsCard
+          expectedOutLabel={expectedOutLabel}
+          feeLabel={feeLabel}
+          primaryPool={primaryPool}
+          quote={quote}
+          priceImpactLabel={priceImpactLabel}
+          routeMode={routeMode}
+          routeSteps={routeSteps}
+          selectedPool={selectedPool}
+          swapMarketError={swapMarketError}
+          swapMarketReady={swapMarketReady}
+          tokenIn={tokenIn}
+          tokenOut={tokenOut}
+        />
+      </div>
       <section className="tool-panel">
         <div className="panel-heading">
           <span>Swap</span>
@@ -2631,20 +2720,6 @@ function SwapView({
         />
       </section>
 
-      <SwapDetailsCard
-        expectedOutLabel={expectedOutLabel}
-        feeLabel={feeLabel}
-        primaryPool={primaryPool}
-        quote={quote}
-        priceImpactLabel={priceImpactLabel}
-        routeMode={routeMode}
-        routeSteps={routeSteps}
-        selectedPool={selectedPool}
-        swapMarketError={swapMarketError}
-        swapMarketReady={swapMarketReady}
-        tokenIn={tokenIn}
-        tokenOut={tokenOut}
-      />
     </div>
   );
 }
@@ -2679,6 +2754,183 @@ function SwapMarketRecovery({
       )}
     </div>
   );
+}
+
+function SwapMarketChart({
+  candles,
+  error,
+  loading,
+  pairAddress,
+  pairLabel,
+  status
+}: {
+  candles: PairCandle[];
+  error: string | null;
+  loading: boolean;
+  pairAddress: string | null;
+  pairLabel: string;
+  status: AnalyticsStatus;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const chartRef = useRef<IChartApi | null>(null);
+  const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
+  const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
+  const fittedDataKeyRef = useRef<string | null>(null);
+  const latestCandle = [...candles].reverse().find((candle) => candle.closeUsdE18 !== null) ?? null;
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (container === null) return;
+
+    const chart = createChart(container, {
+      width: container.clientWidth,
+      height: container.clientHeight,
+      layout: {
+        attributionLogo: true,
+        background: { type: ColorType.Solid, color: "#111411" },
+        fontFamily: '"IBM Plex Mono", ui-monospace, monospace',
+        textColor: "rgba(233, 236, 231, 0.56)"
+      },
+      grid: {
+        horzLines: { color: "rgba(233, 236, 231, 0.06)" },
+        vertLines: { color: "rgba(233, 236, 231, 0.045)" }
+      },
+      crosshair: {
+        horzLine: { color: "rgba(233, 236, 231, 0.38)", labelBackgroundColor: "#252925" },
+        vertLine: { color: "rgba(233, 236, 231, 0.24)", labelBackgroundColor: "#252925" }
+      },
+      localization: { priceFormatter: formatTradingChartPrice },
+      rightPriceScale: {
+        borderColor: "rgba(233, 236, 231, 0.10)",
+        scaleMargins: { top: 0.08, bottom: 0.28 }
+      },
+      timeScale: {
+        borderColor: "rgba(233, 236, 231, 0.10)",
+        rightOffset: 4,
+        barSpacing: 11,
+        timeVisible: true,
+        secondsVisible: false
+      }
+    });
+    const candleSeries = chart.addSeries(CandlestickSeries, {
+      borderVisible: false,
+      downColor: "#e56d70",
+      priceFormat: { type: "price", precision: 8, minMove: 0.00000001 },
+      upColor: "#4ac57c",
+      wickDownColor: "#e56d70",
+      wickUpColor: "#4ac57c"
+    });
+    const volumeSeries = chart.addSeries(HistogramSeries, {
+      color: "rgba(74, 197, 124, 0.32)",
+      priceFormat: { type: "volume" },
+      priceScaleId: ""
+    });
+    volumeSeries.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+    chartRef.current = chart;
+    candleSeriesRef.current = candleSeries;
+    volumeSeriesRef.current = volumeSeries;
+
+    const observer = new ResizeObserver(([entry]) => {
+      if (!entry) return;
+      chart.applyOptions({
+        width: Math.floor(entry.contentRect.width),
+        height: Math.floor(entry.contentRect.height)
+      });
+    });
+    observer.observe(container);
+
+    return () => {
+      observer.disconnect();
+      chart.remove();
+      chartRef.current = null;
+      candleSeriesRef.current = null;
+      volumeSeriesRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    const candleSeries = candleSeriesRef.current;
+    const volumeSeries = volumeSeriesRef.current;
+    if (candleSeries === null || volumeSeries === null) return;
+
+    const ordered = [...candles].sort((left, right) => left.startTimestamp - right.startTimestamp);
+    const candleData: CandlestickData<UTCTimestamp>[] = [];
+    const volumeData: HistogramData<UTCTimestamp>[] = [];
+    for (const candle of ordered) {
+      const open = tradingChartValue(candle.openUsdE18);
+      const high = tradingChartValue(candle.highUsdE18);
+      const low = tradingChartValue(candle.lowUsdE18);
+      const close = tradingChartValue(candle.closeUsdE18);
+      if (open === null || high === null || low === null || close === null) continue;
+      const time = candle.startTimestamp as UTCTimestamp;
+      candleData.push({ close, high, low, open, time });
+      volumeData.push({
+        color: close >= open ? "rgba(74, 197, 124, 0.32)" : "rgba(229, 109, 112, 0.28)",
+        time,
+        value: tradingChartValue(candle.volumeUsdE18) ?? 0
+      });
+    }
+    candleSeries.setData(candleData);
+    volumeSeries.setData(volumeData);
+
+    const fitKey = `${pairAddress ?? "none"}:${candleData[0]?.time ?? "empty"}`;
+    if (candleData.length > 0 && fittedDataKeyRef.current !== fitKey) {
+      chartRef.current?.timeScale().fitContent();
+      fittedDataKeyRef.current = fitKey;
+    }
+  }, [candles, pairAddress]);
+
+  const emptyMessage = loading
+    ? "Loading price history"
+    : status === "UNAVAILABLE" || error
+      ? "Price history is not available yet"
+      : "No completed hourly candles yet";
+
+  return (
+    <section
+      className="info-panel swap-chart-panel"
+      data-testid="swap-market-chart"
+    >
+      <header className="swap-chart-header">
+        <div>
+          <span>Price chart</span>
+          <strong>{pairLabel}</strong>
+        </div>
+        <span className="swap-chart-interval">1H</span>
+      </header>
+      <div className="swap-chart-summary" aria-live="polite">
+        {latestCandle ? (
+          <>
+            <span>O {formatUsdE18(latestCandle.openUsdE18)}</span>
+            <span>H {formatUsdE18(latestCandle.highUsdE18)}</span>
+            <span>L {formatUsdE18(latestCandle.lowUsdE18)}</span>
+            <strong>C {formatUsdE18(latestCandle.closeUsdE18)}</strong>
+            <span>Vol {formatUsdE18(latestCandle.volumeUsdE18)}</span>
+          </>
+        ) : <span>{emptyMessage}</span>}
+      </div>
+      <div className="swap-chart-stage">
+        <div aria-label={`${pairLabel} hourly candlestick chart`} className="swap-chart-canvas" ref={containerRef} role="img" />
+        {candles.length === 0 ? <div className="swap-chart-empty"><span>{emptyMessage}</span></div> : null}
+      </div>
+      <footer className="swap-chart-footer">
+        <span>7D history</span>
+        <span>Hourly USD candles</span>
+      </footer>
+    </section>
+  );
+}
+
+function tradingChartValue(value: string | null): number | null {
+  if (value === null) return null;
+  const parsed = Number(formatUnits(BigInt(value), 18));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatTradingChartPrice(price: number): string {
+  if (Math.abs(price) >= 1_000) return price.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  if (Math.abs(price) >= 1) return price.toLocaleString(undefined, { maximumFractionDigits: 4 });
+  return price.toLocaleString(undefined, { maximumSignificantDigits: 6 });
 }
 
 function SwapDetailsCard({
@@ -2947,11 +3199,6 @@ function swapSnapshotIdentity(snapshot: AppSnapshot | undefined, poolId: string)
     runtimeChainId: snapshot?.runtime.chainId ?? null,
     runtimeStatus: snapshot?.runtime.status ?? null
   });
-}
-
-function runtimeChainLabel(expectedChainId: number, actualChainId: number | null): string {
-  if (actualChainId === null || actualChainId === expectedChainId) return `Chain ${expectedChainId}`;
-  return `Expected ${expectedChainId}, RPC ${actualChainId}`;
 }
 
 function executionPoolFromDescriptor(pool: SelectedPoolDescriptor): SelectedExecutionPool | null {
@@ -3699,35 +3946,34 @@ function PoolsView({
   const [creationOpen, setCreationOpen] = useState(false);
   const creationLaunchRef = useRef<HTMLButtonElement>(null);
   const pageSize = 10;
-  const analyticsBaseEndpoint = analyticsEndpointForRegistry(registry);
-  const ownerEndpoint = analyticsBaseEndpoint === null ? null : `${analyticsBaseEndpoint}/graphql`;
+  const analyticsEndpoint = analyticsEndpointForRegistry(registry);
   const ownerPortfolioQuery = useQuery({
-    queryKey: ["poolDiscoveryOwner", environmentKey, account.address, ownerEndpoint],
+    queryKey: ["poolDiscoveryOwner", environmentKey, account.address, analyticsEndpoint],
     queryFn: async () => {
-      if (!account.address || ownerEndpoint === null) throw new Error("Wallet analytics are unavailable");
-      const page = await loadWalletPortfolio(ownerEndpoint, account.address);
+      if (!account.address || analyticsEndpoint === null) throw new Error("Wallet analytics are unavailable");
+      const page = await loadWalletPortfolio(analyticsEndpoint, account.address);
       if (page.positions.some((position) => position.owner.toLowerCase() !== account.address!.toLowerCase())) {
         throw new Error("Wallet analytics returned a position for another owner");
       }
       return page;
     },
-    enabled: discoveryState.hasLiquidity && account.address !== undefined && ownerEndpoint !== null,
+    enabled: discoveryState.hasLiquidity && account.address !== undefined && analyticsEndpoint !== null,
     refetchInterval: discoveryState.hasLiquidity ? SNAPSHOT_REFRESH_INTERVAL_MS : false,
     refetchOnWindowFocus: "always",
     retry: false
   });
   const poolAddressKey = pools.map((pool) => pool.address.toLowerCase()).sort().join("|");
   const metricsQuery = useQuery({
-    queryKey: ["poolWorkspaceMetrics", environmentKey, ownerEndpoint, poolAddressKey],
-    queryFn: () => loadPoolMetrics(ownerEndpoint, pools.map((pool) => pool.address)),
+    queryKey: ["poolWorkspaceMetrics", environmentKey, analyticsEndpoint, poolAddressKey],
+    queryFn: () => loadPoolMetrics(analyticsEndpoint, pools.map((pool) => pool.address)),
     enabled: pools.length > 0,
     refetchInterval: SNAPSHOT_REFRESH_INTERVAL_MS,
     refetchOnWindowFocus: "always",
     retry: false
   });
   const analyticsHealthQuery = useQuery({
-    queryKey: ["poolWorkspaceHealth", environmentKey, ownerEndpoint],
-    queryFn: () => loadAnalyticsHealth(ownerEndpoint),
+    queryKey: ["poolWorkspaceHealth", environmentKey, analyticsEndpoint],
+    queryFn: () => loadAnalyticsHealth(analyticsEndpoint),
     refetchInterval: SNAPSHOT_REFRESH_INTERVAL_MS,
     refetchOnWindowFocus: "always",
     retry: false
@@ -3776,7 +4022,7 @@ function PoolsView({
     setDiscoveryState(state);
     window.history.replaceState(null, "", discoveryHref(state));
   };
-  const ownerFilterLoading = discoveryState.hasLiquidity && account.address !== undefined && ownerEndpoint !== null &&
+  const ownerFilterLoading = discoveryState.hasLiquidity && account.address !== undefined && analyticsEndpoint !== null &&
     (ownerPortfolioQuery.isPending || ownerPortfolioQuery.isFetching);
   const closeCreation = useCallback(() => {
     setCreationOpen(false);
@@ -3908,7 +4154,7 @@ function PoolsView({
                     ? "Loading wallet liquidity from application analytics."
                     : filteredPage.ownerStatus === "partial"
                   ? "Wallet liquidity results are partial; only verified loaded pools are shown."
-                  : ownerEndpoint === null
+                  : analyticsEndpoint === null
                       ? "Wallet liquidity analytics are not configured for this environment."
                       : "Wallet liquidity analytics are unavailable."
                 }
@@ -5003,84 +5249,22 @@ function poolCreationRecoveryCopy(
 }
 
 function PoolDetailView({
-  environmentKey,
   onSelectPool,
   pool,
   poolDetailId,
   pools,
   snapshotState
 }: {
-  environmentKey: EnvironmentKey;
   onSelectPool: (poolId: string) => void;
   pool: PoolRow | null;
   poolDetailId: string;
   pools: PoolRow[];
   snapshotState: LoadState;
 }) {
-  const registry = registries[environmentKey];
-  const account = useAccount();
-  const analyticsBaseEndpoint = analyticsEndpointForRegistry(registry);
-  const analyticsEndpoint = analyticsBaseEndpoint === null ? null : `${analyticsBaseEndpoint}/graphql`;
+  const workspace = useOptionalPoolWorkspace();
   const discoveryState = parsePoolDiscoveryState(window.location.hash);
   const backHref = discoveryHref(discoveryState);
   const detailReturnHref = pool === null ? backHref : poolDetailHref(pool.id, discoveryState);
-  const currentHourBoundary = Math.floor(Date.now() / 3_600_000) * 3_600;
-  const candleEnd = currentHourBoundary - 3_600;
-  const candleStart = currentHourBoundary - 24 * 3_600;
-  const poolMetricsQuery = useQuery({
-    queryKey: ["poolDetailMetrics", environmentKey, analyticsEndpoint, pool?.address],
-    queryFn: () => {
-      if (pool === null) throw new Error("Pool analytics target is unavailable");
-      return loadPoolMetrics(analyticsEndpoint, [pool.address]);
-    },
-    enabled: pool !== null,
-    refetchInterval: SNAPSHOT_REFRESH_INTERVAL_MS,
-    refetchOnWindowFocus: "always",
-    retry: false
-  });
-  const pairCandlesQuery = useQuery({
-    queryKey: ["poolDetailCandles", environmentKey, analyticsEndpoint, pool?.address, candleStart, candleEnd],
-    queryFn: () => {
-      if (pool === null) throw new Error("Pool candle target is unavailable");
-      return loadPairCandles(analyticsEndpoint, pool.address, "HOUR", candleStart, candleEnd);
-    },
-    enabled: pool !== null,
-    refetchInterval: SNAPSHOT_REFRESH_INTERVAL_MS,
-    refetchOnWindowFocus: "always",
-    retry: false
-  });
-  const analyticsHealthQuery = useQuery({
-    queryKey: ["poolDetailAnalyticsHealth", environmentKey, analyticsEndpoint],
-    queryFn: () => loadAnalyticsHealth(analyticsEndpoint),
-    refetchInterval: SNAPSHOT_REFRESH_INTERVAL_MS,
-    refetchOnWindowFocus: "always",
-    retry: false
-  });
-  const binsQuery = useQuery({
-    queryKey: ["poolBinWindow", environmentKey, pool?.address, pool?.activeId, registry.endpoints.indexerUrl],
-    queryFn: () => {
-      if (pool === null || pool.activeId === null) throw new Error("Pool active bin is unavailable");
-      return loadPoolBinWindow(registry, pool.address, Number(pool.activeId));
-    },
-    enabled: pool !== null && pool.activeId !== null && registry.endpoints.indexerUrl !== null,
-    refetchInterval: pool !== null && pool.activeId !== null && registry.endpoints.indexerUrl !== null ? SNAPSHOT_REFRESH_INTERVAL_MS : false,
-    refetchOnWindowFocus: "always",
-    retry: false
-  });
-  const walletPositionsQuery = useQuery({
-    queryKey: ["poolDetailPositions", environmentKey, account.address, pool?.address, registry.endpoints.indexerUrl],
-    queryFn: () => {
-      if (pool === null || !account.address) throw new Error("Wallet pool position is unavailable");
-      return loadPaginatedPositionsForOwnerPair(registry, account.address, pool.address);
-    },
-    enabled: pool !== null && account.address !== undefined && registry.endpoints.indexerUrl !== null,
-    refetchInterval:
-      pool !== null && account.address !== undefined && registry.endpoints.indexerUrl !== null
-        ? SNAPSHOT_REFRESH_INTERVAL_MS
-        : false,
-    refetchOnWindowFocus: "always",
-    retry: false
-  });
 
   if (pool === null) {
     const lookupResolved = !["loading", "error", "unavailable"].includes(snapshotState);
@@ -5097,58 +5281,31 @@ function PoolDetailView({
     );
   }
 
-  const indexedBins = binsQuery.data ?? [];
+  if (workspace === null) throw new Error("Resolved pool detail requires the canonical pool workspace context");
+
+  const accountAddress = workspace.walletAddress;
+  const indexedBins = workspace.bins;
   const bins = withActiveBin(indexedBins, pool.activeId);
-  const metricPage: AnalyticsPage<PoolAnalyticsMetric> = poolMetricsQuery.data ?? {
-    rows: [],
-    status: poolMetricsQuery.isError ? "UNAVAILABLE" : "PARTIAL",
-    error: poolMetricsQuery.error instanceof Error ? poolMetricsQuery.error.message : null,
-    pageInfo: { endCursor: null, hasNextPage: false, partial: true, pagesLoaded: 0 }
-  };
-  const detailWorkspaceRow = joinPoolWorkspaceRows([pool], metricPage)[0]!;
+  const metricPage = workspace.analytics.metricPage;
+  const detailWorkspaceRow = workspace.analytics.row;
   const metric = detailWorkspaceRow.metric;
   const metricTiles = workspaceMetricTiles(metric);
-  const detailAnalyticsState = poolMetricsQuery.isPending || analyticsHealthQuery.isPending
-    ? { status: "PARTIAL" as const, label: "Loading application analytics", detail: "Pool metrics and freshness are being resolved." }
-    : workspaceAnalyticsState(detailWorkspaceRow.analyticsStatus, analyticsHealthQuery.data?.value ?? null);
-  const candlePage = pairCandlesQuery.data ?? {
-    rows: [],
-    status: pairCandlesQuery.isError ? "UNAVAILABLE" as const : "PARTIAL" as const,
-    error: pairCandlesQuery.error instanceof Error ? pairCandlesQuery.error.message : null,
-    pageInfo: { endCursor: null, hasNextPage: false, partial: true, pagesLoaded: 0 }
+  const detailAnalyticsState = workspace.analytics.state;
+  const detailCandleStart = Math.floor(Date.now() / 3_600_000) * 3_600 - 24 * 3_600;
+  const candlePage = {
+    ...workspace.analytics.candles,
+    rows: workspace.analytics.candles.rows.filter((candle) => candle.startTimestamp >= detailCandleStart)
   };
   const candleModel = buildCandleChartModel(candlePage);
   const binDistribution = pool.tokenX !== null && pool.tokenY !== null
     ? buildBinDistribution(bins, pool.activeId, pool.tokenX.decimals, pool.tokenY.decimals)
     : null;
   const siblingPools = samePairPools(pools, pool);
-  const walletPositions = walletPositionsQuery.data?.rows ?? [];
-  const positionsPartial = isPartialPagination(walletPositionsQuery.data?.pageInfo);
-  const binsState: LoadState = registry.endpoints.indexerUrl === null
-    ? "unavailable"
-    : pool.activeId === null
-      ? "unavailable"
-    : binsQuery.isError
-      ? "error"
-      : binsQuery.isLoading
-        ? "loading"
-        : binsQuery.data
-          ? "ready"
-          : "empty";
-  const positionsState: LoadState = !account.address
-    ? "loading"
-    : registry.endpoints.indexerUrl === null
-      ? "unavailable"
-      : walletPositionsQuery.isError
-        ? "error"
-        : positionsPartial
-          ? "partial"
-          : walletPositionsQuery.isLoading
-            ? "loading"
-            : walletPositions.length > 0
-              ? "ready"
-              : "empty";
-  const positionsLabel = !account.address
+  const walletPositions = workspace.positions;
+  const positionsPartial = workspace.positionsPartial;
+  const binsState = workspace.binsState;
+  const positionsState = workspace.positionsState;
+  const positionsLabel = !accountAddress
     ? "connect wallet"
     : positionsState === "partial"
       ? `${walletPositions.length} loaded · partial`
@@ -5204,7 +5361,7 @@ function PoolDetailView({
       <section className="info-panel">
         <div className="panel-heading">
           <span>Live liquidity bins</span>
-          <StatusBadge state={binsState} label={binsQuery.data ? `${indexedBins.length} indexed bins` : binsState} />
+          <StatusBadge state={binsState} label={binsState === "ready" ? `${indexedBins.length} bins` : binsState} />
         </div>
         <PoolBinDistributionChart
           points={binDistribution}
@@ -5212,7 +5369,7 @@ function PoolDetailView({
           tokenX={pool.tokenX === null ? null : tokenSymbol(pool.tokenX)}
           tokenY={pool.tokenY === null ? null : tokenSymbol(pool.tokenY)}
         />
-        {binsQuery.error ? <p className="inline-error">{getWriteError(binsQuery.error) ?? "Pool bins unavailable"}</p> : null}
+        {workspace.binsError ? <p className="inline-error">{workspace.binsError}</p> : null}
       </section>
 
       {siblingPools.length > 0 ? (
@@ -5249,18 +5406,18 @@ function PoolDetailView({
             </div>
             {positionsPartial ? <p className="state-row warning">The owner/pair position query is partial; destructive actions remain blocked.</p> : null}
           </>
-        ) : account.address && ["loading", "error", "unavailable"].includes(positionsState) ? (
+        ) : accountAddress && ["loading", "error", "unavailable"].includes(positionsState) ? (
           <>
             <EmptyState state={positionsState} />
-            {walletPositionsQuery.error ? <p className="inline-error">{getWriteError(walletPositionsQuery.error) ?? "Wallet pool positions are unavailable."}</p> : null}
+            {workspace.positionsError ? <p className="inline-error">{workspace.positionsError}</p> : null}
           </>
         ) : (
           <p className="inline-empty">
-            {account.address
+            {accountAddress
               ? positionsState === "unavailable"
-                ? "Indexer access is required to load wallet pool balances."
-                : walletPositionsQuery.isError
-                ? getWriteError(walletPositionsQuery.error) ?? "Wallet pool positions are unavailable."
+                ? "Position data is unavailable for this pool."
+                : workspace.positionsError
+                ? workspace.positionsError
                 : positionsPartial
                   ? "The owner/pair position query is partial; destructive actions remain blocked."
                 : "No indexed balances in this pool."
@@ -5454,25 +5611,25 @@ function LiquidityView({
   snapshotQueryErrored: boolean;
   onRefresh: SnapshotRefetch;
 }) {
-  const [amountXInput, setAmountXInput] = useState("0.01");
-  const [amountYInput, setAmountYInput] = useState("1");
-  const [lowerDeltaInput, setLowerDeltaInput] = useState("-1");
-  const [upperDeltaInput, setUpperDeltaInput] = useState("1");
-  const [lowerBinInput, setLowerBinInput] = useState("");
-  const [upperBinInput, setUpperBinInput] = useState("");
-  const [lowerBinId, setLowerBinId] = useState<number | null>(null);
-  const [upperBinId, setUpperBinId] = useState<number | null>(null);
-  const [lowerPriceInput, setLowerPriceInput] = useState("");
-  const [upperPriceInput, setUpperPriceInput] = useState("");
+  const [amountXInput, setAmountXInput] = usePoolDraftState("liquidity.amountX", "0.01");
+  const [amountYInput, setAmountYInput] = usePoolDraftState("liquidity.amountY", "1");
+  const [lowerDeltaInput, setLowerDeltaInput] = usePoolDraftState("liquidity.lowerDelta", "-1");
+  const [upperDeltaInput, setUpperDeltaInput] = usePoolDraftState("liquidity.upperDelta", "1");
+  const [lowerBinInput, setLowerBinInput] = usePoolDraftState("liquidity.lowerBin", "");
+  const [upperBinInput, setUpperBinInput] = usePoolDraftState("liquidity.upperBin", "");
+  const [lowerBinId, setLowerBinId] = usePoolDraftState<number | null>("liquidity.lowerBinId", null);
+  const [upperBinId, setUpperBinId] = usePoolDraftState<number | null>("liquidity.upperBinId", null);
+  const [lowerPriceInput, setLowerPriceInput] = usePoolDraftState("liquidity.lowerPrice", "");
+  const [upperPriceInput, setUpperPriceInput] = usePoolDraftState("liquidity.upperPrice", "");
   const [rangeEditError, setRangeEditError] = useState<string | null>(null);
-  const [narrowPresetInput, setNarrowPresetInput] = useState("3");
-  const [widePresetInput, setWidePresetInput] = useState("21");
-  const [liquidityStrategy, setLiquidityStrategy] = useState<LiquidityStrategy>("spot");
-  const [liquidityAssetMode, setLiquidityAssetMode] = useState<"erc20" | "native">("erc20");
-  const [removeAssetMode, setRemoveAssetMode] = useState<"erc20" | "native">("erc20");
-  const [slippageInput, setSlippageInput] = useState("0.5");
-  const [idSlippageInput, setIdSlippageInput] = useState("2");
-  const [deadlineInput, setDeadlineInput] = useState("20");
+  const [narrowPresetInput, setNarrowPresetInput] = usePoolDraftState("liquidity.narrowPreset", "3");
+  const [widePresetInput, setWidePresetInput] = usePoolDraftState("liquidity.widePreset", "21");
+  const [liquidityStrategy, setLiquidityStrategy] = usePoolDraftState<LiquidityStrategy>("liquidity.strategy", "spot");
+  const [liquidityAssetMode, setLiquidityAssetMode] = usePoolDraftState<"erc20" | "native">("liquidity.assetMode", "erc20");
+  const [removeAssetMode, setRemoveAssetMode] = usePoolDraftState<"erc20" | "native">("liquidity.removeAssetMode", "erc20");
+  const [slippageInput, setSlippageInput] = usePoolDraftState("liquidity.slippage", "0.5");
+  const [idSlippageInput, setIdSlippageInput] = usePoolDraftState("liquidity.idSlippage", "2");
+  const [deadlineInput, setDeadlineInput] = usePoolDraftState("liquidity.deadline", "20");
   const [liquiditySimulationError, setLiquiditySimulationError] = useState<string | null>(null);
   const [liquiditySimulationPending, setLiquiditySimulationPending] = useState(false);
   const [gasReviewError, setGasReviewError] = useState<string | null>(null);
@@ -5487,8 +5644,8 @@ function LiquidityView({
   const [fullExitBatchReview, setFullExitBatchReview] = useState<FullExitBatchReviewState | null>(null);
   const latestFullExitBatchReviewRef = useRef<FullExitBatchReviewState | null>(fullExitBatchReview);
   latestFullExitBatchReviewRef.current = fullExitBatchReview;
-  const [selectedPositionIds, setSelectedPositionIds] = useState<string[]>([]);
-  const [removePercentInput, setRemovePercentInput] = useState("100");
+  const [selectedPositionIds, setSelectedPositionIds] = usePoolDraftState<string[]>("liquidity.selectedPositionIds", []);
+  const [removePercentInput, setRemovePercentInput] = usePoolDraftState("liquidity.removePercent", "100");
   const [explicitFullExitRequested, setExplicitFullExitRequested] = useState(false);
   const [liquidityReceiptPhase, setLiquidityReceiptPhase] = useState<"idle" | "lb-approval" | "remove">("idle");
   const [submittedRemoveReceiptContext, setSubmittedRemoveReceiptContext] = useState<string | null>(null);
@@ -6360,7 +6517,7 @@ function LiquidityView({
     queryKey: ["liquidityPortfolioIntent", registry.chainId, portfolioEndpoint, account.address, pool?.pair],
     queryFn: async () => {
       if (!account.address || !portfolioEndpoint) throw new Error("Portfolio exit intent is unavailable");
-      return loadWalletPortfolio(`${portfolioEndpoint}/graphql`, account.address);
+      return loadWalletPortfolio(portfolioEndpoint, account.address);
     },
     enabled: portfolioExitRequested && connected && !onWrongChain && pool !== null && portfolioEndpoint !== null,
     refetchInterval: portfolioExitRequested && connected && !onWrongChain && pool !== null && portfolioEndpoint !== null ? 10_000 : false,
@@ -9520,7 +9677,7 @@ function PositionsView({
     queryKey: ["walletPortfolio", environmentKey, registry.chainId, portfolioEndpoint, account.address],
     queryFn: () => {
       if (!account.address || !portfolioEndpoint) throw new Error("Analytics portfolio is unavailable");
-      return loadWalletPortfolio(`${portfolioEndpoint}/graphql`, account.address);
+      return loadWalletPortfolio(portfolioEndpoint, account.address);
     },
     enabled: connected && !onWrongChain && portfolioEndpoint !== null,
     refetchInterval: connected && !onWrongChain && portfolioEndpoint !== null ? SNAPSHOT_REFRESH_INTERVAL_MS : false,
@@ -9876,23 +10033,6 @@ function MetricTile({ label, value, tone }: { label: string; value: string; tone
   );
 }
 
-function StatusPill({
-  icon: Icon,
-  label,
-  state
-}: {
-  icon: ComponentType<{ size?: number }>;
-  label: string;
-  state: LoadState;
-}) {
-  return (
-    <div className={`status-pill ${state}`}>
-      <Icon size={16} />
-      <span>{label}</span>
-    </div>
-  );
-}
-
 function StatusBadge({ state, label }: { state: LoadState; label: string }) {
   return <span className={`status-badge ${state}`}>{label}</span>;
 }
@@ -9922,18 +10062,6 @@ function EmptyState({ state }: { state: LoadState }) {
   );
 }
 
-function formatBlock(snapshot: AppSnapshot | undefined): string {
-  if (snapshot?.runtime.blockNumber === null || snapshot?.runtime.blockNumber === undefined) return "offline";
-  return snapshot.runtime.blockNumber.toString();
-}
-
-function formatPoolsMetric(snapshot: AppSnapshot | undefined): string {
-  if (!snapshot) return "0";
-
-  const pairCount = snapshot.indexer.pairCount ?? snapshot.indexer.pools.length.toString();
-  return isPartialPagination(snapshot.indexer.pagination.pools) ? `${snapshot.indexer.pools.length}+ / ${pairCount}` : pairCount;
-}
-
 function paginationBadgeLabel(count: number, pageInfo: PaginationInfo, unit: string): string {
   return isPartialPagination(pageInfo) ? `${count}+ ${unit}` : `${count} ${unit}`;
 }
@@ -9950,14 +10078,6 @@ function isPartialPagination(pageInfo: PaginationInfo | null | undefined): boole
   return Boolean(pageInfo?.capped || pageInfo?.failed);
 }
 
-function formatActiveBin(snapshot: AppSnapshot | undefined): string {
-  if (snapshot?.runtime.seededActiveId !== null && snapshot?.runtime.seededActiveId !== undefined) {
-    return snapshot.runtime.seededActiveId.toString();
-  }
-
-  return snapshot?.indexer.pools[0]?.activeId ?? "n/a";
-}
-
 function useHashRoute(): [
   RouteKey,
   (route: RouteKey) => void,
@@ -9965,7 +10085,8 @@ function useHashRoute(): [
   "add" | "withdraw" | null,
   string | null,
   string | null,
-  "add" | "partial" | "full" | null
+  "add" | "partial" | "full" | null,
+  PoolWorkspaceTask | null
 ] {
   const routeParts = () => window.location.hash.replace("#/", "").split("?", 1)[0].split("/");
   const readRoute = () => {
@@ -10008,12 +10129,17 @@ function useHashRoute(): [
     const [route, action] = routeParts();
     return route === "liquidity" && (action === "add" || action === "partial" || action === "full") ? action : null;
   };
+  const readWorkspaceTask = (): PoolWorkspaceTask | null => {
+    const workspaceRoute = parsePoolWorkspaceRoute(window.location.hash);
+    return workspaceRoute?.source === "canonical" ? workspaceRoute.task : null;
+  };
   const [routeKey, setRouteKeyState] = useState<RouteKey>(readRoute);
   const [poolDetailId, setPoolDetailId] = useState<string | null>(readPoolDetailId);
   const [liquiditySection, setLiquiditySection] = useState<"add" | "withdraw" | null>(readLiquiditySection);
   const [actionPoolId, setActionPoolId] = useState<string | null>(readActionPoolId);
   const [positionDetailId, setPositionDetailId] = useState<string | null>(readPositionDetailId);
   const [portfolioAction, setPortfolioAction] = useState<"add" | "partial" | "full" | null>(readPortfolioAction);
+  const [workspaceTask, setWorkspaceTask] = useState<PoolWorkspaceTask | null>(readWorkspaceTask);
 
   useEffect(() => {
     const listener = () => {
@@ -10023,6 +10149,7 @@ function useHashRoute(): [
       setActionPoolId(readActionPoolId());
       setPositionDetailId(readPositionDetailId());
       setPortfolioAction(readPortfolioAction());
+      setWorkspaceTask(readWorkspaceTask());
     };
     window.addEventListener("hashchange", listener);
     return () => window.removeEventListener("hashchange", listener);
@@ -10035,7 +10162,8 @@ function useHashRoute(): [
     setActionPoolId(null);
     setPositionDetailId(null);
     setPortfolioAction(null);
+    setWorkspaceTask(null);
   };
 
-  return [routeKey, setRouteKey, poolDetailId, liquiditySection, actionPoolId, positionDetailId, portfolioAction];
+  return [routeKey, setRouteKey, poolDetailId, liquiditySection, actionPoolId, positionDetailId, portfolioAction, workspaceTask];
 }

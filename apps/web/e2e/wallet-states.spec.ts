@@ -20,14 +20,8 @@ import {
 import { DEFAULT_ACCOUNT, installMockWallet, LOCALNET_CHAIN_ID, readMockWallet, ROBINHOOD_TESTNET_CHAIN_ID, type MockWalletOptions } from "./fixtures/mock-wallet";
 
 const ONE_TOKEN = 1_000_000_000_000_000_000n;
-const ROBINHOOD_TESTNET_RPC_URL = "https://rpc.testnet.chain.robinhood.com";
 const TRANSACTION_ABI = [...erc20Abi, ...lbPairAbi, ...lbRouterAbi] as const;
 const SWAP_QUOTE_FUNCTIONS = new Set(["findBestPathFromAmountIn", "getSwapOut"]);
-
-interface RuntimeRpcRequest {
-  id?: number | string | null;
-  method: string;
-}
 
 test("disconnected wallet state disables guarded swap actions", async ({ page }) => {
   await installMockRpc(page);
@@ -599,7 +593,7 @@ test("account change resets executable state and receipt banners but preserves t
   expect(await persistedTransactionJournalCount(page)).toBe(1);
 });
 
-test("disconnect, reconnect, chain, and environment changes clear prior-owner drafts", async ({ page }) => {
+test("disconnect, reconnect, and chain changes clear prior-owner drafts", async ({ page }) => {
   await installMockRpc(page);
   await installMockWallet(page);
   await page.goto("/#/swap");
@@ -613,10 +607,6 @@ test("disconnect, reconnect, chain, and environment changes clear prior-owner dr
   await page.locator("#swap-amount").fill("6.5");
   await page.evaluate((chainId) => window.__mockWalletControl.setChain(chainId), ROBINHOOD_TESTNET_CHAIN_ID);
   await expect(page.getByTestId("wallet-switch-button")).toBeVisible();
-  await expect(page.locator("#swap-amount")).toHaveValue("1.0");
-
-  await page.locator("#swap-amount").fill("5.5");
-  await page.getByRole("button", { name: /Robinhood Testnet/ }).click();
   await expect(page.locator("#swap-amount")).toHaveValue("1.0");
 });
 
@@ -679,9 +669,6 @@ test("wrong-chain RPC fails closed even when the wallet is on the expected chain
   await page.goto("/#/swap");
   await connectWallet(page);
 
-  await expect(page.locator(".status-pill").filter({ hasText: "Expected 31337, RPC 46630" })).toContainText(
-    "Expected 31337, RPC 46630"
-  );
   await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
   await expect(page.getByTestId("swap-approve-button")).toBeDisabled();
   await expect(page.getByTestId("swap-failure-state")).toContainText("RPC chain mismatch: expected 31337, received 46630");
@@ -1426,66 +1413,36 @@ test("dashboard polling advances RPC and indexer heads through stale, error, and
 
   const rpc = await installMockRpc(page, { blockNumber: 42n, includePairs: true, indexerBlockNumber: 42n });
   await page.goto("/#/swap");
-  const blockValue = page.locator(".metric").filter({ hasText: "Block" }).locator("strong");
-  const indexerHeadValue = page.locator(".metric").filter({ hasText: "Indexer Head" }).locator("strong");
-  const indexerPill = page.locator(".status-pill").filter({ hasText: "Indexer" });
-  await expect(blockValue).toHaveText("42");
-  await expect(indexerHeadValue).toHaveText("42");
-  await expect(indexerPill).toHaveClass(/ready/);
+  await expect(page.getByRole("tablist", { name: "Environment" })).toHaveCount(0);
+  await expect(page.locator(".status-strip")).toHaveCount(0);
+  await expect(page.locator(".runtime-statuses")).toHaveCount(0);
   await expect.poll(() => swapQuoteCallCount(rpc)).toBeGreaterThan(0);
   const initialQuoteCalls = swapQuoteCallCount(rpc);
 
   rpc.update({ blockNumber: 63n });
-  await expect(blockValue).toHaveText("63", { timeout: 12_000 });
-  await expect(indexerPill).toHaveClass(/stale/);
+  await page.getByTestId("snapshot-refresh-button").click();
 
   rpc.update({ indexerBlockNumber: 63n });
   await page.getByTestId("snapshot-refresh-button").click();
-  await expect(indexerHeadValue).toHaveText("63");
-  await expect(indexerPill).toHaveClass(/ready/);
   await expect
     .poll(() => swapQuoteCallCount(rpc))
     .toBeGreaterThan(initialQuoteCalls);
 
   rpc.update({ indexerMode: "error" });
   await page.getByTestId("snapshot-refresh-button").click();
-  await expect(indexerPill).toHaveClass(/error/);
+  await expect(page.getByTestId("indexer-status-message")).toBeVisible();
 
   rpc.update({ blockNumber: 64n, indexerBlockNumber: 64n, indexerMode: "ready" });
   await page.getByTestId("snapshot-refresh-button").click();
-  await expect(blockValue).toHaveText("64");
-  await expect(indexerHeadValue).toHaveText("64");
-  await expect(indexerPill).toHaveClass(/ready/);
+  await expect(page.getByTestId("indexer-status-message")).toHaveCount(0);
 });
 
-test("dashboard refetches on focus visibility and environment changes", async ({ page }, testInfo) => {
+test("dashboard refetches on focus visibility while the deployment environment stays fixed", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium", "Refresh trigger coverage runs once in desktop Chromium");
 
   const rpc = await installMockRpc(page, { includePairs: true });
-  let testnetRuntimeRequests = 0;
-  await page.route(`${ROBINHOOD_TESTNET_RPC_URL}/`, async (route) => {
-    if (route.request().method() === "OPTIONS") {
-      await route.fulfill({ headers: rpcCorsHeaders(), status: 204 });
-      return;
-    }
-
-    const payload = JSON.parse(route.request().postData() ?? "null") as RuntimeRpcRequest | RuntimeRpcRequest[];
-    const requests = Array.isArray(payload) ? payload : [payload];
-    testnetRuntimeRequests += requests.length;
-    const responses = requests.map((request) => ({
-      id: request.id ?? null,
-      jsonrpc: "2.0",
-      result: request.method === "eth_chainId" ? "0xb626" : request.method === "eth_blockNumber" ? "0x2a" : "0x0"
-    }));
-    await route.fulfill({
-      body: JSON.stringify(Array.isArray(payload) ? responses : responses[0]),
-      contentType: "application/json",
-      headers: rpcCorsHeaders(),
-      status: 200
-    });
-  });
-
   await page.goto("/#/swap");
+  await expect(page.getByRole("tablist", { name: "Environment" })).toHaveCount(0);
   await expect.poll(() => rpc.snapshot().methods.filter((method) => method === "eth_chainId").length).toBeGreaterThan(0);
   const beforeFocus = rpc.snapshot().methods.filter((method) => method === "eth_chainId").length;
 
@@ -1500,10 +1457,6 @@ test("dashboard refetches on focus visibility and environment changes", async ({
   await expect
     .poll(() => rpc.snapshot().methods.filter((method) => method === "eth_chainId").length)
     .toBeGreaterThan(beforeFocus);
-
-  await page.getByRole("button", { name: /Robinhood Testnet/ }).click();
-  await expect.poll(() => testnetRuntimeRequests).toBeGreaterThan(0);
-  await expect(page.locator(".status-pill").filter({ hasText: "Chain 46630" })).toBeVisible();
 });
 
 test("pool discovery deep-links to real indexed bins and preselects liquidity actions", async ({ page }, testInfo) => {
@@ -1533,7 +1486,7 @@ test("pool discovery deep-links to real indexed bins and preselects liquidity ac
   await expect(page.locator(".pool-bin-chart .pool-bin-stack")).toHaveCount(7);
 
   await page.getByRole("link", { name: "Withdraw" }).click();
-  await expect(page).toHaveURL(/#\/liquidity\/withdraw\/0x.+\?returnTo=/i);
+  await expect(page).toHaveURL(/#\/pools\/0x.+\/manage\?returnTo=/i);
   await expect(page.getByTestId("pool-action-back")).toHaveAttribute("href", /#\/pools\/.+q=WNATIVE/);
   await expect(page.locator("#liquidity-withdraw")).toBeInViewport();
 
@@ -1541,7 +1494,7 @@ test("pool discovery deep-links to real indexed bins and preselects liquidity ac
   await expect(page).toHaveURL(/#\/pools\//);
 
   await page.getByRole("link", { name: "Deposit" }).click();
-  await expect(page).toHaveURL(/#\/liquidity\/add\/0x/i);
+  await expect(page).toHaveURL(/#\/pools\/0x.+\/create/i);
   await expect(page.locator("#liquidity-add")).toBeInViewport();
   await expect(page.locator("#liquidity-pair")).toContainText("WNATIVE / USDC");
 });
@@ -1572,11 +1525,16 @@ test("pool and action deep links resolve outside the dashboard page and survive 
   await expect(page.getByText("Live liquidity bins")).toBeVisible();
   await expect(page.getByText(/bin step 11/)).toBeVisible();
   await page.getByRole("link", { name: "Withdraw" }).click();
-  await expect(page).toHaveURL(new RegExp(`#/liquidity/withdraw/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}\\?returnTo=`, "i"));
+  await expect(page).toHaveURL(new RegExp(`#/pools/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}/manage\\?returnTo=`, "i"));
   await expect(page.getByTestId("pool-action-back")).toHaveAttribute("href", new RegExp(`#/pools/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}`, "i"));
 
   await page.reload();
   await expect(page.locator("#liquidity-pair")).toHaveValue(SECOND_WNATIVE_USDC_PAIR.toLowerCase());
+  await expect(page.locator("#liquidity-withdraw")).toBeInViewport();
+
+  await page.goto(`/#/liquidity/withdraw/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}`);
+  await expect(page.locator("#liquidity-pair")).toHaveValue(SECOND_WNATIVE_USDC_PAIR.toLowerCase());
+  await page.reload();
   await expect(page.locator("#liquidity-withdraw")).toBeInViewport();
 });
 
@@ -1641,11 +1599,10 @@ test("GraphQL timeout is visible and recovers through manual refresh and polling
   await expect.poll(() => hangingRequests).toBeGreaterThan(0);
   await page.clock.fastForward(10_100);
   await expect(page.getByTestId("indexer-status-message")).toContainText("Indexer request timed out after 10000ms");
-  await expect(page.locator(".status-pill").filter({ hasText: "Indexer" })).toHaveClass(/error/);
+  await expect(page.getByTestId("indexer-status-message")).toHaveClass(/error/);
 
   hangIndexer = false;
   await page.getByTestId("snapshot-refresh-button").click();
-  await expect(page.locator(".status-pill").filter({ hasText: "Indexer" })).toHaveClass(/ready/);
   await expect(page.getByTestId("indexer-status-message")).toHaveCount(0);
 
   hangIndexer = true;
@@ -1653,11 +1610,10 @@ test("GraphQL timeout is visible and recovers through manual refresh and polling
   await page.getByTestId("snapshot-refresh-button").click();
   await expect.poll(() => hangingRequests).toBeGreaterThan(beforeSecondTimeout);
   await page.clock.fastForward(10_100);
-  await expect(page.locator(".status-pill").filter({ hasText: "Indexer" })).toHaveClass(/error/);
+  await expect(page.getByTestId("indexer-status-message")).toHaveClass(/error/);
 
   hangIndexer = false;
   await page.clock.fastForward(10_100);
-  await expect(page.locator(".status-pill").filter({ hasText: "Indexer" })).toHaveClass(/ready/);
   await expect(page.getByTestId("indexer-status-message")).toHaveCount(0);
 });
 
@@ -3808,14 +3764,6 @@ function assertTransactionMatchesSimulation(transaction: unknown, rpc: Installed
 function normalizeTransactionValue(value: string | number | bigint | null | undefined): bigint {
   if (value === null || value === undefined || value === "") return 0n;
   return BigInt(value);
-}
-
-function rpcCorsHeaders(): Record<string, string> {
-  return {
-    "access-control-allow-headers": "content-type",
-    "access-control-allow-methods": "POST, OPTIONS",
-    "access-control-allow-origin": "*"
-  };
 }
 
 async function assertApprovalDisclosure(
