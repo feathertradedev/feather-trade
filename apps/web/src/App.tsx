@@ -265,7 +265,7 @@ import {
   useOptionalPoolWorkspace,
   usePoolDraftState
 } from "./pool-workspace-context";
-import { PoolWorkspaceShell } from "./pool-workspace-shell";
+import { PoolWorkspaceShell, PoolWorkspaceTaskTabs } from "./pool-workspace-shell";
 
 const queryClient = new QueryClient();
 const SNAPSHOT_REFRESH_INTERVAL_MS = 10_000;
@@ -704,7 +704,7 @@ function DexShell() {
       <header className="app-header">
         <BrandLockup />
         <nav className="nav-list" aria-label="Primary">
-          {routes.filter((route) => ["swap", "pools", "positions"].includes(route.key)).map((route) => {
+          {routes.filter((route) => ["pools", "positions"].includes(route.key)).map((route) => {
             const Icon = routeIcons[route.key];
             return (
               <a
@@ -817,13 +817,12 @@ function LandingView(_: { networkName: string; snapshot: AppSnapshot | undefined
       <header className="landing-header">
         <BrandLockup />
         <nav aria-label="Marketing">
-          <a href="#/swap">Swap</a>
           <a href="#/pools">Pools</a>
           {brandLinks.filter((link) => link.label === "Docs").map((link) => (
             <a href={link.href} key={link.label} rel="noreferrer" target="_blank">{link.label}</a>
           ))}
         </nav>
-        <a className="primary-button landing-launch" href="#/swap">Launch app</a>
+        <a className="primary-button landing-launch" href="#/pools">Launch app</a>
       </header>
 
       <section className="landing-hero" aria-labelledby="landing-title">
@@ -832,7 +831,7 @@ function LandingView(_: { networkName: string; snapshot: AppSnapshot | undefined
           <h1 id="landing-title">Weightless liquidity.</h1>
           <p>Trade and deploy concentrated liquidity through a DLMM with dynamic fees built for fast-moving markets.</p>
           <div className="hero-actions">
-            <a className="primary-button hero-launch" href="#/swap">Launch app <span aria-hidden="true">↗</span></a>
+            <a className="primary-button hero-launch" href="#/pools">Launch app <span aria-hidden="true">↗</span></a>
           </div>
         </div>
 
@@ -2528,7 +2527,8 @@ function SwapView({
           status={swapCandlePage.status}
         />
       </div>
-      <section className="tool-panel swap-task-panel" data-testid="swap-task-panel">
+      <section className={`tool-panel swap-task-panel${workspaceMatchesPool ? " pool-task-panel-scoped" : ""}`} data-testid="swap-task-panel">
+        {workspaceMatchesPool ? <PoolWorkspaceTaskTabs task="swap" /> : null}
         <header className="swap-task-header">
           <div>
             <span>Swap</span>
@@ -5724,6 +5724,8 @@ function LiquidityView({
   const [handledAddHash, setHandledAddHash] = useState<Address | null>(null);
   const [handledRemoveHash, setHandledRemoveHash] = useState<Address | null>(null);
   const registry = registries[environmentKey];
+  const poolWorkspace = useOptionalPoolWorkspace();
+  const workspaceMatchesPool = poolWorkspace !== null && primaryPool !== null && isAddressEqual(poolWorkspace.pool.address, primaryPool.address);
   const portfolioEndpoint = analyticsEndpointForRegistry(registry);
   const localnetRegistry = isLocalnetRegistry(registry) ? registry : null;
   const account = useAccount();
@@ -5748,12 +5750,12 @@ function LiquidityView({
   latestObservedApprovedLbGrantsRef.current = observedApprovedLbGrants;
 
   useEffect(() => {
-    if (initialSection === null) return;
+    if (initialSection === null || workspaceMatchesPool) return;
     const frame = window.requestAnimationFrame(() => {
       document.getElementById(initialSection === "withdraw" ? "liquidity-withdraw" : "liquidity-add")?.scrollIntoView({ block: "start" });
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [initialSection, selectedPoolId]);
+  }, [initialSection, selectedPoolId, workspaceMatchesPool]);
   const selectedPool = buildPoolDescriptor({
     action: "add-liquidity",
     localnetRegistry,
@@ -8725,7 +8727,7 @@ function LiquidityView({
   };
 
   return (
-    <div className="view-grid two-col">
+    <div className={`view-grid two-col${workspaceMatchesPool ? " liquidity-task-workspace" : ""}`}>
       {portfolioAction ? (
         <section className="snapshot-message ready portfolio-action-banner" data-testid="portfolio-action-handoff">
           {portfolioAction === "add"
@@ -8735,19 +8737,37 @@ function LiquidityView({
               : "Full exit prefilled at 100% across every loaded bin in this position."}
         </section>
       ) : null}
-      <section className="tool-panel" id="liquidity-add">
+      {workspaceMatchesPool ? (
+        <div className="liquidity-market-column">
+          <SwapMarketChart
+            candles={poolWorkspace?.analytics.candles.rows ?? []}
+            error={poolWorkspace?.analytics.candles.error ?? null}
+            loading={poolWorkspace?.analytics.candlesLoading ?? false}
+            pairAddress={primaryPool?.address ?? null}
+            pairLabel={`${tokenSymbol(tokenX)} / ${tokenSymbol(tokenY)}`}
+            status={poolWorkspace?.analytics.candles.status ?? "UNAVAILABLE"}
+          />
+        </div>
+      ) : null}
+      {!workspaceMatchesPool || initialSection !== "withdraw" ? (
+      <section className={workspaceMatchesPool ? "tool-panel liquidity-task-panel" : "tool-panel"} id="liquidity-add">
+        {workspaceMatchesPool ? <PoolWorkspaceTaskTabs task="create" /> : null}
         <div className="panel-heading">
-          <span>Add Liquidity</span>
-          <StatusBadge state={addPoolReady ? "ready" : "unavailable"} label={poolDescriptorLabel(selectedPool)} />
+          <span>{workspaceMatchesPool ? "Create position" : "Add Liquidity"}</span>
+          {workspaceMatchesPool ? null : <StatusBadge state={addPoolReady ? "ready" : "unavailable"} label={poolDescriptorLabel(selectedPool)} />}
         </div>
 
-        <PoolSelect
-          id="liquidity-pair"
-          label="Pool"
-          onChange={onSelectedPoolChange}
-          pools={poolOptions}
-          selectedPoolId={selectedPoolId}
-        />
+        {workspaceMatchesPool ? (
+          <span className="field-label liquidity-task-amount-label">Amount</span>
+        ) : (
+          <PoolSelect
+            id="liquidity-pair"
+            label="Pool"
+            onChange={onSelectedPoolChange}
+            pools={poolOptions}
+            selectedPoolId={selectedPoolId}
+          />
+        )}
 
         {connected && liquidityWrappedNative !== null && liquidityWrappedNativeSide !== null ? (
           <fieldset className="routing-mode-control" data-testid="liquidity-native-mode">
@@ -9067,8 +9087,11 @@ function LiquidityView({
           testId="liquidity-add-status"
         />
       </section>
+      ) : null}
 
-      <section className="info-panel" id="liquidity-withdraw">
+      {!workspaceMatchesPool || initialSection === "withdraw" ? (
+      <section className={workspaceMatchesPool ? "info-panel liquidity-task-panel" : "info-panel"} id="liquidity-withdraw">
+        {workspaceMatchesPool ? <PoolWorkspaceTaskTabs task="manage" /> : null}
         <div className="panel-heading">
           <span>{fullExit ? "Full exit" : "Partial withdrawal"}</span>
           <StatusBadge
@@ -9260,6 +9283,7 @@ function LiquidityView({
           </div>
         </dl>
       </section>
+      ) : null}
 
     </div>
   );

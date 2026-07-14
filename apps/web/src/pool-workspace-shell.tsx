@@ -13,8 +13,7 @@ import { PoolWorkspaceProvider, usePoolWorkspace } from "./pool-workspace-contex
 import { poolWorkspaceHref, type PoolWorkspaceTask } from "./pool-workspace-route";
 import type { EnvironmentKey } from "./config";
 
-const TASKS: ReadonlyArray<{ key: PoolWorkspaceTask; label: string }> = [
-  { key: "market", label: "Market" },
+const ACTION_TASKS: ReadonlyArray<{ key: Exclude<PoolWorkspaceTask, "market">; label: string }> = [
   { key: "swap", label: "Swap" },
   { key: "create", label: "Create position" },
   { key: "manage", label: "Manage" }
@@ -50,24 +49,37 @@ function PoolWorkspaceScaffold({ children, pool, task }: { children: ReactNode; 
           <strong>{tokenSymbol(pool.tokenX)} / {tokenSymbol(pool.tokenY)}</strong>
           <small>{formatCompactAddress(pool.address)} · {pool.binStep} bps/bin</small>
         </div>
-        <nav aria-label="Pool tasks" className="pool-workspace-tasks">
-          {TASKS.map((item) => (
-            <a
-              aria-current={task === item.key ? "page" : undefined}
-              className={task === item.key ? "active" : undefined}
-              href={taskHref(pool.id, item.key, returnHref)}
-              key={item.key}
-            >
-              {item.label}
-            </a>
-          ))}
-        </nav>
+        {task === "market" ? (
+          <PoolWorkspaceTaskTabs task={task} />
+        ) : (
+          <a className="pool-workspace-market-link" href={taskHref(pool.id, "market", returnHref)}>Market overview</a>
+        )}
       </header>
       <div className="pool-workspace-body">
         <PoolWorkspaceRail />
         <div className="pool-workspace-task-content">{children}</div>
       </div>
     </section>
+  );
+}
+
+export function PoolWorkspaceTaskTabs({ task }: { task: PoolWorkspaceTask }) {
+  const workspace = usePoolWorkspace();
+  const returnHref = returnHrefFromAction(window.location.hash);
+
+  return (
+    <nav aria-label="Pool tasks" className="pool-workspace-tasks">
+      {ACTION_TASKS.map((item) => (
+        <a
+          aria-current={task === item.key ? "page" : undefined}
+          className={task === item.key ? "active" : undefined}
+          href={taskHref(workspace.pool.id, item.key, returnHref)}
+          key={item.key}
+        >
+          {item.label}
+        </a>
+      ))}
+    </nav>
   );
 }
 

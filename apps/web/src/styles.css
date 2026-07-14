@@ -2635,6 +2635,10 @@ a {
 }
 
 .pool-workspace-tasks a {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
   padding: 8px 11px;
   border-radius: 5px;
   color: var(--ink-60);
@@ -2650,6 +2654,23 @@ a {
 .pool-workspace-tasks a.active {
   color: var(--bone-bright);
   background: var(--card);
+}
+
+.pool-workspace-market-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  padding: 8px 12px;
+  color: var(--ink-60);
+  border: 1px solid var(--hairline);
+  border-radius: 7px;
+  font-size: 0.78rem;
+  font-weight: 750;
+}
+
+.pool-workspace-market-link:hover {
+  color: var(--bone);
+  border-color: rgb(233 236 231 / 28%);
 }
 
 .pool-workspace-body {
@@ -3015,7 +3036,17 @@ a {
   min-width: 0;
 }
 
-@media (max-width: 1180px) {
+@media (min-width: 1041px) and (max-width: 1280px) {
+  .pool-workspace-body {
+    grid-template-columns: minmax(220px, 236px) minmax(0, 1fr);
+  }
+
+  .swap-workspace {
+    grid-template-columns: minmax(0, 1fr) 360px;
+  }
+}
+
+@media (max-width: 1040px) {
   .pool-workspace-body {
     grid-template-columns: 1fr;
   }
@@ -4143,6 +4174,69 @@ a {
   border-radius: 10px;
 }
 
+.swap-task-panel.pool-task-panel-scoped {
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+}
+
+.pool-task-panel-scoped > .pool-workspace-tasks,
+.liquidity-task-panel > .pool-workspace-tasks {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  width: 100%;
+  padding: 4px;
+  border: 0;
+  border-bottom: 1px solid rgb(233 236 231 / 9%);
+  border-radius: 0;
+  background: var(--carbon);
+}
+
+.pool-task-panel-scoped > .pool-workspace-tasks a,
+.liquidity-task-panel > .pool-workspace-tasks a {
+  min-width: 0;
+  padding-right: 7px;
+  padding-left: 7px;
+  overflow: hidden;
+  font-size: 0.72rem;
+  text-overflow: ellipsis;
+}
+
+.view-grid.two-col.liquidity-task-workspace {
+  grid-template-columns: minmax(0, 1fr) minmax(380px, 440px);
+  align-items: start;
+}
+
+.liquidity-task-workspace .portfolio-action-banner {
+  grid-column: 1 / -1;
+}
+
+.liquidity-market-column {
+  display: grid;
+  min-width: 0;
+}
+
+.liquidity-task-panel {
+  position: sticky;
+  top: 12px;
+  max-height: calc(100dvh - 240px);
+  padding: 0 16px 16px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-color: rgb(233 236 231 / 18%) transparent;
+  scrollbar-width: thin;
+}
+
+.liquidity-task-panel > .pool-workspace-tasks {
+  position: sticky;
+  z-index: 4;
+  top: 0;
+  width: calc(100% + 32px);
+  margin: 0 -16px 14px;
+}
+
+.liquidity-task-panel > .panel-heading {
+  margin-top: 0;
+}
+
 .canonical-pool-workspace .swap-task-panel {
   max-height: calc(100dvh - 240px);
 }
@@ -4593,7 +4687,17 @@ a {
   font-size: 0.7rem;
 }
 
+@media (min-width: 1041px) and (max-width: 1280px) {
+  .view-grid.two-col.liquidity-task-workspace {
+    grid-template-columns: minmax(0, 1fr) 360px;
+  }
+}
+
 @media (max-width: 980px) {
+  .view-grid.two-col.liquidity-task-workspace {
+    grid-template-columns: 1fr;
+  }
+
   .swap-task-panel {
     position: static;
     max-height: none;
@@ -4604,6 +4708,12 @@ a {
   }
 
   .swap-task-body {
+    overflow: visible;
+  }
+
+  .liquidity-task-panel {
+    position: static;
+    max-height: none;
     overflow: visible;
   }
 }

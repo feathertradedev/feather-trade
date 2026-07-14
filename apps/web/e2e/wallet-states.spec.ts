@@ -1496,7 +1496,8 @@ test("pool discovery deep-links to real indexed bins and preselects liquidity ac
   await page.getByRole("link", { name: "Deposit" }).click();
   await expect(page).toHaveURL(/#\/pools\/0x.+\/create/i);
   await expect(page.locator("#liquidity-add")).toBeInViewport();
-  await expect(page.locator("#liquidity-pair")).toContainText("WNATIVE / USDC");
+  await expect(page.getByTestId("canonical-pool-workspace")).toHaveAttribute("data-pool-id", WNATIVE_USDC_PAIR.toLowerCase());
+  await expect(page.locator("#liquidity-pair")).toHaveCount(0);
 });
 
 test("pool detail keeps an empty active-bin marker and reports capped wallet positions", async ({ page }) => {
@@ -1529,7 +1530,8 @@ test("pool and action deep links resolve outside the dashboard page and survive 
   await expect(page.getByTestId("pool-action-back")).toHaveAttribute("href", new RegExp(`#/pools/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}`, "i"));
 
   await page.reload();
-  await expect(page.locator("#liquidity-pair")).toHaveValue(SECOND_WNATIVE_USDC_PAIR.toLowerCase());
+  await expect(page.getByTestId("canonical-pool-workspace")).toHaveAttribute("data-pool-id", SECOND_WNATIVE_USDC_PAIR.toLowerCase());
+  await expect(page.locator("#liquidity-pair")).toHaveCount(0);
   await expect(page.locator("#liquidity-withdraw")).toBeInViewport();
 
   await page.goto(`/#/liquidity/withdraw/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}`);

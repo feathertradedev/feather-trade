@@ -23,6 +23,9 @@ test("canonical Feather landing desktop", async ({ page }, testInfo) => {
   await expect(page.getByLabel("Illustrative SPCX and USDC Liquidity Book market simulation")).toBeVisible();
   await expect(page.getByText("10 bps per bin")).toBeVisible();
   await expect(page.getByRole("link", { name: "Docs" })).toHaveCount(0);
+  await expect(page.getByRole("navigation", { name: "Marketing" }).getByRole("link", { name: "Swap" })).toHaveCount(0);
+  await expect(page.locator(".landing-launch")).toHaveAttribute("href", "#/pools");
+  await expect(page.locator(".hero-launch")).toHaveAttribute("href", "#/pools");
   await expect(page).toHaveScreenshot("feather-landing-desktop.png", screenshotOptions);
 });
 
@@ -150,13 +153,14 @@ test("Feather navigation exposes focus and keyboard operations states", async ({
   test.skip(testInfo.project.name !== "chromium");
   await installMockRpc(page, { includePairs: true });
   await page.goto("/#/swap");
-  const swapLink = page.getByRole("link", { name: "Swap" });
-  await expect(swapLink).toHaveAttribute("aria-current", "page");
-  await swapLink.focus();
-  await expect(swapLink).toBeFocused();
-  expect(await swapLink.evaluate((element) => getComputedStyle(element).outlineStyle)).not.toBe("none");
+  await expect(page.getByTestId("swap-submit-button")).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "Primary" }).getByRole("link", { name: "Swap" })).toHaveCount(0);
+  const poolsLink = page.getByRole("link", { name: "Pools" });
+  await poolsLink.focus();
+  await expect(poolsLink).toBeFocused();
+  expect(await poolsLink.evaluate((element) => getComputedStyle(element).outlineStyle)).not.toBe("none");
   await page.keyboard.press("Tab");
-  await expect(page.getByRole("link", { name: "Pools" })).toBeFocused();
+  await expect(page.getByRole("link", { name: "Portfolio" })).toBeFocused();
 
   const operations = page.locator(".operations-menu");
   const summary = operations.locator("summary");

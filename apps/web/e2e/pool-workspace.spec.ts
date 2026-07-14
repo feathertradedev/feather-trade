@@ -53,12 +53,16 @@ test("canonical pool tasks keep one selected pool while reusing swap and liquidi
   await tasks.getByRole("link", { name: "Create position" }).click();
   await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/create$`, "i"));
   await expect(workspace).toHaveAttribute("data-pool-id", WNATIVE_USDC_PAIR.toLowerCase());
-  await expect(page.locator("#liquidity-pair")).toHaveValue(WNATIVE_USDC_PAIR.toLowerCase());
+  await expect(page.getByTestId("swap-market-chart")).toBeVisible();
+  await expect(page.locator("#liquidity-pair")).toHaveCount(0);
+  await expect(page.locator("#liquidity-withdraw")).toHaveCount(0);
   await page.getByTestId("liquidity-amount-x").fill("0.345");
 
   await tasks.getByRole("link", { name: "Manage" }).click();
   await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/manage$`, "i"));
   await expect(workspace).toHaveAttribute("data-pool-id", WNATIVE_USDC_PAIR.toLowerCase());
+  await expect(page.getByTestId("swap-market-chart")).toBeVisible();
+  await expect(page.locator("#liquidity-add")).toHaveCount(0);
   await expect(page.locator("#liquidity-withdraw")).toBeVisible();
 
   await tasks.getByRole("link", { name: "Swap" }).click();
@@ -66,7 +70,7 @@ test("canonical pool tasks keep one selected pool while reusing swap and liquidi
   await tasks.getByRole("link", { name: "Create position" }).click();
   await expect(page.getByTestId("liquidity-amount-x")).toHaveValue("0.345");
 
-  await tasks.getByRole("link", { name: "Market" }).click();
+  await workspace.getByRole("link", { name: "Market overview" }).click();
   await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/market$`, "i"));
   await expect(page.getByTestId("pool-detail-analytics-state")).toContainText("Current through block 42");
 });
@@ -162,7 +166,7 @@ test("unified pool workspace preserves URL filters, analytics, actions, and acce
 
   await page.getByRole("link", { name: "Deposit" }).click();
   await expect(page.getByTestId("pool-action-back")).toBeVisible();
-  await expect(page.locator("#liquidity-pair")).toHaveValue(WNATIVE_USDC_PAIR.toLowerCase());
+  await expect(page.locator("#liquidity-pair")).toHaveCount(0);
   await page.getByTestId("pool-action-back").click();
   await expect(page).toHaveURL(/#\/pools\//);
   await expect(page).toHaveURL(/q=WNATIVE/);
