@@ -2527,204 +2527,258 @@ function SwapView({
           pairLabel={`${tokenSymbol(tokenX)} / ${tokenSymbol(tokenY)}`}
           status={swapCandlePage.status}
         />
-        <SwapDetailsCard
-          expectedOutLabel={expectedOutLabel}
-          feeLabel={feeLabel}
-          primaryPool={primaryPool}
-          quote={quote}
-          priceImpactLabel={priceImpactLabel}
-          routeMode={routeMode}
-          routeSteps={routeSteps}
-          selectedPool={selectedPool}
-          swapMarketError={swapMarketError}
-          swapMarketReady={swapMarketReady}
-          tokenIn={tokenIn}
-          tokenOut={tokenOut}
-        />
       </div>
-      <section className="tool-panel">
-        <div className="panel-heading">
-          <span>Swap</span>
-          <StatusBadge state={swapMarketReady ? "ready" : "unavailable"} label={swapMarketReady ? routeMode === "exact-selected" ? "exact pool" : "best route" : swapMarketError ?? "unavailable"} />
-        </div>
-
-        <fieldset className="routing-mode-control">
-          <legend>Routing choice</legend>
-          <div className="segmented" role="group" aria-label="Swap routing choice">
-            <button aria-pressed={routeMode === "exact-selected"} className={routeMode === "exact-selected" ? "segment active" : "segment"} onClick={() => setRouteMode("exact-selected")} type="button">
-              Exact selected pool
-            </button>
-            <button aria-pressed={routeMode === "best"} className={routeMode === "best" ? "segment active" : "segment"} onClick={() => setRouteMode("best")} type="button">
-              Best route
-            </button>
+      <section className="tool-panel swap-task-panel" data-testid="swap-task-panel">
+        <header className="swap-task-header">
+          <div>
+            <span>Swap</span>
+            <strong>{inputSymbol} / {outputSymbol}</strong>
           </div>
-          <p>{routeMode === "exact-selected" ? "Quote and submit only through the selected pair and bin step." : "Search the supported direct and one-intermediary V2.2 routes for the best output."}</p>
-        </fieldset>
+          <StatusBadge state={swapMarketReady ? "ready" : "unavailable"} label={swapMarketReady ? routeMode === "exact-selected" ? "exact pool" : "best route" : swapMarketError ?? "unavailable"} />
+        </header>
 
-        <PoolSelect
-          id="swap-pool"
-          label="Selected market"
-          onChange={onSelectedPoolChange}
-          pools={poolOptions}
-          selectedPoolId={selectedPoolId}
-        />
-
-        {connected && selectedPoolHasWrapper && wrappedNativeToken ? (
-          <fieldset className="routing-mode-control" data-testid="swap-native-mode">
-            <legend>Wrapped-native asset mode</legend>
-            <div className="segmented" role="group" aria-label="Wrapped-native asset mode">
-              <button aria-pressed={useNativeWrapper} className={useNativeWrapper ? "segment active" : "segment"} onClick={() => { nativeSwapMaxBindingRef.current = null; setUseNativeWrapper(true); setApprovalConfirmation(null); setNativeReceiptReview(null); setNativeReceiptError(null); }} type="button">ETH · native</button>
-              <button aria-pressed={!useNativeWrapper} className={!useNativeWrapper ? "segment active" : "segment"} onClick={() => { nativeSwapMaxBindingRef.current = null; setUseNativeWrapper(false); setApprovalConfirmation(null); setNativeReceiptReview(null); setNativeReceiptError(null); }} type="button">{wrappedNativeToken.symbol} · ERC-20</button>
+        <div className="swap-task-body">
+          {workspaceMatchesPool ? (
+            <div className="swap-market-lock" data-testid="swap-market-lock">
+              <div>
+                <span>Selected pool</span>
+                <strong>{tokenSymbol(tokenX)} / {tokenSymbol(tokenY)}</strong>
+              </div>
+              <small>{selectedPool.binStep ?? "unknown"} bps/bin</small>
             </div>
-            <p data-testid="swap-wrapper-disclosure">ETH uses router native calldata and transaction value. {wrappedNativeToken.symbol} remains ERC-20 {wrappedNativeToken.address} and requires allowance when sold. Native Max requires a current positive probe amount so Feather can review buffered gas before computing spendable ETH.</p>
+          ) : (
+            <PoolSelect
+              id="swap-pool"
+              label="Selected market"
+              onChange={onSelectedPoolChange}
+              pools={poolOptions}
+              selectedPoolId={selectedPoolId}
+            />
+          )}
+
+          <fieldset className="routing-mode-control swap-route-mode">
+            <legend>Route</legend>
+            <div className="segmented" role="group" aria-label="Swap routing choice">
+              <button aria-pressed={routeMode === "exact-selected"} className={routeMode === "exact-selected" ? "segment active" : "segment"} onClick={() => setRouteMode("exact-selected")} type="button">
+                Exact selected pool
+              </button>
+              <button aria-pressed={routeMode === "best"} className={routeMode === "best" ? "segment active" : "segment"} onClick={() => setRouteMode("best")} type="button">
+                Best route
+              </button>
+            </div>
+            <p>{routeMode === "exact-selected" ? "Use only this pool and bin step." : "Compare supported direct and one-intermediary V2.2 routes."}</p>
           </fieldset>
-        ) : null}
 
-        <SwapMarketRecovery
-          error={swapMarketError}
-          onRefresh={onRefresh}
-          pool={primaryPool}
-          readiness={selectedPool}
-        />
-
-        {routeAttestationQuery.error === null && routeAttestationQuery.data?.length ? routeAttestationQuery.data.map((attestation, index) => (
-          <PairAttestationReview attestation={attestation} error={null} key={`${attestation.pair}-${index}`} loading={false} />
-        )) : (
-          <PairAttestationReview
-            attestation={pairAttestationQuery.data ?? null}
-            error={routeAttestationQuery.error ?? pairAttestationQuery.error}
-            loading={routeAttestationQuery.isLoading || routeAttestationQuery.isFetching || pairAttestationQuery.isLoading}
-          />
-        )}
-
-        <label className="field-label" htmlFor="swap-amount">
-          Sell
-        </label>
-        <div className="amount-box">
-          <input id="swap-amount" inputMode="decimal" onChange={(event) => { nativeSwapMaxBindingRef.current = null; setAmount(event.target.value); }} value={amount} />
-          <span>{inputSymbol}</span>
-          <button
-            className="token-max-button"
-            data-testid="swap-max-button"
-            disabled={walletBalance === null || tokenIn === null || (nativeInput && ((!canSwap && !canReuseNativeSwapMaxObservation) || nativeSwapMaxPending))}
-            onClick={() => {
-              if (nativeInput) handleNativeSwapMax();
-              else if (walletBalance !== null && tokenIn !== null) setAmount(maxAmountInput({ asset: "token", balance: walletBalance, decimals: tokenIn.decimals }));
-            }}
-            type="button"
-          >Max</button>
-        </div>
-        {nativeInput && (parsedAmount === null || parsedAmount <= 0n) ? <div className="state-row warning" data-testid="swap-native-max-guidance"><AlertTriangle size={16} /><span>Enter a valid positive ETH probe amount before using Native Max; no wallet request is opened for the gas probe.</span></div> : null}
-        {nativeInput ? <div className="state-row" data-testid="swap-token-in-identity">ETH native asset · router wrapper {wrappedNativeToken?.symbol} {wrappedNativeToken?.address}</div> : <TokenIdentity token={tokenIn} networkName={registry.chain.name} testId="swap-token-in-identity" />}
-        <div className="balance-line">
-          <span>Balance</span>
-          <strong data-testid="swap-balance-value">{walletQuery.data ? nativeInput ? `${formatUnits(BigInt(walletQuery.data.balance), 18)} ETH` : formatTokenAmount(walletQuery.data.balance, tokenIn) : connected ? "loading" : "connect wallet"}</strong>
-        </div>
-
-        <button className="flip-button" type="button" title="Flip tokens" onClick={() => { nativeSwapMaxBindingRef.current = null; setSwapForY((value) => !value); }}>
-          <ArrowLeftRight size={18} />
-        </button>
-
-        <label className="field-label" htmlFor="swap-output">
-          Buy
-        </label>
-        <div className="amount-box output">
-          <input id="swap-output" readOnly value={formatSwapOutput(quoteQuery.isFetching, amountOut, tokenOut)} />
-          <span>{outputSymbol}</span>
-        </div>
-        {nativeOutput ? <div className="state-row" data-testid="swap-token-out-identity">ETH native asset · router wrapper {wrappedNativeToken?.symbol} {wrappedNativeToken?.address}</div> : <TokenIdentity token={tokenOut} networkName={registry.chain.name} testId="swap-token-out-identity" />}
-
-        <div className="swap-settings">
-          <label htmlFor="swap-slippage">
-            <span>Slippage</span>
-            <input id="swap-slippage" inputMode="decimal" value={slippageInput} onChange={(event) => setSlippageInput(event.target.value)} />
-          </label>
-          <label htmlFor="swap-deadline">
-            <span>Deadline</span>
-            <input id="swap-deadline" inputMode="numeric" value={deadlineInput} onChange={(event) => setDeadlineInput(event.target.value)} />
-          </label>
-        </div>
-
-        <div className="quote-grid">
-          <MiniMetric label="Minimum received" value={amountOutMin !== null ? nativeOutput ? `${formatUnits(amountOutMin, 18)} ETH` : formatTokenAmount(amountOutMin.toString(), tokenOut) : "n/a"} />
-          <MiniMetric label="Quote freshness" value={quoteFreshnessLabel} />
-          <MiniMetric data-testid="swap-allowance-value" label="Allowance" value={nativeInput ? "not required for ETH" : walletQuery.data ? formatTokenAmount(walletQuery.data.allowance, tokenIn) : "n/a"} />
-          <MiniMetric data-testid="swap-native-balance" label="ETH for gas" value={nativeBalance !== null ? `${formatUnits(nativeBalance, 18)} ETH` : connected ? "loading" : "connect wallet"} />
-        </div>
-
-        <GasReview review={gasReview} />
-
-        {!nativeInput ? <ApprovalDetails
-          asset={tokenSymbol(tokenIn)}
-          amount={parsedAmount}
-          currentState={walletQuery.data ? `${formatTokenAmount(walletQuery.data.allowance, tokenIn)} allowance${needsApproval ? " (approval needed)" : " (sufficient)"}` : "unavailable"}
-          id="swap-approval-details"
-          requested={parsedAmount !== null ? formatTokenAmount(parsedAmount.toString(), tokenIn) : "invalid amount"}
-          scope="Exact token amount for this swap"
-          spender={registry.contracts.lbRouter}
-          token={tokenIn}
-        /> : <div className="state-row success" data-testid="swap-native-no-approval">ETH uses exact transaction value and never requests ERC-20 approval.</div>}
-
-        <div className="action-stack">
-          {!nativeInput ? <button
-            className="secondary-button wide"
-            data-testid="swap-approve-button"
-            type="button"
-            aria-describedby="swap-approval-details"
-            disabled={!canApprove || approvalWrite.isPending || approvalReceipt.isLoading || approvalSimulationPending}
-            title={swapApprovalDisclosure}
-            onClick={handleApprove}
-          >
-            {approvalSimulationPending || approvalWrite.isPending || approvalReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <CheckCircle2 size={18} />}
-            <span>{needsApproval ? `Approve ${tokenSymbol(tokenIn)}` : "Approved"}</span>
-          </button> : null}
-          <button className="primary-button wide" data-testid="swap-submit-button" type="button" disabled={!canSwap} onClick={handleSwap}>
-            {swapSimulationPending || swapWrite.isPending || swapReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <ArrowLeftRight size={18} />}
-            <span>
-              {buttonLabel({
-                poolReady: swapMarketReady,
-                connected,
-                onWrongChain,
-                needsApproval,
-                insufficientBalance,
-                insufficientGas: actionError?.startsWith("Insufficient ETH for gas") === true,
-                invalidInput: inputError !== null,
-                quoteLoading: quoteQuery.isFetching,
-                quoteReady: quote !== undefined,
-                safetyReason: swapSafetyReason,
-                walletError: walletError !== null,
-                walletLoading: walletReadsPending
-              })}
-            </span>
-          </button>
-          {approvalRefreshRetryRequired ? (
-            <button className="secondary-button wide" data-testid="swap-approval-refresh-button" onClick={retryApprovalRefresh} type="button">
-              <RefreshCw size={18} />
-              <span>Refresh after approval</span>
-            </button>
+          {connected && selectedPoolHasWrapper && wrappedNativeToken ? (
+            <fieldset className="routing-mode-control swap-native-mode" data-testid="swap-native-mode">
+              <legend>Asset mode</legend>
+              <div className="segmented" role="group" aria-label="Wrapped-native asset mode">
+                <button aria-pressed={useNativeWrapper} className={useNativeWrapper ? "segment active" : "segment"} onClick={() => { nativeSwapMaxBindingRef.current = null; setUseNativeWrapper(true); setApprovalConfirmation(null); setNativeReceiptReview(null); setNativeReceiptError(null); }} type="button">ETH · native</button>
+                <button aria-pressed={!useNativeWrapper} className={!useNativeWrapper ? "segment active" : "segment"} onClick={() => { nativeSwapMaxBindingRef.current = null; setUseNativeWrapper(false); setApprovalConfirmation(null); setNativeReceiptReview(null); setNativeReceiptError(null); }} type="button">{wrappedNativeToken.symbol} · ERC-20</button>
+              </div>
+              <p data-testid="swap-wrapper-disclosure">ETH uses router native calldata and transaction value. {wrappedNativeToken.symbol} remains ERC-20 {wrappedNativeToken.address} and requires allowance when sold. Native Max requires a current positive probe amount so Feather can review buffered gas before computing spendable ETH.</p>
+            </fieldset>
           ) : null}
+
+          <SwapMarketRecovery
+            error={swapMarketError}
+            onRefresh={onRefresh}
+            pool={primaryPool}
+            readiness={selectedPool}
+          />
+
+          <div className="swap-amount-stack">
+            <section className="swap-asset-card">
+              <div className="swap-asset-heading">
+                <label htmlFor="swap-amount">Sell</label>
+                <div className="balance-line">
+                  <span>Balance</span>
+                  <strong data-testid="swap-balance-value">{walletQuery.data ? nativeInput ? `${formatUnits(BigInt(walletQuery.data.balance), 18)} ETH` : formatTokenAmount(walletQuery.data.balance, tokenIn) : connected ? "loading" : "connect wallet"}</strong>
+                </div>
+              </div>
+              <div className="amount-box">
+                <input id="swap-amount" inputMode="decimal" onChange={(event) => { nativeSwapMaxBindingRef.current = null; setAmount(event.target.value); }} value={amount} />
+                <span>{inputSymbol}</span>
+                <button
+                  className="token-max-button"
+                  data-testid="swap-max-button"
+                  disabled={walletBalance === null || tokenIn === null || (nativeInput && ((!canSwap && !canReuseNativeSwapMaxObservation) || nativeSwapMaxPending))}
+                  onClick={() => {
+                    if (nativeInput) handleNativeSwapMax();
+                    else if (walletBalance !== null && tokenIn !== null) setAmount(maxAmountInput({ asset: "token", balance: walletBalance, decimals: tokenIn.decimals }));
+                  }}
+                  type="button"
+                >Max</button>
+              </div>
+              {!nativeInput ? <TokenIdentity token={tokenIn} networkName={registry.chain.name} testId="swap-token-in-identity" /> : null}
+            </section>
+
+            {nativeInput && (parsedAmount === null || parsedAmount <= 0n) ? <div className="state-row warning" data-testid="swap-native-max-guidance"><AlertTriangle size={16} /><span>Enter a valid positive ETH probe amount before using Native Max; no wallet request is opened for the gas probe.</span></div> : null}
+
+            <button className="flip-button" type="button" title="Flip tokens" onClick={() => { nativeSwapMaxBindingRef.current = null; setSwapForY((value) => !value); }}>
+              <ArrowLeftRight size={18} />
+            </button>
+
+            <section className="swap-asset-card output">
+              <div className="swap-asset-heading">
+                <label htmlFor="swap-output">Buy</label>
+                <span>Estimated output</span>
+              </div>
+              <div className="amount-box output">
+                <input id="swap-output" readOnly value={formatSwapOutput(quoteQuery.isFetching, amountOut, tokenOut)} />
+                <span>{outputSymbol}</span>
+              </div>
+              {!nativeOutput ? <TokenIdentity token={tokenOut} networkName={registry.chain.name} testId="swap-token-out-identity" /> : null}
+            </section>
+          </div>
+
+          <section aria-label="Trade quote" className="swap-quote-summary">
+            <div className="swap-quote-heading">
+              <span>Trade quote</span>
+              <small>{quoteFreshnessLabel}</small>
+            </div>
+            <dl className="swap-quote-list">
+              <div><dt>Expected output</dt><dd>{expectedOutLabel}</dd></div>
+              <div><dt>Minimum received</dt><dd>{amountOutMin !== null ? nativeOutput ? `${formatUnits(amountOutMin, 18)} ETH` : formatTokenAmount(amountOutMin.toString(), tokenOut) : "n/a"}</dd></div>
+              <div><dt>LP fee</dt><dd>{feeLabel}</dd></div>
+              <div><dt>Price impact</dt><dd>{priceImpactLabel}</dd></div>
+            </dl>
+          </section>
+
+          <div className="swap-settings">
+            <label htmlFor="swap-slippage">
+              <span>Slippage %</span>
+              <input id="swap-slippage" inputMode="decimal" value={slippageInput} onChange={(event) => setSlippageInput(event.target.value)} />
+            </label>
+            <label htmlFor="swap-deadline">
+              <span>Deadline min</span>
+              <input id="swap-deadline" inputMode="numeric" value={deadlineInput} onChange={(event) => setDeadlineInput(event.target.value)} />
+            </label>
+          </div>
+
+          <GasReview review={gasReview} />
+
+          {nativeInput ? <div className="state-row success" data-testid="swap-native-no-approval">ETH uses exact transaction value and never requests ERC-20 approval.</div> : null}
+
+          {nativeReceiptReview ? <div className="review-card" data-testid="native-swap-receipt-review"><strong>Canonical native swap accounting</strong><p>{nativeReceiptReview.direction === "native-in" ? "ETH spent" : "ETH received"}: {formatUnits(BigInt(nativeReceiptReview.nativeAmount), 18)} ETH · token amount {nativeReceiptReview.tokenAmount} · gas {formatUnits(BigInt(nativeReceiptReview.gasCost), 18)} ETH</p></div> : null}
+          {nativeReceiptError ? <div className="state-row failure" data-testid="native-swap-receipt-error">{nativeReceiptError}</div> : null}
+
+          <details
+            className="swap-review-details"
+            data-testid="swap-review-details"
+            open={needsApproval || routeAttestationQuery.error !== null || pairAttestationQuery.error !== null ? true : undefined}
+          >
+            <summary>
+              <span>Market and approval review</span>
+              <small>{routeSteps.length > 0 ? `${routeSteps.length} hop${routeSteps.length === 1 ? "" : "s"}` : "Route pending"}</small>
+            </summary>
+            <div className="swap-review-body">
+              <SwapRouteReview
+                primaryPool={primaryPool}
+                quote={quote}
+                routeMode={routeMode}
+                routeSteps={routeSteps}
+                selectedPool={selectedPool}
+                swapMarketError={swapMarketError}
+                swapMarketReady={swapMarketReady}
+                tokenIn={tokenIn}
+                tokenOut={tokenOut}
+              />
+
+              {routeAttestationQuery.error === null && routeAttestationQuery.data?.length ? routeAttestationQuery.data.map((attestation, index) => (
+                <PairAttestationReview attestation={attestation} error={null} key={`${attestation.pair}-${index}`} loading={false} />
+              )) : (
+                <PairAttestationReview
+                  attestation={pairAttestationQuery.data ?? null}
+                  error={routeAttestationQuery.error ?? pairAttestationQuery.error}
+                  loading={routeAttestationQuery.isLoading || routeAttestationQuery.isFetching || pairAttestationQuery.isLoading}
+                />
+              )}
+
+              {nativeInput ? <div className="state-row" data-testid="swap-token-in-identity">ETH native asset · router wrapper {wrappedNativeToken?.symbol} {wrappedNativeToken?.address}</div> : null}
+              {nativeOutput ? <div className="state-row" data-testid="swap-token-out-identity">ETH native asset · router wrapper {wrappedNativeToken?.symbol} {wrappedNativeToken?.address}</div> : null}
+              {!nativeInput ? <TokenIdentity token={tokenIn} networkName={registry.chain.name} testId="swap-token-in-review" /> : null}
+              {!nativeOutput ? <TokenIdentity token={tokenOut} networkName={registry.chain.name} testId="swap-token-out-review" /> : null}
+
+              <div className="quote-grid swap-account-review">
+                <MiniMetric data-testid="swap-allowance-value" label="Allowance" value={nativeInput ? "not required for ETH" : walletQuery.data ? formatTokenAmount(walletQuery.data.allowance, tokenIn) : "n/a"} />
+                <MiniMetric data-testid="swap-native-balance" label="ETH for gas" value={nativeBalance !== null ? `${formatUnits(nativeBalance, 18)} ETH` : connected ? "loading" : "connect wallet"} />
+              </div>
+
+              {!nativeInput ? <ApprovalDetails
+                asset={tokenSymbol(tokenIn)}
+                amount={parsedAmount}
+                currentState={walletQuery.data ? `${formatTokenAmount(walletQuery.data.allowance, tokenIn)} allowance${needsApproval ? " (approval needed)" : " (sufficient)"}` : "unavailable"}
+                id="swap-approval-details"
+                requested={parsedAmount !== null ? formatTokenAmount(parsedAmount.toString(), tokenIn) : "invalid amount"}
+                scope="Exact token amount for this swap"
+                spender={registry.contracts.lbRouter}
+                token={tokenIn}
+              /> : null}
+            </div>
+          </details>
         </div>
 
-        {nativeReceiptReview ? <div className="review-card" data-testid="native-swap-receipt-review"><strong>Canonical native swap accounting</strong><p>{nativeReceiptReview.direction === "native-in" ? "ETH spent" : "ETH received"}: {formatUnits(BigInt(nativeReceiptReview.nativeAmount), 18)} ETH · token amount {nativeReceiptReview.tokenAmount} · gas {formatUnits(BigInt(nativeReceiptReview.gasCost), 18)} ETH</p></div> : null}
-        {nativeReceiptError ? <div className="state-row failure" data-testid="native-swap-receipt-error">{nativeReceiptError}</div> : null}
+        <footer className="swap-action-dock">
+          <div className="action-stack">
+            {!nativeInput ? <button
+              className="secondary-button wide"
+              data-testid="swap-approve-button"
+              type="button"
+              aria-describedby="swap-approval-details"
+              disabled={!canApprove || approvalWrite.isPending || approvalReceipt.isLoading || approvalSimulationPending}
+              hidden={!connected}
+              title={swapApprovalDisclosure}
+              onClick={handleApprove}
+            >
+              {approvalSimulationPending || approvalWrite.isPending || approvalReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <CheckCircle2 size={18} />}
+              <span>{needsApproval ? `Approve ${tokenSymbol(tokenIn)}` : "Approved"}</span>
+            </button> : null}
+            <button className={`primary-button wide${!connected ? " swap-primary-only" : ""}`} data-testid="swap-submit-button" type="button" disabled={!canSwap} onClick={handleSwap}>
+              {swapSimulationPending || swapWrite.isPending || swapReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <ArrowLeftRight size={18} />}
+              <span>
+                {buttonLabel({
+                  poolReady: swapMarketReady,
+                  connected,
+                  onWrongChain,
+                  needsApproval,
+                  insufficientBalance,
+                  insufficientGas: actionError?.startsWith("Insufficient ETH for gas") === true,
+                  invalidInput: inputError !== null,
+                  quoteLoading: quoteQuery.isFetching,
+                  quoteReady: quote !== undefined,
+                  safetyReason: swapSafetyReason,
+                  walletError: walletError !== null,
+                  walletLoading: walletReadsPending
+                })}
+              </span>
+            </button>
+            {approvalRefreshRetryRequired ? (
+              <button className="secondary-button wide" data-testid="swap-approval-refresh-button" onClick={retryApprovalRefresh} type="button">
+                <RefreshCw size={18} />
+                <span>Refresh after approval</span>
+              </button>
+            ) : null}
+          </div>
 
-        <SwapStateRows
-          amountError={inputError}
-          actionError={actionError}
-          approvalRefreshPending={postApprovalReviewPending && postApprovalRefreshError === null}
-          approvalHash={approvalReceiptMatchesCurrentIntent ? approvalWrite.data : undefined}
-          approvalPending={approvalWrite.isPending || (approvalReceiptMatchesCurrentIntent && approvalReceipt.isLoading)}
-          approvalReverted={approvalReverted}
-          approvalSuccess={approvalSuccess}
-          insufficientBalance={insufficientBalance}
-          insufficientGas={actionError?.startsWith("Insufficient ETH for gas") === true}
-          quoteError={quoteQuery.error}
-          swapHash={swapReceiptMatchesCurrentIntent ? swapWrite.data : undefined}
-          swapPending={swapWrite.isPending || (swapReceiptMatchesCurrentIntent && swapReceipt.isLoading)}
-          swapReverted={swapReverted}
-          swapSuccess={swapSuccess}
-          walletError={walletError}
-        />
+          <SwapStateRows
+            amountError={inputError}
+            actionError={actionError}
+            approvalRefreshPending={postApprovalReviewPending && postApprovalRefreshError === null}
+            approvalHash={approvalReceiptMatchesCurrentIntent ? approvalWrite.data : undefined}
+            approvalPending={approvalWrite.isPending || (approvalReceiptMatchesCurrentIntent && approvalReceipt.isLoading)}
+            approvalReverted={approvalReverted}
+            approvalSuccess={approvalSuccess}
+            insufficientBalance={insufficientBalance}
+            insufficientGas={actionError?.startsWith("Insufficient ETH for gas") === true}
+            quoteError={quoteQuery.error}
+            swapHash={swapReceiptMatchesCurrentIntent ? swapWrite.data : undefined}
+            swapPending={swapWrite.isPending || (swapReceiptMatchesCurrentIntent && swapReceipt.isLoading)}
+            swapReverted={swapReverted}
+            swapSuccess={swapSuccess}
+            walletError={walletError}
+          />
+        </footer>
       </section>
 
     </div>
@@ -2940,12 +2994,9 @@ function formatTradingChartPrice(price: number): string {
   return price.toLocaleString(undefined, { maximumSignificantDigits: 6 });
 }
 
-function SwapDetailsCard({
-  expectedOutLabel,
-  feeLabel,
+function SwapRouteReview({
   primaryPool,
   quote,
-  priceImpactLabel,
   routeMode,
   routeSteps,
   selectedPool,
@@ -2954,11 +3005,8 @@ function SwapDetailsCard({
   tokenIn,
   tokenOut
 }: {
-  expectedOutLabel: string;
-  feeLabel: string;
   primaryPool: PoolRow | null;
   quote: SerializedExactInQuote | undefined;
-  priceImpactLabel: string;
   routeMode: "exact-selected" | "best";
   routeSteps: RouteStepView[];
   selectedPool: SelectedPoolDescriptor;
@@ -2968,19 +3016,13 @@ function SwapDetailsCard({
   tokenOut: TokenMetadata | null;
 }) {
   return (
-    <section className="info-panel">
+    <section className="swap-route-review">
       <div className="panel-heading">
         <span>Route</span>
         <StatusBadge
           state={!swapMarketReady ? "unavailable" : quote ? "ready" : primaryPool ? "loading" : "empty"}
           label={!swapMarketReady ? swapMarketError ?? "unavailable" : quote ? routeMode === "exact-selected" ? "Exact selected pool" : "Best V2.2 route" : primaryPool ? "waiting" : "no market"}
         />
-      </div>
-
-      <div className="quote-grid">
-        <MiniMetric label="Expected out" value={expectedOutLabel} />
-        <MiniMetric label="Fee" value={feeLabel} />
-        <MiniMetric label="Price impact" value={priceImpactLabel} />
       </div>
 
       {routeSteps.length > 0 ? (

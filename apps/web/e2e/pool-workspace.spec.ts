@@ -71,6 +71,40 @@ test("canonical pool tasks keep one selected pool while reusing swap and liquidi
   await expect(page.getByTestId("pool-detail-analytics-state")).toContainText("Current through block 42");
 });
 
+test("pool-scoped swap presents a compact market task rail with its guarded action in view", async ({ page }) => {
+  await page.setViewportSize({ height: 1000, width: 1600 });
+  await installMockRpc(page, { includePairs: true });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+
+  const chart = page.getByTestId("swap-market-chart");
+  const panel = page.getByTestId("swap-task-panel");
+  const market = page.getByTestId("swap-market-lock");
+  const action = page.getByTestId("swap-submit-button");
+
+  await expect(chart).toBeVisible();
+  await expect(panel).toBeVisible();
+  await expect(market).toContainText("WNATIVE / USDC");
+  await expect(market).toContainText("10 bps/bin");
+  await expect(page.getByTestId("swap-pool-search")).toHaveCount(0);
+  await expect(panel.locator(".swap-asset-card")).toHaveCount(2);
+  await expect(panel.getByRole("group", { name: "Swap routing choice" })).toBeVisible();
+  await expect(panel.getByRole("region", { name: "Trade quote" })).toBeVisible();
+  await expect(page.getByTestId("swap-review-details")).toContainText("Market and approval review");
+  await expect(action).toBeVisible();
+
+  const geometry = await page.evaluate(() => {
+    const chartBox = document.querySelector<HTMLElement>('[data-testid="swap-market-chart"]')?.getBoundingClientRect();
+    const panelBox = document.querySelector<HTMLElement>('[data-testid="swap-task-panel"]')?.getBoundingClientRect();
+    const actionBox = document.querySelector<HTMLElement>('[data-testid="swap-submit-button"]')?.getBoundingClientRect();
+    return chartBox && panelBox && actionBox
+      ? { actionBottom: actionBox.bottom, chartRight: chartBox.right, panelLeft: panelBox.left }
+      : null;
+  });
+  expect(geometry).not.toBeNull();
+  expect(geometry!.panelLeft).toBeGreaterThanOrEqual(geometry!.chartRight);
+  expect(geometry!.actionBottom).toBeLessThanOrEqual(1000);
+});
+
 test("unified pool workspace preserves URL filters, analytics, actions, and accessible charts", async ({ page }) => {
   const analyticsUrls: string[] = [];
   page.on("request", (request) => {
