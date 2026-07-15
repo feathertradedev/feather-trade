@@ -15,7 +15,6 @@ import {
   readPoolCreationFactoryDiscovery,
   reconcileCreatedPool,
   type CreatablePoolPreflight,
-  type PoolCreationFactoryDiscovery,
   type PoolCreationSelection
 } from "../../../packages/sdk/src/pool-creation";
 import { erc20Abi, lbFactoryAbi, lbPairAbi, lbRouterAbi } from "@robinhood-lb/sdk/abi";
@@ -37,7 +36,6 @@ import {
 import type { DexRegistry, LocalnetDexRegistry } from "@robinhood-lb/sdk/registry";
 import {
   assertQuoteMatchesExactInRequest,
-  buildExactInSwapPath,
   buildExactInSwapTransaction,
   buildExactNativeForTokensSwapTransaction,
   buildExactTokensForNativeSwapTransaction,
@@ -112,7 +110,6 @@ import {
   loadPoolById,
   loadPositionHistory,
   loadWalletPortfolio,
-  loadPoolBinWindow,
   tokenSymbol,
   type AppSnapshot,
   type BinRow,
@@ -256,8 +253,7 @@ import {
   workspaceMetricTiles,
   type BinDistributionPoint,
   type CandleChartModel,
-  type PoolEconomicSort,
-  type PoolWorkspaceRow
+  type PoolEconomicSort
 } from "./pool-workspace";
 import {
   parsePoolWorkspaceRoute,
@@ -5640,35 +5636,6 @@ function formatCandleHour(timestamp: number): string {
   return new Intl.DateTimeFormat("en", { day: "2-digit", hour: "2-digit", hour12: false, month: "short", timeZone: "UTC" }).format(new Date(timestamp * 1_000));
 }
 
-function PoolBinChart({ activeId, bins, state }: { activeId: string | null; bins: BinRow[]; state: LoadState }) {
-  const maxLiquidity = bins.reduce((maximum, bin) => {
-    const supply = BigInt(bin.totalSupply);
-    return supply > maximum ? supply : maximum;
-  }, 0n);
-
-  if (bins.length === 0 || state !== "ready") return <EmptyState state={state} />;
-
-  return (
-    <div className="pool-bin-chart" aria-label="Indexed pool liquidity by bin">
-      {bins.map((bin) => {
-        const liquidity = BigInt(bin.totalSupply);
-        const height = maxLiquidity === 0n ? 8 : 8 + Number((liquidity * 92n) / maxLiquidity);
-        return (
-          <span
-            aria-label={`Bin ${bin.binId}; LB supply ${bin.totalSupply}; token X reserve ${bin.reserveX}; token Y reserve ${bin.reserveY}${bin.binId === activeId ? "; active bin" : ""}`}
-            className={bin.binId === activeId ? "pool-bin active" : "pool-bin"}
-            key={bin.id}
-            role="img"
-            style={{ height: `${height}%` }}
-            tabIndex={0}
-            title={`Bin ${bin.binId} · X ${bin.reserveX} · Y ${bin.reserveY}`}
-          />
-        );
-      })}
-    </div>
-  );
-}
-
 function withActiveBin(bins: BinRow[], activeId: string | null): BinRow[] {
   if (activeId === null || bins.some((bin) => bin.binId === activeId)) return bins;
 
@@ -10404,61 +10371,6 @@ function ActivityView({ snapshot }: { snapshot: AppSnapshot | undefined }) {
         )}
       </section>
     </div>
-  );
-}
-
-function PoolFocusCard({ pool }: { pool: PoolRow | null }) {
-  const bars = useMemo(() => {
-    if (!pool) return [];
-    const reserveX = Number(formatUnits(BigInt(pool.reserveX), pool.tokenX?.decimals ?? 18));
-    const reserveY = Number(formatUnits(BigInt(pool.reserveY), pool.tokenY?.decimals ?? 18));
-    const base = Math.max(reserveX, reserveY, 1);
-    return [
-      { label: tokenSymbol(pool.tokenX), value: Math.max(12, (reserveX / base) * 100) },
-      { label: tokenSymbol(pool.tokenY), value: Math.max(12, (reserveY / base) * 100) }
-    ];
-  }, [pool]);
-
-  return (
-    <section className="info-panel">
-      <div className="panel-heading">
-        <span>Pool State</span>
-        <StatusBadge state={pool ? "ready" : "empty"} label={pool ? formatCompactAddress(pool.address) : "no pool"} />
-      </div>
-
-      {pool ? (
-        <>
-          <div className="reserve-bars">
-            {bars.map((bar) => (
-              <div className="bar-row" key={bar.label}>
-                <span>{bar.label}</span>
-                <div className="bar-track">
-                  <span style={{ width: `${bar.value}%` }} />
-                </div>
-              </div>
-            ))}
-          </div>
-          <dl className="contract-list">
-            <div>
-              <dt>Factory Pair</dt>
-              <dd>{formatCompactAddress(pool.address)}</dd>
-            </div>
-            <div>
-              <dt>Active ID</dt>
-              <dd>{pool.activeId ?? "n/a"}</dd>
-            </div>
-            <div>
-              <dt>Fees</dt>
-              <dd>
-                {formatTokenAmount(pool.feesX, pool.tokenX)} / {formatTokenAmount(pool.feesY, pool.tokenY)}
-              </dd>
-            </div>
-          </dl>
-        </>
-      ) : (
-        <EmptyState state="empty" />
-      )}
-    </section>
   );
 }
 

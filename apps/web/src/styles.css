@@ -2484,34 +2484,6 @@ a {
   font-size: 0.78rem;
 }
 
-.reserve-bars {
-  display: grid;
-  gap: 14px;
-}
-
-.bar-row {
-  display: grid;
-  grid-template-columns: 72px minmax(0, 1fr);
-  gap: 10px;
-  align-items: center;
-  color: #4d5b62;
-  font-weight: 800;
-}
-
-.bar-track {
-  height: 14px;
-  overflow: hidden;
-  background: #e7edf0;
-  border-radius: 999px;
-}
-
-.bar-track span {
-  display: block;
-  height: 100%;
-  background: linear-gradient(90deg, #33c481, #1b9aaa);
-  border-radius: inherit;
-}
-
 .contract-list {
   display: grid;
   gap: 10px;
