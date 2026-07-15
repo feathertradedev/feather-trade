@@ -26,6 +26,8 @@
   "dependencies": {
     "@fontsource/ibm-plex-mono": "^5.2.7",
     "@fontsource/schibsted-grotesk": "^5.2.8",
+    "@reown/appkit": "1.8.22",
+    "@reown/appkit-adapter-wagmi": "1.8.22",
     "@robinhood-lb/sdk": "workspace:*",
     "@tanstack/react-query": "^5.101.2",
     "lightweight-charts": "^5.2.0",

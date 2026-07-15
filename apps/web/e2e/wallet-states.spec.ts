@@ -328,7 +328,7 @@ test("missing injected provider is distinguished from an ordinary disconnected w
 
   await expect(page.getByTestId("wallet-connect-button")).toBeDisabled();
   await expect(page.getByTestId("wallet-status")).toHaveAttribute("data-wallet-state", "missing");
-  await expect(page.getByTestId("wallet-status")).toContainText("No wallet provider was found");
+  await expect(page.getByTestId("wallet-status")).toContainText("No browser wallet was found");
 });
 
 for (const failure of [
@@ -364,25 +364,24 @@ test("multiple EIP-6963 providers require an explicit provider choice", async ({
   });
   await page.goto("/#/swap");
 
+  await page.getByTestId("wallet-connect-button").click();
   const choices = page.getByTestId("wallet-provider-choices");
-  await expect(choices.getByRole("button")).toHaveCount(2);
-  await expect(page.getByTestId("wallet-connect-button")).toHaveCount(0);
+  await expect(choices.getByRole("button")).toHaveCount(3);
+  await expect(page.getByTestId("wallet-connect-button")).toBeVisible();
   await choices.getByRole("button", { name: "Brave Wallet" }).click();
   await expect(page.getByTestId("wallet-account-button")).toContainText("0x1111...1111");
   expect(await page.evaluate(() => window.__mockWalletStates["io.metamask"].calls)).toEqual([]);
 });
 
-test("unsupported announced provider remains non-executable", async ({ page }) => {
+test("an EIP-6963 announced provider can be selected explicitly", async ({ page }) => {
   await installMockRpc(page);
   await installMockWallet(page, {
     primaryProvider: { name: "Unknown Wallet", rdns: "org.example.unknown", uuid: "robinhood-lb-unknown" }
   });
   await page.goto("/#/swap");
 
-  await expect(page.getByTestId("wallet-connect-button")).toBeDisabled();
-  await expect(page.getByTestId("wallet-status")).toHaveAttribute("data-wallet-state", "missing");
-  await expect(page.getByTestId("wallet-status")).toContainText("No supported wallet was found");
-  await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
+  await page.getByTestId("wallet-connect-button").click();
+  await expect(page.getByTestId("wallet-account-button")).toContainText("0xf39F...2266");
 });
 
 test("unknown active network is added before switching", async ({ page }) => {

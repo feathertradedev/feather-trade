@@ -31,6 +31,11 @@ configured HTTPS destination. Set `VITE_FEATHER_DOCS_URL`,
 launch-footer links; invalid or unset destinations are
 deliberately omitted.
 
+Set `VITE_REOWN_PROJECT_ID` to a project ID from the Reown Dashboard to enable
+the unified wallet chooser, including WalletConnect QR and mobile deep links.
+Without it, local development keeps a compact EIP-6963 browser-wallet chooser
+and does not send wallet-discovery traffic to Reown.
+
 ### Fresh local product stack
 
 The owned full-stack command starts an isolated Anvil deployment, Graph Node,

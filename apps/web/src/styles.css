@@ -1736,8 +1736,126 @@ a {
 }
 
 .wallet-provider-choices {
-  display: flex;
+  display: grid;
   gap: 8px;
+}
+
+.wallet-provider-dialog {
+  width: min(420px, calc(100vw - 32px));
+  max-width: none;
+  padding: 0;
+  color: var(--bone);
+  background: var(--panel);
+  border: 1px solid rgb(233 236 231 / 16%);
+  border-radius: 14px;
+  box-shadow: 0 28px 90px rgb(0 0 0 / 54%);
+}
+
+.wallet-provider-dialog::backdrop {
+  background: rgb(7 8 7 / 72%);
+  backdrop-filter: blur(8px);
+}
+
+.wallet-provider-sheet {
+  display: grid;
+  gap: 18px;
+  padding: 20px;
+}
+
+.wallet-provider-sheet header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.wallet-provider-sheet h2 {
+  margin: 0;
+  color: var(--bone-bright);
+  font-size: 1.1rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.wallet-dialog-close {
+  display: inline-grid;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  color: var(--ink-60);
+  background: transparent;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  place-items: center;
+}
+
+.wallet-dialog-close:hover,
+.wallet-dialog-close:focus-visible {
+  color: var(--bone-bright);
+  border-color: rgb(233 236 231 / 28%);
+}
+
+.wallet-provider-option {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+  min-height: 64px;
+  padding: 10px 12px;
+  color: var(--bone);
+  text-align: left;
+  background: var(--card);
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+}
+
+.wallet-provider-option:hover,
+.wallet-provider-option:focus-visible {
+  background: rgb(74 197 124 / 7%);
+  border-color: rgb(74 197 124 / 46%);
+}
+
+.wallet-provider-option:active {
+  transform: translateY(1px);
+}
+
+.wallet-provider-option > span:last-child {
+  display: grid;
+  gap: 2px;
+}
+
+.wallet-provider-option strong {
+  color: var(--bone-bright);
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.wallet-provider-option small,
+.wallet-provider-sheet > p {
+  color: var(--ink-60);
+  font-size: 0.75rem;
+}
+
+.wallet-provider-sheet > p {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.wallet-provider-icon {
+  display: inline-grid;
+  width: 42px;
+  height: 42px;
+  color: var(--green);
+  background: rgb(233 236 231 / 5%);
+  border: 1px solid var(--hairline);
+  border-radius: 9px;
+  place-items: center;
+}
+
+.wallet-provider-icon img {
+  width: 26px;
+  height: 26px;
+  object-fit: contain;
+  border-radius: 6px;
 }
 
 .wallet-network-state,

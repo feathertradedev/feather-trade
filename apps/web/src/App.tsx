@@ -75,7 +75,8 @@ import {
   Network,
   RefreshCw,
   Server,
-  Wallet
+  Wallet,
+  X
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from "react";
 import { decodeEventLog, encodeFunctionData, isAddress, isAddressEqual, keccak256, zeroAddress, type Address, type Chain, type Hex, type PublicClient, formatUnits } from "viem";
@@ -175,7 +176,7 @@ import {
   type NativeSwapSubmissionBinding,
   type SwapExecutionContext
 } from "./transaction-safety";
-import { wagmiConfig } from "./wagmi";
+import { openWalletModal, wagmiConfig, walletModalConfigured } from "./wagmi";
 import { SUPPORTED_WALLET_RDNS, walletFailure, walletSessionIdentity, type WalletFailure } from "./wallet-lifecycle";
 import { TransactionJournalProvider, useTransactionJournal, type TransactionJournalApi } from "./transaction-journal-react";
 import {
@@ -1042,27 +1043,22 @@ function BinGlyph({ mode }: { mode: "spot" | "curve" | "bidask" }) {
 function WalletPanel({ activeChain }: { activeChain: Chain }) {
   const [localFailure, setLocalFailure] = useState<WalletFailure | null>(null);
   const [discoverySettled, setDiscoverySettled] = useState(false);
+  const walletDialogRef = useRef<HTMLDialogElement>(null);
   const account = useAccount();
   const activeWalletChainId = useChainId();
   const { connect, connectors, error: connectError, isPending, reset: resetConnect } = useConnect();
   const { disconnect } = useDisconnect();
   const { error: switchError, switchChain, isPending: isSwitching, reset: resetSwitch } = useSwitchChain();
   const discoveredConnectors = connectors.filter((connector) => connector.id !== "injected");
-  const supportedDiscoveredConnectors = discoveredConnectors.filter(
-    (connector, index, all) => SUPPORTED_WALLET_RDNS.has(connector.id) && all.findIndex((candidate) => candidate.id === connector.id) === index
-  );
-  const availableConnectors = discoveredConnectors.length > 0 ? supportedDiscoveredConnectors : connectors;
-  const injectedConnector = availableConnectors[0];
+  const availableConnectors = discoveredConnectors.length > 0
+    ? discoveredConnectors.filter((connector, index, all) => all.findIndex((candidate) => candidate.id === connector.id) === index)
+    : connectors;
   const connected = account.status === "connected";
   const onWrongChain = connected && activeWalletChainId !== activeChain.id;
-  const unsupportedProviderFailure: WalletFailure | null =
-    discoveredConnectors.length > 0 && supportedDiscoveredConnectors.length === 0
-      ? { action: "No supported wallet was found. Enable MetaMask or Brave Wallet, then reload this page.", kind: "missing" }
-      : null;
-  const noProviderFailure: WalletFailure | null = discoverySettled && connectors.length === 0
-    ? { action: "No wallet provider was found. Enable MetaMask or Brave Wallet, then reload this page.", kind: "missing" }
+  const noProviderFailure: WalletFailure | null = discoverySettled && !walletModalConfigured && connectors.length === 0
+    ? { action: "No browser wallet was found. Install a compatible wallet or use a build with mobile wallet connections enabled.", kind: "missing" }
     : null;
-  const connectionFailure = localFailure ?? (connectError ? walletFailure(connectError, "connect") : unsupportedProviderFailure ?? noProviderFailure);
+  const connectionFailure = localFailure ?? (connectError ? walletFailure(connectError, "connect") : noProviderFailure);
   const switchingFailure = switchError ? walletFailure(switchError, "switch") : null;
 
   useEffect(() => {
@@ -1087,37 +1083,78 @@ function WalletPanel({ activeChain }: { activeChain: Chain }) {
     connect({ connector });
   };
 
+  const openConnectionFlow = () => {
+    resetConnect();
+    setLocalFailure(null);
+    if (walletModalConfigured) {
+      void openWalletModal().catch(() => {
+        setLocalFailure({ action: "The wallet chooser could not open. Reload the page and try again.", kind: "provider-error" });
+      });
+      return;
+    }
+    if (availableConnectors.length === 1) {
+      void connectWith(availableConnectors[0]);
+      return;
+    }
+    walletDialogRef.current?.showModal();
+  };
+
   if (!connected) {
     return (
       <div className="wallet-cluster" data-testid="wallet-disconnected-state">
-        {availableConnectors.length > 1 ? (
-          <div className="wallet-provider-choices" data-testid="wallet-provider-choices" role="group" aria-label="Choose wallet provider">
-            {availableConnectors.map((connector) => (
-              <button
-                className="secondary-button"
-                data-provider-id={connector.id}
-                disabled={isPending}
-                key={connector.uid}
-                onClick={() => void connectWith(connector)}
-                type="button"
-              >
-                <Wallet size={18} />
-                <span>{isPending ? "Connecting" : connector.name}</span>
-              </button>
-            ))}
-          </div>
-        ) : (
-          <button
-            className="primary-button"
-            data-testid="wallet-connect-button"
-            disabled={!injectedConnector || isPending}
-            onClick={() => injectedConnector && void connectWith(injectedConnector)}
-            type="button"
+        <button
+          className="primary-button"
+          data-testid="wallet-connect-button"
+          disabled={(!walletModalConfigured && availableConnectors.length === 0) || isPending}
+          onClick={openConnectionFlow}
+          type="button"
+        >
+          {isPending ? <LoaderCircle className="spin" size={18} /> : <Wallet size={18} />}
+          <span>{isPending ? "Connecting" : "Connect wallet"}</span>
+        </button>
+        {!walletModalConfigured && availableConnectors.length > 1 ? (
+          <dialog
+            aria-labelledby="wallet-provider-title"
+            className="wallet-provider-dialog"
+            onClick={(event) => {
+              if (event.target === event.currentTarget) event.currentTarget.close();
+            }}
+            ref={walletDialogRef}
           >
-            {isPending ? <LoaderCircle className="spin" size={18} /> : <Wallet size={18} />}
-            <span>{injectedConnector ? "Connect" : "No wallet"}</span>
-          </button>
-        )}
+            <div className="wallet-provider-sheet">
+              <header>
+                <h2 id="wallet-provider-title">Choose a wallet</h2>
+                <button aria-label="Close wallet chooser" className="wallet-dialog-close" onClick={() => walletDialogRef.current?.close()} type="button">
+                  <X size={18} />
+                </button>
+              </header>
+              <div className="wallet-provider-choices" data-testid="wallet-provider-choices" role="group" aria-label="Choose wallet provider">
+                {availableConnectors.map((connector) => (
+                  <button
+                    className="wallet-provider-option"
+                    data-provider-id={connector.id}
+                    disabled={isPending}
+                    key={connector.uid}
+                    onClick={() => {
+                      walletDialogRef.current?.close();
+                      void connectWith(connector);
+                    }}
+                    type="button"
+                  >
+                    <span className="wallet-provider-icon">
+                      {connector.icon ? <img alt="" src={connector.icon} /> : <Wallet size={20} />}
+                    </span>
+                    <span>
+                      <strong>{connector.name}</strong>
+                      <small>Browser wallet</small>
+                    </span>
+                  </button>
+                ))}
+              </div>
+              <p>Only wallets announced by your browser are shown in this local build.</p>
+            </div>
+          </dialog>
+        ) : null}
         {connectionFailure ? (
           <span className="inline-error" data-testid="wallet-status" data-wallet-state={connectionFailure.kind} role="alert">
             {connectionFailure.action}
