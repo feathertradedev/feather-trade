@@ -12,6 +12,7 @@ try {
   const pool = "0x4A47586912f0e03d9f3DCAa762fB8B659E52604b";
 
   assert.deepEqual(parsePoolWorkspaceRoute(`#/pools/${pool}`), { poolId: pool, task: "market", intent: null, source: "canonical" });
+  assert.deepEqual(parsePoolWorkspaceRoute(`#/pools/${pool}/market`), { poolId: pool, task: "market", intent: null, source: "canonical" });
   assert.deepEqual(parsePoolWorkspaceRoute(`#/pools/${pool}/swap?returnTo=%23%2Fpools`), { poolId: pool, task: "swap", intent: null, source: "canonical" });
   assert.deepEqual(parsePoolWorkspaceRoute(`#/pools/${pool}/create`), { poolId: pool, task: "create", intent: "add", source: "canonical" });
   assert.deepEqual(parsePoolWorkspaceRoute(`#/pools/${pool}/manage`), { poolId: pool, task: "manage", intent: null, source: "canonical" });
@@ -21,10 +22,11 @@ try {
   assert.deepEqual(parsePoolWorkspaceRoute(`#/liquidity/full/${pool}`), { poolId: pool, task: "manage", intent: "full", source: "legacy" });
   assert.equal(parsePoolWorkspaceRoute(`#/pools/${pool}/unknown`), null);
   assert.equal(parsePoolWorkspaceRoute("#/pools/%252e%252e/swap"), null);
+  assert.equal(poolWorkspaceHref(pool), `#/pools/${pool}/create`);
   assert.equal(poolWorkspaceHref(pool, "create"), `#/pools/${pool}/create`);
   assert.throws(() => poolWorkspaceHref("../escape", "swap"), /Invalid pool route identifier/);
 
-  console.log("Pool workspace route fixture passed: canonical tasks, legacy adapters, and safe pool identity.");
+  console.log("Pool workspace route fixture passed: canonical create default, market compatibility alias, legacy adapters, and safe pool identity.");
 } finally {
   await server.close();
 }

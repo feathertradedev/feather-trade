@@ -70,24 +70,30 @@ test("canonical Feather pools mobile", async ({ page }, testInfo) => {
   await expect(page).toHaveScreenshot("feather-pools-mobile.png", screenshotOptions);
 });
 
-test("canonical Feather pool detail desktop", async ({ page }, testInfo) => {
+test("canonical Feather pool workspace desktop", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium");
   await page.clock.setFixedTime("2026-07-12T14:00:00Z");
   await installMockRpc(page, { includePairs: true });
   await page.goto("/#/pools");
   await page.locator(".discovery-table .pair-name").first().click();
-  await expect(page.getByText("Live liquidity bins")).toBeVisible();
-  await expect(page).toHaveScreenshot("feather-pool-detail-desktop.png", screenshotOptions);
+  await expect(page).toHaveURL(/#\/pools\/.+\/create\?returnTo=/);
+  await expect(page.getByTestId("swap-market-chart")).toBeVisible();
+  await expect(page.getByTestId("pool-workspace-rail")).toBeVisible();
+  await expect(page.getByTestId("liquidity-range-editor")).toBeVisible();
+  await expect(page.getByRole("link", { name: "Market overview" })).toHaveCount(0);
 });
 
-test("canonical Feather pool detail mobile", async ({ page }, testInfo) => {
+test("canonical Feather pool workspace mobile", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile-chromium");
   await page.clock.setFixedTime("2026-07-12T14:00:00Z");
   await installMockRpc(page, { includePairs: true });
   await page.goto("/#/pools");
   await page.locator(".discovery-table .pair-name").first().click();
-  await expect(page.getByText("Live liquidity bins")).toBeVisible();
-  await expect(page).toHaveScreenshot("feather-pool-detail-mobile.png", screenshotOptions);
+  await expect(page).toHaveURL(/#\/pools\/.+\/create\?returnTo=/);
+  await expect(page.getByTestId("swap-market-chart")).toBeVisible();
+  await expect(page.getByTestId("pool-workspace-rail")).toBeVisible();
+  await expect(page.getByTestId("liquidity-range-editor")).toBeVisible();
+  await expect(page.getByRole("link", { name: "Market overview" })).toHaveCount(0);
 });
 
 test("canonical Feather liquidity desktop", async ({ page }, testInfo) => {

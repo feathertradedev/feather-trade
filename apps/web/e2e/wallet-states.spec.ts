@@ -1473,28 +1473,26 @@ test("pool discovery deep-links to real indexed bins and preselects liquidity ac
   }
   await page.getByRole("link", { name: /WNATIVE \/ USDC/ }).click();
 
-  await expect(page).toHaveURL(/#\/pools\//);
-  await expect(page.getByText("Live liquidity bins")).toBeVisible();
-  await expect(page.locator(".pool-bin-chart .pool-bin-stack")).toHaveCount(7);
-  await expect(page.locator(".pool-bin-chart .pool-bin-stack.active")).toHaveCount(1);
-  await expect(page.getByTestId("pool-bin-distribution-table").locator("tbody tr")).toHaveCount(7);
+  await expect(page).toHaveURL(/#\/pools\/.+\/create\?returnTo=/);
+  const distribution = page.getByTestId("pool-rail-liquidity-distribution");
+  await expect(distribution).toBeVisible();
+  await expect(distribution.locator(".pool-rail-liquidity-bars > span")).toHaveCount(33);
+  await expect(distribution.locator(".pool-rail-liquidity-bars > span.active")).toHaveCount(1);
+  await expect(page.getByTestId("swap-market-chart")).toBeVisible();
   await expect.poll(() => rpc.snapshot().graphQueries.some((query) => query.includes("PairBinWindow"))).toBe(true);
   await expect.poll(() => rpc.snapshot().graphQueries.some((query) => query.includes("OwnerPairPositions"))).toBe(true);
 
   await page.reload();
-  await expect(page.locator(".pool-bin-chart .pool-bin-stack")).toHaveCount(7);
+  await expect(distribution.locator(".pool-rail-liquidity-bars > span")).toHaveCount(33);
 
-  await page.getByRole("link", { name: "Withdraw" }).click();
+  await page.getByRole("navigation", { name: "Pool tasks" }).getByRole("link", { name: "Manage" }).click();
   await expect(page).toHaveURL(/#\/pools\/0x.+\/manage\?returnTo=/i);
-  await expect(page.getByTestId("pool-action-back")).toHaveAttribute("href", /#\/pools\/.+q=WNATIVE/);
-  await expect(page.locator("#liquidity-withdraw")).toBeInViewport();
+  await expect(page.getByTestId("pool-action-back")).toHaveAttribute("href", /#\/pools\?q=WNATIVE/);
+  await expect(page.locator("#liquidity-withdraw")).toBeVisible();
 
   await page.goBack();
-  await expect(page).toHaveURL(/#\/pools\//);
-
-  await page.getByRole("link", { name: "Deposit" }).click();
   await expect(page).toHaveURL(/#\/pools\/0x.+\/create/i);
-  await expect(page.locator("#liquidity-add")).toBeInViewport();
+  await expect(page.locator("#liquidity-add")).toBeVisible();
   await expect(page.getByTestId("canonical-pool-workspace")).toHaveAttribute("data-pool-id", WNATIVE_USDC_PAIR.toLowerCase());
   await expect(page.locator("#liquidity-pair")).toHaveCount(0);
 });
@@ -1511,32 +1509,33 @@ test("pool detail keeps an empty active-bin marker and reports capped wallet pos
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR.toLowerCase()}`);
   await connectWallet(page);
 
-  await expect(page.locator(".pool-bin-chart .pool-bin-stack.active")).toHaveCount(1);
-  await expect(page.locator(".pool-bin-chart .pool-bin-stack.active")).toHaveAttribute("aria-label", /active bin/);
-  await expect(page.getByTestId("pool-bin-distribution-table").locator("tbody tr").filter({ hasText: "Active" })).toHaveCount(1);
-  await expect(page.locator(".table-panel").filter({ hasText: "Your bins" }).locator(".status-badge")).toContainText("partial");
-  await expect(page.getByText("The owner/pair position query is partial; destructive actions remain blocked.")).toBeVisible();
+  await expect(page).toHaveURL(/#\/pools\/.+\/create\?returnTo=/);
+  await expect(page.locator(".pool-rail-liquidity-bars > span.active")).toHaveCount(1);
+  await expect(page.locator(".pool-rail-liquidity-bars > span.active")).toHaveAttribute("aria-label", /active bin/);
+  await expect(page.locator(".pool-rail-position-state")).toContainText("partial");
 });
 
 test("pool and action deep links resolve outside the dashboard page and survive reload", async ({ page }) => {
   await installMockRpc(page, { dashboardPoolLimit: 1, includePairs: true, poolCount: 2, poolBinCount: 5 });
   await page.goto(`/#/pools/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}`);
 
-  await expect(page.getByText("Live liquidity bins")).toBeVisible();
-  await expect(page.getByText(/bin step 11/)).toBeVisible();
-  await page.getByRole("link", { name: "Withdraw" }).click();
+  await expect(page).toHaveURL(new RegExp(`#/pools/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}/create\\?returnTo=`, "i"));
+  const rail = page.getByTestId("pool-workspace-rail");
+  await expect(rail).toBeVisible();
+  await expect(rail.getByText("11 bps/bin", { exact: true })).toBeVisible();
+  await page.getByRole("navigation", { name: "Pool tasks" }).getByRole("link", { name: "Manage" }).click();
   await expect(page).toHaveURL(new RegExp(`#/pools/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}/manage\\?returnTo=`, "i"));
-  await expect(page.getByTestId("pool-action-back")).toHaveAttribute("href", new RegExp(`#/pools/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}`, "i"));
+  await expect(page.getByTestId("pool-action-back")).toHaveAttribute("href", "#/pools");
 
   await page.reload();
   await expect(page.getByTestId("canonical-pool-workspace")).toHaveAttribute("data-pool-id", SECOND_WNATIVE_USDC_PAIR.toLowerCase());
   await expect(page.locator("#liquidity-pair")).toHaveCount(0);
-  await expect(page.locator("#liquidity-withdraw")).toBeInViewport();
+  await expect(page.locator("#liquidity-withdraw")).toBeVisible();
 
   await page.goto(`/#/liquidity/withdraw/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}`);
   await expect(page.locator("#liquidity-pair")).toHaveValue(SECOND_WNATIVE_USDC_PAIR.toLowerCase());
   await page.reload();
-  await expect(page.locator("#liquidity-withdraw")).toBeInViewport();
+  await expect(page.locator("#liquidity-withdraw")).toBeVisible();
 });
 
 test("action deep links never fall back to the default pool while lookup is pending", async ({ page }) => {
@@ -2824,8 +2823,7 @@ test("strategy and synchronized range controls enforce the 69-bin product envelo
   await expect(page.locator("#range-upper-bin")).toHaveValue("8388609");
   await expect(page.getByLabel("Min USDC per WNATIVE")).toHaveValue("0.5");
   await expect(page.getByLabel("Max USDC per WNATIVE")).toHaveValue("2");
-  await expect(page.getByTestId("liquidity-min-price-inverse")).toContainText("0.5 WNATIVE per USDC");
-  await expect(page.getByTestId("liquidity-max-price-inverse")).toContainText("2 WNATIVE per USDC");
+  await expect(page.getByText("Inverse", { exact: true })).toHaveCount(0);
   await page.getByTestId("liquidity-strategy-curve").click();
   await expect(page.getByTestId("liquidity-strategy-curve")).toHaveAttribute("aria-pressed", "true");
   await expect(page.getByTestId("liquidity-composition-guidance")).toContainText("does not silently swap");
@@ -2892,16 +2890,12 @@ test("extreme prices render exactly while active-bin movement preserves absolute
   const priceOptions = { baseDecimals: 18, quoteDecimals: 18 };
   const forwardMinimum = formatExactPriceFraction(normalizeQ128Price(1n, priceOptions));
   const forwardMaximum = formatExactPriceFraction(normalizeQ128Price(maximumQ128, priceOptions));
-  const inverseMinimum = formatExactPriceFraction(normalizeQ128Price(maximumQ128, { ...priceOptions, inverse: true }));
-  const inverseMaximum = formatExactPriceFraction(normalizeQ128Price(1n, { ...priceOptions, inverse: true }));
   const minimumInput = page.getByLabel("Min USDC per WNATIVE");
   const maximumInput = page.getByLabel("Max USDC per WNATIVE");
 
   await expect(minimumInput).toHaveValue(forwardMinimum);
   await expect(maximumInput).toHaveValue(forwardMaximum);
-  await expect(page.getByTestId("liquidity-min-price-inverse").locator("output")).toHaveText(`${inverseMinimum} WNATIVE per USDC`);
-  await expect(page.getByTestId("liquidity-max-price-inverse").locator("output")).toHaveText(`${inverseMaximum} WNATIVE per USDC`);
-  for (const value of [forwardMinimum, forwardMaximum, inverseMinimum, inverseMaximum]) {
+  for (const value of [forwardMinimum, forwardMaximum]) {
     expect(value).not.toMatch(/^0(?:\.0*)?$/);
   }
   await minimumInput.fill(forwardMinimum);

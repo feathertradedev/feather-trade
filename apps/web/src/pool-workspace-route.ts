@@ -35,7 +35,7 @@ export function parsePoolWorkspaceRoute(hash: string): PoolWorkspaceRoute | null
   return { poolId, task: "create", intent: "add", source: "legacy" };
 }
 
-export function poolWorkspaceHref(poolId: string, task: PoolWorkspaceTask = "market"): string {
+export function poolWorkspaceHref(poolId: string, task: PoolWorkspaceTask = "create"): string {
   const encodedPoolId = encodeRoutePart(poolId);
   return `#/pools/${encodedPoolId}/${task}`;
 }

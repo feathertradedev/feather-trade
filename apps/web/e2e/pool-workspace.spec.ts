@@ -70,9 +70,11 @@ test("canonical pool tasks keep one selected pool while reusing swap and liquidi
   await tasks.getByRole("link", { name: "Create position" }).click();
   await expect(page.getByTestId("liquidity-amount-x")).toHaveValue("0.345");
 
-  await workspace.getByRole("link", { name: "Market overview" }).click();
-  await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/market$`, "i"));
-  await expect(page.getByTestId("pool-detail-analytics-state")).toContainText("Current through block 42");
+  await expect(workspace.getByRole("link", { name: "Market overview" })).toHaveCount(0);
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/market`);
+  await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/create\\?returnTo=`, "i"));
+  await expect(page.getByTestId("swap-market-chart")).toBeVisible();
+  await expect(page.getByTestId("pool-workspace-state")).toContainText("Current through block 42");
 });
 
 test("create position range editor layers exact distribution over indexed pool reserves", async ({ page }) => {
@@ -216,29 +218,26 @@ test("unified pool workspace preserves URL filters, analytics, actions, and acce
   }
 
   const poolLink = page.locator(".discovery-table .pair-name").first();
-  await expect(poolLink).toHaveAttribute("href", /q=WNATIVE/);
-  await expect(poolLink).toHaveAttribute("href", /sort=tvl/);
-  await expect(poolLink).toHaveAttribute("href", /mine=1/);
+  const poolHref = await poolLink.getAttribute("href");
+  expect(poolHref).not.toBeNull();
+  const returnHref = new URLSearchParams(poolHref!.split("?", 2)[1]).get("returnTo");
+  expect(returnHref).toContain("q=WNATIVE");
+  expect(returnHref).toContain("sort=tvl");
+  expect(returnHref).toContain("mine=1");
   await poolLink.click();
 
-  await expect(page.getByTestId("pool-detail-analytics-state")).toContainText("Current through block 42");
-  await expect(page.getByTestId("pool-candle-table").locator("tbody tr")).toHaveCount(24);
-  await expect(page.getByTestId("pool-bin-distribution-table").locator("tbody tr")).toHaveCount(5);
-  await expect(page.getByTestId("pool-candle-workspace")).toContainText("Hourly OHLCV and LP-net fee data");
-  await expect(page.getByTestId("same-pair-pools")).toBeVisible();
-  const normalizedGeometry = await page.evaluate(() => ({
-    binHeights: [...document.querySelectorAll<HTMLElement>(".pool-bin-stack i")].map((element) => Number.parseFloat(element.style.height)),
-    candleYs: [...document.querySelectorAll(".candle-chart polyline")].flatMap((line) => (line.getAttribute("points") ?? "").split(" ").filter(Boolean).map((point) => Number(point.split(",")[1])))
-  }));
-  expect(normalizedGeometry.binHeights.every((height) => height >= 2 && height <= 100)).toBe(true);
-  expect(normalizedGeometry.candleYs.every((value) => value >= 10 && value <= 94)).toBe(true);
-  await expect(page.locator(".back-link").first()).toHaveAttribute("href", /q=WNATIVE/);
-
-  await page.getByRole("link", { name: "Deposit" }).click();
+  await expect(page).toHaveURL(/#\/pools\/.+\/create\?returnTo=/);
+  await expect(page.getByTestId("pool-workspace-state")).toContainText("Current through block 42");
+  await expect(page.getByTestId("swap-market-chart")).toBeVisible();
+  await expect(page.getByTestId("pool-rail-liquidity-distribution").locator(".pool-rail-liquidity-bars > span")).toHaveCount(33);
+  await expect(page.getByTestId("pool-detail-analytics-state")).toHaveCount(0);
+  await expect(page.getByTestId("pool-candle-workspace")).toHaveCount(0);
+  await expect(page.getByTestId("pool-bin-distribution-table")).toHaveCount(0);
+  await expect(page.getByRole("link", { name: "Market overview" })).toHaveCount(0);
   await expect(page.getByTestId("pool-action-back")).toBeVisible();
   await expect(page.locator("#liquidity-pair")).toHaveCount(0);
   await page.getByTestId("pool-action-back").click();
-  await expect(page).toHaveURL(/#\/pools\//);
+  await expect(page).toHaveURL(/#\/pools\?/);
   await expect(page).toHaveURL(/q=WNATIVE/);
   await expect(page).toHaveURL(/sort=tvl/);
   await expect(page).toHaveURL(/mine=1/);
@@ -270,16 +269,14 @@ test("stale owner analytics remains partial while verified current liquidity sta
   await expect(page.locator(".discovery-table .table-row:not(.header)")).toHaveCount(1);
 });
 
-test("candle gaps keep true time spacing and token identity mismatches stay partial", async ({ page }, testInfo) => {
+test("analytics token identity mismatches remain partial in the unified workspace", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium");
   await installMockRpc(page, { analyticsCandleGap: true, analyticsMetricTokenMismatch: true, includePairs: true });
   await page.goto("/#/pools");
   await page.locator(".discovery-table .pair-name").first().click();
-  await expect(page.getByTestId("pool-detail-analytics-state")).toContainText("Analytics token identity does not match");
-  await expect(page.getByTestId("pool-detail-analytics-state")).toHaveClass(/partial/);
-  await expect(page.locator(".candle-chart polyline")).toHaveCount(2);
-  await expect(page.locator(".candle-volume .gap")).toHaveCount(1);
-  await expect(page.getByTestId("pool-market-chart")).toContainText("partial");
+  await expect(page.getByTestId("pool-workspace-state")).toContainText("Analytics token identity does not match");
+  await expect(page.getByTestId("pool-workspace-state")).toHaveClass(/partial/);
+  await expect(page.getByTestId("swap-market-chart")).toBeVisible();
 });
 
 test("unknown token decimals never fabricate bin reserve amounts", async ({ page }, testInfo) => {
@@ -290,8 +287,8 @@ test("unknown token decimals never fabricate bin reserve amounts", async ({ page
   });
   await page.goto("/#/pools");
   await page.locator(".discovery-table .pair-name").first().click();
-  await expect(page.getByText("Token decimals are unavailable; reserve amounts and distribution heights are not inferred.")).toBeVisible();
-  await expect(page.getByTestId("pool-bin-distribution-table")).toHaveCount(0);
+  await expect(page.getByTestId("pool-rail-liquidity-distribution")).toContainText("Pool bin identity or token decimals are unavailable.");
+  await expect(page.getByTestId("pool-rail-liquidity-distribution").locator(".pool-rail-liquidity-bars")).toHaveCount(0);
 });
 
 test("historical zero-only positions are excluded from My liquidity", async ({ page }, testInfo) => {

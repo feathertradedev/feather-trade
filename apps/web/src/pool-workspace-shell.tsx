@@ -22,38 +22,31 @@ const ACTION_TASKS: ReadonlyArray<{ key: Exclude<PoolWorkspaceTask, "market">; l
 export function PoolWorkspaceShell({
   children,
   environmentKey,
-  pool,
-  task
+  pool
 }: {
   children: ReactNode;
   environmentKey: EnvironmentKey;
   pool: PoolRow;
-  task: PoolWorkspaceTask;
 }) {
   return (
     <PoolWorkspaceProvider environmentKey={environmentKey} pool={pool}>
-      <PoolWorkspaceScaffold pool={pool} task={task}>{children}</PoolWorkspaceScaffold>
+      <PoolWorkspaceScaffold pool={pool}>{children}</PoolWorkspaceScaffold>
     </PoolWorkspaceProvider>
   );
 }
 
-function PoolWorkspaceScaffold({ children, pool, task }: { children: ReactNode; pool: PoolRow; task: PoolWorkspaceTask }) {
+function PoolWorkspaceScaffold({ children, pool }: { children: ReactNode; pool: PoolRow }) {
   const returnHref = returnHrefFromAction(window.location.hash);
 
   return (
     <section className="canonical-pool-workspace" data-pool-id={pool.id} data-testid="canonical-pool-workspace">
-      {returnHref === null ? null : <a className="back-link action-return-link" data-testid="pool-action-back" href={returnHref}>← Back to pool workspace</a>}
+      {returnHref === null ? null : <a className="back-link action-return-link" data-testid="pool-action-back" href={returnHref}>← Back to pools</a>}
       <header className="pool-workspace-header">
         <div className="pool-workspace-identity">
           <span>Pool workspace</span>
           <strong>{tokenSymbol(pool.tokenX)} / {tokenSymbol(pool.tokenY)}</strong>
           <small>{formatCompactAddress(pool.address)} · {pool.binStep} bps/bin</small>
         </div>
-        {task === "market" ? (
-          <PoolWorkspaceTaskTabs task={task} />
-        ) : (
-          <a className="pool-workspace-market-link" href={taskHref(pool.id, "market", returnHref)}>Market overview</a>
-        )}
       </header>
       <div className="pool-workspace-body">
         <PoolWorkspaceRail />
@@ -167,6 +160,7 @@ function PoolWorkspaceRail() {
       <div className={`pool-rail-state ${workspace.analytics.state.status.toLowerCase()}`} data-testid="pool-workspace-state" role="status">
         <span>{workspace.analytics.state.label}</span>
         {workspace.analytics.state.detail ? <small>{workspace.analytics.state.detail}</small> : null}
+        {workspace.analytics.row.analyticsIssue ? <small>{workspace.analytics.row.analyticsIssue}</small> : null}
       </div>
 
       <div className="pool-rail-position-state">

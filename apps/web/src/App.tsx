@@ -112,7 +112,6 @@ import {
   loadWalletPortfolio,
   tokenSymbol,
   type AppSnapshot,
-  type BinRow,
   type LoadState,
   type PaginatedRows,
   type PaginationInfo,
@@ -229,9 +228,7 @@ import {
   discoveryHref,
   filterPoolPage,
   parsePoolDiscoveryState,
-  poolDetailHref,
   returnHrefFromAction,
-  samePairPools,
   type PoolDiscoveryState
 } from "./pool-discovery";
 import {
@@ -244,15 +241,12 @@ import {
   type PoolAnalyticsMetric
 } from "./analytics-data";
 import {
-  buildBinDistribution,
   buildCenteredBinDistribution,
-  buildCandleChartModel,
   joinPoolWorkspaceRows,
   sortPoolWorkspaceRows,
   workspaceAnalyticsState,
   workspaceMetricTiles,
   type BinDistributionPoint,
-  type CandleChartModel,
   type PoolEconomicSort
 } from "./pool-workspace";
 import {
@@ -672,6 +666,14 @@ function DexShell() {
     refetchOnWindowFocus: "always"
   });
   const snapshot = snapshotQuery.data;
+
+  useEffect(() => {
+    if (routeKey !== "pools" || poolDetailId === null || workspaceTask !== "market") return;
+    const returnContext = returnHrefFromAction(window.location.hash) ?? window.location.hash;
+    const returnHref = discoveryHref(parsePoolDiscoveryState(returnContext));
+    const createHref = actionHref("add", poolDetailId, returnHref);
+    if (window.location.hash !== createHref) window.location.replace(createHref);
+  }, [poolDetailId, routeKey, workspaceTask]);
 
   useEffect(() => {
     if (previousWalletSessionKey.current === walletSessionKey) return;
@@ -1301,7 +1303,7 @@ function ContentView({
     setSelectedPoolId(poolId);
 
     if (routeKey === "pools" && workspaceTask !== null) {
-      window.location.hash = poolWorkspaceHref(poolId, workspaceTask);
+      window.location.hash = poolWorkspaceHref(poolId, workspaceTask === "market" ? "create" : workspaceTask);
       return;
     }
 
@@ -1362,7 +1364,7 @@ function ContentView({
             : snapshotState;
 
       if (detailPool !== null) {
-        const resolvedWorkspaceTask = workspaceTask ?? "market";
+        const resolvedWorkspaceTask = workspaceTask === "swap" || workspaceTask === "manage" ? workspaceTask : "create";
         const workspacePoolOptions = pools.some((pool) => pool.id === detailPool.id) ? pools : [detailPool, ...pools];
         const workspaceContent = resolvedWorkspaceTask === "swap"
           ? (
@@ -1376,46 +1378,30 @@ function ContentView({
                 snapshot={snapshot}
               />
             )
-          : resolvedWorkspaceTask === "create" || resolvedWorkspaceTask === "manage"
-            ? (
-                <LiquidityView
-                  environmentKey={environmentKey}
-                  initialSection={resolvedWorkspaceTask === "create" ? "add" : "withdraw"}
-                  onRefresh={onRefresh}
-                  onSelectedPoolChange={handleSelectedPoolChange}
-                  poolOptions={workspacePoolOptions}
-                  portfolioAction={null}
-                  primaryPool={detailPool}
-                  selectedPoolId={detailPool.id}
-                  snapshot={snapshot}
-                  snapshotQueryErrored={snapshotState === "error"}
-                />
-              )
-            : (
-                <PoolDetailView
-                  onSelectPool={setSelectedPoolId}
-                  pool={detailPool}
-                  poolDetailId={poolDetailId}
-                  pools={pools}
-                  snapshotState={detailState}
-                />
-              );
+          : (
+              <LiquidityView
+                environmentKey={environmentKey}
+                initialSection={resolvedWorkspaceTask === "create" ? "add" : "withdraw"}
+                onRefresh={onRefresh}
+                onSelectedPoolChange={handleSelectedPoolChange}
+                poolOptions={workspacePoolOptions}
+                portfolioAction={null}
+                primaryPool={detailPool}
+                selectedPoolId={detailPool.id}
+                snapshot={snapshot}
+                snapshotQueryErrored={snapshotState === "error"}
+              />
+            );
 
         return (
-          <PoolWorkspaceShell environmentKey={environmentKey} key={detailPool.id} pool={detailPool} task={resolvedWorkspaceTask}>
+          <PoolWorkspaceShell environmentKey={environmentKey} key={detailPool.id} pool={detailPool}>
             {workspaceContent}
           </PoolWorkspaceShell>
         );
       }
 
       return (
-        <PoolDetailView
-          onSelectPool={setSelectedPoolId}
-          pool={detailPool ?? null}
-          poolDetailId={poolDetailId}
-          pools={pools}
-          snapshotState={detailState}
-        />
+        <RequestedPoolState error={directPoolQuery.error} poolId={poolDetailId} state={detailState} />
       );
     }
 
@@ -4211,8 +4197,9 @@ function PoolsView({
               {filteredPage.rows.map((pool) => {
                 const workspaceRow = workspaceRowsByPair.get(pool.address.toLowerCase()) ?? null;
                 const tiles = workspaceMetricTiles(workspaceRow?.metric ?? null);
+                const workspaceHref = actionHref("add", pool.id, discoveryHref(discoveryState));
                 return <div className="table-row" key={pool.id}>
-                  <a className="pair-name" href={poolDetailHref(pool.id, discoveryState)}>
+                  <a className="pair-name" href={workspaceHref}>
                     {tokenSymbol(pool.tokenX)} / {tokenSymbol(pool.tokenY)}
                     <small>DLMM · bin step {pool.binStep} · {formatCompactAddress(pool.address)}</small>
                     <small>{pool.tokenX?.name ?? "Unknown token"} · {pool.tokenXAddress} · chain {pool.tokenX?.chainId ?? "?"} · review {pool.tokenX?.risk.reviewStatus ?? "unlisted"}</small>
@@ -4222,8 +4209,8 @@ function PoolsView({
                   <WorkspaceTableMetric tile={tiles[1]} />
                   <WorkspaceTableMetric tile={tiles[2]} />
                   <WorkspaceTableMetric tile={tiles[3]} />
-                  <a className="secondary-button" href={poolDetailHref(pool.id, discoveryState)}>
-                    View
+                  <a className="secondary-button" href={workspaceHref}>
+                    Open pool
                   </a>
                   {workspaceRow?.analyticsIssue ? <small className="workspace-row-issue">{workspaceRow.analyticsIssue}</small> : null}
                 </div>;
@@ -5332,317 +5319,6 @@ function poolCreationRecoveryCopy(
   }
 }
 
-function PoolDetailView({
-  onSelectPool,
-  pool,
-  poolDetailId,
-  pools,
-  snapshotState
-}: {
-  onSelectPool: (poolId: string) => void;
-  pool: PoolRow | null;
-  poolDetailId: string;
-  pools: PoolRow[];
-  snapshotState: LoadState;
-}) {
-  const workspace = useOptionalPoolWorkspace();
-  const discoveryState = parsePoolDiscoveryState(window.location.hash);
-  const backHref = discoveryHref(discoveryState);
-  const detailReturnHref = pool === null ? backHref : poolDetailHref(pool.id, discoveryState);
-
-  if (pool === null) {
-    const lookupResolved = !["loading", "error", "unavailable"].includes(snapshotState);
-    return (
-      <div className="view-grid">
-        <section className="table-panel">
-          <a className="back-link" href={backHref}>← All pools</a>
-          <EmptyState state={lookupResolved ? "empty" : snapshotState} />
-          {lookupResolved ? (
-            <p className="inline-error">Pool {formatCompactAddress(poolDetailId)} was not found in the current environment.</p>
-          ) : null}
-        </section>
-      </div>
-    );
-  }
-
-  if (workspace === null) throw new Error("Resolved pool detail requires the canonical pool workspace context");
-
-  const accountAddress = workspace.walletAddress;
-  const indexedBins = workspace.bins;
-  const bins = withActiveBin(indexedBins, pool.activeId);
-  const metricPage = workspace.analytics.metricPage;
-  const detailWorkspaceRow = workspace.analytics.row;
-  const metric = detailWorkspaceRow.metric;
-  const metricTiles = workspaceMetricTiles(metric);
-  const detailAnalyticsState = workspace.analytics.state;
-  const detailCandleStart = Math.floor(Date.now() / 3_600_000) * 3_600 - 24 * 3_600;
-  const candlePage = {
-    ...workspace.analytics.candles,
-    rows: workspace.analytics.candles.rows.filter((candle) => candle.startTimestamp >= detailCandleStart)
-  };
-  const candleModel = buildCandleChartModel(candlePage);
-  const binDistribution = pool.tokenX !== null && pool.tokenY !== null
-    ? buildBinDistribution(bins, pool.activeId, pool.tokenX.decimals, pool.tokenY.decimals)
-    : null;
-  const siblingPools = samePairPools(pools, pool);
-  const walletPositions = workspace.positions;
-  const positionsPartial = workspace.positionsPartial;
-  const binsState = workspace.binsState;
-  const positionsState = workspace.positionsState;
-  const positionsLabel = !accountAddress
-    ? "connect wallet"
-    : positionsState === "partial"
-      ? `${walletPositions.length} loaded · partial`
-      : positionsState === "ready" || positionsState === "empty"
-        ? `${walletPositions.length} bins`
-        : positionsState;
-  const selectPool = () => onSelectPool(pool.id);
-
-  return (
-    <div className="view-grid pool-detail">
-      <section className="table-panel pool-detail-header">
-        <a className="back-link" href={backHref}>← All pools</a>
-        <div className="pool-title-row">
-          <div>
-            <h2>{tokenSymbol(pool.tokenX)} / {tokenSymbol(pool.tokenY)}</h2>
-            <p>{formatCompactAddress(pool.address)} · DLMM · bin step {pool.binStep}</p>
-          </div>
-          <div className="pool-actions">
-            <a className="secondary-button" href={actionHref("swap", pool.id, detailReturnHref)} onClick={selectPool}>Swap</a>
-            <a className="secondary-button" href={actionHref("withdraw", pool.id, detailReturnHref)} onClick={selectPool}>Withdraw</a>
-            <a className="primary-button" href={actionHref("add", pool.id, detailReturnHref)} onClick={selectPool}>Deposit</a>
-          </div>
-        </div>
-      </section>
-
-      <section className={`workspace-analytics-state detail ${detailAnalyticsState.status.toLowerCase()}`} data-testid="pool-detail-analytics-state" role="status">
-        <span>{detailAnalyticsState.label}</span>
-        {detailAnalyticsState.detail ? <small>{detailAnalyticsState.detail}</small> : null}
-        {metricPage.error ? <small>{metricPage.error}</small> : null}
-        {detailWorkspaceRow.analyticsIssue ? <small>{detailWorkspaceRow.analyticsIssue}</small> : null}
-      </section>
-
-      <section className="pool-detail-metrics workspace-metrics" aria-label="Pool analytics metrics">
-        {metricTiles.map((tile) => <WorkspaceMetricTileView key={tile.key} tile={tile} />)}
-      </section>
-
-      <section className="pool-detail-metrics indexed-lifetime-metrics" aria-label="Indexed lifetime pool counters">
-        <MetricTile label="Indexed token reserves" value={`${formatTokenAmount(pool.reserveX, pool.tokenX)} / ${formatTokenAmount(pool.reserveY, pool.tokenY)}`} tone="neutral" />
-        <MetricTile label="Indexed lifetime volume" value={`${formatTokenAmount(pool.volumeX, pool.tokenX)} / ${formatTokenAmount(pool.volumeY, pool.tokenY)}`} tone="neutral" />
-        <MetricTile label="Indexed lifetime fees" value={`${formatTokenAmount(pool.feesX, pool.tokenX)} / ${formatTokenAmount(pool.feesY, pool.tokenY)}`} tone="good" />
-        <MetricTile label="Indexed swaps / active bin" value={`${pool.swapCount} / ${pool.activeId ?? "n/a"}`} tone="neutral" />
-      </section>
-
-      <section className="info-panel pool-market-chart" data-testid="pool-market-chart">
-        <div className="panel-heading">
-          <span>24h hourly OHLCV</span>
-          <span className="analytics-status-label" data-analytics-status={candleModel.status}>{candleModel.status.toLowerCase()}</span>
-        </div>
-        <PoolCandleChart model={candleModel} />
-        {candlePage.error ? <p className="inline-error">{candlePage.error}</p> : null}
-      </section>
-
-      <section className="info-panel">
-        <div className="panel-heading">
-          <span>Live liquidity bins</span>
-          <StatusBadge state={binsState} label={binsState === "ready" ? `${indexedBins.length} bins` : binsState} />
-        </div>
-        <PoolBinDistributionChart
-          points={binDistribution}
-          state={binsState}
-          tokenX={pool.tokenX === null ? null : tokenSymbol(pool.tokenX)}
-          tokenY={pool.tokenY === null ? null : tokenSymbol(pool.tokenY)}
-        />
-        {workspace.binsError ? <p className="inline-error">{workspace.binsError}</p> : null}
-      </section>
-
-      {siblingPools.length > 0 ? (
-        <section className="table-panel same-pair-pools" data-testid="same-pair-pools">
-          <div className="panel-heading"><span>Same pair · other bin steps</span><span>{siblingPools.length}</span></div>
-          <div className="same-pair-list">
-            {siblingPools.map((candidate) => (
-              <a href={poolDetailHref(candidate.id, discoveryState)} key={candidate.id}>
-                <span>Bin step {candidate.binStep}</span>
-                <small>{formatCompactAddress(candidate.address)}</small>
-              </a>
-            ))}
-          </div>
-        </section>
-      ) : null}
-
-      <section className="table-panel">
-        <div className="panel-heading">
-          <span>Your bins</span>
-          <StatusBadge
-            state={positionsState}
-            label={positionsLabel}
-          />
-        </div>
-        {walletPositions.length > 0 ? (
-          <>
-            <div className="wallet-bin-list">
-              {walletPositions.map((position) => (
-                <div key={position.id}>
-                  <span>Bin {position.binId}</span>
-                  <strong>{formatTokenAmount(position.liquidity, null)} LB</strong>
-                </div>
-              ))}
-            </div>
-            {positionsPartial ? <p className="state-row warning">The owner/pair position query is partial; destructive actions remain blocked.</p> : null}
-          </>
-        ) : accountAddress && ["loading", "error", "unavailable"].includes(positionsState) ? (
-          <>
-            <EmptyState state={positionsState} />
-            {workspace.positionsError ? <p className="inline-error">{workspace.positionsError}</p> : null}
-          </>
-        ) : (
-          <p className="inline-empty">
-            {accountAddress
-              ? positionsState === "unavailable"
-                ? "Position data is unavailable for this pool."
-                : workspace.positionsError
-                ? workspace.positionsError
-                : positionsPartial
-                  ? "The owner/pair position query is partial; destructive actions remain blocked."
-                : "No indexed balances in this pool."
-              : "Connect a wallet to view your pool balances."}
-          </p>
-        )}
-      </section>
-    </div>
-  );
-}
-
-function WorkspaceMetricTileView({ tile }: { tile: ReturnType<typeof workspaceMetricTiles>[number] }) {
-  return (
-    <div className="metric-tile workspace-metric-tile" data-analytics-status={tile.status}>
-      <span>{tile.label}</span>
-      <strong>{tile.value}</strong>
-      <small>{tile.status.toLowerCase()}</small>
-    </div>
-  );
-}
-
-function PoolCandleChart({ model }: { model: CandleChartModel }) {
-  if (model.points.length === 0) return <EmptyState state={analyticsStatusToLoadState(model.status)} />;
-  const segments: string[][] = [];
-  let segment: string[] = [];
-  let previousEnd: number | null = null;
-  const firstStart = model.points[0]!.startTimestamp;
-  const lastStart = model.points.at(-1)!.startTimestamp;
-  model.points.forEach((point) => {
-    if (previousEnd !== null && previousEnd !== point.startTimestamp && segment.length > 0) {
-      segments.push(segment);
-      segment = [];
-    }
-    previousEnd = point.endTimestamp;
-    if (point.normalizedClose === null) {
-      if (segment.length > 0) segments.push(segment);
-      segment = [];
-      return;
-    }
-    const x = lastStart === firstStart ? 50 : (point.startTimestamp - firstStart) * 100 / (lastStart - firstStart);
-    const y = 94 - point.normalizedClose * 0.84;
-    segment.push(`${x.toFixed(2)},${y.toFixed(2)}`);
-  });
-  if (segment.length > 0) segments.push(segment);
-  const maximumSwaps = Math.max(1, ...model.points.map((point) => point.swapCount));
-  const intervalSeconds = model.points[0]!.endTimestamp - model.points[0]!.startTimestamp;
-  const pointsByStart = new Map(model.points.map((point) => [point.startTimestamp, point]));
-  const activitySlots = intervalSeconds > 0
-    ? Array.from({ length: Math.floor((lastStart - firstStart) / intervalSeconds) + 1 }, (_, index) => pointsByStart.get(firstStart + index * intervalSeconds) ?? null)
-    : model.points;
-
-  return (
-    <div className="candle-workspace" data-testid="pool-candle-workspace">
-      <div className="candle-chart" role="img" aria-label={`Hourly close price with swap-count activity; ${model.points.length} candles${model.hasGaps ? "; partial history with gaps" : ""}`}>
-        <svg aria-hidden="true" preserveAspectRatio="none" viewBox="0 0 100 100">
-          {segments.map((points, index) => <polyline fill="none" key={index} points={points.join(" ")} vectorEffect="non-scaling-stroke" />)}
-        </svg>
-        <div className="candle-volume" aria-hidden="true">
-          {activitySlots.map((point, index) => point === null
-            ? <i className="gap" key={`gap-${index}`} />
-            : <i key={point.startTimestamp} style={{ height: `${Math.max(4, point.swapCount * 100 / maximumSwaps)}%` }} />)}
-        </div>
-        <span className="candle-legend">Close price · swap-count activity</span>
-      </div>
-      <div className="semantic-table-scroll">
-        <table className="analytics-table" data-testid="pool-candle-table">
-          <caption>Hourly OHLCV and LP-net fee data</caption>
-          <thead><tr><th>Hour</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Volume</th><th>LP fees</th><th>TVL</th><th>Swaps</th><th>Status</th></tr></thead>
-          <tbody>
-            {model.points.map((point) => (
-              <tr key={point.startTimestamp}>
-                <th scope="row"><time dateTime={new Date(point.startTimestamp * 1_000).toISOString()}>{formatCandleHour(point.startTimestamp)}</time></th>
-                <td>{point.open}</td><td>{point.high}</td><td>{point.low}</td><td>{point.close}</td>
-                <td>{point.volume}</td><td>{point.lpFees}</td><td>{point.tvl}</td><td>{point.swapCount}</td><td>{point.status.toLowerCase()}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
-function PoolBinDistributionChart({
-  points,
-  state,
-  tokenX,
-  tokenY
-}: {
-  points: ReturnType<typeof buildBinDistribution> | null;
-  state: LoadState;
-  tokenX: string | null;
-  tokenY: string | null;
-}) {
-  if (points === null || tokenX === null || tokenY === null) {
-    return <p className="state-row warning">Token decimals are unavailable; reserve amounts and distribution heights are not inferred.</p>;
-  }
-  if (points.length === 0 || state !== "ready") return <EmptyState state={state} />;
-  return (
-    <div className="bin-distribution-workspace">
-      <div className="pool-bin-chart distribution" aria-label={`Indexed ${tokenX}, ${tokenY}, and LB supply by bin`}>
-        {points.map((point) => (
-          <span
-            aria-label={`Bin ${point.binId}; ${tokenX} ${point.tokenX}; ${tokenY} ${point.tokenY}; LB supply ${point.lbSupply}${point.active ? "; active bin" : ""}`}
-            className={point.active ? "pool-bin-stack active" : "pool-bin-stack"}
-            key={point.id}
-            role="img"
-            tabIndex={0}
-          >
-            <i className="token-x" style={{ height: `${Math.max(2, point.tokenXHeight)}%` }} />
-            <i className="token-y" style={{ height: `${Math.max(2, point.tokenYHeight)}%` }} />
-            <i className="lb-supply" style={{ height: `${Math.max(2, point.lbSupplyHeight)}%` }} />
-          </span>
-        ))}
-      </div>
-      <div className="semantic-table-scroll">
-        <table className="analytics-table compact" data-testid="pool-bin-distribution-table">
-          <caption>Indexed bin reserve and LB supply data</caption>
-          <thead><tr><th>Bin</th><th>{tokenX}</th><th>{tokenY}</th><th>LB supply</th><th>Range</th></tr></thead>
-          <tbody>{points.map((point) => <tr key={point.id}><th scope="row">{point.binId}</th><td>{point.tokenX}</td><td>{point.tokenY}</td><td>{point.lbSupply}</td><td>{point.active ? "Active" : "Indexed"}</td></tr>)}</tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
-function analyticsStatusToLoadState(status: AnalyticsStatus): LoadState {
-  return status === "UNAVAILABLE" ? "unavailable" : status === "PARTIAL" ? "partial" : "ready";
-}
-
-function formatCandleHour(timestamp: number): string {
-  return new Intl.DateTimeFormat("en", { day: "2-digit", hour: "2-digit", hour12: false, month: "short", timeZone: "UTC" }).format(new Date(timestamp * 1_000));
-}
-
-function withActiveBin(bins: BinRow[], activeId: string | null): BinRow[] {
-  if (activeId === null || bins.some((bin) => bin.binId === activeId)) return bins;
-
-  return [...bins, { id: `active-${activeId}`, binId: activeId, reserveX: "0", reserveY: "0", totalSupply: "0", updatedAtBlock: "0" }]
-    .sort((left, right) => Number(left.binId) - Number(right.binId));
-}
-
 function LiquidityView({
   environmentKey,
   initialSection,
@@ -5939,14 +5615,6 @@ function LiquidityView({
     setLowerPriceInput(formatExactPriceFraction(normalizeQ128Price(rangePriceQuery.data.lowerPriceQ128, rangePriceOptions)));
     setUpperPriceInput(formatExactPriceFraction(normalizeQ128Price(rangePriceQuery.data.upperPriceQ128, rangePriceOptions)));
   }, [rangePriceOptions?.baseDecimals, rangePriceOptions?.quoteDecimals, rangePriceQuery.data]);
-  const lowerInversePrice =
-    rangePriceQuery.data !== undefined && rangePriceOptions !== null
-      ? formatExactPriceFraction(normalizeQ128Price(rangePriceQuery.data.upperPriceQ128, { ...rangePriceOptions, inverse: true }))
-      : "n/a";
-  const upperInversePrice =
-    rangePriceQuery.data !== undefined && rangePriceOptions !== null
-      ? formatExactPriceFraction(normalizeQ128Price(rangePriceQuery.data.lowerPriceQ128, { ...rangePriceOptions, inverse: true }))
-      : "n/a";
   const slippageBps = parseSlippageToBps(slippageInput);
   const idSlippage = parseIdSlippage(idSlippageInput);
   const idSlippageError = idSlippageInputError(idSlippageInput);
@@ -8853,7 +8521,6 @@ function LiquidityView({
           lowerBinInput={lowerBinInput}
           lowerDelta={lowerDelta}
           lowerDeltaInput={lowerDeltaInput}
-          lowerInversePrice={lowerInversePrice}
           lowerPriceInput={lowerPriceInput}
           maxBins={MAX_LIQUIDITY_BINS}
           narrowPresetInput={narrowPresetInput}
@@ -8896,7 +8563,6 @@ function LiquidityView({
           upperBinInput={upperBinInput}
           upperDelta={upperDelta}
           upperDeltaInput={upperDeltaInput}
-          upperInversePrice={upperInversePrice}
           upperPriceInput={upperPriceInput}
           widePresetInput={widePresetInput}
         />
@@ -9404,7 +9070,6 @@ function LiquidityRangeEditor({
   lowerBinInput,
   lowerDelta,
   lowerDeltaInput,
-  lowerInversePrice,
   lowerPriceInput,
   maxBins,
   narrowPresetInput,
@@ -9433,7 +9098,6 @@ function LiquidityRangeEditor({
   upperBinInput,
   upperDelta,
   upperDeltaInput,
-  upperInversePrice,
   upperPriceInput,
   widePresetInput
 }: {
@@ -9448,7 +9112,6 @@ function LiquidityRangeEditor({
   lowerBinInput: string;
   lowerDelta: number | null;
   lowerDeltaInput: string;
-  lowerInversePrice: string;
   lowerPriceInput: string;
   maxBins: number;
   narrowPresetInput: string;
@@ -9477,7 +9140,6 @@ function LiquidityRangeEditor({
   upperBinInput: string;
   upperDelta: number | null;
   upperDeltaInput: string;
-  upperInversePrice: string;
   upperPriceInput: string;
   widePresetInput: string;
 }) {
@@ -9667,12 +9329,10 @@ function LiquidityRangeEditor({
           <label htmlFor="range-min-price">
             <span>Min {tokenYSymbol} per {tokenXSymbol}</span>
             <input aria-label={`Min ${tokenYSymbol} per ${tokenXSymbol}`} id="range-min-price" inputMode="decimal" value={lowerPriceInput} onChange={(event) => onLowerPriceInput(event.target.value)} onBlur={onLowerPriceCommit} />
-            <small data-testid="liquidity-min-price-inverse">Inverse <output title={`${lowerInversePrice} ${tokenXSymbol} per ${tokenYSymbol}`}>{lowerInversePrice} {tokenXSymbol} per {tokenYSymbol}</output></small>
           </label>
           <label htmlFor="range-max-price">
             <span>Max {tokenYSymbol} per {tokenXSymbol}</span>
             <input aria-label={`Max ${tokenYSymbol} per ${tokenXSymbol}`} id="range-max-price" inputMode="decimal" value={upperPriceInput} onChange={(event) => onUpperPriceInput(event.target.value)} onBlur={onUpperPriceCommit} />
-            <small data-testid="liquidity-max-price-inverse">Inverse <output title={`${upperInversePrice} ${tokenXSymbol} per ${tokenYSymbol}`}>{upperInversePrice} {tokenXSymbol} per {tokenYSymbol}</output></small>
           </label>
         </div>
 
@@ -10370,15 +10030,6 @@ function ActivityView({ snapshot }: { snapshot: AppSnapshot | undefined }) {
           <EmptyState state={snapshot?.indexer.status ?? "loading"} />
         )}
       </section>
-    </div>
-  );
-}
-
-function MetricTile({ label, value, tone }: { label: string; value: string; tone: "good" | "warn" | "neutral" }) {
-  return (
-    <div className={`metric ${tone}`}>
-      <span>{label}</span>
-      <strong>{value}</strong>
     </div>
   );
 }
