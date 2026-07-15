@@ -82,6 +82,7 @@ test("create position range editor layers exact distribution over indexed pool r
 
   const editor = page.getByTestId("liquidity-range-editor");
   const chart = editor.getByLabel("Liquidity bin distribution");
+  const transactionReview = page.getByTestId("liquidity-transaction-review");
   await expect(editor).toBeVisible();
   await expect(editor).toContainText("Pool WNATIVE");
   await expect(editor).toContainText("Pool USDC");
@@ -92,6 +93,13 @@ test("create position range editor layers exact distribution over indexed pool r
   await expect(page.getByLabel("Max USDC per WNATIVE")).toBeVisible();
   await expect(editor).toContainText("3 bins selected");
   await expect(page.locator("#range-lower-bin")).not.toBeVisible();
+  await expect(transactionReview).toBeVisible();
+  await expect(transactionReview).not.toHaveAttribute("open", "");
+  await expect(page.getByTestId("liquidity-token-x-identity")).not.toBeVisible();
+  await expect(page.getByTestId("liquidity-add-button")).toBeVisible();
+  await transactionReview.getByText("Transaction review").click();
+  await expect(page.getByTestId("liquidity-token-x-identity")).toBeVisible();
+  await transactionReview.getByText("Transaction review").click();
 
   const lowerHandle = page.getByLabel("Lower range handle");
   const upperHandle = page.getByLabel("Upper range handle");

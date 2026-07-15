@@ -4701,10 +4701,11 @@ a {
 .liquidity-task-panel {
   position: sticky;
   top: 12px;
-  max-height: calc(100dvh - 240px);
-  padding: 0 16px 16px;
-  overflow-x: hidden;
-  overflow-y: auto;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  max-height: calc(100dvh - 104px);
+  padding: 0;
+  overflow: hidden;
   scrollbar-color: rgb(233 236 231 / 18%) transparent;
   scrollbar-width: thin;
 }
@@ -4713,12 +4714,158 @@ a {
   position: sticky;
   z-index: 4;
   top: 0;
-  width: calc(100% + 32px);
-  margin: 0 -16px 14px;
+  width: 100%;
+  margin: 0;
 }
 
-.liquidity-task-panel > .panel-heading {
+.liquidity-task-body {
+  min-height: 0;
+  padding: 0 16px 18px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-color: rgb(233 236 231 / 18%) transparent;
+  scrollbar-width: thin;
+}
+
+.liquidity-task-body > .panel-heading {
+  margin-top: 14px;
+}
+
+.liquidity-position-summary {
   margin-top: 0;
+  color: var(--bone);
+  background: rgb(74 197 124 / 6%);
+  border: 1px solid rgb(74 197 124 / 20%);
+}
+
+.liquidity-composition-note {
+  align-items: flex-start;
+  margin-top: 7px;
+  padding: 0 2px;
+  color: var(--ink-60);
+  background: transparent;
+  border: 0;
+  font-size: 0.68rem;
+  line-height: 1.45;
+}
+
+.liquidity-composition-note svg {
+  margin-top: 1px;
+  color: var(--green);
+}
+
+.liquidity-review-details {
+  margin-top: 12px;
+  overflow: hidden;
+  background: var(--carbon);
+  border: 1px solid rgb(233 236 231 / 10%);
+  border-radius: 8px;
+}
+
+.liquidity-review-details > summary {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 54px;
+  padding: 10px 11px;
+  color: var(--bone);
+  cursor: pointer;
+  list-style: none;
+}
+
+.liquidity-review-details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.liquidity-review-details > summary > span:first-child {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.liquidity-review-details > summary strong {
+  color: var(--bone-bright);
+  font-size: 0.74rem;
+  font-weight: 600;
+}
+
+.liquidity-review-details > summary small {
+  color: var(--ink-45);
+  font-size: 0.61rem;
+  font-weight: 400;
+}
+
+.liquidity-review-details > summary > span:last-child {
+  flex: 0 0 auto;
+  color: var(--ink-60);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.58rem;
+  white-space: nowrap;
+}
+
+.liquidity-review-details > summary > span:last-child::after {
+  margin-left: 8px;
+  color: var(--green);
+  content: "+";
+}
+
+.liquidity-review-details[open] > summary > span:last-child::after {
+  content: "−";
+}
+
+.liquidity-review-body {
+  padding: 0 11px 12px;
+  border-top: 1px solid rgb(233 236 231 / 8%);
+}
+
+.liquidity-review-body > .token-identity,
+.liquidity-review-body > .state-row,
+.liquidity-review-body > .approval-disclosure,
+.liquidity-review-body > .quote-grid,
+.liquidity-review-body > .review-card {
+  margin-top: 10px;
+}
+
+.liquidity-action-dock {
+  z-index: 5;
+  padding: 10px 16px 12px;
+  background: var(--panel);
+  border-top: 1px solid rgb(233 236 231 / 9%);
+  box-shadow: 0 -14px 30px rgb(0 0 0 / 18%);
+}
+
+.liquidity-action-dock .action-stack {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.liquidity-action-dock [hidden] {
+  display: none;
+}
+
+.liquidity-action-dock .primary-button {
+  grid-column: 1 / -1;
+}
+
+.liquidity-action-dock .secondary-button:first-child:nth-last-child(2) {
+  grid-column: 1 / -1;
+}
+
+.liquidity-action-dock .primary-button,
+.liquidity-action-dock .secondary-button {
+  min-height: 46px;
+  padding: 8px 10px;
+  font-size: 0.73rem;
+}
+
+.liquidity-action-dock .transaction-status {
+  min-height: 34px;
+  margin-top: 8px;
+  padding: 7px 9px;
+  font-size: 0.68rem;
 }
 
 .canonical-pool-workspace .swap-task-panel {
@@ -5197,7 +5344,12 @@ a {
 
   .liquidity-task-panel {
     position: static;
+    display: block;
     max-height: none;
+    overflow: visible;
+  }
+
+  .liquidity-task-body {
     overflow: visible;
   }
 }
@@ -5214,7 +5366,12 @@ a {
     grid-template-columns: 1fr;
   }
 
-  .swap-action-dock .action-stack > * {
+  .liquidity-action-dock .action-stack {
+    grid-template-columns: 1fr;
+  }
+
+  .swap-action-dock .action-stack > *,
+  .liquidity-action-dock .action-stack > * {
     grid-column: 1;
   }
 

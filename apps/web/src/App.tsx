@@ -77,7 +77,7 @@ import {
   Server,
   Wallet
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from "react";
 import { decodeEventLog, encodeFunctionData, isAddress, isAddressEqual, keccak256, zeroAddress, type Address, type Chain, type Hex, type PublicClient, formatUnits } from "viem";
 import {
   useAccount,
@@ -8774,6 +8774,7 @@ function LiquidityView({
       {!workspaceMatchesPool || initialSection !== "withdraw" ? (
       <section className={workspaceMatchesPool ? "tool-panel liquidity-task-panel" : "tool-panel"} id="liquidity-add">
         {workspaceMatchesPool ? <PoolWorkspaceTaskTabs task="create" /> : null}
+        <LiquidityTaskBody compact={workspaceMatchesPool}>
         <div className="panel-heading">
           <span>{workspaceMatchesPool ? "Create position" : "Add Liquidity"}</span>
           {workspaceMatchesPool ? null : <StatusBadge state={addPoolReady ? "ready" : "unavailable"} label={poolDescriptorLabel(selectedPool)} />}
@@ -8892,9 +8893,7 @@ function LiquidityView({
           upperPriceInput={upperPriceInput}
           widePresetInput={widePresetInput}
         />
-        {nativeModeX ? <div className="state-row" data-testid="liquidity-token-x-identity">ETH native asset · router wrapper {liquidityWrappedNative?.symbol} {liquidityWrappedNative?.address}</div> : <TokenIdentity token={tokenX} networkName={registry.chain.name} testId="liquidity-token-x-identity" />}
-        {nativeModeY ? <div className="state-row" data-testid="liquidity-token-y-identity">ETH native asset · router wrapper {liquidityWrappedNative?.symbol} {liquidityWrappedNative?.address}</div> : <TokenIdentity token={tokenY} networkName={registry.chain.name} testId="liquidity-token-y-identity" />}
-        <div className="state-row" data-testid="liquidity-range-mode">
+        <div className={workspaceMatchesPool ? "state-row liquidity-position-summary" : "state-row"} data-testid="liquidity-range-mode">
           <Droplets size={16} />
           <span>{liquidityModeDescription(liquidityMode, tokenSymbol(tokenX), tokenSymbol(tokenY))}</span>
         </div>
@@ -8904,17 +8903,24 @@ function LiquidityView({
             <span>One-sided liquidity deposits one token directly into the selected bins. It does not perform a swap; use the Swap screen separately if you want to rebalance first.</span>
           </div>
         ) : null}
+        {liquidityMode === "balanced" ? (
+          <div className={workspaceMatchesPool ? "state-row liquidity-composition-note" : "state-row"} data-testid="liquidity-composition-guidance">
+            <CircleDollarSign size={16} />
+            <span>Balanced ranges require both tokens. Amounts stay user-controlled; Feather does not silently swap or auto-Zap composition.</span>
+          </div>
+        ) : null}
+
+        <LiquidityTransactionReview
+          compact={workspaceMatchesPool}
+          status={liquidityAddReview !== null ? "Pinned review ready" : connected && (needsXApproval || needsYApproval) ? "Approval required" : "Limits and approvals"}
+        >
+        {nativeModeX ? <div className="state-row" data-testid="liquidity-token-x-identity">ETH native asset · router wrapper {liquidityWrappedNative?.symbol} {liquidityWrappedNative?.address}</div> : <TokenIdentity token={tokenX} networkName={registry.chain.name} testId="liquidity-token-x-identity" />}
+        {nativeModeY ? <div className="state-row" data-testid="liquidity-token-y-identity">ETH native asset · router wrapper {liquidityWrappedNative?.symbol} {liquidityWrappedNative?.address}</div> : <TokenIdentity token={tokenY} networkName={registry.chain.name} testId="liquidity-token-y-identity" />}
         {liquidityAssetMode === "native" && !nativeAdd ? (
           <div className="state-row" data-testid="liquidity-native-unused-range"><CircleDollarSign size={16} /><span>This range uses only the non-wrapper token. Submission remains ERC-20 addLiquidity with 0 ETH value.</span></div>
         ) : null}
         {liquidityAssetMode === "native" && liquidityWrappedNativeSide !== null && (nativeSideAmount === null || nativeSideAmount <= 0n) && ((liquidityWrappedNativeSide === "x" && liquidityMode !== "token-y") || (liquidityWrappedNativeSide === "y" && liquidityMode !== "token-x")) ? (
           <div className="state-row warning" data-testid="liquidity-native-max-guidance"><AlertTriangle size={16} /><span>Enter a valid positive ETH probe amount before using Native Max; no wallet request is opened for the gas probe.</span></div>
-        ) : null}
-        {liquidityMode === "balanced" ? (
-          <div className="state-row" data-testid="liquidity-composition-guidance">
-            <CircleDollarSign size={16} />
-            <span>Balanced ranges require both tokens. Amounts stay user-controlled; Feather does not silently swap or auto-Zap composition.</span>
-          </div>
         ) : null}
         <div className="quote-grid">
           <MiniMetric label={`${nativeModeX ? "ETH" : tokenSymbol(tokenX)} balance`} value={nativeModeX ? nativeBalance !== null ? `${formatUnits(nativeBalance, 18)} ETH` : connected ? "loading" : "connect" : walletData ? formatTokenAmount(walletData.balanceX, tokenX) : connected ? "loading" : "connect"} />
@@ -9001,10 +9007,15 @@ function LiquidityView({
           token={tokenY}
         /> : <div className="state-row success" data-testid="liquidity-native-no-approval">ETH uses exact transaction value and never requests wrapper approval.</div>}
 
+        </LiquidityTransactionReview>
+        </LiquidityTaskBody>
+
+        <div className={workspaceMatchesPool ? "liquidity-action-dock" : undefined}>
         <div className="action-stack">
           {!nativeModeX ? <button
             className="secondary-button wide"
             data-testid="liquidity-approve-x-button"
+            hidden={workspaceMatchesPool && !needsXApproval}
             type="button"
             aria-describedby="liquidity-x-approval-details"
             disabled={!canApproveX}
@@ -9017,6 +9028,7 @@ function LiquidityView({
           {!nativeModeY ? <button
             className="secondary-button wide"
             data-testid="liquidity-approve-y-button"
+            hidden={workspaceMatchesPool && !needsYApproval}
             type="button"
             aria-describedby="liquidity-y-approval-details"
             disabled={!canApproveY}
@@ -9057,6 +9069,7 @@ function LiquidityView({
           revertedText={addReverted ? "Add liquidity reverted" : approveXReverted ? `${tokenSymbol(tokenX)} approval reverted` : approveYReverted ? `${tokenSymbol(tokenY)} approval reverted` : null}
           testId="liquidity-add-status"
         />
+        </div>
       </section>
       ) : null}
 
@@ -9318,6 +9331,35 @@ function BurnPlanWarnings({ plan }: { plan: PositionBurnPlanResult }) {
       <span>{warningText}</span>
     </div>
   );
+}
+
+function LiquidityTransactionReview({
+  children,
+  compact,
+  status
+}: {
+  children: ReactNode;
+  compact: boolean;
+  status: string;
+}) {
+  if (!compact) return <>{children}</>;
+
+  return (
+    <details className="liquidity-review-details" data-testid="liquidity-transaction-review">
+      <summary>
+        <span>
+          <strong>Transaction review</strong>
+          <small>Safety, limits, balances and approvals</small>
+        </span>
+        <span>{status}</span>
+      </summary>
+      <div className="liquidity-review-body">{children}</div>
+    </details>
+  );
+}
+
+function LiquidityTaskBody({ children, compact }: { children: ReactNode; compact: boolean }) {
+  return compact ? <div className="liquidity-task-body">{children}</div> : <>{children}</>;
 }
 
 const RANGE_EDITOR_RADII = [8, 16, 24, 40, 69] as const;
