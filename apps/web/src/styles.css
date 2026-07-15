@@ -5209,6 +5209,99 @@ a {
   font-size: 0.7rem;
 }
 
+/* Pool workspace surface system. The workspace should read as one trading
+   terminal, so structural regions stay sharp while interactive controls use
+   one compact radius. Circular marks are reserved for tokens and drag handles. */
+.canonical-pool-workspace {
+  --pool-structure-radius: 2px;
+  --pool-control-radius: 3px;
+  gap: 8px;
+}
+
+.canonical-pool-workspace .pool-workspace-header {
+  align-items: center;
+  padding: 11px 2px 12px;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--hairline);
+  border-radius: 0;
+}
+
+.canonical-pool-workspace .pool-workspace-body,
+.canonical-pool-workspace .view-grid.two-col.liquidity-task-workspace {
+  gap: 8px;
+}
+
+.canonical-pool-workspace :is(
+  .pool-workspace-rail,
+  .swap-chart-panel,
+  .swap-task-panel,
+  .liquidity-task-panel,
+  .tool-panel,
+  .info-panel,
+  .table-panel
+) {
+  border-radius: var(--pool-structure-radius);
+  box-shadow: none;
+}
+
+.canonical-pool-workspace .pool-workspace-tasks {
+  border-radius: var(--pool-structure-radius);
+}
+
+.canonical-pool-workspace .pool-workspace-tasks a {
+  border-radius: 0;
+}
+
+.canonical-pool-workspace .pool-workspace-tasks a.active {
+  background: rgb(233 236 231 / 4%);
+  box-shadow: inset 0 -2px var(--green);
+}
+
+.canonical-pool-workspace :is(
+  .pool-rail-bin-step,
+  .pool-rail-price-flip,
+  .pool-rail-zoom button,
+  .swap-chart-interval,
+  .range-editor-heading-actions,
+  .range-editor-chart-state,
+  .range-editor-price-grid label,
+  .range-editor-exact-grid label,
+  .range-editor-price-grid input,
+  .range-editor-exact-grid input,
+  .range-presets,
+  .distribution-row,
+  .swap-market-lock,
+  .swap-asset-card,
+  .swap-quote-summary,
+  .swap-review-details,
+  .liquidity-review-details,
+  .select-input,
+  .position-picker,
+  .position-option,
+  .amount-box,
+  .amount-box > span,
+  .state-row,
+  .primary-button,
+  .secondary-button,
+  .warn-button,
+  .token-max-button
+) {
+  border-radius: var(--pool-control-radius);
+}
+
+.canonical-pool-workspace .liquidity-range-editor .strategy-picker button {
+  border-radius: var(--pool-control-radius);
+}
+
+.canonical-pool-workspace .swap-task-panel .flip-button {
+  border-radius: var(--pool-control-radius);
+}
+
+.canonical-pool-workspace .liquidity-position-summary {
+  border-radius: var(--pool-control-radius);
+}
+
 @media (min-width: 1041px) and (max-width: 1280px) {
   .view-grid.two-col.liquidity-task-workspace {
     grid-template-columns: minmax(0, 1fr) 360px;
