@@ -3520,6 +3520,490 @@ a {
   margin: 0;
 }
 
+.liquidity-range-editor {
+  display: grid;
+  gap: 12px;
+  margin: 16px 0;
+  padding: 15px 0;
+  border-top: 1px solid rgb(233 236 231 / 9%);
+  border-bottom: 1px solid rgb(233 236 231 / 9%);
+}
+
+.range-editor-heading,
+.range-editor-heading-actions,
+.range-editor-range-meta {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.range-editor-heading > div:first-child {
+  display: grid;
+  gap: 2px;
+}
+
+.range-editor-heading strong {
+  color: var(--bone-bright);
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.range-editor-heading span {
+  color: var(--ink-60);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.66rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.range-editor-heading-actions > button,
+.range-editor-zoom button {
+  min-height: 28px;
+  padding: 4px 9px;
+  color: var(--ink-60);
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  font-size: 0.68rem;
+}
+
+.range-editor-heading-actions {
+  gap: 0;
+  overflow: hidden;
+  background: var(--carbon);
+  border: 1px solid var(--hairline);
+  border-radius: 7px;
+}
+
+.range-editor-heading-actions > button,
+.range-editor-zoom button:first-child,
+.range-editor-zoom button:last-child {
+  border-right: 1px solid var(--hairline);
+}
+
+.range-editor-zoom button:last-child {
+  border-right: 0;
+}
+
+.range-editor-heading-actions > button:hover,
+.range-editor-zoom button:hover:not(:disabled) {
+  color: var(--bone-bright);
+  background: rgb(233 236 231 / 5%);
+}
+
+.range-editor-heading-actions > button:active,
+.range-editor-zoom button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.range-editor-zoom {
+  display: flex;
+  gap: 0;
+}
+
+.range-editor-zoom button {
+  width: 28px;
+  padding: 0;
+  font-size: 0.9rem;
+}
+
+.range-editor-zoom button:disabled {
+  cursor: default;
+  opacity: 0.32;
+}
+
+.liquidity-range-editor .strategy-picker {
+  gap: 4px;
+  margin: 0;
+  background: transparent;
+}
+
+.liquidity-range-editor .strategy-picker legend {
+  margin: 0 0 3px;
+  color: var(--ink-60);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.64rem;
+  font-weight: 400;
+  letter-spacing: 0.02em;
+  text-transform: none;
+}
+
+.liquidity-range-editor .strategy-picker button {
+  min-height: 42px;
+  padding: 6px;
+  border-radius: 5px;
+}
+
+.liquidity-range-editor .strategy-picker button strong {
+  font-size: 0.74rem;
+  font-weight: 500;
+}
+
+.liquidity-range-editor .strategy-picker button span {
+  font-size: 0.61rem;
+}
+
+.range-editor-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px 12px;
+  color: var(--ink-60);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.59rem;
+}
+
+.range-editor-legend span {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+}
+
+.range-editor-legend i {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 2px;
+}
+
+.range-editor-legend .live-x,
+.range-editor-bin > i.live-x {
+  background: #55b8c3;
+}
+
+.range-editor-legend .live-y,
+.range-editor-bin > i.live-y {
+  background: #8572d1;
+}
+
+.range-editor-legend .selected,
+.selected-distribution {
+  background: var(--green);
+}
+
+.range-editor-chart {
+  position: relative;
+  display: flex;
+  gap: 1px;
+  align-items: end;
+  height: 156px;
+  min-width: 0;
+  padding: 9px 2px 0;
+  border-bottom: 1px solid rgb(233 236 231 / 20%);
+  background:
+    repeating-linear-gradient(to top, transparent 0 35px, rgb(233 236 231 / 5%) 35px 36px);
+}
+
+.range-editor-plot {
+  position: relative;
+  min-width: 0;
+  padding-bottom: 34px;
+}
+
+.range-editor-bin {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 1px;
+  height: 100%;
+}
+
+.range-editor-bin > i,
+.selected-distribution {
+  position: absolute;
+  bottom: 0;
+  display: block;
+  min-height: 0;
+}
+
+.range-editor-bin > i {
+  z-index: 1;
+  width: 50%;
+  opacity: 0.38;
+}
+
+.range-editor-bin > i.live-x {
+  left: 0;
+}
+
+.range-editor-bin > i.live-y {
+  right: 0;
+}
+
+.selected-distribution {
+  z-index: 2;
+  left: 17%;
+  width: 66%;
+  max-height: calc(100% - 8px);
+  min-height: 3px;
+  border-radius: 2px 2px 0 0;
+  opacity: 0.86;
+}
+
+.range-editor-bin.boundary::before,
+.range-editor-bin.active::after {
+  position: absolute;
+  z-index: 3;
+  top: -3px;
+  bottom: -5px;
+  width: 1px;
+  content: "";
+  pointer-events: none;
+}
+
+.range-editor-bin.boundary::before {
+  left: 50%;
+  background: var(--green);
+}
+
+.range-editor-bin.active::after {
+  left: 50%;
+  background: var(--bone-bright);
+  box-shadow: 0 0 0 1px rgb(13 14 13 / 60%);
+}
+
+.range-editor-bin.outside-backdrop:not(.boundary) {
+  background: rgb(233 236 231 / 1.5%);
+}
+
+.range-editor-chart-state {
+  position: absolute;
+  z-index: 4;
+  top: 50%;
+  left: 50%;
+  padding: 5px 8px;
+  color: var(--ink-60);
+  background: rgb(13 14 13 / 88%);
+  border: 1px solid var(--hairline);
+  border-radius: 5px;
+  font-size: 0.66rem;
+  transform: translate(-50%, -50%);
+  white-space: nowrap;
+}
+
+.range-editor-data-note,
+.range-editor-validation {
+  margin: 0;
+  color: var(--ink-60);
+  font-size: 0.66rem;
+  line-height: 1.45;
+}
+
+.range-editor-validation {
+  color: var(--warn);
+}
+
+.range-editor-range-meta {
+  margin-top: -5px;
+  padding: 0 2px;
+}
+
+.range-editor-range-meta strong,
+.range-editor-range-meta span {
+  color: var(--ink-60);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.62rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.range-editor-range-meta strong {
+  color: var(--bone);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+
+.range-editor-axis-control {
+  position: absolute;
+  z-index: 5;
+  right: 2px;
+  bottom: 34px;
+  left: 2px;
+  height: 1px;
+  background: rgb(233 236 231 / 30%);
+  touch-action: none;
+}
+
+.range-editor-track-selection {
+  position: absolute;
+  top: -1px;
+  height: 3px;
+  background: var(--green);
+  box-shadow: 0 0 10px rgb(74 197 124 / 18%);
+}
+
+.range-editor-thumb {
+  position: absolute;
+  z-index: 6;
+  top: -18px;
+  width: 44px;
+  height: 50px;
+  padding: 0;
+  color: var(--bone);
+  background: transparent;
+  border: 0;
+  transform: translateX(-50%);
+  touch-action: none;
+}
+
+.range-editor-thumb i {
+  position: absolute;
+  top: 11px;
+  left: 50%;
+  display: block;
+  width: 14px;
+  height: 14px;
+  background: var(--carbon);
+  border: 3px solid var(--green);
+  border-radius: 50%;
+  box-shadow: 0 0 0 2px var(--carbon);
+  transform: translateX(-50%);
+}
+
+.range-editor-thumb.upper i {
+  background: var(--bone-bright);
+}
+
+.range-editor-thumb span {
+  position: absolute;
+  top: 30px;
+  left: 50%;
+  color: var(--ink-60);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.57rem;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  line-height: 1;
+  text-transform: uppercase;
+  transform: translateX(-50%);
+}
+
+.range-editor-axis-control.handles-close .range-editor-thumb.lower {
+  transform: translateX(calc(-50% - 12px));
+}
+
+.range-editor-axis-control.handles-close .range-editor-thumb.upper {
+  transform: translateX(calc(-50% + 12px));
+}
+
+.range-editor-thumb:hover i,
+.range-editor-thumb:focus-visible i {
+  box-shadow: 0 0 0 3px var(--carbon), 0 0 0 5px rgb(74 197 124 / 34%);
+}
+
+.liquidity-range-editor .liquidity-range-fields {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+  margin: 0;
+}
+
+.range-editor-price-grid,
+.range-editor-exact-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.range-editor-price-grid label,
+.range-editor-exact-grid label {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.range-editor-price-grid label {
+  padding: 9px;
+  background: var(--carbon);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+}
+
+.range-editor-price-grid label > span,
+.range-editor-exact-grid label > span {
+  color: var(--ink-60);
+  font-size: 0.64rem;
+}
+
+.range-editor-price-grid input,
+.range-editor-exact-grid input {
+  width: 100%;
+  min-width: 0;
+  height: 36px;
+  padding: 6px 8px;
+  color: var(--bone-bright);
+  background: var(--card);
+  border: 1px solid var(--hairline);
+  border-radius: 5px;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.range-editor-price-grid small {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+  color: var(--ink-60);
+  font-size: 0.58rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.range-editor-price-grid output {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--bone);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.range-editor-summary {
+  padding: 0 2px;
+}
+
+.range-editor-advanced,
+.liquidity-range-editor > .distribution-details {
+  border-top: 1px solid rgb(233 236 231 / 8%);
+}
+
+.range-editor-advanced summary,
+.liquidity-range-editor > .distribution-details summary {
+  padding: 9px 0 0;
+  color: var(--ink-60);
+  font-size: 0.7rem;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.range-editor-exact-grid {
+  margin-top: 10px;
+}
+
+.liquidity-range-editor .range-presets {
+  gap: 7px;
+  margin: 10px 0 0;
+  padding: 9px;
+  border-radius: 6px;
+}
+
+.liquidity-range-editor .range-presets legend {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.62rem;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.liquidity-range-editor .distribution-table {
+  max-height: 180px;
+}
+
+.liquidity-range-editor .distribution-row {
+  padding: 6px 8px;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.62rem;
+  border-radius: 5px;
+}
+
 .distribution-details {
   margin-top: 10px;
 }
@@ -4732,5 +5216,18 @@ a {
 
   .swap-action-dock .action-stack > * {
     grid-column: 1;
+  }
+
+  .range-editor-price-grid,
+  .range-editor-exact-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .range-editor-chart {
+    height: 132px;
+  }
+
+  .range-editor-heading {
+    align-items: flex-start;
   }
 }

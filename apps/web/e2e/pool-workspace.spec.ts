@@ -75,6 +75,52 @@ test("canonical pool tasks keep one selected pool while reusing swap and liquidi
   await expect(page.getByTestId("pool-detail-analytics-state")).toContainText("Current through block 42");
 });
 
+test("create position range editor layers exact distribution over indexed pool reserves", async ({ page }) => {
+  await page.setViewportSize({ height: 1000, width: 1600 });
+  await installMockRpc(page, { includePairs: true, poolBinCount: 9 });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
+
+  const editor = page.getByTestId("liquidity-range-editor");
+  const chart = editor.getByLabel("Liquidity bin distribution");
+  await expect(editor).toBeVisible();
+  await expect(editor).toContainText("Pool WNATIVE");
+  await expect(editor).toContainText("Pool USDC");
+  await expect(editor).toContainText("New position");
+  await expect(chart.locator(".range-editor-bin > i")).not.toHaveCount(0);
+  await expect(chart.getByRole("img")).toHaveCount(3);
+  await expect(page.getByLabel("Min USDC per WNATIVE")).toBeVisible();
+  await expect(page.getByLabel("Max USDC per WNATIVE")).toBeVisible();
+  await expect(editor).toContainText("3 bins selected");
+  await expect(page.locator("#range-lower-bin")).not.toBeVisible();
+
+  const lowerHandle = page.getByLabel("Lower range handle");
+  const upperHandle = page.getByLabel("Upper range handle");
+  await expect(lowerHandle).toHaveAttribute("aria-valuemin", "-16");
+  await expect(lowerHandle).toHaveAttribute("aria-valuenow", "-1");
+  await expect(upperHandle).toHaveAttribute("aria-valuenow", "1");
+  await lowerHandle.scrollIntoViewIfNeeded();
+  const lowerHandleBox = await lowerHandle.boundingBox();
+  expect(lowerHandleBox).not.toBeNull();
+  const lowerThumbX = lowerHandleBox!.x + lowerHandleBox!.width / 2;
+  const thumbY = lowerHandleBox!.y + lowerHandleBox!.height / 2;
+  await page.mouse.move(lowerThumbX, thumbY);
+  await page.mouse.down();
+  await page.mouse.move(lowerThumbX - 36, thumbY, { steps: 4 });
+  await page.mouse.up();
+  await expect(lowerHandle).not.toHaveAttribute("aria-valuenow", "-1");
+  await expect(upperHandle).toHaveAttribute("aria-valuenow", "1");
+  await editor.getByRole("button", { name: "Reset" }).click();
+  await expect(lowerHandle).toHaveAttribute("aria-valuenow", "-1");
+
+  await editor.getByText("Advanced range controls").click();
+  await expect(page.locator("#range-lower-bin")).toBeVisible();
+  await lowerHandle.focus();
+  await page.keyboard.press("ArrowLeft");
+  await expect(page.locator("#range-lower")).toHaveValue("-2");
+  await expect(chart.getByRole("img")).toHaveCount(4);
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
 test("pool-scoped swap presents a compact market task rail with its guarded action in view", async ({ page }) => {
   await page.setViewportSize({ height: 1000, width: 1600 });
   await installMockRpc(page, { includePairs: true });

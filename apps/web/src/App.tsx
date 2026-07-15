@@ -247,11 +247,13 @@ import {
 } from "./analytics-data";
 import {
   buildBinDistribution,
+  buildCenteredBinDistribution,
   buildCandleChartModel,
   joinPoolWorkspaceRows,
   sortPoolWorkspaceRows,
   workspaceAnalyticsState,
   workspaceMetricTiles,
+  type BinDistributionPoint,
   type CandleChartModel,
   type PoolEconomicSort,
   type PoolWorkspaceRow
@@ -5947,6 +5949,26 @@ function LiquidityView({
   const deadlineMinutes = parseDeadlineMinutes(deadlineInput);
   const removePercentBps = parsePercentToBps(removePercentInput);
   const distributionResult = buildLiquidityDistributionForView(activeBin, lowerDelta, upperDelta, liquidityStrategy);
+  const rangeBackdrop = useMemo<{ error: string | null; points: BinDistributionPoint[] | null; state: LoadState }>(() => {
+    if (!workspaceMatchesPool || poolWorkspace === null) {
+      return { error: "Open a pool workspace to compare this position with indexed reserves.", points: null, state: "unavailable" };
+    }
+    if (poolWorkspace.binsState !== "ready") {
+      return { error: poolWorkspace.binsError, points: null, state: poolWorkspace.binsState };
+    }
+    if (activeBin === null || tokenX === null || tokenY === null) {
+      return { error: "Pool bin identity or token decimals are unavailable.", points: null, state: "unavailable" };
+    }
+    try {
+      return {
+        error: null,
+        points: buildCenteredBinDistribution(poolWorkspace.bins, String(activeBin), tokenX.decimals, tokenY.decimals, 40),
+        state: "ready"
+      };
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : "Indexed liquidity is unavailable.", points: null, state: "error" };
+    }
+  }, [activeBin, poolWorkspace, tokenX, tokenY, workspaceMatchesPool]);
   const liquidityMode = distributionResult.distribution?.mode ?? null;
   const amountX = liquidityMode === "token-y" ? 0n : parsedAmountX;
   const amountY = liquidityMode === "token-x" ? 0n : parsedAmountY;
@@ -8812,6 +8834,64 @@ function LiquidityView({
             }} type="button">Max</button>
           </div>
         </div>
+        <LiquidityRangeEditor
+          advancedOpenByDefault={!workspaceMatchesPool}
+          activeBin={activeBin}
+          bins={distributionResult.preview}
+          liveBins={rangeBackdrop.points}
+          liveBinsError={rangeBackdrop.error}
+          liveBinsState={rangeBackdrop.state}
+          lowerBinId={lowerBinId}
+          lowerBinInput={lowerBinInput}
+          lowerDelta={lowerDelta}
+          lowerDeltaInput={lowerDeltaInput}
+          lowerInversePrice={lowerInversePrice}
+          lowerPriceInput={lowerPriceInput}
+          maxBins={MAX_LIQUIDITY_BINS}
+          narrowPresetInput={narrowPresetInput}
+          onApplyPreset={applyRangePreset}
+          onLowerBinInput={updateLowerBin}
+          onLowerDeltaInput={updateLowerDelta}
+          onLowerHandleChange={(next) => {
+            if (activeBin === null || upperBinId === null) return;
+            const nextLowerBin = activeBin + next;
+            commitAbsoluteRange(nextLowerBin, Math.min(upperBinId, nextLowerBin + MAX_LIQUIDITY_BINS - 1));
+          }}
+          onLowerPriceCommit={() => void updatePriceBoundary("lower", lowerPriceInput)}
+          onLowerPriceInput={(value) => {
+            setLowerPriceInput(value);
+            setRangeEditError("Review the edited minimum price");
+          }}
+          onNarrowPresetInput={setNarrowPresetInput}
+          onReset={() => applyRangePreset("3")}
+          onStrategyChange={setLiquidityStrategy}
+          onUpperBinInput={updateUpperBin}
+          onUpperDeltaInput={updateUpperDelta}
+          onUpperHandleChange={(next) => {
+            if (activeBin === null || lowerBinId === null) return;
+            const nextUpperBin = activeBin + next;
+            commitAbsoluteRange(Math.max(lowerBinId, nextUpperBin - MAX_LIQUIDITY_BINS + 1), nextUpperBin);
+          }}
+          onUpperPriceCommit={() => void updatePriceBoundary("upper", upperPriceInput)}
+          onUpperPriceInput={(value) => {
+            setUpperPriceInput(value);
+            setRangeEditError("Review the edited maximum price");
+          }}
+          onWidePresetInput={setWidePresetInput}
+          rangeError={rangeControlError}
+          rangeSliderMax={rangeSliderMax}
+          rangeSliderMin={rangeSliderMin}
+          strategy={liquidityStrategy}
+          tokenXSymbol={tokenSymbol(tokenX)}
+          tokenYSymbol={tokenSymbol(tokenY)}
+          upperBinId={upperBinId}
+          upperBinInput={upperBinInput}
+          upperDelta={upperDelta}
+          upperDeltaInput={upperDeltaInput}
+          upperInversePrice={upperInversePrice}
+          upperPriceInput={upperPriceInput}
+          widePresetInput={widePresetInput}
+        />
         {nativeModeX ? <div className="state-row" data-testid="liquidity-token-x-identity">ETH native asset · router wrapper {liquidityWrappedNative?.symbol} {liquidityWrappedNative?.address}</div> : <TokenIdentity token={tokenX} networkName={registry.chain.name} testId="liquidity-token-x-identity" />}
         {nativeModeY ? <div className="state-row" data-testid="liquidity-token-y-identity">ETH native asset · router wrapper {liquidityWrappedNative?.symbol} {liquidityWrappedNative?.address}</div> : <TokenIdentity token={tokenY} networkName={registry.chain.name} testId="liquidity-token-y-identity" />}
         <div className="state-row" data-testid="liquidity-range-mode">
@@ -8861,106 +8941,6 @@ function LiquidityView({
           error={liquidityAttestationQuery.error}
           loading={liquidityAttestationQuery.isLoading || liquidityAttestationQuery.isFetching}
         />
-
-        <fieldset className="strategy-picker" aria-label="Liquidity strategy">
-          <legend>Volatility strategy</legend>
-          {(["spot", "curve", "bid-ask"] as const).map((strategy) => (
-            <button
-              aria-pressed={liquidityStrategy === strategy}
-              className={liquidityStrategy === strategy ? "selected" : ""}
-              data-testid={`liquidity-strategy-${strategy}`}
-              key={strategy}
-              onClick={() => setLiquidityStrategy(strategy)}
-              type="button"
-            >
-              <strong>{strategy === "bid-ask" ? "Bid-Ask" : strategy[0].toUpperCase() + strategy.slice(1)}</strong>
-              <span>{strategy === "spot" ? "Even" : strategy === "curve" ? "Near price" : "Range edges"}</span>
-            </button>
-          ))}
-        </fieldset>
-
-        <fieldset className="range-presets" aria-label="Liquidity range presets">
-          <legend>Editable range presets</legend>
-          <label>
-            <span>Narrow bins</span>
-            <input aria-label="Narrow preset bin count" inputMode="numeric" value={narrowPresetInput} onChange={(event) => setNarrowPresetInput(event.target.value)} />
-            <button data-testid="liquidity-preset-narrow" onClick={() => applyRangePreset(narrowPresetInput)} type="button">Apply Narrow</button>
-          </label>
-          <label>
-            <span>Wide bins</span>
-            <input aria-label="Wide preset bin count" inputMode="numeric" value={widePresetInput} onChange={(event) => setWidePresetInput(event.target.value)} />
-            <button data-testid="liquidity-preset-wide" onClick={() => applyRangePreset(widePresetInput)} type="button">Apply Wide</button>
-          </label>
-        </fieldset>
-
-        <div className="range-sliders" data-testid="liquidity-range-sliders">
-          <label>Lower handle<input aria-label="Lower range handle" max={rangeSliderMax} min={rangeSliderMin} step="1" type="range" value={lowerDelta ?? 0} onChange={(event) => {
-            const next = Number(event.target.value);
-            if (activeBin === null || upperBinId === null) return;
-            const nextLowerBin = activeBin + next;
-            commitAbsoluteRange(nextLowerBin, Math.min(upperBinId, nextLowerBin + MAX_LIQUIDITY_BINS - 1));
-          }} /></label>
-          <label>Upper handle<input aria-label="Upper range handle" max={rangeSliderMax} min={rangeSliderMin} step="1" type="range" value={upperDelta ?? 0} onChange={(event) => {
-            const next = Number(event.target.value);
-            if (activeBin === null || lowerBinId === null) return;
-            const nextUpperBin = activeBin + next;
-            commitAbsoluteRange(Math.max(lowerBinId, nextUpperBin - MAX_LIQUIDITY_BINS + 1), nextUpperBin);
-          }} /></label>
-          <p>{lowerBinId !== null && upperBinId !== null && upperBinId >= lowerBinId ? `${upperBinId - lowerBinId + 1} bins` : "Invalid range"} · max {MAX_LIQUIDITY_BINS}. Every exact distribution is simulated before wallet submission.</p>
-        </div>
-
-        <div className="liquidity-range-fields" data-testid="liquidity-range-fields">
-          <label htmlFor="range-lower">
-            <span>Lower Delta</span>
-            <input id="range-lower" inputMode="numeric" value={lowerDeltaInput} onChange={(event) => updateLowerDelta(event.target.value)} />
-          </label>
-          <label htmlFor="range-lower-bin">
-            <span>Lower Bin</span>
-            <input id="range-lower-bin" inputMode="numeric" value={lowerBinInput} onChange={(event) => updateLowerBin(event.target.value)} />
-          </label>
-          <label htmlFor="range-min-price">
-            <span>Min {tokenSymbol(tokenY)} per {tokenSymbol(tokenX)}</span>
-            <input
-              id="range-min-price"
-              inputMode="decimal"
-              value={lowerPriceInput}
-              onChange={(event) => {
-                setLowerPriceInput(event.target.value);
-                setRangeEditError("Review the edited minimum price");
-              }}
-              onBlur={() => void updatePriceBoundary("lower", lowerPriceInput)}
-            />
-          </label>
-          <div className="range-inverse" data-testid="liquidity-min-price-inverse">
-            <span>Inverse min</span>
-            <output>{lowerInversePrice} {tokenSymbol(tokenX)} per {tokenSymbol(tokenY)}</output>
-          </div>
-          <label htmlFor="range-upper">
-            <span>Upper Delta</span>
-            <input id="range-upper" inputMode="numeric" value={upperDeltaInput} onChange={(event) => updateUpperDelta(event.target.value)} />
-          </label>
-          <label htmlFor="range-upper-bin">
-            <span>Upper Bin</span>
-            <input id="range-upper-bin" inputMode="numeric" value={upperBinInput} onChange={(event) => updateUpperBin(event.target.value)} />
-          </label>
-          <label htmlFor="range-max-price">
-            <span>Max {tokenSymbol(tokenY)} per {tokenSymbol(tokenX)}</span>
-            <input
-              id="range-max-price"
-              inputMode="decimal"
-              value={upperPriceInput}
-              onChange={(event) => {
-                setUpperPriceInput(event.target.value);
-                setRangeEditError("Review the edited maximum price");
-              }}
-              onBlur={() => void updatePriceBoundary("upper", upperPriceInput)}
-            />
-          </label>
-          <div className="range-inverse" data-testid="liquidity-max-price-inverse">
-            <span>Inverse max</span>
-            <output>{upperInversePrice} {tokenSymbol(tokenX)} per {tokenSymbol(tokenY)}</output>
-          </div>
-        </div>
 
         <div className="state-row warning liquidity-range-risk" data-testid="liquidity-range-risk">
           <AlertTriangle size={16} />
@@ -9020,15 +9000,6 @@ function LiquidityView({
           spender={registry.contracts.lbRouter}
           token={tokenY}
         /> : <div className="state-row success" data-testid="liquidity-native-no-approval">ETH uses exact transaction value and never requests wrapper approval.</div>}
-
-        <LiquidityDistributionPreview
-          activeBin={activeBin}
-          bins={distributionResult.preview}
-          lowerBinId={lowerBinId}
-          lowerPrice={lowerPriceInput}
-          upperBinId={upperBinId}
-          upperPrice={upperPriceInput}
-        />
 
         <div className="action-stack">
           {!nativeModeX ? <button
@@ -9349,60 +9320,341 @@ function BurnPlanWarnings({ plan }: { plan: PositionBurnPlanResult }) {
   );
 }
 
-function LiquidityDistributionPreview({
+const RANGE_EDITOR_RADII = [8, 16, 24, 40, 69] as const;
+
+function LiquidityRangeEditor({
+  advancedOpenByDefault,
   activeBin,
   bins,
+  liveBins,
+  liveBinsError,
+  liveBinsState,
   lowerBinId,
-  lowerPrice,
+  lowerBinInput,
+  lowerDelta,
+  lowerDeltaInput,
+  lowerInversePrice,
+  lowerPriceInput,
+  maxBins,
+  narrowPresetInput,
+  onApplyPreset,
+  onLowerBinInput,
+  onLowerDeltaInput,
+  onLowerHandleChange,
+  onLowerPriceCommit,
+  onLowerPriceInput,
+  onNarrowPresetInput,
+  onReset,
+  onStrategyChange,
+  onUpperBinInput,
+  onUpperDeltaInput,
+  onUpperHandleChange,
+  onUpperPriceCommit,
+  onUpperPriceInput,
+  onWidePresetInput,
+  rangeError,
+  rangeSliderMax,
+  rangeSliderMin,
+  strategy,
+  tokenXSymbol,
+  tokenYSymbol,
   upperBinId,
-  upperPrice
+  upperBinInput,
+  upperDelta,
+  upperDeltaInput,
+  upperInversePrice,
+  upperPriceInput,
+  widePresetInput
 }: {
+  advancedOpenByDefault: boolean;
   activeBin: number | null;
   bins: LiquidityDistributionView[];
+  liveBins: BinDistributionPoint[] | null;
+  liveBinsError: string | null;
+  liveBinsState: LoadState;
   lowerBinId: number | null;
-  lowerPrice: string;
+  lowerBinInput: string;
+  lowerDelta: number | null;
+  lowerDeltaInput: string;
+  lowerInversePrice: string;
+  lowerPriceInput: string;
+  maxBins: number;
+  narrowPresetInput: string;
+  onApplyPreset: (value: string) => void;
+  onLowerBinInput: (value: string) => void;
+  onLowerDeltaInput: (value: string) => void;
+  onLowerHandleChange: (value: number) => void;
+  onLowerPriceCommit: () => void;
+  onLowerPriceInput: (value: string) => void;
+  onNarrowPresetInput: (value: string) => void;
+  onReset: () => void;
+  onStrategyChange: (strategy: LiquidityStrategy) => void;
+  onUpperBinInput: (value: string) => void;
+  onUpperDeltaInput: (value: string) => void;
+  onUpperHandleChange: (value: number) => void;
+  onUpperPriceCommit: () => void;
+  onUpperPriceInput: (value: string) => void;
+  onWidePresetInput: (value: string) => void;
+  rangeError: string | null;
+  rangeSliderMax: number;
+  rangeSliderMin: number;
+  strategy: LiquidityStrategy;
+  tokenXSymbol: string;
+  tokenYSymbol: string;
   upperBinId: number | null;
-  upperPrice: string;
+  upperBinInput: string;
+  upperDelta: number | null;
+  upperDeltaInput: string;
+  upperInversePrice: string;
+  upperPriceInput: string;
+  widePresetInput: string;
 }) {
-  if (bins.length === 0) {
-    return <EmptyState state="empty" />;
-  }
+  const [radiusIndex, setRadiusIndex] = useState(1);
+  const rangeTrackRef = useRef<HTMLDivElement>(null);
+  const radius = RANGE_EDITOR_RADII[radiusIndex]!;
+  const selectedById = new Map(bins.map((bin) => [Number(bin.binId), bin]));
+  const liveById = new Map((liveBins ?? []).map((bin) => [Number(bin.binId), bin]));
+  const selectedBinCount = lowerBinId !== null && upperBinId !== null && upperBinId >= lowerBinId
+    ? upperBinId - lowerBinId + 1
+    : null;
+  const sliderControlMin = Math.max(rangeSliderMin, Math.min(-radius, lowerDelta ?? 0));
+  const sliderControlMax = Math.min(rangeSliderMax, Math.max(radius, upperDelta ?? 0));
+  const sliderSpan = Math.max(1, sliderControlMax - sliderControlMin);
+  const lowerPosition = Math.max(0, Math.min(100, (((lowerDelta ?? sliderControlMin) - sliderControlMin) / sliderSpan) * 100));
+  const upperPosition = Math.max(0, Math.min(100, (((upperDelta ?? sliderControlMax) - sliderControlMin) / sliderSpan) * 100));
+  const activeViewportStart = activeBin === null ? lowerBinId ?? 0 : Math.max(0, activeBin - radius);
+  const activeViewportEnd = activeBin === null ? upperBinId ?? activeViewportStart : Math.min(MAX_LIQUIDITY_BIN_ID, activeBin + radius);
+  const unionStart = lowerBinId === null ? activeViewportStart : Math.min(activeViewportStart, lowerBinId);
+  const unionEnd = upperBinId === null ? activeViewportEnd : Math.max(activeViewportEnd, upperBinId);
+  const selectionIsFarFromActive = unionEnd - unionStart + 1 > 109;
+  const visualStart = selectionIsFarFromActive && lowerBinId !== null ? lowerBinId : unionStart;
+  const visualEnd = selectionIsFarFromActive && upperBinId !== null ? upperBinId : unionEnd;
+  const visualBinIds = Array.from({ length: Math.max(0, visualEnd - visualStart + 1) }, (_, index) => visualStart + index);
+  const selectedExtendsPastBackdrop = lowerBinId !== null && upperBinId !== null && liveBins !== null && (
+    !liveById.has(lowerBinId) || !liveById.has(upperBinId)
+  );
+  const handlesAreClose = Math.abs(upperPosition - lowerPosition) < 4;
+
+  const updateHandleFromPointer = (boundary: "lower" | "upper", clientX: number) => {
+    const track = rangeTrackRef.current;
+    if (track === null) return;
+
+    const bounds = track.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (clientX - bounds.left) / Math.max(1, bounds.width)));
+    const nextValue = Math.round(sliderControlMin + ratio * sliderSpan);
+    if (boundary === "lower") {
+      onLowerHandleChange(Math.min(nextValue, upperDelta ?? nextValue));
+      return;
+    }
+    onUpperHandleChange(Math.max(nextValue, lowerDelta ?? nextValue));
+  };
+
+  const updateHandleFromKey = (boundary: "lower" | "upper", key: string) => {
+    const direction = key === "ArrowLeft" || key === "ArrowDown" ? -1 : key === "ArrowRight" || key === "ArrowUp" ? 1 : 0;
+    if (direction === 0) return false;
+
+    if (boundary === "lower") {
+      const current = lowerDelta ?? 0;
+      onLowerHandleChange(Math.max(sliderControlMin, Math.min(current + direction, upperDelta ?? sliderControlMax)));
+    } else {
+      const current = upperDelta ?? 0;
+      onUpperHandleChange(Math.min(sliderControlMax, Math.max(current + direction, lowerDelta ?? sliderControlMin)));
+    }
+    return true;
+  };
 
   return (
-    <div className="distribution-panel">
-      <div className="range-map" aria-label="Liquidity bin distribution">
-        {bins.map((bin) => {
-          const binId = Number(bin.binId);
-          const boundary = binId === lowerBinId ? "lower" : binId === upperBinId ? "upper" : null;
-          const price = boundary === "lower" ? lowerPrice : boundary === "upper" ? upperPrice : null;
-          return (
-            <span
-              aria-label={`Selected bin ${bin.binId}${binId === activeBin ? "; active bin" : ""}${boundary ? `; ${boundary} boundary${price ? `; ${price}` : ""}` : ""}`}
-              className={["bin", binId === activeBin ? "active" : "", boundary ? "boundary" : ""].filter(Boolean).join(" ")}
-              data-bin-id={bin.binId}
-              key={bin.key}
-              role="img"
-              style={{ height: bin.height }}
-              title={`Bin ${bin.binId}`}
-            />
-          );
-        })}
+    <section className="liquidity-range-editor" data-testid="liquidity-range-editor">
+      <div className="range-editor-heading">
+        <div>
+          <strong>Price range</strong>
+          <span>{tokenYSymbol} per {tokenXSymbol}</span>
+        </div>
+        <div className="range-editor-heading-actions">
+          <button onClick={onReset} type="button">Reset</button>
+          <div className="range-editor-zoom" role="group" aria-label="Position range chart zoom">
+            <button aria-label="Zoom into position range chart" disabled={radiusIndex === 0} onClick={() => setRadiusIndex((current) => Math.max(0, current - 1))} type="button">−</button>
+            <button aria-label="Zoom out of position range chart" disabled={radiusIndex === RANGE_EDITOR_RADII.length - 1} onClick={() => setRadiusIndex((current) => Math.min(RANGE_EDITOR_RADII.length - 1, current + 1))} type="button">+</button>
+          </div>
+        </div>
       </div>
-      <details className="distribution-details" open={bins.length <= 15 ? true : undefined}>
+
+      <fieldset className="strategy-picker" aria-label="Liquidity strategy">
+        <legend>Strategy</legend>
+        {(["spot", "curve", "bid-ask"] as const).map((value) => (
+          <button
+            aria-pressed={strategy === value}
+            className={strategy === value ? "selected" : ""}
+            data-testid={`liquidity-strategy-${value}`}
+            key={value}
+            onClick={() => onStrategyChange(value)}
+            type="button"
+          >
+            <strong>{value === "bid-ask" ? "Bid-Ask" : value[0].toUpperCase() + value.slice(1)}</strong>
+            <span>{value === "spot" ? "Even" : value === "curve" ? "Near price" : "Range edges"}</span>
+          </button>
+        ))}
+      </fieldset>
+
+      <div className="range-editor-legend" aria-hidden="true">
+        <span><i className="live-x" />Pool {tokenXSymbol}</span>
+        <span><i className="live-y" />Pool {tokenYSymbol}</span>
+        <span><i className="selected" />New position</span>
+      </div>
+
+      <div className="range-editor-plot">
+        <div className="range-editor-chart" aria-label="Liquidity bin distribution">
+          {visualBinIds.map((binId) => {
+            const live = liveById.get(binId);
+            const selected = selectedById.get(binId);
+            const boundary = binId === lowerBinId ? "lower" : binId === upperBinId ? "upper" : null;
+            const boundaryPrice = boundary === "lower" ? lowerPriceInput : boundary === "upper" ? upperPriceInput : null;
+            return (
+              <span
+                className={[
+                  "range-editor-bin",
+                  binId === activeBin ? "active" : "",
+                  boundary ? `boundary ${boundary}` : "",
+                  live === undefined ? "outside-backdrop" : ""
+                ].filter(Boolean).join(" ")}
+                data-bin-id={binId}
+                key={binId}
+              >
+                {live ? <i className="live-x" style={{ height: `${live.tokenX === "0" ? 0 : Math.max(4, live.tokenXHeight)}%` }} /> : null}
+                {live ? <i className="live-y" style={{ height: `${live.tokenY === "0" ? 0 : Math.max(4, live.tokenYHeight)}%` }} /> : null}
+                {selected ? (
+                  <b
+                    aria-label={`Selected bin${binId === activeBin ? "; active bin" : ""}${boundary ? `; ${boundary} boundary${boundaryPrice ? `; ${boundaryPrice}` : ""}` : ""}`}
+                    className="selected-distribution"
+                    role="img"
+                    style={{ height: selected.height }}
+                  />
+                ) : null}
+              </span>
+            );
+          })}
+          {liveBinsState === "loading" ? <span className="range-editor-chart-state">Loading pool reserves</span> : null}
+        </div>
+
+        <div
+          className={["range-editor-axis-control", handlesAreClose ? "handles-close" : ""].filter(Boolean).join(" ")}
+          data-testid="liquidity-range-sliders"
+          ref={rangeTrackRef}
+        >
+          <span className="range-editor-track-selection" aria-hidden="true" style={{ left: `${Math.min(lowerPosition, upperPosition)}%`, width: `${Math.max(0, Math.abs(upperPosition - lowerPosition))}%` }} />
+          {(["lower", "upper"] as const).map((boundary) => {
+            const isLower = boundary === "lower";
+            const value = isLower ? lowerDelta ?? 0 : upperDelta ?? 0;
+            const position = isLower ? lowerPosition : upperPosition;
+            return (
+              <button
+                aria-label={`${isLower ? "Lower" : "Upper"} range handle`}
+                aria-valuemax={isLower ? upperDelta ?? sliderControlMax : sliderControlMax}
+                aria-valuemin={isLower ? sliderControlMin : lowerDelta ?? sliderControlMin}
+                aria-valuenow={value}
+                aria-valuetext={`${isLower ? "Minimum" : "Maximum"} ${isLower ? lowerPriceInput : upperPriceInput} ${tokenYSymbol} per ${tokenXSymbol}`}
+                className={`range-editor-thumb ${boundary}`}
+                key={boundary}
+                onKeyDown={(event) => {
+                  if (updateHandleFromKey(boundary, event.key)) event.preventDefault();
+                }}
+                onPointerDown={(event) => {
+                  event.currentTarget.setPointerCapture(event.pointerId);
+                }}
+                onPointerMove={(event) => {
+                  if (event.currentTarget.hasPointerCapture(event.pointerId)) updateHandleFromPointer(boundary, event.clientX);
+                }}
+                onPointerUp={(event) => {
+                  if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+                }}
+                role="slider"
+                style={{ left: `${position}%` }}
+                type="button"
+              >
+                <i aria-hidden="true" />
+                <span>{isLower ? "Min" : "Max"}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      <div className="range-editor-range-meta" aria-live="polite">
+        <strong>{selectedBinCount === null ? "Invalid range" : `${selectedBinCount} bins selected`}</strong>
+        <span>Maximum {maxBins}</span>
+      </div>
+      {liveBinsState !== "ready" ? (
+        <p className="range-editor-data-note" role="status">Existing pool liquidity is {liveBinsState}. {liveBinsError ?? "The exact new-position distribution remains available."}</p>
+      ) : selectedExtendsPastBackdrop ? (
+        <p className="range-editor-data-note">Part of the selected range is outside the indexed ±40-bin reserve backdrop. The new-position weights shown there are still exact.</p>
+      ) : selectionIsFarFromActive ? (
+        <p className="range-editor-data-note">The selected range is outside the current-price viewport, so this view is focused on the selected bins.</p>
+      ) : null}
+
+      <div className="liquidity-range-fields" data-testid="liquidity-range-fields">
+        <div className="range-editor-price-grid">
+          <label htmlFor="range-min-price">
+            <span>Min {tokenYSymbol} per {tokenXSymbol}</span>
+            <input aria-label={`Min ${tokenYSymbol} per ${tokenXSymbol}`} id="range-min-price" inputMode="decimal" value={lowerPriceInput} onChange={(event) => onLowerPriceInput(event.target.value)} onBlur={onLowerPriceCommit} />
+            <small data-testid="liquidity-min-price-inverse">Inverse <output title={`${lowerInversePrice} ${tokenXSymbol} per ${tokenYSymbol}`}>{lowerInversePrice} {tokenXSymbol} per {tokenYSymbol}</output></small>
+          </label>
+          <label htmlFor="range-max-price">
+            <span>Max {tokenYSymbol} per {tokenXSymbol}</span>
+            <input aria-label={`Max ${tokenYSymbol} per ${tokenXSymbol}`} id="range-max-price" inputMode="decimal" value={upperPriceInput} onChange={(event) => onUpperPriceInput(event.target.value)} onBlur={onUpperPriceCommit} />
+            <small data-testid="liquidity-max-price-inverse">Inverse <output title={`${upperInversePrice} ${tokenXSymbol} per ${tokenYSymbol}`}>{upperInversePrice} {tokenXSymbol} per {tokenYSymbol}</output></small>
+          </label>
+        </div>
+
+        {rangeError ? <p className="range-editor-validation" role="status">{rangeError}</p> : null}
+
+        <details className="range-editor-advanced" open={advancedOpenByDefault ? true : undefined}>
+          <summary>Advanced range controls</summary>
+          <div className="range-editor-exact-grid">
+            <label htmlFor="range-lower">
+              <span>Lower delta</span>
+              <input id="range-lower" inputMode="numeric" value={lowerDeltaInput} onChange={(event) => onLowerDeltaInput(event.target.value)} />
+            </label>
+            <label htmlFor="range-upper">
+              <span>Upper delta</span>
+              <input id="range-upper" inputMode="numeric" value={upperDeltaInput} onChange={(event) => onUpperDeltaInput(event.target.value)} />
+            </label>
+            <label htmlFor="range-lower-bin">
+              <span>Lower bin</span>
+              <input id="range-lower-bin" inputMode="numeric" value={lowerBinInput} onChange={(event) => onLowerBinInput(event.target.value)} />
+            </label>
+            <label htmlFor="range-upper-bin">
+              <span>Upper bin</span>
+              <input id="range-upper-bin" inputMode="numeric" value={upperBinInput} onChange={(event) => onUpperBinInput(event.target.value)} />
+            </label>
+          </div>
+          <fieldset className="range-presets" aria-label="Liquidity range presets">
+            <legend>Editable presets</legend>
+            <label>
+              <span>Narrow bins</span>
+              <input aria-label="Narrow preset bin count" inputMode="numeric" value={narrowPresetInput} onChange={(event) => onNarrowPresetInput(event.target.value)} />
+              <button data-testid="liquidity-preset-narrow" onClick={() => onApplyPreset(narrowPresetInput)} type="button">Apply narrow</button>
+            </label>
+            <label>
+              <span>Wide bins</span>
+              <input aria-label="Wide preset bin count" inputMode="numeric" value={widePresetInput} onChange={(event) => onWidePresetInput(event.target.value)} />
+              <button data-testid="liquidity-preset-wide" onClick={() => onApplyPreset(widePresetInput)} type="button">Apply wide</button>
+            </label>
+          </fieldset>
+        </details>
+      </div>
+
+      <details className="distribution-details">
         <summary>Per-bin weights ({bins.length})</summary>
         <div className="distribution-table">
           {bins.map((bin) => (
             <div className="distribution-row" key={`${bin.key}-row`}>
-              <span>
-                {bin.delta} / {bin.binId}
-              </span>
+              <span>{bin.delta} / {bin.binId}</span>
               <span>X {bin.xWeight}</span>
               <span>Y {bin.yWeight}</span>
             </div>
           ))}
         </div>
       </details>
-    </div>
+    </section>
   );
 }
 

@@ -2840,11 +2840,12 @@ test("strategy and synchronized range controls enforce the 69-bin product envelo
   expect(parameters.distributionX).toEqual(expected.distributionX);
   expect(parameters.distributionY).toEqual(expected.distributionY);
 
-  await page.getByLabel("Lower range handle").fill("-10");
+  await page.getByLabel("Lower range handle").focus();
+  for (let step = 0; step < 9; step += 1) await page.keyboard.press("ArrowLeft");
   await expect(page.locator("#range-lower")).toHaveValue("-10");
   await expect(page.locator("#range-lower-bin")).toHaveValue("8388598");
   await page.locator("#range-upper").fill("10");
-  await expect(page.getByLabel("Upper range handle")).toHaveValue("10");
+  await expect(page.getByLabel("Upper range handle")).toHaveAttribute("aria-valuenow", "10");
   await expect(page.locator("#range-upper-bin")).toHaveValue("8388618");
   await page.getByLabel("Lower range handle").focus();
   await page.keyboard.press("ArrowRight");
@@ -2859,9 +2860,9 @@ test("strategy and synchronized range controls enforce the 69-bin product envelo
   await page.getByTestId("liquidity-preset-wide").click();
   await expect(page.locator("#range-lower-bin")).toHaveValue("8388574");
   await expect(page.locator("#range-upper-bin")).toHaveValue("8388642");
-  await expect(page.getByLabel("Lower range handle")).toHaveValue("-34");
-  await expect(page.getByLabel("Upper range handle")).toHaveValue("34");
-  await expect(page.getByTestId("liquidity-range-sliders")).toContainText("69 bins · max 69");
+  await expect(page.getByLabel("Lower range handle")).toHaveAttribute("aria-valuenow", "-34");
+  await expect(page.getByLabel("Upper range handle")).toHaveAttribute("aria-valuenow", "34");
+  await expect(page.getByTestId("liquidity-range-editor")).toContainText("69 bins selected");
   await expect(page.locator('[aria-label="Liquidity bin distribution"] [role="img"]')).toHaveCount(69);
   await clickReviewedAction(page, "liquidity-add-button");
   await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(2);
