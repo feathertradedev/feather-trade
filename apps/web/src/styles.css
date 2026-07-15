@@ -4828,6 +4828,12 @@ a {
   scrollbar-width: thin;
 }
 
+.liquidity-task-panel#liquidity-add {
+  height: calc(100dvh - 300px);
+  min-height: 420px;
+  max-height: 720px;
+}
+
 .liquidity-task-panel > .pool-workspace-tasks {
   position: sticky;
   z-index: 4;
@@ -4838,7 +4844,7 @@ a {
 
 .liquidity-task-body {
   min-height: 0;
-  padding: 0 16px 18px;
+  padding: 13px 16px 18px;
   overflow-x: hidden;
   overflow-y: auto;
   scrollbar-color: rgb(233 236 231 / 18%) transparent;
@@ -4846,7 +4852,42 @@ a {
 }
 
 .liquidity-task-body > .panel-heading {
-  margin-top: 14px;
+  margin-top: 1px;
+}
+
+.liquidity-task-panel .liquidity-range-editor.compact {
+  gap: 10px;
+  margin: 12px 0;
+  padding: 12px 0;
+}
+
+.liquidity-range-editor.compact .range-editor-chart {
+  height: 104px;
+}
+
+.liquidity-range-editor.compact .range-editor-price-grid label {
+  padding: 7px;
+}
+
+.liquidity-range-editor.compact .range-editor-price-grid input {
+  height: 32px;
+}
+
+.liquidity-range-editor.compact .range-editor-thumb span {
+  top: -2px;
+  color: var(--bone);
+}
+
+.liquidity-range-editor.compact .range-editor-axis-control.handles-close .range-editor-thumb.lower {
+  transform: translateX(calc(-50% - 16px));
+}
+
+.liquidity-range-editor.compact .range-editor-axis-control.handles-close .range-editor-thumb.upper {
+  transform: translateX(calc(-50% + 16px));
+}
+
+.liquidity-range-editor.compact .range-editor-advanced summary {
+  padding-top: 7px;
 }
 
 .liquidity-position-summary {
@@ -4951,6 +4992,43 @@ a {
   background: var(--panel);
   border-top: 1px solid rgb(233 236 231 / 9%);
   box-shadow: 0 -14px 30px rgb(0 0 0 / 18%);
+}
+
+.liquidity-action-summary {
+  display: grid;
+  gap: 5px;
+  margin: 0 0 9px;
+}
+
+.liquidity-action-summary > div {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.liquidity-action-summary dt,
+.liquidity-action-summary dd {
+  margin: 0;
+  font-size: 0.63rem;
+  line-height: 1.35;
+}
+
+.liquidity-action-summary dt {
+  flex: 0 0 auto;
+  color: var(--ink-45);
+}
+
+.liquidity-action-summary dd {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--bone);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .liquidity-action-dock .action-stack {
@@ -5463,8 +5541,16 @@ a {
   .liquidity-task-panel {
     position: static;
     display: block;
+    height: auto;
+    min-height: 0;
     max-height: none;
     overflow: visible;
+  }
+
+  .liquidity-task-panel#liquidity-add {
+    height: auto;
+    min-height: 0;
+    max-height: none;
   }
 
   .liquidity-task-body {
@@ -5486,6 +5572,10 @@ a {
 
   .liquidity-action-dock .action-stack {
     grid-template-columns: 1fr;
+  }
+
+  .liquidity-action-summary > div {
+    align-items: flex-start;
   }
 
   .swap-action-dock .action-stack > *,

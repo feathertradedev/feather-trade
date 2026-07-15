@@ -82,6 +82,7 @@ test("create position range editor layers exact distribution over indexed pool r
 
   const editor = page.getByTestId("liquidity-range-editor");
   const chart = editor.getByLabel("Liquidity bin distribution");
+  const actionSummary = page.getByTestId("liquidity-action-summary");
   const transactionReview = page.getByTestId("liquidity-transaction-review");
   await expect(editor).toBeVisible();
   await expect(editor).toContainText("Pool WNATIVE");
@@ -92,11 +93,14 @@ test("create position range editor layers exact distribution over indexed pool r
   await expect(page.getByLabel("Min USDC per WNATIVE")).toBeVisible();
   await expect(page.getByLabel("Max USDC per WNATIVE")).toBeVisible();
   await expect(editor).toContainText("3 bins selected");
-  await expect(page.locator("#range-lower-bin")).not.toBeVisible();
+  await expect(page.locator("#range-lower-bin")).toHaveCount(0);
+  await expect(editor.locator(".distribution-details")).toHaveCount(0);
   await expect(transactionReview).toBeVisible();
   await expect(transactionReview).not.toHaveAttribute("open", "");
   await expect(page.getByTestId("liquidity-token-x-identity")).not.toBeVisible();
   await expect(page.getByTestId("liquidity-add-button")).toBeVisible();
+  await expect(actionSummary).toContainText("Spot · 3 bins · Two-sided");
+  await expect(actionSummary).toContainText("0.01 WNATIVE + 1 USDC");
   await transactionReview.getByText("Transaction review").click();
   await expect(page.getByTestId("liquidity-token-x-identity")).toBeVisible();
   await transactionReview.getByText("Transaction review").click();
@@ -121,11 +125,23 @@ test("create position range editor layers exact distribution over indexed pool r
   await expect(lowerHandle).toHaveAttribute("aria-valuenow", "-1");
 
   await editor.getByText("Advanced range controls").click();
-  await expect(page.locator("#range-lower-bin")).toBeVisible();
+  await expect(page.locator("#range-lower")).toBeVisible();
+  await expect(page.locator("#range-lower-bin")).toHaveCount(0);
   await lowerHandle.focus();
   await page.keyboard.press("ArrowLeft");
   await expect(page.locator("#range-lower")).toHaveValue("-2");
   await expect(chart.getByRole("img")).toHaveCount(4);
+  const railGeometry = await page.evaluate(() => {
+    const chartBox = document.querySelector<HTMLElement>('[data-testid="swap-market-chart"]')?.getBoundingClientRect();
+    const panelBox = document.querySelector<HTMLElement>('#liquidity-add')?.getBoundingClientRect();
+    const actionBox = document.querySelector<HTMLElement>('[data-testid="liquidity-add-button"]')?.getBoundingClientRect();
+    return chartBox && panelBox && actionBox
+      ? { actionBottom: actionBox.bottom, chartRight: chartBox.right, panelLeft: panelBox.left }
+      : null;
+  });
+  expect(railGeometry).not.toBeNull();
+  expect(railGeometry!.panelLeft).toBeGreaterThanOrEqual(railGeometry!.chartRight);
+  expect(railGeometry!.actionBottom).toBeLessThanOrEqual(1000);
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 

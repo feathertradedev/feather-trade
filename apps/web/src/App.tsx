@@ -8812,10 +8812,12 @@ function LiquidityView({
       <section className={workspaceMatchesPool ? "tool-panel liquidity-task-panel" : "tool-panel"} id="liquidity-add">
         {workspaceMatchesPool ? <PoolWorkspaceTaskTabs task="create" /> : null}
         <LiquidityTaskBody compact={workspaceMatchesPool}>
-        <div className="panel-heading">
-          <span>{workspaceMatchesPool ? "Create position" : "Add Liquidity"}</span>
-          {workspaceMatchesPool ? null : <StatusBadge state={addPoolReady ? "ready" : "unavailable"} label={poolDescriptorLabel(selectedPool)} />}
-        </div>
+        {!workspaceMatchesPool ? (
+          <div className="panel-heading">
+            <span>Add Liquidity</span>
+            <StatusBadge state={addPoolReady ? "ready" : "unavailable"} label={poolDescriptorLabel(selectedPool)} />
+          </div>
+        ) : null}
 
         {workspaceMatchesPool ? (
           <span className="field-label liquidity-task-amount-label">Amount</span>
@@ -8876,6 +8878,7 @@ function LiquidityView({
           advancedOpenByDefault={!workspaceMatchesPool}
           activeBin={activeBin}
           bins={distributionResult.preview}
+          compact={workspaceMatchesPool}
           liveBins={rangeBackdrop.points}
           liveBinsError={rangeBackdrop.error}
           liveBinsState={rangeBackdrop.state}
@@ -9012,9 +9015,9 @@ function LiquidityView({
         </div>
 
         <div className="quote-grid">
-          <MiniMetric label="Active Bin" value={activeBin?.toString() ?? "n/a"} />
-          <MiniMetric label="Min Bin" value={activeBin !== null && lowerDelta !== null ? String(activeBin + lowerDelta) : "n/a"} />
-          <MiniMetric label="Max Bin" value={activeBin !== null && upperDelta !== null ? String(activeBin + upperDelta) : "n/a"} />
+          {!workspaceMatchesPool ? <MiniMetric label="Active Bin" value={activeBin?.toString() ?? "n/a"} /> : null}
+          {!workspaceMatchesPool ? <MiniMetric label="Min Bin" value={activeBin !== null && lowerDelta !== null ? String(activeBin + lowerDelta) : "n/a"} /> : null}
+          {!workspaceMatchesPool ? <MiniMetric label="Max Bin" value={activeBin !== null && upperDelta !== null ? String(activeBin + upperDelta) : "n/a"} /> : null}
           <MiniMetric label="Liquidity Mode" value={liquidityMode ?? "n/a"} />
           <MiniMetric label="Bin Step" value={pool?.binStep.toString() ?? primaryPool?.binStep ?? "n/a"} />
           <MiniMetric label={`${nativeModeX ? "ETH" : tokenSymbol(tokenX)} allowance`} value={nativeModeX ? "not required for ETH" : walletData ? formatTokenAmount(walletData.allowanceX, tokenX) : "n/a"} />
@@ -9048,6 +9051,26 @@ function LiquidityView({
         </LiquidityTaskBody>
 
         <div className={workspaceMatchesPool ? "liquidity-action-dock" : undefined}>
+        {workspaceMatchesPool ? (
+          <dl className="liquidity-action-summary" data-testid="liquidity-action-summary">
+            <div>
+              <dt>Position</dt>
+              <dd>
+                {liquidityStrategy === "bid-ask" ? "Bid-Ask" : liquidityStrategy[0].toUpperCase() + liquidityStrategy.slice(1)}
+                {lowerBinId !== null && upperBinId !== null && upperBinId >= lowerBinId ? ` · ${upperBinId - lowerBinId + 1} bins` : " · range unavailable"}
+                {liquidityMode === "balanced" ? " · Two-sided" : liquidityMode === "token-x" ? ` · ${tokenSymbol(tokenX)} only` : ` · ${tokenSymbol(tokenY)} only`}
+              </dd>
+            </div>
+            <div>
+              <dt>Deposit</dt>
+              <dd>
+                {liquidityMode === "token-y" ? "0" : amountXInput || "0"} {nativeModeX ? "ETH" : tokenSymbol(tokenX)}
+                {" + "}
+                {liquidityMode === "token-x" ? "0" : amountYInput || "0"} {nativeModeY ? "ETH" : tokenSymbol(tokenY)}
+              </dd>
+            </div>
+          </dl>
+        ) : null}
         <div className="action-stack">
           {!nativeModeX ? <button
             className="secondary-button wide"
@@ -9092,6 +9115,7 @@ function LiquidityView({
           finalSuccessText={addSuccessReconciled ? "Liquidity added" : null}
           inputError={addInputError}
           insufficientBalance={insufficientX || insufficientY}
+          idleText={!connected ? "Connect wallet to continue" : undefined}
           pendingHash={submittedAddReceiptContext === addExecutionFingerprint
             ? addWrite.data
             : submittedApproveXReceiptContext === approveXExecutionFingerprint
@@ -9405,6 +9429,7 @@ function LiquidityRangeEditor({
   advancedOpenByDefault,
   activeBin,
   bins,
+  compact,
   liveBins,
   liveBinsError,
   liveBinsState,
@@ -9448,6 +9473,7 @@ function LiquidityRangeEditor({
   advancedOpenByDefault: boolean;
   activeBin: number | null;
   bins: LiquidityDistributionView[];
+  compact: boolean;
   liveBins: BinDistributionPoint[] | null;
   liveBinsError: string | null;
   liveBinsState: LoadState;
@@ -9512,7 +9538,7 @@ function LiquidityRangeEditor({
   const selectedExtendsPastBackdrop = lowerBinId !== null && upperBinId !== null && liveBins !== null && (
     !liveById.has(lowerBinId) || !liveById.has(upperBinId)
   );
-  const handlesAreClose = Math.abs(upperPosition - lowerPosition) < 4;
+  const handlesAreClose = Math.abs(upperPosition - lowerPosition) < 8;
 
   const updateHandleFromPointer = (boundary: "lower" | "upper", clientX: number) => {
     const track = rangeTrackRef.current;
@@ -9543,7 +9569,7 @@ function LiquidityRangeEditor({
   };
 
   return (
-    <section className="liquidity-range-editor" data-testid="liquidity-range-editor">
+    <section className={`liquidity-range-editor${compact ? " compact" : ""}`} data-testid="liquidity-range-editor">
       <div className="range-editor-heading">
         <div>
           <strong>Price range</strong>
@@ -9696,14 +9722,18 @@ function LiquidityRangeEditor({
               <span>Upper delta</span>
               <input id="range-upper" inputMode="numeric" value={upperDeltaInput} onChange={(event) => onUpperDeltaInput(event.target.value)} />
             </label>
-            <label htmlFor="range-lower-bin">
-              <span>Lower bin</span>
-              <input id="range-lower-bin" inputMode="numeric" value={lowerBinInput} onChange={(event) => onLowerBinInput(event.target.value)} />
-            </label>
-            <label htmlFor="range-upper-bin">
-              <span>Upper bin</span>
-              <input id="range-upper-bin" inputMode="numeric" value={upperBinInput} onChange={(event) => onUpperBinInput(event.target.value)} />
-            </label>
+            {!compact ? (
+              <>
+                <label htmlFor="range-lower-bin">
+                  <span>Lower bin</span>
+                  <input id="range-lower-bin" inputMode="numeric" value={lowerBinInput} onChange={(event) => onLowerBinInput(event.target.value)} />
+                </label>
+                <label htmlFor="range-upper-bin">
+                  <span>Upper bin</span>
+                  <input id="range-upper-bin" inputMode="numeric" value={upperBinInput} onChange={(event) => onUpperBinInput(event.target.value)} />
+                </label>
+              </>
+            ) : null}
           </div>
           <fieldset className="range-presets" aria-label="Liquidity range presets">
             <legend>Editable presets</legend>
@@ -9721,7 +9751,7 @@ function LiquidityRangeEditor({
         </details>
       </div>
 
-      <details className="distribution-details">
+      {!compact ? <details className="distribution-details">
         <summary>Per-bin weights ({bins.length})</summary>
         <div className="distribution-table">
           {bins.map((bin) => (
@@ -9732,7 +9762,7 @@ function LiquidityRangeEditor({
             </div>
           ))}
         </div>
-      </details>
+      </details> : null}
     </section>
   );
 }
@@ -9741,6 +9771,7 @@ function LiquidityStateRows({
   actionError,
   finalActionPending,
   finalSuccessText,
+  idleText,
   inputError,
   insufficientBalance,
   pendingHash,
@@ -9752,6 +9783,7 @@ function LiquidityStateRows({
   actionError: string | null;
   finalActionPending: boolean;
   finalSuccessText: string | null;
+  idleText?: string;
   inputError: string | null;
   insufficientBalance: boolean;
   pendingHash: Address | undefined;
@@ -9771,7 +9803,9 @@ function LiquidityStateRows({
           ? { icon: <CheckCircle2 size={16} />, message: prerequisiteSuccessText, tone: "success" }
           : prerequisitePending || pendingHash
             ? { icon: <LoaderCircle className="spin" size={16} />, message: pendingHash ? `Pending ${formatCompactAddress(pendingHash)}` : "Awaiting approval wallet confirmation", tone: "pending" }
-          : { icon: <CheckCircle2 size={16} />, message: "Ready for wallet confirmation", tone: "ready" };
+          : idleText
+            ? { icon: <Wallet size={16} />, message: idleText, tone: "ready" }
+            : { icon: <CheckCircle2 size={16} />, message: "Ready for wallet confirmation", tone: "ready" };
 
   return (
     <div
