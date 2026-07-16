@@ -4712,6 +4712,113 @@ a {
   padding: 12px 0;
 }
 
+.liquidity-amount-card {
+  grid-template-rows: auto auto;
+  gap: 5px 9px;
+  min-height: 76px;
+  padding: 8px 10px 10px;
+}
+
+.liquidity-amount-card-meta {
+  display: flex;
+  grid-column: 1 / -1;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.61rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.amount-box .liquidity-amount-card-meta > span {
+  min-width: 0;
+  padding: 0;
+  color: var(--ink-45);
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  font-size: inherit;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-align: left;
+  text-transform: uppercase;
+}
+
+.liquidity-amount-card-meta strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-60);
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.liquidity-amount-card[data-unused="true"] input,
+.liquidity-amount-card[data-unused="true"] > .liquidity-amount-token {
+  opacity: 0.46;
+}
+
+.liquidity-paired-fill {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 5px 12px;
+  align-items: center;
+  padding: 10px 2px 11px;
+  border-bottom: 1px solid rgb(233 236 231 / 8%);
+}
+
+.liquidity-paired-fill-heading {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.liquidity-paired-fill-heading strong {
+  color: var(--bone);
+  font-size: 0.72rem;
+  font-weight: 550;
+}
+
+.liquidity-paired-fill-heading span {
+  overflow: hidden;
+  color: var(--ink-60);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.6rem;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.liquidity-paired-fill p {
+  grid-column: 1;
+  margin: 0;
+  color: var(--ink-45);
+  font-size: 0.66rem;
+  line-height: 1.45;
+}
+
+.liquidity-paired-fill > button {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  min-width: 126px;
+  min-height: 44px;
+  padding: 7px 10px;
+  white-space: nowrap;
+}
+
+.liquidity-paired-fill[data-state="applied"] .liquidity-paired-fill-heading strong,
+.liquidity-paired-fill[data-state="one-sided"] .liquidity-paired-fill-heading strong {
+  color: var(--green);
+}
+
+.liquidity-paired-fill[data-state="stale"] p,
+.liquidity-paired-fill[data-state="native-review-required"] p {
+  color: var(--warn);
+}
+
 .liquidity-range-editor.compact .range-editor-chart {
   height: 104px;
 }
@@ -5881,6 +5988,22 @@ a {
 
   .liquidity-action-summary > div {
     align-items: flex-start;
+  }
+
+  .liquidity-paired-fill {
+    grid-template-columns: 1fr;
+  }
+
+  .liquidity-paired-fill-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .liquidity-paired-fill > button,
+  .liquidity-paired-fill p {
+    grid-column: 1;
+    grid-row: auto;
   }
 
   .swap-action-dock .action-stack > *,

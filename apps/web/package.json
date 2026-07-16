@@ -12,6 +12,7 @@
     "test:full-exit-batching": "node scripts/test-full-exit-batching.mjs",
     "test:pagination": "node scripts/test-graphql-pagination.mjs",
     "test:pair-attestation": "node scripts/test-pair-attestation.mjs",
+    "test:liquidity-amount-suggestion": "node scripts/test-liquidity-amount-suggestion.mjs",
     "test:liquidity-review": "node scripts/test-liquidity-review.mjs",
     "test:full-exit-policy": "node scripts/test-full-exit-policy.mjs",
     "test:lb-operator-approval": "node scripts/test-lb-operator-approval.mjs",

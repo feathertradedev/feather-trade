@@ -195,6 +195,7 @@ import {
   type NativeRemoveLiquidityReceiptReconciliation,
   type PinnedAddLiquidityReview
 } from "./liquidity-review";
+import { suggestPairedLiquidityAmounts } from "./liquidity-amount-suggestion";
 import {
   assertExecutableTokenAction,
   deterministicTokenFallback,
@@ -5505,6 +5506,11 @@ function LiquidityView({
   const nativeAddMaxBindingRef = useRef<{ balance: bigint; context: string; gasPrice: bigint; reserve: bigint; side: "x" | "y"; value: bigint } | null>(null);
   const latestAddGasObservationRef = useRef<{ balance: bigint; context: string; gasPrice: bigint; reserve: bigint } | null>(null);
   const [nativeAddMaxPending, setNativeAddMaxPending] = useState(false);
+  const [pairedFillApplication, setPairedFillApplication] = useState<{
+    amountX: string;
+    amountY: string;
+    fingerprint: string;
+  } | null>(null);
   const latestLiquidityAddReviewRef = useRef<LiquidityAddReviewState | null>(null);
   const removeSubmitInFlightRef = useRef<number | null>(null);
   const [handledApproveXHash, setHandledApproveXHash] = useState<Address | null>(null);
@@ -6320,6 +6326,61 @@ function LiquidityView({
   const nativeBalance = walletData ? BigInt(walletData.nativeBalance) : null;
   const nativeModeX = liquidityAssetMode === "native" && liquidityWrappedNativeSide === "x";
   const nativeModeY = liquidityAssetMode === "native" && liquidityWrappedNativeSide === "y";
+  const pairedFillNativeBlockedSide =
+    nativeModeX && liquidityMode !== "token-y"
+      ? "x"
+      : nativeModeY && liquidityMode !== "token-x"
+        ? "y"
+        : null;
+  const pairedFillSuggestion = useMemo(
+    () => suggestPairedLiquidityAmounts({
+      balanceX: nativeModeX ? null : walletBalanceX,
+      balanceY: nativeModeY ? null : walletBalanceY,
+      binStep: pool?.binStep ?? -1,
+      distribution: distributionResult.distribution
+    }),
+    [
+      activeBin,
+      liquidityStrategy,
+      lowerDelta,
+      nativeModeX,
+      nativeModeY,
+      pool?.binStep,
+      upperDelta,
+      walletBalanceX,
+      walletBalanceY
+    ]
+  );
+  const pairedFillFingerprint = [
+    environmentKey,
+    registry.chainId.toString(),
+    account.address ?? "",
+    activeWalletChainId?.toString() ?? "",
+    pool?.pair ?? "",
+    pool?.binStep.toString() ?? "",
+    tokenX?.address ?? "",
+    tokenX?.decimals.toString() ?? "",
+    tokenY?.address ?? "",
+    tokenY?.decimals.toString() ?? "",
+    liquidityWrappedNative?.address ?? "",
+    liquidityWrappedNativeSide ?? "",
+    activeBin?.toString() ?? "",
+    liquidityStrategy,
+    liquidityAssetMode,
+    distributionResult.distribution?.deltaIds.join(",") ?? "",
+    distributionResult.distribution?.distributionX.join(",") ?? "",
+    distributionResult.distribution?.distributionY.join(",") ?? "",
+    walletData?.balanceX ?? "",
+    walletData?.balanceY ?? "",
+    walletData?.nativeBalance ?? "",
+    pairedFillSuggestion.amountX.toString(),
+    pairedFillSuggestion.amountY.toString()
+  ].join("|");
+  const pairedFillApplied =
+    pairedFillApplication?.fingerprint === pairedFillFingerprint &&
+    amountX?.toString() === pairedFillApplication.amountX &&
+    amountY?.toString() === pairedFillApplication.amountY;
+  const pairedFillStale = pairedFillApplication !== null && !pairedFillApplied;
   const nativeX = nativeAdd && liquidityWrappedNativeSide === "x";
   const nativeY = nativeAdd && liquidityWrappedNativeSide === "y";
   const spendableBalanceX = nativeX ? nativeBalance : walletBalanceX;
@@ -8526,6 +8587,71 @@ function LiquidityView({
     intentionalEmptySelectionRef.current = true;
     setSelectedPositionIds([]);
   };
+  const amountCardBalanceX = nativeModeX
+    ? nativeBalance !== null ? `${formatUnits(nativeBalance, 18)} ETH` : connected ? "loading" : "connect wallet"
+    : walletData !== null ? `${formatTokenAmount(walletData.balanceX, tokenX)} ${tokenSymbol(tokenX)}` : connected ? "loading" : "connect wallet";
+  const amountCardBalanceY = nativeModeY
+    ? nativeBalance !== null ? `${formatUnits(nativeBalance, 18)} ETH` : connected ? "loading" : "connect wallet"
+    : walletData !== null ? `${formatTokenAmount(walletData.balanceY, tokenY)} ${tokenSymbol(tokenY)}` : connected ? "loading" : "connect wallet";
+  const pairedFillInputX = tokenX === null ? "0" : formatUnits(pairedFillSuggestion.amountX, tokenX.decimals);
+  const pairedFillInputY = tokenY === null ? "0" : formatUnits(pairedFillSuggestion.amountY, tokenY.decimals);
+  const pairedFillFormattedX = formatTokenAmount(pairedFillSuggestion.amountX, tokenX);
+  const pairedFillFormattedY = formatTokenAmount(pairedFillSuggestion.amountY, tokenY);
+  const pairedFillState = pairedFillNativeBlockedSide !== null
+    ? "native-review-required"
+    : pairedFillSuggestion.status === "unavailable"
+      ? "unavailable"
+      : pairedFillStale
+        ? "stale"
+        : pairedFillApplied
+          ? "applied"
+          : pairedFillSuggestion.mode === "balanced"
+            ? "ready"
+            : "one-sided";
+  const pairedFillMessage = pairedFillNativeBlockedSide !== null
+    ? `Paired fill will not spend the full ETH balance. Use Native Max for a gas-reserved ${pairedFillNativeBlockedSide.toUpperCase()} amount, or switch to ERC-20 mode.`
+    : !connected
+      ? "Connect a wallet to calculate a suggestion from current balances."
+      : walletQuery.isLoading
+        ? "Reading current wallet balances."
+        : pairedFillSuggestion.status === "unavailable"
+          ? pairedFillSuggestion.reason === "empty-balance"
+            ? "The required wallet balance is empty, so no amount suggestion is available."
+            : pairedFillSuggestion.reason === "rounding-underflow"
+              ? "Current balances are too small for a nonzero paired amount at this range."
+              : "A safe suggestion is unavailable until the current range, distribution, and balances are ready."
+          : pairedFillStale
+            ? "Range, strategy, active price, asset mode, or wallet balance changed. Review and apply the updated suggestion again."
+            : pairedFillApplied
+              ? `Applied ${pairedFillFormattedX} ${nativeModeX ? "ETH" : tokenSymbol(tokenX)} + ${pairedFillFormattedY} ${nativeModeY ? "ETH" : tokenSymbol(tokenY)} for this exact context. No swap or Zap was performed.`
+              : pairedFillSuggestion.mode === "token-x"
+                ? `This range uses only ${tokenSymbol(tokenX)}. Applying the suggestion keeps ${tokenSymbol(tokenY)} at zero and performs no swap.`
+                : pairedFillSuggestion.mode === "token-y"
+                  ? `This range uses only ${tokenSymbol(tokenY)}. Applying the suggestion keeps ${tokenSymbol(tokenX)} at zero and performs no swap.`
+                  : `Ready to apply the maximum balance-clamped pair from exact ${liquidityStrategy === "bid-ask" ? "Bid-Ask" : liquidityStrategy} bin weights. Nothing changes until you apply it.`;
+  const pairedFillCanApply =
+    connected &&
+    !onWrongChain &&
+    tokenX !== null &&
+    tokenY !== null &&
+    pairedFillNativeBlockedSide === null &&
+    pairedFillSuggestion.status === "ready";
+  const pairedFillButtonLabel = pairedFillSuggestion.mode === "token-x"
+    ? `Use ${tokenSymbol(tokenX)} only`
+    : pairedFillSuggestion.mode === "token-y"
+      ? `Use ${tokenSymbol(tokenY)} only`
+      : "Apply max pair";
+  const applyPairedFill = () => {
+    if (!pairedFillCanApply || tokenX === null || tokenY === null) return;
+    nativeAddMaxBindingRef.current = null;
+    setAmountXInput(pairedFillInputX);
+    setAmountYInput(pairedFillInputY);
+    setPairedFillApplication({
+      amountX: pairedFillSuggestion.amountX.toString(),
+      amountY: pairedFillSuggestion.amountY.toString(),
+      fingerprint: pairedFillFingerprint
+    });
+  };
 
   return (
     <div className={`view-grid two-col${workspaceMatchesPool ? " liquidity-task-workspace" : ""}`}>
@@ -8589,37 +8715,59 @@ function LiquidityView({
         ) : null}
 
         <div className="liquidity-rows">
-          <div className="amount-box compact">
+          <div className="amount-box compact liquidity-amount-card" data-unused={liquidityMode === "token-y" ? "true" : "false"}>
+            <div className="liquidity-amount-card-meta">
+              <span>Balance</span>
+              <strong data-testid="liquidity-balance-x">{amountCardBalanceX}</strong>
+            </div>
             <input
               aria-label={`${nativeModeX ? "ETH" : tokenSymbol(tokenX)} liquidity amount`}
               data-testid="liquidity-amount-x"
               disabled={liquidityMode === "token-y"}
               inputMode="decimal"
               value={liquidityMode === "token-y" ? "0" : amountXInput}
-              onChange={(event) => { nativeAddMaxBindingRef.current = null; setAmountXInput(event.target.value); }}
+              onChange={(event) => { nativeAddMaxBindingRef.current = null; setPairedFillApplication(null); setAmountXInput(event.target.value); }}
             />
-            <span>{nativeModeX ? "ETH" : tokenSymbol(tokenX)}</span>
+            <span className="liquidity-amount-token">{nativeModeX ? "ETH" : tokenSymbol(tokenX)}</span>
             <button aria-label={`Use maximum ${nativeModeX ? "ETH" : tokenSymbol(tokenX)} balance`} className="token-max-button" data-testid="liquidity-max-x" disabled={nativeModeX ? ((!nativeAdd || !addReady) && !canReuseNativeAddMaxObservation("x")) || nativeAddMaxPending : walletBalanceX === null || tokenX === null || liquidityMode === "token-y"} onClick={() => {
               if (nativeModeX) handleNativeAddMax("x");
-              else if (walletBalanceX !== null && tokenX !== null) { nativeAddMaxBindingRef.current = null; setAmountXInput(maxAmountInput({ asset: "token", balance: walletBalanceX, decimals: tokenX.decimals })); }
+              else if (walletBalanceX !== null && tokenX !== null) { nativeAddMaxBindingRef.current = null; setPairedFillApplication(null); setAmountXInput(maxAmountInput({ asset: "token", balance: walletBalanceX, decimals: tokenX.decimals })); }
             }} type="button">Max</button>
           </div>
-          <div className="amount-box compact">
+          <div className="amount-box compact liquidity-amount-card" data-unused={liquidityMode === "token-x" ? "true" : "false"}>
+            <div className="liquidity-amount-card-meta">
+              <span>Balance</span>
+              <strong data-testid="liquidity-balance-y">{amountCardBalanceY}</strong>
+            </div>
             <input
               aria-label={`${nativeModeY ? "ETH" : tokenSymbol(tokenY)} liquidity amount`}
               data-testid="liquidity-amount-y"
               disabled={liquidityMode === "token-x"}
               inputMode="decimal"
               value={liquidityMode === "token-x" ? "0" : amountYInput}
-              onChange={(event) => { nativeAddMaxBindingRef.current = null; setAmountYInput(event.target.value); }}
+              onChange={(event) => { nativeAddMaxBindingRef.current = null; setPairedFillApplication(null); setAmountYInput(event.target.value); }}
             />
-            <span>{nativeModeY ? "ETH" : tokenSymbol(tokenY)}</span>
+            <span className="liquidity-amount-token">{nativeModeY ? "ETH" : tokenSymbol(tokenY)}</span>
             <button aria-label={`Use maximum ${nativeModeY ? "ETH" : tokenSymbol(tokenY)} balance`} className="token-max-button" data-testid="liquidity-max-y" disabled={nativeModeY ? ((!nativeAdd || !addReady) && !canReuseNativeAddMaxObservation("y")) || nativeAddMaxPending : walletBalanceY === null || tokenY === null || liquidityMode === "token-x"} onClick={() => {
               if (nativeModeY) handleNativeAddMax("y");
-              else if (walletBalanceY !== null && tokenY !== null) { nativeAddMaxBindingRef.current = null; setAmountYInput(maxAmountInput({ asset: "token", balance: walletBalanceY, decimals: tokenY.decimals })); }
+              else if (walletBalanceY !== null && tokenY !== null) { nativeAddMaxBindingRef.current = null; setPairedFillApplication(null); setAmountYInput(maxAmountInput({ asset: "token", balance: walletBalanceY, decimals: tokenY.decimals })); }
             }} type="button">Max</button>
           </div>
         </div>
+        <section aria-label="Liquidity amount suggestion" className="liquidity-paired-fill" data-state={pairedFillState} data-testid="liquidity-paired-fill">
+          <div className="liquidity-paired-fill-heading">
+            <strong>Suggested composition</strong>
+            {pairedFillSuggestion.status === "ready" && pairedFillNativeBlockedSide === null ? (
+              <span data-testid="liquidity-paired-fill-preview">
+                {pairedFillFormattedX} {nativeModeX ? "ETH" : tokenSymbol(tokenX)} + {pairedFillFormattedY} {nativeModeY ? "ETH" : tokenSymbol(tokenY)}
+              </span>
+            ) : <span>Unavailable</span>}
+          </div>
+          <p aria-live="polite" data-testid="liquidity-paired-fill-status" id="liquidity-paired-fill-status" role="status">{pairedFillMessage}</p>
+          <button aria-describedby="liquidity-paired-fill-status" className="secondary-button" data-testid="liquidity-paired-fill-apply" disabled={!pairedFillCanApply} onClick={applyPairedFill} type="button">
+            {pairedFillButtonLabel}
+          </button>
+        </section>
         <LiquidityRangeEditor
           advancedOpenByDefault={!workspaceMatchesPool}
           activeBin={activeBin}

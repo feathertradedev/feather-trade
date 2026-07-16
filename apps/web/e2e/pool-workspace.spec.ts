@@ -6,6 +6,8 @@ import { installMockRpc, SECOND_WNATIVE_USDC_PAIR, USDC, WNATIVE, WNATIVE_USDC_P
 import { installMockWallet, LOCALNET_CHAIN_ID, readMockWallet } from "./fixtures/mock-wallet";
 
 const ONE_TOKEN = 10n ** 18n;
+const TEST_ACTIVE_ID = 8_388_608;
+const TEST_Q128 = 1n << 128n;
 
 async function connectWallet(page: Parameters<typeof installMockRpc>[0]) {
   await page.getByTestId("wallet-connect-button").click();
@@ -361,7 +363,17 @@ test("pool owner panel does not query before connection and exposes a real empty
 
 test("create position range editor layers exact distribution over indexed pool reserves", async ({ page }) => {
   await page.setViewportSize({ height: 1000, width: 1600 });
-  await installMockRpc(page, { includePairs: true, poolBinCount: 9 });
+  await installMockRpc(page, {
+    includePairs: true,
+    poolBinCount: 9,
+    priceQ128ByBin: {
+      [String(TEST_ACTIVE_ID - 2)]: TEST_Q128,
+      [String(TEST_ACTIVE_ID - 1)]: 2n * TEST_Q128,
+      [String(TEST_ACTIVE_ID)]: 3n * TEST_Q128,
+      [String(TEST_ACTIVE_ID + 1)]: 4n * TEST_Q128,
+      [String(TEST_ACTIVE_ID + 2)]: 5n * TEST_Q128
+    }
+  });
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
 
   const editor = page.getByTestId("liquidity-range-editor");
@@ -411,10 +423,32 @@ test("create position range editor layers exact distribution over indexed pool r
   await editor.getByText("Advanced range controls").click();
   await expect(page.locator("#range-lower")).toBeVisible();
   await expect(page.locator("#range-lower-bin")).toHaveCount(0);
+  await expect(page.locator("#range-upper-bin")).toHaveCount(0);
+  await expect(editor.getByRole("button", { name: /inverse/i })).toHaveCount(0);
+  const initialMinPrice = await page.getByLabel("Min USDC per WNATIVE").inputValue();
+  const initialMaxPrice = await page.getByLabel("Max USDC per WNATIVE").inputValue();
   await lowerHandle.focus();
   await page.keyboard.press("ArrowLeft");
   await expect(page.locator("#range-lower")).toHaveValue("-2");
+  await expect(page.getByLabel("Min USDC per WNATIVE")).not.toHaveValue(initialMinPrice);
   await expect(chart.getByRole("img")).toHaveCount(4);
+  await upperHandle.focus();
+  await page.keyboard.press("ArrowRight");
+  await expect(page.locator("#range-upper")).toHaveValue("2");
+  await expect(page.getByLabel("Max USDC per WNATIVE")).not.toHaveValue(initialMaxPrice);
+  await expect(chart.getByRole("img")).toHaveCount(5);
+  await page.getByTestId("liquidity-strategy-curve").click();
+  await expect(page.getByTestId("liquidity-strategy-curve")).toHaveAttribute("aria-pressed", "true");
+  await page.getByTestId("liquidity-strategy-bid-ask").click();
+  await expect(page.getByTestId("liquidity-strategy-bid-ask")).toHaveAttribute("aria-pressed", "true");
+  await expect(actionSummary).toContainText("Bid-Ask · 5 bins · Two-sided");
+  await page.getByLabel("Narrow preset bin count").fill("69");
+  await page.getByTestId("liquidity-preset-narrow").click();
+  await expect(editor).toContainText("69 bins selected");
+  await page.getByLabel("Narrow preset bin count").fill("70");
+  await page.getByTestId("liquidity-preset-narrow").click();
+  await expect(editor.getByRole("status")).toContainText("between 1 and 69 bins");
+  await expect(editor).toContainText("69 bins selected");
   const railGeometry = await page.evaluate(() => {
     const chartBox = document.querySelector<HTMLElement>('[data-testid="swap-market-chart"]')?.getBoundingClientRect();
     const panelBox = document.querySelector<HTMLElement>('#liquidity-add')?.getBoundingClientRect();
@@ -426,6 +460,154 @@ test("create position range editor layers exact distribution over indexed pool r
   expect(railGeometry).not.toBeNull();
   expect(railGeometry!.panelLeft).toBeGreaterThanOrEqual(railGeometry!.chartRight);
   expect(railGeometry!.actionBottom).toBeLessThanOrEqual(1000);
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test("connected create position previews and explicitly applies a balance-clamped ERC-20 pair", async ({ page }) => {
+  const rpc = await installMockRpc(page, {
+    balance: 5n * ONE_TOKEN,
+    includePairs: true,
+    nativeBalance: 10n * ONE_TOKEN
+  });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
+  await connectWallet(page);
+
+  const amountX = page.getByTestId("liquidity-amount-x");
+  const amountY = page.getByTestId("liquidity-amount-y");
+  const suggestion = page.getByTestId("liquidity-paired-fill");
+  const apply = page.getByTestId("liquidity-paired-fill-apply");
+  const initialX = await amountX.inputValue();
+  const initialY = await amountY.inputValue();
+
+  await expect(page.getByTestId("liquidity-balance-x")).toContainText("5");
+  await expect(page.getByTestId("liquidity-balance-y")).toContainText("5");
+  await expect(page.getByTestId("liquidity-balance-x")).not.toContainText("$");
+  await expect(page.getByTestId("liquidity-balance-y")).not.toContainText("$");
+  await expect(suggestion).toHaveAttribute("data-state", "ready");
+  await expect(apply).toHaveText("Apply max pair");
+  await expect(amountX).toHaveValue(initialX);
+  await expect(amountY).toHaveValue(initialY);
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+
+  await apply.click();
+  await expect(suggestion).toHaveAttribute("data-state", "applied");
+  const appliedX = await amountX.inputValue();
+  const appliedY = await amountY.inputValue();
+  expect(Number(appliedX)).toBeGreaterThan(0);
+  expect(Number(appliedY)).toBeGreaterThan(0);
+  expect(Number(appliedX)).toBeLessThanOrEqual(5);
+  expect(Number(appliedY)).toBeLessThanOrEqual(5);
+  await expect(page.getByTestId("liquidity-paired-fill-preview")).toContainText("WNATIVE");
+  await expect(page.getByTestId("liquidity-paired-fill-preview")).toContainText("USDC");
+  await expect(page.getByTestId("liquidity-paired-fill-status")).toContainText("No swap or Zap was performed");
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+  expect(rpc.snapshot().ethCalls.some(({ functionName }) => functionName.toLowerCase().includes("swap"))).toBe(false);
+
+  await amountX.fill("1.25");
+  await expect(suggestion).toHaveAttribute("data-state", "ready");
+  await expect(page.getByTestId("liquidity-paired-fill-status")).toContainText("Nothing changes until you apply it");
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+
+  await apply.click();
+  await expect(suggestion).toHaveAttribute("data-state", "applied");
+  const beforeStrategyChange = [await amountX.inputValue(), await amountY.inputValue()];
+  await page.getByTestId("liquidity-strategy-curve").click();
+  await expect(suggestion).toHaveAttribute("data-state", "stale");
+  await expect(page.getByTestId("liquidity-paired-fill-status")).toContainText("apply the updated suggestion again");
+  await expect(amountX).toHaveValue(beforeStrategyChange[0]);
+  await expect(amountY).toHaveValue(beforeStrategyChange[1]);
+  await apply.click();
+  await expect(suggestion).toHaveAttribute("data-state", "applied");
+  await page.getByLabel("Lower range handle").focus();
+  await page.keyboard.press("ArrowLeft");
+  await expect(suggestion).toHaveAttribute("data-state", "stale");
+  await expect(page.getByTestId("liquidity-paired-fill-status")).toContainText("apply the updated suggestion again");
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
+test("one-sided and native position suggestions fail safe without hidden swaps", async ({ page }) => {
+  const rpc = await installMockRpc(page, {
+    balance: 5n * ONE_TOKEN,
+    includePairs: true,
+    nativeBalance: 10n * ONE_TOKEN
+  });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
+  await connectWallet(page);
+
+  const suggestion = page.getByTestId("liquidity-paired-fill");
+  const apply = page.getByTestId("liquidity-paired-fill-apply");
+  await expect(suggestion).toHaveAttribute("data-state", "ready");
+  await page.getByText("Advanced range controls").click();
+  await page.locator("#range-lower").fill("1");
+  await page.locator("#range-upper").fill("2");
+
+  await expect(page.getByTestId("liquidity-range-mode")).toContainText("One-sided WNATIVE");
+  await expect(page.getByTestId("liquidity-amount-y")).toBeDisabled();
+  await expect(page.getByTestId("liquidity-amount-y")).toHaveValue("0");
+  await expect(suggestion).toHaveAttribute("data-state", "one-sided");
+  await expect(apply).toHaveText("Use WNATIVE only");
+  await expect(page.getByTestId("liquidity-paired-fill-status")).toContainText("performs no swap");
+  await apply.click();
+  await expect(suggestion).toHaveAttribute("data-state", "applied");
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+  expect(rpc.snapshot().ethCalls.some(({ functionName }) => functionName.toLowerCase().includes("swap"))).toBe(false);
+
+  await page.getByRole("button", { name: "ETH · native" }).click();
+  await expect(suggestion).toHaveAttribute("data-state", "native-review-required");
+  await expect(apply).toBeDisabled();
+  await expect(page.getByTestId("liquidity-paired-fill-status")).toContainText("will not spend the full ETH balance");
+  await expect(page.getByTestId("liquidity-paired-fill-status")).toContainText("gas-reserved");
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
+for (const viewport of [
+  { label: "desktop", width: 1440, height: 900 },
+  { label: "tablet", width: 820, height: 900 },
+  { label: "mobile", width: 390, height: 844 }
+] as const) {
+  test(`create position keeps the range and guarded action reachable on ${viewport.label}`, async ({ page }) => {
+    await page.setViewportSize({ height: viewport.height, width: viewport.width });
+    await installMockRpc(page, { includePairs: true });
+    await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
+
+    const editor = page.getByTestId("liquidity-range-editor");
+    const apply = page.getByTestId("liquidity-paired-fill-apply");
+    const add = page.getByTestId("liquidity-add-button");
+    await expect(editor).toBeVisible();
+    await expect(page.getByLabel("Lower range handle")).toBeVisible();
+    await expect(page.getByLabel("Upper range handle")).toBeVisible();
+    await expect(apply).toBeVisible();
+    await add.scrollIntoViewIfNeeded();
+    await expect(add).toBeVisible();
+    const actionBox = await add.boundingBox();
+    expect(actionBox).not.toBeNull();
+    expect(actionBox!.y + actionBox!.height).toBeLessThanOrEqual(viewport.height);
+    await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  });
+}
+
+test("create position remains operable at 200 percent layout scale", async ({ page }) => {
+  await page.setViewportSize({ height: 900, width: 640 });
+  await installMockRpc(page, { includePairs: true });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
+  await page.evaluate(() => { document.documentElement.style.zoom = "2"; });
+
+  const lowerHandle = page.getByLabel("Lower range handle");
+  const upperHandle = page.getByLabel("Upper range handle");
+  await lowerHandle.focus();
+  await page.keyboard.press("ArrowLeft");
+  await expect(lowerHandle).toHaveAttribute("aria-valuenow", "-2");
+  await upperHandle.focus();
+  await page.keyboard.press("ArrowRight");
+  await expect(upperHandle).toHaveAttribute("aria-valuenow", "2");
+  const add = page.getByTestId("liquidity-add-button");
+  await add.scrollIntoViewIfNeeded();
+  await expect(add).toBeVisible();
+  const actionBox = await add.boundingBox();
+  expect(actionBox).not.toBeNull();
+  expect(actionBox!.y + actionBox!.height).toBeLessThanOrEqual(900);
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
