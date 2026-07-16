@@ -1311,8 +1311,17 @@ function pairMetadata(address: Address | undefined, options: MockRpcOptions) {
 }
 
 function allPairMetadata(options: MockRpcOptions) {
+  const primary = {
+    pair: (options.pairAddress ?? WNATIVE_USDC_PAIR) as Address,
+    tokenX: (options.pairTokenX ?? WNATIVE) as Address,
+    tokenY: (options.pairTokenY ?? USDC) as Address,
+    binStep: Number(options.pairBinStep ?? 10)
+  };
   return [
-    { pair: (options.pairAddress ?? WNATIVE_USDC_PAIR) as Address, tokenX: (options.pairTokenX ?? WNATIVE) as Address, tokenY: (options.pairTokenY ?? USDC) as Address, binStep: Number(options.pairBinStep ?? 10) },
+    primary,
+    ...(addressEquals(primary.pair, WNATIVE_USDC_PAIR)
+      ? []
+      : [{ pair: WNATIVE_USDC_PAIR as Address, tokenX: WNATIVE as Address, tokenY: USDC as Address, binStep: 10 }]),
     { pair: ALT_WNATIVE_USDC_PAIR as Address, tokenX: WNATIVE as Address, tokenY: USDC as Address, binStep: 20 },
     { pair: WNATIVE_USDT_PAIR as Address, tokenX: WNATIVE as Address, tokenY: USDT as Address, binStep: 11 },
     { pair: USDT_USDC_PAIR as Address, tokenX: USDT as Address, tokenY: USDC as Address, binStep: 12 },
