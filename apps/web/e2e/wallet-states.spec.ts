@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { decodeFunctionData, type Hex } from "viem";
+import { decodeFunctionData, parseUnits, type Hex } from "viem";
 
 import { erc20Abi, lbPairAbi, lbRouterAbi } from "../../../packages/sdk/src/abi";
 import { buildLiquidityDistribution } from "../../../packages/sdk/src/liquidity";
@@ -1407,6 +1407,36 @@ test("LP Max binds exact balances and disables the unused one-sided token", asyn
   await expect(page.getByTestId("liquidity-max-y")).toBeDisabled();
   await expect(page.getByTestId("liquidity-amount-y")).toBeDisabled();
   await expect(page.getByTestId("liquidity-amount-y")).toHaveValue("0");
+});
+
+test("paired LP draft binds exact source, paired amount, and strategy weights into reviewed calldata", async ({ page }) => {
+  const rpc = await setupConnectedLiquidity(page, {
+    allowance: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    lbApproved: true
+  });
+  await page.getByTestId("liquidity-amount-x").fill("1.25");
+  await page.getByTestId("liquidity-strategy-bid-ask").click();
+  await expect(page.getByTestId("liquidity-paired-fill-apply")).toHaveText("Fill USDC");
+  await page.getByTestId("liquidity-paired-fill-apply").click();
+  await expect(page.getByTestId("liquidity-paired-fill")).toHaveAttribute("data-state", "applied");
+
+  const exactSourceX = parseUnits("1.25", 18);
+  const exactPairedY = parseUnits(await page.getByTestId("liquidity-amount-y").inputValue(), 18);
+  await expect(page.getByTestId("liquidity-amount-x")).toHaveValue("1.25");
+  await clickReviewedAction(page, "liquidity-add-button");
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+
+  const decoded = decodeSubmittedTransaction((await readMockWallet(page)).sentTransactions[0]);
+  expect(decoded.functionName).toBe("addLiquidity");
+  const parameters = (decoded.args as readonly [LiquidityParams])[0];
+  const expected = buildLiquidityDistribution(8_388_608, -1, 1, "bid-ask");
+  expect(parameters.amountX).toBe(exactSourceX);
+  expect(parameters.amountY).toBe(exactPairedY);
+  expect(parameters.deltaIds).toEqual(expected.deltaIds);
+  expect(parameters.distributionX).toEqual(expected.distributionX);
+  expect(parameters.distributionY).toEqual(expected.distributionY);
+  expect(simulatedFunctions(rpc)).not.toContain("swapExactTokensForTokens");
 });
 
 test("dashboard polling advances RPC and indexer heads through stale, error, and recovery states", async ({ page }, testInfo) => {
@@ -3809,6 +3839,7 @@ interface LiquidityParams {
   amountY: bigint;
   amountXMin: bigint;
   amountYMin: bigint;
+  deltaIds: readonly bigint[];
   distributionX: readonly bigint[];
   distributionY: readonly bigint[];
 }

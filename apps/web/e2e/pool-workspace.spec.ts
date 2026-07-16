@@ -3,7 +3,7 @@ import { decodeFunctionData, type Hex } from "viem";
 
 import { lbRouterAbi } from "../../../packages/sdk/src/abi";
 import { installMockRpc, SECOND_WNATIVE_USDC_PAIR, USDC, WNATIVE, WNATIVE_USDC_PAIR } from "./fixtures/mock-rpc";
-import { installMockWallet, LOCALNET_CHAIN_ID, readMockWallet } from "./fixtures/mock-wallet";
+import { DEFAULT_ACCOUNT, installMockWallet, LOCALNET_CHAIN_ID, readMockWallet } from "./fixtures/mock-wallet";
 
 const ONE_TOKEN = 10n ** 18n;
 const TEST_ACTIVE_ID = 8_388_608;
@@ -463,8 +463,10 @@ test("create position range editor layers exact distribution over indexed pool r
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
-test("connected create position previews and explicitly applies a balance-clamped ERC-20 pair", async ({ page }) => {
+test("connected create position preserves the edited source and fills only its paired ERC-20", async ({ page }) => {
+  const pairedActiveId = TEST_ACTIVE_ID + 2_000;
   const rpc = await installMockRpc(page, {
+    activeId: pairedActiveId,
     balance: 5n * ONE_TOKEN,
     includePairs: true,
     nativeBalance: 10n * ONE_TOKEN
@@ -477,53 +479,80 @@ test("connected create position previews and explicitly applies a balance-clampe
   const amountY = page.getByTestId("liquidity-amount-y");
   const suggestion = page.getByTestId("liquidity-paired-fill");
   const apply = page.getByTestId("liquidity-paired-fill-apply");
-  const initialX = await amountX.inputValue();
-  const initialY = await amountY.inputValue();
-
   await expect(page.getByTestId("liquidity-balance-x")).toContainText("5");
   await expect(page.getByTestId("liquidity-balance-y")).toContainText("5");
   await expect(page.getByTestId("liquidity-balance-x")).not.toContainText("$");
   await expect(page.getByTestId("liquidity-balance-y")).not.toContainText("$");
+  await amountX.fill("1.25");
+  const initialY = await amountY.inputValue();
   await expect(suggestion).toHaveAttribute("data-state", "ready");
-  await expect(apply).toHaveText("Apply max pair");
-  await expect(amountX).toHaveValue(initialX);
+  await expect(apply).toHaveText("Fill USDC to balance");
+  await expect(page.getByTestId("liquidity-paired-fill-status")).toContainText("clamped to its wallet balance");
+  await expect(amountX).toHaveValue("1.25");
   await expect(amountY).toHaveValue(initialY);
   expect((await readMockWallet(page)).sentTransactions).toEqual([]);
 
   await apply.click();
   await expect(suggestion).toHaveAttribute("data-state", "applied");
-  const appliedX = await amountX.inputValue();
-  const appliedY = await amountY.inputValue();
-  expect(Number(appliedX)).toBeGreaterThan(0);
-  expect(Number(appliedY)).toBeGreaterThan(0);
-  expect(Number(appliedX)).toBeLessThanOrEqual(5);
-  expect(Number(appliedY)).toBeLessThanOrEqual(5);
+  await expect(amountX).toHaveValue("1.25");
+  const pairedY = await amountY.inputValue();
+  expect(pairedY).not.toBe(initialY);
+  expect(Number(pairedY)).toBeGreaterThan(0);
+  expect(Number(pairedY)).toBeLessThanOrEqual(5);
   await expect(page.getByTestId("liquidity-paired-fill-preview")).toContainText("WNATIVE");
   await expect(page.getByTestId("liquidity-paired-fill-preview")).toContainText("USDC");
   await expect(page.getByTestId("liquidity-paired-fill-status")).toContainText("No swap or Zap was performed");
   expect((await readMockWallet(page)).sentTransactions).toEqual([]);
   expect(rpc.snapshot().ethCalls.some(({ functionName }) => functionName.toLowerCase().includes("swap"))).toBe(false);
 
-  await amountX.fill("1.25");
+  await amountY.fill("2.5");
+  const beforeInverseFillX = await amountX.inputValue();
   await expect(suggestion).toHaveAttribute("data-state", "ready");
+  await expect(apply).toHaveText("Fill WNATIVE");
   await expect(page.getByTestId("liquidity-paired-fill-status")).toContainText("Nothing changes until you apply it");
-  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
-
   await apply.click();
   await expect(suggestion).toHaveAttribute("data-state", "applied");
-  const beforeStrategyChange = [await amountX.inputValue(), await amountY.inputValue()];
+  await expect(amountY).toHaveValue("2.5");
+  const pairedX = await amountX.inputValue();
+  expect(pairedX).not.toBe(beforeInverseFillX);
+  expect(Number(pairedX)).toBeGreaterThan(0);
+  expect(Number(pairedX)).toBeLessThanOrEqual(5);
+
   await page.getByTestId("liquidity-strategy-curve").click();
-  await expect(suggestion).toHaveAttribute("data-state", "stale");
-  await expect(page.getByTestId("liquidity-paired-fill-status")).toContainText("apply the updated suggestion again");
-  await expect(amountX).toHaveValue(beforeStrategyChange[0]);
-  await expect(amountY).toHaveValue(beforeStrategyChange[1]);
+  await expect(suggestion).toHaveAttribute("data-state", "ready");
+  await page.getByTestId("liquidity-strategy-spot").click();
+  await expect(suggestion).toHaveAttribute("data-state", "ready");
   await apply.click();
   await expect(suggestion).toHaveAttribute("data-state", "applied");
   await page.getByLabel("Lower range handle").focus();
   await page.keyboard.press("ArrowLeft");
-  await expect(suggestion).toHaveAttribute("data-state", "stale");
-  await expect(page.getByTestId("liquidity-paired-fill-status")).toContainText("apply the updated suggestion again");
+  await expect(suggestion).toHaveAttribute("data-state", "ready");
+  await page.keyboard.press("ArrowRight");
+  await expect(suggestion).toHaveAttribute("data-state", "ready");
+
+  await apply.click();
+  await expect(suggestion).toHaveAttribute("data-state", "applied");
+  rpc.update({ activeId: pairedActiveId + 1, blockNumber: 43n, indexerBlockNumber: 43n });
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(page.locator(".range-editor-bin.active")).toHaveAttribute("data-bin-id", String(pairedActiveId + 1), { timeout: 15_000 });
+  await expect(suggestion).toHaveAttribute("data-state", "ready");
+  rpc.update({ activeId: pairedActiveId, blockNumber: 44n, indexerBlockNumber: 44n });
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(page.locator(".range-editor-bin.active")).toHaveAttribute("data-bin-id", String(pairedActiveId), { timeout: 15_000 });
+  await expect(suggestion).toHaveAttribute("data-state", "ready");
+
+  await apply.click();
+  await expect(suggestion).toHaveAttribute("data-state", "applied");
+  rpc.update({ balance: 4n * ONE_TOKEN });
+  await page.evaluate(() => window.__mockWalletControl.setAccounts(["0x1111111111111111111111111111111111111111"]));
+  await expect(page.getByTestId("liquidity-balance-x")).toContainText("4", { timeout: 15_000 });
+  await expect(suggestion).toHaveAttribute("data-state", "ready");
+  rpc.update({ balance: 5n * ONE_TOKEN });
+  await page.evaluate((account) => window.__mockWalletControl.setAccounts([account]), DEFAULT_ACCOUNT);
+  await expect(page.getByTestId("liquidity-balance-x")).toContainText("5", { timeout: 15_000 });
+  await expect(suggestion).toHaveAttribute("data-state", "ready");
   expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+  expect(rpc.snapshot().ethCalls.some(({ functionName }) => functionName.toLowerCase().includes("swap"))).toBe(false);
 });
 
 test("one-sided and native position suggestions fail safe without hidden swaps", async ({ page }) => {
@@ -547,10 +576,9 @@ test("one-sided and native position suggestions fail safe without hidden swaps",
   await expect(page.getByTestId("liquidity-amount-y")).toBeDisabled();
   await expect(page.getByTestId("liquidity-amount-y")).toHaveValue("0");
   await expect(suggestion).toHaveAttribute("data-state", "one-sided");
-  await expect(apply).toHaveText("Use WNATIVE only");
-  await expect(page.getByTestId("liquidity-paired-fill-status")).toContainText("performs no swap");
-  await apply.click();
-  await expect(suggestion).toHaveAttribute("data-state", "applied");
+  await expect(apply).toHaveText("No pair needed");
+  await expect(apply).toBeDisabled();
+  await expect(page.getByTestId("liquidity-paired-fill-status")).toContainText("No paired amount or swap is needed");
   expect((await readMockWallet(page)).sentTransactions).toEqual([]);
   expect(rpc.snapshot().ethCalls.some(({ functionName }) => functionName.toLowerCase().includes("swap"))).toBe(false);
 
@@ -559,6 +587,19 @@ test("one-sided and native position suggestions fail safe without hidden swaps",
   await expect(apply).toBeDisabled();
   await expect(page.getByTestId("liquidity-paired-fill-status")).toContainText("will not spend the full ETH balance");
   await expect(page.getByTestId("liquidity-paired-fill-status")).toContainText("gas-reserved");
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
+test("wallet read failures show unavailable balances and block paired fill", async ({ page }) => {
+  await installMockRpc(page, { includePairs: true, walletReadMode: "error" });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
+  await connectWallet(page);
+
+  await expect(page.getByTestId("liquidity-balance-x")).toHaveText("unavailable");
+  await expect(page.getByTestId("liquidity-balance-y")).toHaveText("unavailable");
+  await expect(page.getByTestId("liquidity-paired-fill-status")).toContainText("Wallet balances are unavailable");
+  await expect(page.getByTestId("liquidity-paired-fill-apply")).toBeDisabled();
   expect((await readMockWallet(page)).sentTransactions).toEqual([]);
 });
 

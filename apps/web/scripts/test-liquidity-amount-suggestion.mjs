@@ -15,155 +15,185 @@ const server = await createServer({
 try {
   const { buildLiquidityDistribution, DISTRIBUTION_PRECISION } = await server.ssrLoadModule("@robinhood-lb/sdk/liquidity");
   const liquidityPriceModule = `/@fs/${resolve(webRoot, "../../packages/sdk/src/liquidity-price.ts")}`;
-  const { activeIdFromPriceQ128, Q128 } = await server.ssrLoadModule(liquidityPriceModule);
+  const { activeIdFromPriceQ128, priceQ128FromActiveId, Q128 } = await server.ssrLoadModule(liquidityPriceModule);
   const { suggestPairedLiquidityAmounts } = await server.ssrLoadModule("/src/liquidity-amount-suggestion.ts");
   const activeId = 8_388_608;
-
   const balanced = buildLiquidityDistribution(activeId, -1, 1, "spot");
-  const bounded = suggestPairedLiquidityAmounts({
-    balanceX: 500n,
-    balanceY: 120n,
-    binStep: 10,
-    distribution: balanced
-  });
-  assert.equal(bounded.status, "ready");
-  assert.equal(bounded.mode, "balanced");
-  assert.equal(bounded.limitingSide, "y");
-  assert.ok(bounded.amountX > 0n && bounded.amountX <= 500n);
-  assert.ok(bounded.amountY > 0n && bounded.amountY <= 120n);
-
-  const xLimited = suggestPairedLiquidityAmounts({
-    balanceX: 75n,
+  const suggest = (overrides = {}) => suggestPairedLiquidityAmounts({
+    balanceX: 10_000n,
     balanceY: 10_000n,
     binStep: 10,
-    distribution: balanced
+    distribution: balanced,
+    sourceAmount: 75n,
+    sourceSide: "x",
+    ...overrides
   });
-  assert.equal(xLimited.status, "ready");
-  assert.equal(xLimited.amountX, 75n);
-  assert.equal(xLimited.limitingSide, "x");
 
-  const spot = suggestPairedLiquidityAmounts({
+  const fromX = suggest({ sourceAmount: 75n, sourceSide: "x" });
+  assert.equal(fromX.status, "ready");
+  assert.equal(fromX.amountX, 75n, "X source must remain byte-exact");
+  assert.equal(fromX.sourceAmount, 75n);
+  assert.equal(fromX.pairedSide, "y");
+  assert.equal(fromX.amountY, fromX.pairedAmount);
+  assert.equal(fromX.clamped, false);
+
+  const fromY = suggest({ sourceAmount: 120n, sourceSide: "y" });
+  assert.equal(fromY.status, "ready");
+  assert.equal(fromY.amountY, 120n, "Y source must remain byte-exact");
+  assert.equal(fromY.sourceAmount, 120n);
+  assert.equal(fromY.pairedSide, "x");
+  assert.equal(fromY.amountX, fromY.pairedAmount);
+
+  const xToClampedY = suggest({ balanceY: 20n, sourceAmount: 500n, sourceSide: "x" });
+  assert.equal(xToClampedY.status, "ready");
+  assert.equal(xToClampedY.amountX, 500n);
+  assert.equal(xToClampedY.amountY, 20n);
+  assert.equal(xToClampedY.clamped, true);
+  assert.ok(xToClampedY.requiredPairedAmount > xToClampedY.pairedAmount);
+
+  const yToClampedX = suggest({ balanceX: 20n, sourceAmount: 500n, sourceSide: "y" });
+  assert.equal(yToClampedX.status, "ready");
+  assert.equal(yToClampedX.amountX, 20n);
+  assert.equal(yToClampedX.amountY, 500n);
+  assert.equal(yToClampedX.clamped, true);
+
+  const floorDistribution = buildLiquidityDistribution(activeId + 1, 0, 0, "spot");
+  const floorPrice = priceQ128FromActiveId(BigInt(activeId + 1), 100);
+  const xFloor = suggest({ binStep: 100, distribution: floorDistribution, sourceAmount: 101n, sourceSide: "x" });
+  assert.equal(xFloor.pairedAmount, 101n * floorPrice / Q128);
+  const yFloor = suggest({ binStep: 100, distribution: floorDistribution, sourceAmount: 101n, sourceSide: "y" });
+  assert.equal(yFloor.pairedAmount, 101n * Q128 / floorPrice);
+
+  const spot = suggest({
     balanceX: 10n ** 18n,
     balanceY: 10n ** 30n,
     binStep: 100,
-    distribution: buildLiquidityDistribution(activeId, -2, 2, "spot")
+    distribution: buildLiquidityDistribution(activeId, -2, 2, "spot"),
+    sourceAmount: 10n ** 18n
   });
-  const bidAsk = suggestPairedLiquidityAmounts({
+  const bidAsk = suggest({
     balanceX: 10n ** 18n,
     balanceY: 10n ** 30n,
     binStep: 100,
-    distribution: buildLiquidityDistribution(activeId, -2, 2, "bid-ask")
+    distribution: buildLiquidityDistribution(activeId, -2, 2, "bid-ask"),
+    sourceAmount: 10n ** 18n
   });
-  assert.equal(spot.status, "ready");
-  assert.equal(bidAsk.status, "ready");
   assert.notEqual(spot.weightedPriceQ128, bidAsk.weightedPriceQ128);
-  assert.notEqual(spot.amountY, bidAsk.amountY);
+  assert.notEqual(spot.pairedAmount, bidAsk.pairedAmount);
 
   const wethUsdcPriceQ128 = Q128 * 2_000n * 10n ** 6n / 10n ** 18n;
   const wethUsdcActiveId = Number(activeIdFromPriceQ128(wethUsdcPriceQ128, 10));
-  const wethUsdc = suggestPairedLiquidityAmounts({
+  const wethUsdcDistribution = buildLiquidityDistribution(wethUsdcActiveId, 0, 0, "spot");
+  const wethToUsdc = suggest({
     balanceX: 10n ** 18n,
+    balanceY: 2_500n * 10n ** 6n,
+    distribution: wethUsdcDistribution,
+    sourceAmount: 10n ** 18n,
+    sourceSide: "x"
+  });
+  assert.equal(wethToUsdc.amountX, 10n ** 18n);
+  assert.ok(wethToUsdc.amountY > 1_990n * 10n ** 6n && wethToUsdc.amountY < 2_010n * 10n ** 6n);
+  const usdcToWeth = suggest({
+    balanceX: 2n * 10n ** 18n,
     balanceY: 2_000n * 10n ** 6n,
-    binStep: 10,
-    distribution: buildLiquidityDistribution(wethUsdcActiveId, 0, 0, "spot")
+    distribution: wethUsdcDistribution,
+    sourceAmount: 2_000n * 10n ** 6n,
+    sourceSide: "y"
   });
-  assert.equal(wethUsdc.status, "ready");
-  assert.ok(wethUsdc.amountX > 99n * 10n ** 16n);
-  assert.ok(wethUsdc.amountX <= 10n ** 18n);
-  assert.ok(wethUsdc.amountY > 1_990n * 10n ** 6n);
-  assert.ok(wethUsdc.amountY <= 2_000n * 10n ** 6n);
+  assert.equal(usdcToWeth.amountY, 2_000n * 10n ** 6n);
+  assert.ok(usdcToWeth.amountX > 99n * 10n ** 16n && usdcToWeth.amountX < 101n * 10n ** 16n);
 
-  const dusty = suggestPairedLiquidityAmounts({
-    balanceX: 101n,
-    balanceY: 100n,
-    binStep: 10,
-    distribution: balanced
-  });
-  assert.equal(dusty.status, "ready");
-  assert.ok(dusty.amountX <= 101n);
-  assert.ok(dusty.amountY <= 100n);
-  assert.equal(
-    suggestPairedLiquidityAmounts({
-      balanceX: 1n,
-      balanceY: 1n,
-      binStep: 10,
-      distribution: buildLiquidityDistribution(activeId - 1_000, -1, 1, "spot")
-    }).reason,
-    "rounding-underflow"
-  );
+  assert.equal(suggest({ sourceAmount: null }).reason, "invalid-source-amount");
+  assert.equal(suggest({ sourceAmount: 0n }).reason, "invalid-source-amount");
+  assert.equal(suggest({ balanceX: 74n, sourceAmount: 75n }).reason, "source-balance-exceeded");
+  assert.equal(suggest({ balanceX: null }).reason, "missing-source-balance");
+  assert.equal(suggest({ balanceY: null }).reason, "missing-paired-balance");
+  assert.equal(suggest({ balanceY: 0n }).reason, "empty-paired-balance");
+  assert.equal(suggest({
+    balanceX: 1n,
+    balanceY: 1n,
+    distribution: buildLiquidityDistribution(activeId - 1_000, -1, 1, "spot"),
+    sourceAmount: 1n
+  }).reason, "rounding-underflow");
 
-  assert.deepEqual(
-    suggestPairedLiquidityAmounts({
-      balanceX: 321n,
-      balanceY: null,
-      binStep: 10,
-      distribution: buildLiquidityDistribution(activeId, 1, 3, "curve")
-    }),
-    {
-      amountX: 321n,
-      amountY: 0n,
-      limitingSide: "x",
-      mode: "token-x",
-      reason: null,
-      status: "ready",
-      weightedPriceQ128: null
-    }
-  );
-  assert.deepEqual(
-    suggestPairedLiquidityAmounts({
-      balanceX: null,
-      balanceY: 654n,
-      binStep: 10,
-      distribution: buildLiquidityDistribution(activeId, -3, -1, "curve")
-    }),
-    {
-      amountX: 0n,
-      amountY: 654n,
-      limitingSide: "y",
-      mode: "token-y",
-      reason: null,
-      status: "ready",
-      weightedPriceQ128: null
-    }
-  );
-
-  assert.equal(suggestPairedLiquidityAmounts({ balanceX: null, balanceY: 1n, binStep: 10, distribution: balanced }).reason, "missing-balance");
-  assert.equal(suggestPairedLiquidityAmounts({ balanceX: 0n, balanceY: 1n, binStep: 10, distribution: balanced }).reason, "empty-balance");
-  assert.equal(suggestPairedLiquidityAmounts({ balanceX: 1n, balanceY: 1n, binStep: 10, distribution: null }).reason, "invalid-distribution");
-  assert.equal(buildLiquidityDistribution(activeId, -34, 34, "spot").bins.length, 69);
-  assert.throws(() => buildLiquidityDistribution(activeId, -34, 35, "spot"), /between 1 and 69 bins/);
+  const oneSidedX = suggest({ distribution: buildLiquidityDistribution(activeId, 1, 3, "curve") });
+  assert.equal(oneSidedX.reason, "one-sided-range");
+  assert.equal(oneSidedX.status, "unavailable");
+  assert.equal(oneSidedX.amountX, 0n);
+  assert.equal(oneSidedX.amountY, 0n);
+  const oneSidedY = suggest({ distribution: buildLiquidityDistribution(activeId, -3, -1, "curve"), sourceSide: "y" });
+  assert.equal(oneSidedY.reason, "one-sided-range");
 
   const clone = (value) => structuredClone(value);
-  const malformedParallelWeight = clone(balanced);
-  malformedParallelWeight.distributionX[0] += 1n;
-  assert.equal(suggestPairedLiquidityAmounts({ balanceX: 1n, balanceY: 1n, binStep: 10, distribution: malformedParallelWeight }).reason, "invalid-distribution");
-  const malformedParallelDelta = clone(balanced);
-  malformedParallelDelta.deltaIds[0] -= 1n;
-  assert.equal(suggestPairedLiquidityAmounts({ balanceX: 1n, balanceY: 1n, binStep: 10, distribution: malformedParallelDelta }).reason, "invalid-distribution");
+  const invalid = (distribution, binStep = 10) => assert.equal(suggest({ binStep, distribution }).reason, "invalid-distribution");
+  invalid(null);
+  invalid(balanced, 0);
+  invalid(balanced, 65_536);
+  invalid(balanced, 1.5);
+
+  const parallelWeight = clone(balanced);
+  parallelWeight.distributionX[0] += 1n;
+  invalid(parallelWeight);
+  const parallelDelta = clone(balanced);
+  parallelDelta.deltaIds[0] -= 1n;
+  invalid(parallelDelta);
+  const unordered = clone(balanced);
+  [unordered.bins[0], unordered.bins[1]] = [unordered.bins[1], unordered.bins[0]];
+  [unordered.deltaIds[0], unordered.deltaIds[1]] = [unordered.deltaIds[1], unordered.deltaIds[0]];
+  [unordered.distributionX[0], unordered.distributionX[1]] = [unordered.distributionX[1], unordered.distributionX[0]];
+  [unordered.distributionY[0], unordered.distributionY[1]] = [unordered.distributionY[1], unordered.distributionY[0]];
+  invalid(unordered);
+  const duplicate = clone(balanced);
+  duplicate.bins[1].deltaId = duplicate.bins[0].deltaId;
+  duplicate.deltaIds[1] = duplicate.deltaIds[0];
+  duplicate.bins[1].binId = duplicate.bins[0].binId;
+  invalid(duplicate);
+  const mismatchedActive = clone(balanced);
+  mismatchedActive.bins[1].binId += 1n;
+  invalid(mismatchedActive);
+  const xBelowActive = clone(balanced);
+  xBelowActive.bins[0].distributionX = 1n;
+  xBelowActive.distributionX[0] = 1n;
+  xBelowActive.bins[1].distributionX -= 1n;
+  xBelowActive.distributionX[1] -= 1n;
+  invalid(xBelowActive);
+  const yAboveActive = clone(balanced);
+  yAboveActive.bins[2].distributionY = 1n;
+  yAboveActive.distributionY[2] = 1n;
+  yAboveActive.bins[1].distributionY -= 1n;
+  yAboveActive.distributionY[1] -= 1n;
+  invalid(yAboveActive);
+  const wrongMode = clone(balanced);
+  wrongMode.mode = "token-x";
+  invalid(wrongMode);
+  const wrongStrategy = clone(balanced);
+  wrongStrategy.strategy = "invented";
+  invalid(wrongStrategy);
   const negativeWeight = clone(balanced);
   negativeWeight.bins[0].distributionY = -1n;
   negativeWeight.distributionY[0] = -1n;
-  assert.equal(suggestPairedLiquidityAmounts({ balanceX: 1n, balanceY: 1n, binStep: 10, distribution: negativeWeight }).reason, "invalid-distribution");
-  const excessiveWeight = clone(balanced);
-  excessiveWeight.bins[0].distributionX = DISTRIBUTION_PRECISION + 1n;
-  excessiveWeight.distributionX[0] = DISTRIBUTION_PRECISION + 1n;
-  assert.equal(suggestPairedLiquidityAmounts({ balanceX: 1n, balanceY: 1n, binStep: 10, distribution: excessiveWeight }).reason, "invalid-distribution");
+  invalid(negativeWeight);
+  const badWeight = clone(balanced);
+  badWeight.bins[0].distributionY = DISTRIBUTION_PRECISION + 1n;
+  badWeight.distributionY[0] = DISTRIBUTION_PRECISION + 1n;
+  invalid(badWeight);
+  const invalidBin = clone(balanced);
+  invalidBin.bins[0].binId = 16_777_216n;
+  invalid(invalidBin);
   const seventyBins = clone(balanced);
   while (seventyBins.bins.length < 70) {
-    seventyBins.bins.push(clone(seventyBins.bins.at(-1)));
-    seventyBins.deltaIds.push(seventyBins.deltaIds.at(-1));
+    const previous = seventyBins.bins.at(-1);
+    const nextDelta = previous.deltaId + 1n;
+    seventyBins.bins.push({ ...previous, binId: previous.binId + 1n, deltaId: nextDelta, distributionX: 0n, distributionY: 0n });
+    seventyBins.deltaIds.push(nextDelta);
     seventyBins.distributionX.push(0n);
     seventyBins.distributionY.push(0n);
   }
-  assert.equal(suggestPairedLiquidityAmounts({ balanceX: 1n, balanceY: 1n, binStep: 10, distribution: seventyBins }).reason, "invalid-distribution");
-  assert.equal(suggestPairedLiquidityAmounts({ balanceX: 1n, balanceY: 1n, binStep: -1, distribution: balanced }).reason, "invalid-distribution");
-  const invalidBin = clone(balanced);
-  invalidBin.bins[0].binId = 16_777_216n;
-  assert.equal(suggestPairedLiquidityAmounts({ balanceX: 1n, balanceY: 1n, binStep: 10, distribution: invalidBin }).reason, "invalid-distribution");
-  assert.deepEqual(
-    suggestPairedLiquidityAmounts({ balanceX: 500n, balanceY: 120n, binStep: 10, distribution: balanced }),
-    bounded
-  );
+  invalid(seventyBins);
+
+  assert.equal(buildLiquidityDistribution(activeId, -34, 34, "spot").bins.length, 69);
+  assert.throws(() => buildLiquidityDistribution(activeId, -34, 35, "spot"), /between 1 and 69 bins/);
+  assert.deepEqual(suggest({ sourceAmount: 75n, sourceSide: "x" }), fromX);
 
   console.log("liquidity amount suggestion tests passed");
 } finally {
