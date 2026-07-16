@@ -46,6 +46,8 @@ test("persists canonical blocks, candles, and replay events in PostgreSQL", { sk
       amountInY: 0n,
       feeX: 0n,
       feeY: 0n,
+      protocolFeeX: 0n,
+      protocolFeeY: 0n,
       reserveX: 10n,
       reserveY: 10n,
       marketPriceQuoteE18: USD_SCALE,

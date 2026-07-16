@@ -20,7 +20,8 @@ import {
   type BlockSubmission,
   type PriceSampleVerifier,
   type PricePolicy,
-  type PositionSnapshotEvent
+  type PositionSnapshotEvent,
+  type SwapAnalyticsEvent
 } from "../src/index.js";
 
 test("serves GraphQL CORS only to exact configured browser origins", async () => {
@@ -167,6 +168,11 @@ test("builds exact 24h USD metrics and bounded OHLC candles", () => {
   assert.equal(metrics.volume24hUsdE18, 20n * USD_SCALE);
   assert.equal(metrics.fees24hUsdE18, 2n * USD_SCALE);
   assert.equal(metrics.feeToTvlE18, (2n * USD_SCALE * USD_SCALE) / (390n * USD_SCALE));
+  assert.equal(metrics.totalSwapFees24hUsdE18, 2n * USD_SCALE);
+  assert.equal(metrics.protocolSwapFees24hUsdE18, 0n);
+  assert.equal(metrics.lpNetSwapFees24hUsdE18, 2n * USD_SCALE);
+  assert.equal(metrics.lpNetSwapFeeToTvlE18, (2n * USD_SCALE * USD_SCALE) / (390n * USD_SCALE));
+  assert.equal(metrics.feeBreakdownComplete, true);
   assert.equal(metrics.priceUsdE18, 3n * USD_SCALE);
 
   const historical = engine.queryPoolMetrics({ first: 10, asOfTimestamp: 3_600 }).nodes[0];
@@ -181,7 +187,85 @@ test("builds exact 24h USD metrics and bounded OHLC candles", () => {
   assert.equal(candle.lowUsdE18, 2n * USD_SCALE);
   assert.equal(candle.closeUsdE18, 3n * USD_SCALE);
   assert.equal(candle.volumeUsdE18, 20n * USD_SCALE);
+  assert.equal(candle.feesUsdE18, 2n * USD_SCALE);
+  assert.equal(candle.totalSwapFeesUsdE18, 2n * USD_SCALE);
+  assert.equal(candle.protocolSwapFeesUsdE18, 0n);
+  assert.equal(candle.lpNetSwapFeesUsdE18, 2n * USD_SCALE);
+  assert.equal(candle.feeBreakdownComplete, true);
   assert.equal(candle.swapCount, 1);
+});
+
+test("attributes indexed total, protocol, and LP-net swap fees without guessing legacy protocol shares", () => {
+  const complete = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  complete.ingestBlock(block(1n, "0xf1", "0x00", 3_600, [{
+    ...swap(10n * UNIT, 0n, UNIT, 0n),
+    protocolFeeX: UNIT / 4n,
+    protocolFeeY: 0n
+  }], [
+    price(TOKEN_X, "x-usd", 2n * USD_SCALE, 3_600, 1n),
+    price(TOKEN_Y, "y-usd", USD_SCALE, 3_600, 1n)
+  ]));
+
+  const metrics = complete.queryPoolMetrics({ first: 10 }).nodes[0];
+  assert.equal(metrics.totalSwapFees24hUsdE18, 2n * USD_SCALE);
+  assert.equal(metrics.protocolSwapFees24hUsdE18, USD_SCALE / 2n);
+  assert.equal(metrics.lpNetSwapFees24hUsdE18, 3n * USD_SCALE / 2n);
+  assert.equal(metrics.feeBreakdownComplete, true);
+  const candle = complete.queryCandles({ pair: PAIR, interval: "hour", fromTimestamp: 3_600, toTimestamp: 3_600, first: 10 }).nodes[0];
+  assert.equal(candle.feesUsdE18, candle.totalSwapFeesUsdE18);
+  assert.equal(candle.protocolSwapFeesUsdE18, USD_SCALE / 2n);
+  assert.equal(candle.lpNetSwapFeesUsdE18, 3n * USD_SCALE / 2n);
+  assert.equal(candle.feeBreakdownComplete, true);
+
+  const legacy = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  const { protocolFeeX: _protocolFeeX, protocolFeeY: _protocolFeeY, ...legacySwap } =
+    swap(10n * UNIT, 0n, UNIT, 0n) as Extract<AnalyticsEvent, { kind: "swap" }>;
+  legacy.ingestBlock(block(1n, "0xf2", "0x00", 3_600, [legacySwap], [
+    price(TOKEN_X, "x-usd", 2n * USD_SCALE, 3_600, 1n),
+    price(TOKEN_Y, "y-usd", USD_SCALE, 3_600, 1n)
+  ]));
+  const legacyMetrics = legacy.queryPoolMetrics({ first: 10 }).nodes[0];
+  assert.equal(legacyMetrics.fees24hUsdE18, 2n * USD_SCALE);
+  assert.equal(legacyMetrics.totalSwapFees24hUsdE18, 2n * USD_SCALE);
+  assert.equal(legacyMetrics.protocolSwapFees24hUsdE18, null);
+  assert.equal(legacyMetrics.lpNetSwapFees24hUsdE18, null);
+  assert.equal(legacyMetrics.lpNetSwapFeeToTvlE18, null);
+  assert.equal(legacyMetrics.feeBreakdownComplete, false);
+  assert.equal(legacyMetrics.status, "partial");
+  const legacyCandle = legacy.queryCandles({ pair: PAIR, interval: "hour", fromTimestamp: 3_600, toTimestamp: 3_600, first: 10 }).nodes[0];
+  assert.equal(legacyCandle.totalSwapFeesUsdE18, 2n * USD_SCALE);
+  assert.equal(legacyCandle.protocolSwapFeesUsdE18, null);
+  assert.equal(legacyCandle.lpNetSwapFeesUsdE18, null);
+  assert.equal(legacyCandle.feeBreakdownComplete, false);
+  assert.equal(legacyCandle.status, "partial");
+
+  const noSwap = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  noSwap.ingestBlock(block(1n, "0xf3", "0x00", 3_600, [pairSnapshot(UNIT, UNIT)], [
+    price(TOKEN_X, "x-usd", USD_SCALE, 3_600, 1n),
+    price(TOKEN_Y, "y-usd", USD_SCALE, 3_600, 1n)
+  ]));
+  const zeroMetrics = noSwap.queryPoolMetrics({ first: 10 }).nodes[0];
+  assert.equal(zeroMetrics.totalSwapFees24hUsdE18, 0n);
+  assert.equal(zeroMetrics.protocolSwapFees24hUsdE18, 0n);
+  assert.equal(zeroMetrics.lpNetSwapFees24hUsdE18, 0n);
+  assert.equal(zeroMetrics.feeBreakdownComplete, true);
+  const zeroCandle = noSwap.queryCandles({ pair: PAIR, interval: "hour", fromTimestamp: 3_600, toTimestamp: 3_600, first: 10 }).nodes[0];
+  assert.equal(zeroCandle.totalSwapFeesUsdE18, 0n);
+  assert.equal(zeroCandle.protocolSwapFeesUsdE18, 0n);
+  assert.equal(zeroCandle.lpNetSwapFeesUsdE18, 0n);
+  assert.equal(zeroCandle.feeBreakdownComplete, true);
+});
+
+test("rejects invalid fee attribution at the canonical engine boundary", () => {
+  const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  assert.throws(
+    () => engine.ingestBlock(block(1n, "0xfa", "0x00", 3_600, [{ ...swap(UNIT, 0n, -1n, 0n) }], [])),
+    /non-negative/
+  );
+  assert.throws(
+    () => engine.ingestBlock(block(1n, "0xfb", "0x00", 3_600, [{ ...swap(UNIT, 0n, 1n, 0n), protocolFeeX: 2n }], [])),
+    /cannot exceed/
+  );
 });
 
 test("materializes minute candles, hierarchical rollups, revisions, finalization, and Monday weeks", () => {
@@ -710,7 +794,11 @@ test("serves and restores the bounded GraphQL query surface", async () => {
 
     const query = `query Metrics($first: Int!) {
       poolMetrics(first: $first) {
-        nodes { pair tvlUsdE18 volume24hUsdE18 fees24hUsdE18 status }
+        nodes {
+          pair tvlUsdE18 volume24hUsdE18 fees24hUsdE18
+          totalSwapFees24hUsdE18 protocolSwapFees24hUsdE18 lpNetSwapFees24hUsdE18
+          lpNetSwapFeeToTvlE18 feeBreakdownComplete status
+        }
         pageInfo { hasNextPage partial }
       }
     }`;
@@ -724,6 +812,11 @@ test("serves and restores the bounded GraphQL query surface", async () => {
           tvlUsdE18: "300000000000000000000",
           volume24hUsdE18: "2000000000000000000",
           fees24hUsdE18: "20000000000000000",
+          totalSwapFees24hUsdE18: "20000000000000000",
+          protocolSwapFees24hUsdE18: "0",
+          lpNetSwapFees24hUsdE18: "20000000000000000",
+          lpNetSwapFeeToTvlE18: "66666666666666",
+          feeBreakdownComplete: true,
           status: "READY"
         }
       ],
@@ -828,11 +921,11 @@ function pairSnapshot(reserveX: bigint, reserveY: bigint): AnalyticsEvent {
   return { ...identity(), kind: "pair-snapshot", reserveX, reserveY };
 }
 
-function swap(amountInX: bigint, amountInY: bigint, feeX: bigint, feeY: bigint): AnalyticsEvent {
-  return { ...identity(), kind: "swap", amountInX, amountInY, feeX, feeY, reserveX: 100n * UNIT, reserveY: 100n * UNIT };
+function swap(amountInX: bigint, amountInY: bigint, feeX: bigint, feeY: bigint): SwapAnalyticsEvent {
+  return { ...identity(), kind: "swap", amountInX, amountInY, feeX, feeY, protocolFeeX: 0n, protocolFeeY: 0n, reserveX: 100n * UNIT, reserveY: 100n * UNIT };
 }
 
-function marketSwap(marketPriceQuoteE18: bigint, amountInX: bigint): AnalyticsEvent {
+function marketSwap(marketPriceQuoteE18: bigint, amountInX: bigint): SwapAnalyticsEvent {
   return {
     ...identity(),
     kind: "swap",
@@ -840,6 +933,8 @@ function marketSwap(marketPriceQuoteE18: bigint, amountInX: bigint): AnalyticsEv
     amountInY: 0n,
     feeX: amountInX / 100n,
     feeY: 0n,
+    protocolFeeX: 0n,
+    protocolFeeY: 0n,
     reserveX: 100n * UNIT,
     reserveY: 100n * UNIT,
     marketPriceQuoteE18,

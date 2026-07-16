@@ -71,7 +71,9 @@ test("local analytics adapters produce exact canonical blocks and head-pinned po
       amountInX: 10n,
       amountInY: 0n,
       feeX: 1n,
-      feeY: 0n
+      feeY: 0n,
+      protocolFeeX: 0n,
+      protocolFeeY: 0n
     });
 
     const deposit = events.find((event) => event.kind === "deposit");
@@ -174,6 +176,8 @@ function graph(payload, state) {
           amountOutY: "7",
           totalFeeX: "1",
           totalFeeY: "0",
+          protocolFeeX: "0",
+          protocolFeeY: "0",
           activeId: "8388609",
           transactionHash: TX_SWAP
         }],

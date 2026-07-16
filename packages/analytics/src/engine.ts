@@ -58,7 +58,10 @@ interface FlowRow {
   pair: string;
   timestamp: number;
   volumeUsdE18: bigint | null;
-  feesUsdE18: bigint | null;
+  totalSwapFeesUsdE18: bigint | null;
+  protocolSwapFeesUsdE18: bigint | null;
+  lpNetSwapFeesUsdE18: bigint | null;
+  feeBreakdownComplete: boolean;
   missingPriceTokens: Set<string>;
 }
 
@@ -72,11 +75,15 @@ interface MutableCandle {
   lowUsdE18: bigint | null;
   closeUsdE18: bigint | null;
   volumeUsdE18: bigint;
-  feesUsdE18: bigint;
+  totalSwapFeesUsdE18: bigint;
+  protocolSwapFeesUsdE18: bigint;
+  lpNetSwapFeesUsdE18: bigint;
   tvlUsdE18: bigint | null;
   swapCount: number;
   missingVolumeValue: boolean;
-  missingFeeValue: boolean;
+  missingTotalSwapFeeValue: boolean;
+  missingProtocolSwapFeeValue: boolean;
+  missingLpNetSwapFeeValue: boolean;
   missingPriceTokens: Set<string>;
   firstBlock: bigint;
   lastBlock: bigint;
@@ -556,24 +563,51 @@ export class AnalyticsEngine {
 
   #applySwap(event: SwapAnalyticsEvent, pair: PairState, blockNumber: bigint, blockHash: Hex, timestamp: number): void {
     const volume = valueAmounts(pair, event.amountInX, event.amountInY, this.#priceBook, timestamp);
-    const fees = valueAmounts(pair, event.feeX, event.feeY, this.#priceBook, timestamp);
-    const missing = union(volume.missingPriceTokens, fees.missingPriceTokens, pair.missingPriceTokens);
+    const totalSwapFees = valueAmounts(pair, event.feeX, event.feeY, this.#priceBook, timestamp);
+    const feeBreakdownComplete = event.protocolFeeX !== undefined && event.protocolFeeX !== null &&
+      event.protocolFeeY !== undefined && event.protocolFeeY !== null;
+    const protocolSwapFees = feeBreakdownComplete
+      ? valueAmounts(pair, event.protocolFeeX!, event.protocolFeeY!, this.#priceBook, timestamp)
+      : null;
+    const lpNetSwapFees = feeBreakdownComplete
+      ? valueAmounts(
+          pair,
+          event.feeX - event.protocolFeeX!,
+          event.feeY - event.protocolFeeY!,
+          this.#priceBook,
+          timestamp
+        )
+      : null;
+    const missing = union(
+      volume.missingPriceTokens,
+      totalSwapFees.missingPriceTokens,
+      protocolSwapFees?.missingPriceTokens ?? new Set(),
+      lpNetSwapFees?.missingPriceTokens ?? new Set(),
+      pair.missingPriceTokens
+    );
     this.#flows.push({
       pair: pair.pair,
       timestamp,
       volumeUsdE18: volume.totalUsdE18,
-      feesUsdE18: fees.totalUsdE18,
+      totalSwapFeesUsdE18: totalSwapFees.totalUsdE18,
+      protocolSwapFeesUsdE18: protocolSwapFees?.totalUsdE18 ?? null,
+      lpNetSwapFeesUsdE18: lpNetSwapFees?.totalUsdE18 ?? null,
+      feeBreakdownComplete,
       missingPriceTokens: missing
     });
-    this.#recordPartial(missing);
+    this.#recordPartial(missing, !feeBreakdownComplete);
 
     const candle = this.#getCandle(pair, "minute", blockNumber, blockHash, timestamp);
     candle.swapCount += 1;
     candle.revision += 1;
     if (volume.totalUsdE18 === null) candle.missingVolumeValue = true;
     else candle.volumeUsdE18 += volume.totalUsdE18;
-    if (fees.totalUsdE18 === null) candle.missingFeeValue = true;
-    else candle.feesUsdE18 += fees.totalUsdE18;
+    if (totalSwapFees.totalUsdE18 === null) candle.missingTotalSwapFeeValue = true;
+    else candle.totalSwapFeesUsdE18 += totalSwapFees.totalUsdE18;
+    if (protocolSwapFees?.totalUsdE18 === null || protocolSwapFees === null) candle.missingProtocolSwapFeeValue = true;
+    else candle.protocolSwapFeesUsdE18 += protocolSwapFees.totalUsdE18;
+    if (lpNetSwapFees?.totalUsdE18 === null || lpNetSwapFees === null) candle.missingLpNetSwapFeeValue = true;
+    else candle.lpNetSwapFeesUsdE18 += lpNetSwapFees.totalUsdE18;
     addAll(candle.missingPriceTokens, missing);
   }
 
@@ -609,11 +643,15 @@ export class AnalyticsEngine {
         lowUsdE18: null,
         closeUsdE18: null,
         volumeUsdE18: 0n,
-        feesUsdE18: 0n,
+        totalSwapFeesUsdE18: 0n,
+        protocolSwapFeesUsdE18: 0n,
+        lpNetSwapFeesUsdE18: 0n,
         tvlUsdE18: null,
         swapCount: 0,
         missingVolumeValue: false,
-        missingFeeValue: false,
+        missingTotalSwapFeeValue: false,
+        missingProtocolSwapFeeValue: false,
+        missingLpNetSwapFeeValue: false,
         missingPriceTokens: new Set(),
         firstBlock: blockNumber,
         lastBlock: blockNumber,
@@ -820,18 +858,36 @@ export class AnalyticsEngine {
       price.priceUsdE18 === null ? new Set([pair.tokenX]) : new Set()
     );
     let volume = 0n;
-    let fees = 0n;
+    let totalSwapFees = 0n;
+    let protocolSwapFees = 0n;
+    let lpNetSwapFees = 0n;
     let volumePartial = false;
-    let feesPartial = false;
+    let totalSwapFeesPartial = false;
+    let protocolSwapFeesPartial = false;
+    let lpNetSwapFeesPartial = false;
+    let feeBreakdownComplete = true;
     for (const flow of flows) {
       addAll(missing, flow.missingPriceTokens);
       if (flow.volumeUsdE18 === null) volumePartial = true;
       else volume += flow.volumeUsdE18;
-      if (flow.feesUsdE18 === null) feesPartial = true;
-      else fees += flow.feesUsdE18;
+      if (flow.totalSwapFeesUsdE18 === null) totalSwapFeesPartial = true;
+      else totalSwapFees += flow.totalSwapFeesUsdE18;
+      if (flow.protocolSwapFeesUsdE18 === null) protocolSwapFeesPartial = true;
+      else protocolSwapFees += flow.protocolSwapFeesUsdE18;
+      if (flow.lpNetSwapFeesUsdE18 === null) lpNetSwapFeesPartial = true;
+      else lpNetSwapFees += flow.lpNetSwapFeesUsdE18;
+      feeBreakdownComplete &&= flow.feeBreakdownComplete;
     }
     const coveragePartial = !this.#historyCovers(cutoff, asOfTimestamp);
-    const partial = valuation.totalUsdE18 === null || price.priceUsdE18 === null || volumePartial || feesPartial || coveragePartial;
+    feeBreakdownComplete &&= !coveragePartial && !protocolSwapFeesPartial && !lpNetSwapFeesPartial;
+    const partial = valuation.totalUsdE18 === null || price.priceUsdE18 === null || volumePartial ||
+      totalSwapFeesPartial || !feeBreakdownComplete || coveragePartial;
+    const legacyFeeToTvl = totalSwapFeesPartial || coveragePartial || valuation.totalUsdE18 === null
+      ? null
+      : ratioE18(totalSwapFees, valuation.totalUsdE18);
+    const lpNetFeeToTvl = !feeBreakdownComplete || valuation.totalUsdE18 === null
+      ? null
+      : ratioE18(lpNetSwapFees, valuation.totalUsdE18);
 
     return {
       pair: pair.pair,
@@ -839,8 +895,13 @@ export class AnalyticsEngine {
       tokenY: pair.tokenY,
       tvlUsdE18: valuation.totalUsdE18,
       volume24hUsdE18: volumePartial || coveragePartial ? null : volume,
-      fees24hUsdE18: feesPartial || coveragePartial ? null : fees,
-      feeToTvlE18: feesPartial || coveragePartial || valuation.totalUsdE18 === null ? null : ratioE18(fees, valuation.totalUsdE18),
+      fees24hUsdE18: totalSwapFeesPartial || coveragePartial ? null : totalSwapFees,
+      feeToTvlE18: legacyFeeToTvl,
+      totalSwapFees24hUsdE18: totalSwapFeesPartial || coveragePartial ? null : totalSwapFees,
+      protocolSwapFees24hUsdE18: feeBreakdownComplete ? protocolSwapFees : null,
+      lpNetSwapFees24hUsdE18: feeBreakdownComplete ? lpNetSwapFees : null,
+      lpNetSwapFeeToTvlE18: lpNetFeeToTvl,
+      feeBreakdownComplete,
       priceUsdE18: price.priceUsdE18,
       asOfBlock: pair.updatedAtBlock,
       asOfTimestamp,
@@ -956,7 +1017,9 @@ function getOrCreatePositionBin(
 function finalizeCandle(candle: MutableCandle, headTimestamp: number | null): Candle {
   const partial =
     candle.missingVolumeValue ||
-    candle.missingFeeValue ||
+    candle.missingTotalSwapFeeValue ||
+    candle.missingProtocolSwapFeeValue ||
+    candle.missingLpNetSwapFeeValue ||
     candle.missingPriceTokens.size > 0 ||
     candle.tvlUsdE18 === null ||
     candle.closeUsdE18 === null;
@@ -970,7 +1033,11 @@ function finalizeCandle(candle: MutableCandle, headTimestamp: number | null): Ca
     lowUsdE18: candle.lowUsdE18,
     closeUsdE18: candle.closeUsdE18,
     volumeUsdE18: candle.missingVolumeValue ? null : candle.volumeUsdE18,
-    feesUsdE18: candle.missingFeeValue ? null : candle.feesUsdE18,
+    feesUsdE18: candle.missingTotalSwapFeeValue ? null : candle.totalSwapFeesUsdE18,
+    totalSwapFeesUsdE18: candle.missingTotalSwapFeeValue ? null : candle.totalSwapFeesUsdE18,
+    protocolSwapFeesUsdE18: candle.missingProtocolSwapFeeValue ? null : candle.protocolSwapFeesUsdE18,
+    lpNetSwapFeesUsdE18: candle.missingLpNetSwapFeeValue ? null : candle.lpNetSwapFeesUsdE18,
+    feeBreakdownComplete: !candle.missingProtocolSwapFeeValue && !candle.missingLpNetSwapFeeValue,
     tvlUsdE18: candle.tvlUsdE18,
     swapCount: candle.swapCount,
     status: partial ? "partial" : "ready",
@@ -1000,11 +1067,15 @@ function mergeCandleIntoRollup(rollup: MutableCandle, source: MutableCandle): vo
   }
   if (source.closeUsdE18 !== null) rollup.closeUsdE18 = source.closeUsdE18;
   rollup.volumeUsdE18 += source.volumeUsdE18;
-  rollup.feesUsdE18 += source.feesUsdE18;
+  rollup.totalSwapFeesUsdE18 += source.totalSwapFeesUsdE18;
+  rollup.protocolSwapFeesUsdE18 += source.protocolSwapFeesUsdE18;
+  rollup.lpNetSwapFeesUsdE18 += source.lpNetSwapFeesUsdE18;
   rollup.swapCount += source.swapCount;
   rollup.tvlUsdE18 = source.tvlUsdE18;
   rollup.missingVolumeValue ||= source.missingVolumeValue;
-  rollup.missingFeeValue ||= source.missingFeeValue;
+  rollup.missingTotalSwapFeeValue ||= source.missingTotalSwapFeeValue;
+  rollup.missingProtocolSwapFeeValue ||= source.missingProtocolSwapFeeValue;
+  rollup.missingLpNetSwapFeeValue ||= source.missingLpNetSwapFeeValue;
   addAll(rollup.missingPriceTokens, source.missingPriceTokens);
   rollup.lastBlock = source.lastBlock;
   rollup.lastBlockHash = source.lastBlockHash;
@@ -1027,11 +1098,15 @@ function createRollupCandle(
     lowUsdE18: null,
     closeUsdE18: null,
     volumeUsdE18: 0n,
-    feesUsdE18: 0n,
+    totalSwapFeesUsdE18: 0n,
+    protocolSwapFeesUsdE18: 0n,
+    lpNetSwapFeesUsdE18: 0n,
     tvlUsdE18: null,
     swapCount: 0,
     missingVolumeValue: false,
-    missingFeeValue: false,
+    missingTotalSwapFeeValue: false,
+    missingProtocolSwapFeeValue: false,
+    missingLpNetSwapFeeValue: false,
     missingPriceTokens: new Set(),
     firstBlock: source.firstBlock,
     lastBlock: source.lastBlock,
@@ -1222,6 +1297,17 @@ function validateBlock(block: BlockEnvelope): void {
     throw new Error("Block hashes must be hex strings");
   }
   for (const event of block.events) {
+    if (event.kind === "swap") {
+      if (event.feeX < 0n || event.feeY < 0n) throw new Error("Total swap fees must be non-negative");
+      if (event.protocolFeeX !== undefined && event.protocolFeeX !== null && event.protocolFeeX < 0n ||
+        event.protocolFeeY !== undefined && event.protocolFeeY !== null && event.protocolFeeY < 0n) {
+        throw new Error("Protocol swap fees must be non-negative");
+      }
+      if (event.protocolFeeX !== undefined && event.protocolFeeX !== null && event.protocolFeeX > event.feeX ||
+        event.protocolFeeY !== undefined && event.protocolFeeY !== null && event.protocolFeeY > event.feeY) {
+        throw new Error("Protocol swap fees cannot exceed total swap fees");
+      }
+    }
     if ("marketPriceQuoteE18" in event && event.marketPriceQuoteE18 !== undefined && event.marketPriceQuoteE18 !== null && event.marketPriceQuoteE18 <= 0n) {
       throw new Error("Active-bin market price must be positive when present");
     }

@@ -108,6 +108,15 @@ try {
   assert.equal(centeredDistribution[1].tokenX, "0");
   assert.equal(centeredDistribution[1].tokenY, "0");
   assert.equal(centeredDistribution[4].tokenY, "3");
+  const zeroActiveDistribution = buildCenteredBinDistribution([
+    bin("8388607", "1", "0", "1"),
+    bin("8388609", "0", "1", "1")
+  ], "8388608", 18, 18, 1);
+  assert.equal(zeroActiveDistribution.length, 3);
+  assert.equal(zeroActiveDistribution[1].active, true);
+  assert.equal(zeroActiveDistribution[1].tokenX, "0");
+  assert.equal(zeroActiveDistribution[1].tokenY, "0");
+  assert.equal(zeroActiveDistribution[1].lbSupply, "0");
   assert.throws(() => buildCenteredBinDistribution([], "8388608", 18, 18, 0), /radius/);
   assert.throws(() => buildCenteredBinDistribution([bin("1", "0", "0", "0"), bin("1", "0", "0", "0")], "1", 18, 18, 1), /Duplicate pool bin/);
   assert.throws(() => buildCenteredBinDistribution([], "16777216", 18, 18, 1), /uint24/);
@@ -167,8 +176,9 @@ function pool(address) {
 
 function metric(pair, overrides) {
   return {
-    pair, tokenX, tokenY, tvlUsdE18: "0", volume24hUsdE18: "0", lpFees24hUsdE18: null,
-    feeToTvlE18: "0", priceUsdE18: "1000000000000000000", asOfBlock: "99", asOfTimestamp: 100,
+    pair, tokenX, tokenY, tvlUsdE18: "0", volume24hUsdE18: "0", totalSwapFees24hUsdE18: "0",
+    protocolSwapFees24hUsdE18: null, lpFees24hUsdE18: null, feeToTvlE18: "0", feeBreakdownComplete: false,
+    priceUsdE18: "1000000000000000000", asOfBlock: "99", asOfTimestamp: 100,
     status: "READY", missingPriceTokens: [], ...overrides
   };
 }
@@ -177,7 +187,9 @@ function candle(startTimestamp, closeUsdE18, status) {
   return {
     pair: pairA, interval: "HOUR", startTimestamp, endTimestamp: startTimestamp + 3_600,
     openUsdE18: closeUsdE18, highUsdE18: closeUsdE18, lowUsdE18: closeUsdE18, closeUsdE18,
-    volumeUsdE18: closeUsdE18 === null ? null : "0", lpFeesUsdE18: closeUsdE18 === null ? null : "0",
+    volumeUsdE18: closeUsdE18 === null ? null : "0", totalSwapFeesUsdE18: "0",
+    protocolSwapFeesUsdE18: closeUsdE18 === null ? null : "0", lpFeesUsdE18: closeUsdE18 === null ? null : "0",
+    feeBreakdownComplete: closeUsdE18 !== null,
     tvlUsdE18: closeUsdE18, swapCount: closeUsdE18 === null ? 0 : 1, status,
     missingPriceTokens: closeUsdE18 === null ? [tokenX] : [], firstBlock: "1", lastBlock: "2"
   };

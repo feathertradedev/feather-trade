@@ -2,6 +2,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type Dispatch, type ReactNode, type SetStateAction } from "react";
 import { useAccount } from "wagmi";
 
+import { createDexPublicClient } from "@robinhood-lb/sdk/client";
 import type { DexRegistry } from "@robinhood-lb/sdk/registry";
 
 import {
@@ -23,8 +24,10 @@ import {
   loadPaginatedPositionsForOwnerPair,
   loadPositionHistory,
   loadPoolBinWindow,
+  loadPoolIndexerSnapshot,
   type BinRow,
   type LoadState,
+  type PoolIndexerSnapshot,
   type PoolRow,
   type PositionHistoryRow,
   type PositionRow
@@ -36,6 +39,7 @@ import {
   type PoolWorkspaceRow,
   type WorkspaceAnalyticsState
 } from "./pool-workspace";
+import { loadPinnedPoolEconomics, type PinnedPoolEconomics } from "./pool-economics";
 
 const WORKSPACE_REFRESH_INTERVAL_MS = 10_000;
 export type CandleStreamState = "connecting" | "live" | "stale" | "unavailable";
@@ -51,6 +55,16 @@ export interface PoolWorkspaceContextValue {
     row: PoolWorkspaceRow;
     state: WorkspaceAnalyticsState;
     stateVisible: boolean;
+  };
+  economics: {
+    error: string | null;
+    state: LoadState;
+    value: PinnedPoolEconomics | null;
+  };
+  indexerSnapshot: {
+    error: string | null;
+    state: LoadState;
+    value: PoolIndexerSnapshot | null;
   };
   bins: BinRow[];
   binsError: string | null;
@@ -84,6 +98,10 @@ export function PoolWorkspaceProvider({
 }) {
   const registry = registries[environmentKey];
   const analyticsEndpoint = analyticsEndpointForRegistry(registry);
+  const publicClient = useMemo(
+    () => createDexPublicClient(registry.chain, registry.endpoints.rpcUrl),
+    [registry]
+  );
   const queryClient = useQueryClient();
   const account = useAccount();
   const walletAddress = account.address ?? null;
@@ -186,14 +204,81 @@ export function PoolWorkspaceProvider({
     refetchOnWindowFocus: "always",
     retry: false
   });
-  const binsQuery = useQuery({
-    queryKey: ["canonicalPoolBins", environmentKey, pool.address, pool.activeId, registry.endpoints.indexerUrl],
+  const indexerSnapshotQuery = useQuery({
+    queryKey: [
+      "canonicalPoolIndexerSnapshot",
+      environmentKey,
+      pool.address,
+      pool.factoryAddress,
+      pool.tokenXAddress,
+      pool.tokenYAddress,
+      pool.binStep,
+      registry.endpoints.indexerUrl
+    ],
+    queryFn: () => loadPoolIndexerSnapshot(registry, pool),
+    enabled: registry.endpoints.indexerUrl !== null,
+    refetchInterval: registry.endpoints.indexerUrl !== null ? WORKSPACE_REFRESH_INTERVAL_MS : false,
+    refetchOnWindowFocus: "always",
+    retry: false
+  });
+  const indexerSnapshot = indexerSnapshotQuery.isError ? undefined : indexerSnapshotQuery.data;
+  const indexerSnapshotBlockNumber = indexerSnapshot?.blockNumber.toString() ?? null;
+  const indexerSnapshotBlockHash = indexerSnapshot?.blockHash ?? null;
+  const economicsQuery = useQuery({
+    queryKey: [
+      "canonicalPoolEconomics",
+      environmentKey,
+      pool.address,
+      pool.factoryAddress,
+      pool.tokenXAddress,
+      pool.tokenYAddress,
+      pool.binStep,
+      indexerSnapshotBlockNumber,
+      indexerSnapshotBlockHash,
+      indexerSnapshot?.activeId.toString() ?? null
+    ],
     queryFn: () => {
-      if (pool.activeId === null) throw new Error("Pool active bin is unavailable");
-      return loadPoolBinWindow(registry, pool.address, Number(pool.activeId));
+      const snapshot = indexerSnapshot;
+      if (snapshot === undefined) throw new Error("Pool indexer snapshot is unavailable");
+      return loadPinnedPoolEconomics(publicClient, registry, pool, snapshot);
     },
-    enabled: pool.activeId !== null && registry.endpoints.indexerUrl !== null,
-    refetchInterval: pool.activeId !== null && registry.endpoints.indexerUrl !== null ? WORKSPACE_REFRESH_INTERVAL_MS : false,
+    enabled: indexerSnapshot !== undefined,
+    refetchInterval: indexerSnapshot !== undefined ? WORKSPACE_REFRESH_INTERVAL_MS : false,
+    refetchOnWindowFocus: "always",
+    retry: false
+  });
+  const economicsValue = indexerSnapshot !== undefined && !economicsQuery.isError && economicsQuery.data !== undefined &&
+    economicsMatchesIndexerSnapshot(economicsQuery.data, indexerSnapshot)
+    ? economicsQuery.data
+    : undefined;
+  const currentActiveId = economicsValue?.activeId.toString() ?? null;
+  const economicsBlockNumber = economicsValue?.blockNumber.toString() ?? null;
+  const economicsBlockHash = economicsValue?.blockHash ?? null;
+  const binsQuery = useQuery({
+    queryKey: [
+      "canonicalPoolBins",
+      environmentKey,
+      pool.address,
+      currentActiveId,
+      economicsBlockNumber,
+      economicsBlockHash,
+      registry.endpoints.indexerUrl
+    ],
+    queryFn: () => {
+      const economics = economicsValue;
+      if (economics === undefined) throw new Error("Pinned pool economics are unavailable");
+      return loadPoolBinWindow(registry, pool.address, {
+        activeId: economics.activeId,
+        binStep: economics.binStep,
+        blockHash: economics.blockHash,
+        blockNumber: economics.blockNumber,
+        factory: economics.factory,
+        tokenX: economics.tokenX,
+        tokenY: economics.tokenY
+      });
+    },
+    enabled: currentActiveId !== null && registry.endpoints.indexerUrl !== null,
+    refetchInterval: currentActiveId !== null && registry.endpoints.indexerUrl !== null ? WORKSPACE_REFRESH_INTERVAL_MS : false,
     refetchOnWindowFocus: "always",
     retry: false
   });
@@ -240,7 +325,7 @@ export function PoolWorkspaceProvider({
   const positionsPartial = Boolean(positionsQuery.data?.pageInfo.capped || positionsQuery.data?.pageInfo.failed);
   const history = historyQuery.data?.rows ?? [];
   const historyPartial = Boolean(historyQuery.data?.pageInfo.capped || historyQuery.data?.pageInfo.failed);
-  const binsState: LoadState = registry.endpoints.indexerUrl === null || pool.activeId === null
+  const binsState: LoadState = registry.endpoints.indexerUrl === null || currentActiveId === null
     ? "unavailable"
     : binsQuery.isError
       ? "error"
@@ -275,6 +360,20 @@ export function PoolWorkspaceProvider({
             : history.length > 0
               ? "ready"
               : "empty";
+  const economicsState: LoadState = indexerSnapshotQuery.isError || economicsQuery.isError
+    ? "error"
+    : economicsValue !== undefined
+      ? "ready"
+      : indexerSnapshotQuery.isLoading || economicsQuery.isLoading || indexerSnapshotQuery.isFetching || economicsQuery.isFetching
+      ? "loading"
+      : "unavailable";
+  const indexerSnapshotState: LoadState = indexerSnapshotQuery.isError
+    ? "error"
+    : indexerSnapshot !== undefined
+      ? "ready"
+      : indexerSnapshotQuery.isLoading || indexerSnapshotQuery.isFetching
+        ? "loading"
+        : "unavailable";
   const setDraftValue = useCallback(<T,>(key: string, next: SetStateAction<T>, fallback: T) => {
     setDraftValues((current) => {
       const previous = Object.prototype.hasOwnProperty.call(current, key) ? current[key] as T : fallback;
@@ -301,11 +400,21 @@ export function PoolWorkspaceProvider({
     binsError: errorMessage(binsQuery.error),
     binsState,
     draftValues,
+    economics: {
+      error: errorMessage(indexerSnapshotQuery.error) ?? errorMessage(economicsQuery.error),
+      state: economicsState,
+      value: economicsValue ?? null
+    },
     environmentKey,
     history,
     historyError: errorMessage(historyQuery.error) ?? historyQuery.data?.pageInfo.error ?? null,
     historyPartial,
     historyState,
+    indexerSnapshot: {
+      error: errorMessage(indexerSnapshotQuery.error),
+      state: indexerSnapshotState,
+      value: indexerSnapshot ?? null
+    },
     pool,
     positions,
     positionsError: errorMessage(positionsQuery.error) ?? positionsQuery.data?.pageInfo.error ?? null,
@@ -326,12 +435,18 @@ export function PoolWorkspaceProvider({
     candlesQuery.isLoading,
     candlesQuery.isPlaceholderData,
     draftValues,
+    economicsValue,
+    economicsQuery.error,
+    economicsState,
     environmentKey,
     history,
     historyPartial,
     historyQuery.data?.pageInfo.error,
     historyQuery.error,
     historyState,
+    indexerSnapshotQuery.error,
+    indexerSnapshot,
+    indexerSnapshotState,
     metricPage,
     pool,
     positions,
@@ -372,6 +487,16 @@ export function usePoolDraftState<T>(key: string, initialValue: T): [T, Dispatch
     workspace.setDraftValue(key, next, localValue);
   }, [key, localValue, workspace]);
   return [workspace === null ? localValue : workspaceValue, setValue];
+}
+
+function economicsMatchesIndexerSnapshot(economics: PinnedPoolEconomics, snapshot: PoolIndexerSnapshot): boolean {
+  return economics.blockNumber === snapshot.blockNumber &&
+    economics.blockHash.toLowerCase() === snapshot.blockHash.toLowerCase() &&
+    economics.activeId === snapshot.activeId &&
+    economics.binStep === snapshot.binStep &&
+    economics.factory.toLowerCase() === snapshot.factory.toLowerCase() &&
+    economics.tokenX.toLowerCase() === snapshot.tokenX.toLowerCase() &&
+    economics.tokenY.toLowerCase() === snapshot.tokenY.toLowerCase();
 }
 
 function emptyAnalyticsPage<T>(status: "PARTIAL" | "UNAVAILABLE", error: string | null): AnalyticsPage<T> {

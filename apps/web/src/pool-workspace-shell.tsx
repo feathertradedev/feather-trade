@@ -7,10 +7,10 @@ import {
 } from "../../../packages/sdk/src/liquidity-price";
 
 import { formatCompactAddress, formatTokenAmount, tokenSymbol, type PoolRow } from "./data";
-import { returnHrefFromAction } from "./pool-discovery";
-import { buildCenteredBinDistribution, workspaceMetricTiles } from "./pool-workspace";
+import { returnHrefFromAction, samePairPools } from "./pool-discovery";
+import { buildCenteredBinDistribution, formatRatioPercentE18, workspaceMetricTiles } from "./pool-workspace";
 import { PoolWorkspaceProvider, usePoolWorkspace } from "./pool-workspace-context";
-import { poolWorkspaceHref, type PoolWorkspaceTask } from "./pool-workspace-route";
+import { parsePoolWorkspaceRoute, poolWorkspaceHref, type PoolWorkspaceTask } from "./pool-workspace-route";
 import type { EnvironmentKey } from "./config";
 
 const ACTION_TASKS: ReadonlyArray<{ key: Exclude<PoolWorkspaceTask, "market">; label: string }> = [
@@ -22,20 +22,22 @@ const ACTION_TASKS: ReadonlyArray<{ key: Exclude<PoolWorkspaceTask, "market">; l
 export function PoolWorkspaceShell({
   children,
   environmentKey,
-  pool
+  pool,
+  pools
 }: {
   children: ReactNode;
   environmentKey: EnvironmentKey;
   pool: PoolRow;
+  pools: PoolRow[];
 }) {
   return (
     <PoolWorkspaceProvider environmentKey={environmentKey} pool={pool}>
-      <PoolWorkspaceScaffold pool={pool}>{children}</PoolWorkspaceScaffold>
+      <PoolWorkspaceScaffold pool={pool} pools={pools}>{children}</PoolWorkspaceScaffold>
     </PoolWorkspaceProvider>
   );
 }
 
-function PoolWorkspaceScaffold({ children, pool }: { children: ReactNode; pool: PoolRow }) {
+function PoolWorkspaceScaffold({ children, pool, pools }: { children: ReactNode; pool: PoolRow; pools: PoolRow[] }) {
   const returnHref = returnHrefFromAction(window.location.hash);
 
   return (
@@ -47,6 +49,7 @@ function PoolWorkspaceScaffold({ children, pool }: { children: ReactNode; pool: 
           <strong>{tokenSymbol(pool.tokenX)} / {tokenSymbol(pool.tokenY)}</strong>
           <small>{formatCompactAddress(pool.address)} · {pool.binStep} bps/bin</small>
         </div>
+        <PoolBinStepSelector pool={pool} pools={pools} />
       </header>
       <div className="pool-workspace-body">
         <PoolWorkspaceRail />
@@ -76,15 +79,47 @@ export function PoolWorkspaceTaskTabs({ task }: { task: PoolWorkspaceTask }) {
   );
 }
 
+function PoolBinStepSelector({ pool, pools }: { pool: PoolRow; pools: PoolRow[] }) {
+  const alternatives = samePairPools(pools, pool);
+  const choices = [pool, ...alternatives].sort((left, right) => {
+    const binStepOrder = BigInt(left.binStep) < BigInt(right.binStep) ? -1 : BigInt(left.binStep) > BigInt(right.binStep) ? 1 : 0;
+    return binStepOrder !== 0 ? binStepOrder : left.address.toLowerCase().localeCompare(right.address.toLowerCase());
+  });
+  if (choices.length <= 1) return null;
+  const routeTask = parsePoolWorkspaceRoute(window.location.hash)?.task ?? "create";
+  const returnHref = returnHrefFromAction(window.location.hash);
+
+  return (
+    <label className="pool-workspace-tier-selector">
+      <span>Bin step</span>
+      <select
+        aria-label="Pool bin step"
+        data-testid="pool-bin-step-selector"
+        onChange={(event) => { window.location.hash = taskHref(event.target.value, routeTask, returnHref); }}
+        value={pool.id}
+      >
+        {choices.map((choice) => (
+          <option key={choice.id} value={choice.id}>
+            {choice.binStep} bps/bin · {formatCompactAddress(choice.address)}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
 function PoolWorkspaceRail() {
   const workspace = usePoolWorkspace();
-  const metricTiles = workspaceMetricTiles(workspace.analytics.row.metric);
+  const metricTiles = workspaceMetricTiles(workspace.analytics.row.metric).map((tile) => workspace.economics.value === null
+    ? { ...tile, status: "UNAVAILABLE" as const, value: "Unavailable" }
+    : tile);
   const tvl = metricTiles.find((tile) => tile.key === "tvl")!;
   const volume = metricTiles.find((tile) => tile.key === "volume24h")!;
   const fees = metricTiles.find((tile) => tile.key === "lpFees24h")!;
   const feeToTvl = metricTiles.find((tile) => tile.key === "feeToTvl")!;
   const [inversePrice, setInversePrice] = useState(false);
-  const currentPrice = formatCurrentPoolPrice(workspace.pool, inversePrice);
+  const currentActiveId = workspace.economics.value?.activeId.toString() ?? null;
+  const currentPrice = formatCurrentPoolPrice(workspace.pool, inversePrice, currentActiveId);
   const baseSymbol = tokenSymbol(inversePrice ? workspace.pool.tokenY : workspace.pool.tokenX);
   const quoteSymbol = tokenSymbol(inversePrice ? workspace.pool.tokenX : workspace.pool.tokenY);
   const positionsLabel = workspace.walletAddress === null
@@ -125,7 +160,7 @@ function PoolWorkspaceRail() {
             </button>
           </div>
           <strong>{currentPrice}</strong>
-          <small>{quoteSymbol} per {baseSymbol} · bin {workspace.pool.activeId ?? "unavailable"}</small>
+          <small>{quoteSymbol} per {baseSymbol} · {economicsSourceLabel(workspace)}</small>
         </div>
         <div className="pool-rail-tvl-row" data-analytics-status={tvl.status}>
           <span>
@@ -134,28 +169,36 @@ function PoolWorkspaceRail() {
           </span>
           <strong>{tvl.value}</strong>
         </div>
+        <small className="pool-rail-data-source">Analytics TVL · {metricSourceLabel(workspace.analytics.row.metric)}</small>
         <small className="pool-rail-address">{formatCompactAddress(workspace.pool.address)}</small>
       </section>
 
-      <dl className="pool-rail-reserves" aria-label="Pool token reserves">
-        <div>
-          <dt><i className="pool-token-dot token-x" />{tokenSymbol(workspace.pool.tokenX)}</dt>
-          <dd>{formatTokenAmount(workspace.pool.reserveX, workspace.pool.tokenX)}</dd>
-        </div>
-        <div>
-          <dt><i className="pool-token-dot token-y" />{tokenSymbol(workspace.pool.tokenY)}</dt>
-          <dd>{formatTokenAmount(workspace.pool.reserveY, workspace.pool.tokenY)}</dd>
-        </div>
-      </dl>
+      <section className="pool-rail-reserves">
+        <dl aria-label="Pool token reserves">
+          <div>
+            <dt><i className="pool-token-dot token-x" />{tokenSymbol(workspace.pool.tokenX)}</dt>
+            <dd>{formatSnapshotReserve(workspace.indexerSnapshot.value?.reserveX, workspace.pool.tokenX, workspace.economics.value !== null)}</dd>
+          </div>
+          <div>
+            <dt><i className="pool-token-dot token-y" />{tokenSymbol(workspace.pool.tokenY)}</dt>
+            <dd>{formatSnapshotReserve(workspace.indexerSnapshot.value?.reserveY, workspace.pool.tokenY, workspace.economics.value !== null)}</dd>
+          </div>
+        </dl>
+        <small className="pool-rail-data-source">{indexedReserveSourceLabel(workspace)}</small>
+      </section>
 
       <PoolRailLiquidityDistribution />
 
-      <dl className="pool-rail-stats">
-        <div data-analytics-status={volume.status}><dt>24h volume</dt><dd>{volume.value}</dd></div>
-        <div data-analytics-status={fees.status}><dt>24h LP fees</dt><dd>{fees.value}</dd></div>
-        <div data-analytics-status={feeToTvl.status}><dt>24h Fees / TVL</dt><dd>{feeToTvl.value}</dd></div>
-        <div><dt>Current bin</dt><dd>{workspace.pool.activeId ?? "Unavailable"}</dd></div>
-      </dl>
+      <section className="pool-rail-stats">
+        <dl aria-label="Pool analytics">
+          <div data-analytics-status={volume.status}><dt>24h volume</dt><dd>{volume.value}</dd></div>
+          <div data-analytics-status={fees.status}><dt>24h LP fees</dt><dd>{fees.value}</dd></div>
+          <div data-analytics-status={feeToTvl.status}><dt>24h LP fees / TVL</dt><dd>{feeToTvl.value}</dd></div>
+        </dl>
+        <small className="pool-rail-data-source">Analytics · {metricSourceLabel(workspace.analytics.row.metric)}</small>
+      </section>
+
+      <PoolRailFeeEconomics />
 
       {workspace.analytics.stateVisible ? (
         <div className={`pool-rail-state ${workspace.analytics.state.status.toLowerCase()}`} data-testid="pool-workspace-state" role="status">
@@ -175,6 +218,32 @@ function PoolWorkspaceRail() {
   );
 }
 
+function PoolRailFeeEconomics() {
+  const workspace = usePoolWorkspace();
+  const economics = workspace.economics.value;
+  return (
+    <section className="pool-rail-fees" data-testid="pool-fee-economics">
+      <div className="pool-rail-fees-heading">
+        <span className="pool-rail-label">Current active-bin fees</span>
+        <small>{economicsSourceLabel(workspace)}</small>
+      </div>
+      {economics === null ? (
+        <p>{workspace.economics.state === "loading" ? "Reading pinned fee state…" : workspace.economics.error ?? "Pinned fee state is unavailable."}</p>
+      ) : (
+        <dl>
+          <div><dt>Base fee</dt><dd>{formatRatioPercentE18(economics.feeRates.baseFeeRate.toString())}</dd></div>
+          <div><dt>Variable fee</dt><dd>{formatRatioPercentE18(economics.feeRates.variableFeeRate.toString())}</dd></div>
+          <div className="total"><dt>Current active-bin total</dt><dd>{formatRatioPercentE18(economics.feeRates.totalFeeRate.toString())}</dd></div>
+          <div><dt>Protocol share of fee</dt><dd>{formatFeeSharePercent(economics.feeRates.protocolShare)}</dd></div>
+          <div><dt>Protocol fee rate</dt><dd>{formatRatioPercentE18(economics.feeRates.protocolFeeRate.toString())}</dd></div>
+          <div><dt>LP net share of fee</dt><dd>{formatFeeSharePercent(10_000n - economics.feeRates.protocolShare)}</dd></div>
+          <div><dt>LP net fee rate</dt><dd>{formatRatioPercentE18(economics.feeRates.lpNetFeeRate.toString())}</dd></div>
+        </dl>
+      )}
+    </section>
+  );
+}
+
 const DISTRIBUTION_RADII = [8, 16, 24, 40] as const;
 
 function PoolRailLiquidityDistribution() {
@@ -183,16 +252,25 @@ function PoolRailLiquidityDistribution() {
   const radius = DISTRIBUTION_RADII[radiusIndex]!;
   const tokenX = tokenSymbol(workspace.pool.tokenX);
   const tokenY = tokenSymbol(workspace.pool.tokenY);
+  const currentActiveId = workspace.economics.value?.activeId.toString() ?? null;
   const distribution = useMemo(() => {
-    if (workspace.pool.activeId === null || workspace.pool.tokenX === null || workspace.pool.tokenY === null) {
-      return { error: "Pool bin identity or token decimals are unavailable.", points: null };
+    if (currentActiveId === null) {
+      return {
+        error: workspace.economics.state === "loading"
+          ? "Verifying pinned RPC market identity."
+          : distributionIdentityError(workspace.economics.error),
+        points: null
+      };
+    }
+    if (workspace.pool.tokenX === null || workspace.pool.tokenY === null) {
+      return { error: "Pool token decimals are unavailable.", points: null };
     }
     try {
       return {
         error: null,
         points: buildCenteredBinDistribution(
           workspace.bins,
-          workspace.pool.activeId,
+          currentActiveId,
           workspace.pool.tokenX.decimals,
           workspace.pool.tokenY.decimals,
           radius
@@ -201,7 +279,7 @@ function PoolRailLiquidityDistribution() {
     } catch (error) {
       return { error: error instanceof Error ? error.message : "Liquidity distribution is unavailable.", points: null };
     }
-  }, [radius, workspace.bins, workspace.pool.activeId, workspace.pool.tokenX, workspace.pool.tokenY]);
+  }, [currentActiveId, radius, workspace.bins, workspace.economics.error, workspace.economics.state, workspace.pool.tokenX, workspace.pool.tokenY]);
   const rangePercent = formatBinRangePercent(workspace.pool.binStep, radius);
 
   return (
@@ -241,15 +319,16 @@ function PoolRailLiquidityDistribution() {
           <div
             aria-label={`${tokenX} and ${tokenY} reserves across ${distribution.points.length} bins; active bin centered`}
             className="pool-rail-liquidity-bars"
-            role="img"
+            role="group"
           >
             {distribution.points.map((point) => (
               <span
-                aria-label={`Bin ${point.binId}; ${tokenX} ${point.tokenX}; ${tokenY} ${point.tokenY}${point.active ? "; active bin" : ""}`}
+                aria-hidden={point.active ? undefined : true}
+                aria-label={point.active ? `${tokenX} ${point.tokenX}; ${tokenY} ${point.tokenY}; active bin` : undefined}
                 className={point.active ? "active" : undefined}
                 data-bin-id={point.binId}
                 key={point.id}
-                role="img"
+                role={point.active ? "img" : undefined}
                 tabIndex={point.active ? 0 : undefined}
               >
                 <i className="token-x" style={{ height: `${reserveBarHeight(point.tokenX, point.tokenXHeight)}%` }} />
@@ -268,10 +347,10 @@ function PoolRailLiquidityDistribution() {
   );
 }
 
-function formatCurrentPoolPrice(pool: PoolRow, inverse: boolean): string {
-  if (pool.activeId === null || pool.tokenX === null || pool.tokenY === null) return "Unavailable";
+function formatCurrentPoolPrice(pool: PoolRow, inverse: boolean, activeId = pool.activeId): string {
+  if (activeId === null || pool.tokenX === null || pool.tokenY === null) return "Unavailable";
   try {
-    const rawPrice = priceQ128FromActiveId(BigInt(pool.activeId), BigInt(pool.binStep));
+    const rawPrice = priceQ128FromActiveId(BigInt(activeId), BigInt(pool.binStep));
     const normalized = normalizeQ128Price(rawPrice, {
       baseDecimals: pool.tokenX.decimals,
       inverse,
@@ -281,6 +360,55 @@ function formatCurrentPoolPrice(pool: PoolRow, inverse: boolean): string {
   } catch {
     return "Unavailable";
   }
+}
+
+function economicsSourceLabel(workspace: ReturnType<typeof usePoolWorkspace>): string {
+  const economics = workspace.economics.value;
+  if (economics !== null) {
+    return `RPC block ${economics.blockNumber} · indexed snapshot · ${freshnessLabel(Number(economics.blockTimestamp))}`;
+  }
+  return workspace.economics.state === "loading"
+    ? "RPC fee state loading"
+    : "Pinned RPC state unavailable";
+}
+
+function indexedReserveSourceLabel(workspace: ReturnType<typeof usePoolWorkspace>): string {
+  const snapshot = workspace.indexerSnapshot.value;
+  if (snapshot === null) {
+    return workspace.indexerSnapshot.state === "loading" ? "Indexed reserves · snapshot loading" : "Indexed reserves unavailable";
+  }
+  return `Indexed reserves · snapshot block ${snapshot.blockNumber} · last pool update block ${snapshot.updatedAtBlock}`;
+}
+
+function formatSnapshotReserve(value: string | undefined, token: PoolRow["tokenX"], decimalsVerified: boolean): string {
+  return value === undefined || token === null || !decimalsVerified ? "Unavailable" : formatTokenAmount(value, token);
+}
+
+function metricSourceLabel(metric: ReturnType<typeof usePoolWorkspace>["analytics"]["row"]["metric"]): string {
+  if (metric === null) return "source unavailable";
+  return `block ${metric.asOfBlock} · ${freshnessLabel(metric.asOfTimestamp)}`;
+}
+
+function freshnessLabel(timestamp: number): string {
+  if (!Number.isSafeInteger(timestamp) || timestamp < 0) return "freshness unavailable";
+  const age = Math.floor(Date.now() / 1_000) - timestamp;
+  if (age < -5) return "future timestamp";
+  if (age <= 5) return "just now";
+  if (age < 60) return `${age}s ago`;
+  if (age < 3_600) return `${Math.floor(age / 60)}m ago`;
+  if (age < 86_400) return `${Math.floor(age / 3_600)}h ago`;
+  return `${Math.floor(age / 86_400)}d ago`;
+}
+
+function formatFeeSharePercent(basisPoints: bigint): string {
+  return formatRatioPercentE18((basisPoints * 10n ** 14n).toString());
+}
+
+function distributionIdentityError(error: string | null): string {
+  if (error === null) return "Pinned RPC market identity is unavailable.";
+  return /allowlist|token [XY] decimals/i.test(error)
+    ? "Pool bin identity or token decimals are unavailable."
+    : error;
 }
 
 function formatBinRangePercent(binStep: string, radius: number): string {

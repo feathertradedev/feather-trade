@@ -7,7 +7,8 @@ than reconstructing history in a browser.
 The package provides:
 
 - trusted, policy-gated USD price samples;
-- exact 24-hour pool volume, fee, TVL, and fee/TVL metrics;
+- exact 24-hour pool volume, total swap fee, protocol swap fee, LP-net swap fee,
+  TVL, and LP-net fee/TVL metrics;
 - 1m, 5m, 15m, 1h, 4h, 1d, and Monday-aligned 1w OHLC/volume/fee/TVL candles;
 - bounded historical GraphQL pages plus resumable SSE candle replacements;
 - grouped owner/pair/bin balances with cost basis and realized/unrealized P&L;
@@ -18,6 +19,14 @@ The package provides:
 All USD integers use 18-decimal fixed point. Query fields become `null` and the
 row becomes `partial` when required pricing or history is unavailable; the
 engine never silently substitutes zero, a pool spot price, or a stablecoin peg.
+
+`SwapAnalyticsEvent.feeX/feeY` remain the legacy total trader-paid swap-fee
+fields for checkpoint compatibility. New adapters also supply indexed
+`protocolFeeX/protocolFeeY`; LP-net fees are exactly total minus protocol. If a
+legacy checkpoint lacks either protocol field, total fees remain queryable but
+protocol and LP-net values are `null`, `feeBreakdownComplete` is false, and the
+row is partial. Composition fees and flash-loan fees are separate event classes
+and are never included in these swap-fee metrics.
 
 Run:
 

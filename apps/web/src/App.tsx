@@ -1403,7 +1403,7 @@ function ContentView({
             );
 
         return (
-          <PoolWorkspaceShell environmentKey={environmentKey} key={detailPool.id} pool={detailPool}>
+          <PoolWorkspaceShell environmentKey={environmentKey} key={detailPool.id} pool={detailPool} pools={workspacePoolOptions}>
             {workspaceContent}
           </PoolWorkspaceShell>
         );

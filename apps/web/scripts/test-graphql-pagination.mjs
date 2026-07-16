@@ -12,6 +12,7 @@ const pairAddress = "0x2222222222222222222222222222222222222222";
 const ownerAddress = "0x3333333333333333333333333333333333333333";
 const tokenXAddress = "0x4444444444444444444444444444444444444444";
 const tokenYAddress = "0x5555555555555555555555555555555555555555";
+const pinnedBlockHash = `0x${"99".repeat(32)}`;
 
 const fixtures = {
   bins: range(501, (index) => ({
@@ -88,7 +89,7 @@ try {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = mockFetch;
 
-  const { GRAPHQL_ACTIVITY_RENDER_LIMIT, GRAPHQL_MAX_PAGES, GRAPHQL_PAGE_SIZE, loadAppSnapshot, loadPaginatedBinsForPair, loadPaginatedPositionsForOwnerPair, loadPaginatedPositionsForOwnerPairAtBlock, loadPoolBinWindow } =
+  const { GRAPHQL_ACTIVITY_RENDER_LIMIT, GRAPHQL_MAX_PAGES, GRAPHQL_PAGE_SIZE, loadAppSnapshot, loadPaginatedBinsForPair, loadPaginatedPositionsForOwnerPair, loadPaginatedPositionsForOwnerPairAtBlock, loadPoolBinWindow, loadPoolIndexerSnapshot } =
     await server.ssrLoadModule("/src/data.ts");
 
   const snapshot = await loadAppSnapshot(registry());
@@ -112,6 +113,11 @@ try {
   assert.equal(snapshot.indexer.status, "ready");
   assert.equal(snapshot.indexer.message, null);
 
+  const indexerSnapshot = await loadPoolIndexerSnapshot(registry(), snapshot.indexer.pools[0]);
+  assert.equal(indexerSnapshot.blockNumber, 123_456n);
+  assert.equal(indexerSnapshot.blockHash, pinnedBlockHash);
+  assert.equal(indexerSnapshot.activeId, 8_388_608n);
+
   const ownerPositions = await loadPaginatedPositionsForOwnerPair(registry(), ownerAddress, pairAddress);
   assert.equal(ownerPositions.rows.length, GRAPHQL_PAGE_SIZE * GRAPHQL_MAX_PAGES);
   assert.equal(ownerPositions.pageInfo.capped, true);
@@ -131,7 +137,15 @@ try {
   assert.equal(pairBins.pageInfo.capped, true);
   assert.equal(pairBins.rows.at(-1)?.binId, String(8_388_000 + GRAPHQL_PAGE_SIZE * GRAPHQL_MAX_PAGES - 1));
 
-  const binWindow = await loadPoolBinWindow(registry(), pairAddress, 8_388_250, 40);
+  const binWindow = await loadPoolBinWindow(registry(), pairAddress, {
+    activeId: 8_388_250n,
+    binStep: 10n,
+    blockHash: pinnedBlockHash,
+    blockNumber: 123_456n,
+    factory: factoryAddress,
+    tokenX: tokenXAddress,
+    tokenY: tokenYAddress
+  }, 40);
   assert.equal(binWindow.length, 81);
   assert.equal(binWindow[0]?.binId, "8388210");
   assert.equal(binWindow.at(-1)?.binId, "8388290");
@@ -336,14 +350,51 @@ async function mockFetch(url, init) {
     return jsonResponse({ data: { pairs: page(fixtures.pairs, variables) } });
   }
 
+  if (query.includes("PoolIndexerSnapshot")) {
+    const selected = fixtures.pairs[0];
+    return jsonResponse({
+      data: {
+        _meta: { block: { number: 123_456, hash: pinnedBlockHash }, hasIndexingErrors: false },
+        pair: {
+          id: String(variables.pairId).toLowerCase(),
+          address: String(variables.pairId),
+          activeId: selected.activeId,
+          binStep: selected.binStep,
+          factory: selected.factory,
+          reserveX: selected.reserveX,
+          reserveY: selected.reserveY,
+          tokenX: selected.tokenX,
+          tokenY: selected.tokenY,
+          updatedAtBlock: selected.updatedAtBlock
+        }
+      }
+    });
+  }
+
   if (query.includes("PairBinWindow")) {
     assert.equal(String(variables.pair), pairAddress.toLowerCase());
+    assert.equal(String(variables.pairId), pairAddress.toLowerCase());
+    assert.equal(Number(variables.block), 123_456);
     const minBin = BigInt(variables.minBin);
     const maxBin = BigInt(variables.maxBin);
     const bins = fixtures.bins
       .filter((bin) => BigInt(bin.binId) >= minBin && BigInt(bin.binId) <= maxBin)
       .slice(0, Number(variables.first));
-    return jsonResponse({ data: { bins } });
+    return jsonResponse({
+      data: {
+        _meta: { block: { number: 123_456, hash: pinnedBlockHash }, hasIndexingErrors: false },
+        pair: {
+          id: pairAddress.toLowerCase(),
+          address: pairAddress,
+          activeId: "8388250",
+          binStep: "10",
+          factory: { id: factoryAddress.toLowerCase() },
+          tokenX: { address: tokenXAddress },
+          tokenY: { address: tokenYAddress }
+        },
+        bins
+      }
+    });
   }
 
   if (query.includes("PairBins")) {

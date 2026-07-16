@@ -259,6 +259,8 @@ function block(index: number, blockHash: `0x${string}`, parentHash: `0x${string}
       amountInY: 0n,
       feeX: UNIT / 1_000n,
       feeY: 0n,
+      protocolFeeX: 0n,
+      protocolFeeY: 0n,
       reserveX: 100n * UNIT,
       reserveY: 200_000n * UNIT
     }]

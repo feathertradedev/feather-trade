@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-import { installMockRpc, USDC, WNATIVE, WNATIVE_USDC_PAIR } from "./fixtures/mock-rpc";
+import { installMockRpc, SECOND_WNATIVE_USDC_PAIR, USDC, WNATIVE, WNATIVE_USDC_PAIR } from "./fixtures/mock-rpc";
 import { installMockWallet, LOCALNET_CHAIN_ID } from "./fixtures/mock-wallet";
 
 async function connectWallet(page: Parameters<typeof installMockRpc>[0]) {
@@ -109,7 +109,10 @@ test("pool chart applies live candle replacements and exposes stream failure", a
       lowUsdE18: "2300000000000000000000",
       closeUsdE18: "2600000000000000000000",
       volumeUsdE18: "123000000000000000000",
-      feesUsdE18: "246000000000000000",
+      totalSwapFeesUsdE18: "300000000000000000",
+      protocolSwapFeesUsdE18: "54000000000000000",
+      lpNetSwapFeesUsdE18: "246000000000000000",
+      feeBreakdownComplete: true,
       tvlUsdE18: "500000000000000000000000",
       swapCount: 99,
       status: "READY",
@@ -188,7 +191,10 @@ test("an SSE candle crossing a 1m boundary appends without refetching historical
       lowUsdE18: "2550000000000000000000",
       closeUsdE18: "2700000000000000000000",
       volumeUsdE18: "10000000000000000000",
-      feesUsdE18: "20000000000000000",
+      totalSwapFeesUsdE18: "25000000000000000",
+      protocolSwapFeesUsdE18: "5000000000000000",
+      lpNetSwapFeesUsdE18: "20000000000000000",
+      feeBreakdownComplete: true,
       tvlUsdE18: "500000000000000000000000",
       swapCount: 1,
       status: "READY",
@@ -500,6 +506,118 @@ test("unified pool workspace preserves URL filters, analytics, actions, and acce
   await expect(page).toHaveURL(/sort=tvl/);
   await expect(page).toHaveURL(/mine=1/);
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test("pool economics uses one pinned active ID and labels every market data source", async ({ page }) => {
+  const pinnedActiveId = 8_388_611;
+  await installMockRpc(page, {
+    activeId: pinnedActiveId,
+    includePairs: true,
+    omitActivePoolBin: true,
+    pairRuntimeActiveId: pinnedActiveId,
+    poolBinCount: 5
+  });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
+
+  const fees = page.getByTestId("pool-fee-economics");
+  await expect(fees).toContainText("Current active-bin fees");
+  await expect(fees).toContainText("RPC block 42");
+  await expect(fees).toContainText("Base fee");
+  await expect(fees).toContainText("Variable fee");
+  await expect(fees).toContainText("Current active-bin total");
+  await expect(fees).toContainText("Protocol share of fee");
+  await expect(fees).toContainText("LP net fee rate");
+  await expect(page.getByTestId("pool-workspace-rail")).toContainText("Indexed reserves · snapshot block 42 · last pool update block 42");
+  await expect(page.getByTestId("pool-workspace-rail")).toContainText("Analytics · block 42");
+  const priceBlock = page.locator(".pool-rail-price-block");
+  await expect(priceBlock).toContainText("USDC per WNATIVE");
+  const forwardPrice = await priceBlock.locator("> strong").textContent();
+  await priceBlock.getByRole("button", { name: "Show price as WNATIVE per USDC" }).click();
+  await expect(priceBlock).toContainText("WNATIVE per USDC");
+  await expect(priceBlock.locator("> strong")).not.toHaveText(forwardPrice ?? "");
+  await expect(priceBlock).toContainText("RPC block 42");
+  const activeBar = page.getByTestId("pool-rail-liquidity-distribution").locator(".pool-rail-liquidity-bars > span.active");
+  await expect(activeBar).toHaveAttribute("data-bin-id", String(pinnedActiveId));
+  await expect(activeBar).toHaveAttribute("aria-label", /WNATIVE 0; USDC 0; active bin/);
+  await expect(activeBar.locator("i.token-x")).toHaveCSS("height", "0px");
+  await expect(activeBar.locator("i.token-y")).toHaveCSS("height", "0px");
+});
+
+test("liquidity distribution rejects an indexed active ID that lags the pinned RPC snapshot", async ({ page }) => {
+  await installMockRpc(page, { includePairs: true, pairRuntimeActiveId: 8_388_609, poolBinCount: 5 });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
+
+  await expect(page.getByTestId("pool-fee-economics")).toContainText("active ID differs from the indexer snapshot");
+  await expect(page.locator(".pool-rail-price-block > strong")).toHaveText("Unavailable");
+  const distribution = page.getByTestId("pool-rail-liquidity-distribution");
+  await expect(distribution).toContainText("active ID differs from the indexer snapshot");
+  await expect(distribution.locator(".pool-rail-liquidity-bars")).toHaveCount(0);
+  await expect(distribution.locator("span.active")).toHaveCount(0);
+});
+
+test("normal indexer lag uses the indexed common block instead of failing against RPC latest", async ({ page }) => {
+  await installMockRpc(page, { blockNumber: 50n, includePairs: true, indexerBlockNumber: 42n, poolBinCount: 5 });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
+
+  await expect(page.locator(".pool-rail-price-block")).toContainText("RPC block 42");
+  await expect(page.locator(".pool-rail-price-block > strong")).not.toHaveText("Unavailable");
+  await expect(page.getByTestId("pool-fee-economics")).toContainText("RPC block 42");
+  await expect(page.getByTestId("pool-rail-liquidity-distribution").locator(".pool-rail-liquidity-bars > span")).toHaveCount(33);
+});
+
+test("a background snapshot failure hides previously cached market economics", async ({ page }) => {
+  const rpc = await installMockRpc(page, { includePairs: true, poolBinCount: 5 });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
+
+  await expect(page.locator(".pool-rail-price-block > strong")).not.toHaveText("Unavailable");
+  await expect(page.getByTestId("pool-fee-economics")).toContainText("RPC block 42");
+  rpc.update({ poolIndexerSnapshotMode: "error" });
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+
+  await expect(page.getByTestId("pool-fee-economics")).toContainText("Mock pool indexer snapshot failed", { timeout: 15_000 });
+  await expect(page.locator(".pool-rail-price-block > strong")).toHaveText("Unavailable");
+  await expect(page.getByTestId("pool-rail-liquidity-distribution").locator(".pool-rail-liquidity-bars")).toHaveCount(0);
+});
+
+test("pool market fails closed when pinned RPC identity differs from the indexed pool", async ({ page }) => {
+  await installMockRpc(page, { includePairs: true, pairRuntimeBinStep: 11 });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
+
+  await expect(page.getByTestId("pool-fee-economics")).toContainText("differs from indexed bin step");
+  await expect(page.locator(".pool-rail-price-block > strong")).toHaveText("Unavailable");
+  await expect(page.locator(".pool-rail-tvl-row strong")).toHaveText("Unavailable");
+  await expect(page.locator(".pool-rail-stats dd")).toHaveText(["Unavailable", "Unavailable", "Unavailable"]);
+  await expect(page.getByTestId("pool-rail-liquidity-distribution")).toContainText("differs from indexed bin step");
+  await expect(page.getByTestId("pool-rail-liquidity-distribution").locator(".pool-rail-liquidity-bars")).toHaveCount(0);
+  await expect(page.getByTestId("pool-rail-liquidity-distribution").locator("span.active")).toHaveCount(0);
+});
+
+test("pool market fails closed when pinned token decimals differ from allowlisted metadata", async ({ page }) => {
+  await installMockRpc(page, { includePairs: true, pairRuntimeTokenXDecimals: 17 });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
+
+  await expect(page.getByTestId("pool-fee-economics")).toContainText("token X decimals");
+  await expect(page.locator(".pool-rail-price-block > strong")).toHaveText("Unavailable");
+  await expect(page.locator(".pool-rail-tvl-row strong")).toHaveText("Unavailable");
+  await expect(page.locator(".pool-rail-stats dd")).toHaveText(["Unavailable", "Unavailable", "Unavailable"]);
+  await expect(page.locator(".pool-rail-reserves dd")).toHaveText(["Unavailable", "Unavailable"]);
+  await expect(page.getByTestId("pool-rail-liquidity-distribution").locator(".pool-rail-liquidity-bars")).toHaveCount(0);
+});
+
+test("same-pair bin-step selector preserves the pool task and safe return context", async ({ page }) => {
+  await installMockRpc(page, { includePairs: true, poolCount: 2 });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap?returnTo=%23%2Fpools%3Fq%3DWNATIVE%26sort%3Dtvl`);
+
+  const selector = page.getByTestId("pool-bin-step-selector");
+  await expect(selector).toBeVisible();
+  await expect(selector.locator("option")).toHaveCount(2);
+  await expect(selector.locator("option").nth(0)).toContainText("10 bps/bin");
+  await expect(selector.locator("option").nth(1)).toContainText("11 bps/bin");
+  await selector.selectOption(SECOND_WNATIVE_USDC_PAIR.toLowerCase());
+  await expect(page).toHaveURL(new RegExp(`#/pools/${SECOND_WNATIVE_USDC_PAIR}/swap\\?returnTo=`, "i"));
+  await expect(page.getByTestId("canonical-pool-workspace")).toHaveAttribute("data-pool-id", SECOND_WNATIVE_USDC_PAIR.toLowerCase());
+  await expect(page.getByTestId("pool-action-back")).toHaveAttribute("href", /q=WNATIVE/);
+  await expect(page.getByTestId("pool-action-back")).toHaveAttribute("href", /sort=tvl/);
 });
 
 test("pool workspace fails closed for foreign-owner and stale owner analytics", async ({ page }, testInfo) => {

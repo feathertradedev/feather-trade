@@ -2758,6 +2758,30 @@ a {
   white-space: nowrap;
 }
 
+.pool-workspace-tier-selector {
+  display: grid;
+  min-width: 176px;
+  gap: 4px;
+}
+
+.pool-workspace-tier-selector > span {
+  color: var(--ink-60);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.64rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.pool-workspace-tier-selector select {
+  min-height: 34px;
+  padding: 6px 28px 6px 8px;
+  border: 1px solid var(--hairline);
+  border-radius: 3px;
+  color: var(--bone);
+  background: var(--carbon);
+  font: 0.7rem "IBM Plex Mono", ui-monospace, monospace;
+}
+
 .pool-workspace-tasks {
   display: flex;
   align-items: center;
@@ -2817,6 +2841,7 @@ a {
 .pool-rail-reserves,
 .pool-rail-liquidity,
 .pool-rail-stats,
+.pool-rail-fees,
 .pool-rail-state,
 .pool-rail-position-state {
   padding: 14px 16px;
@@ -2849,8 +2874,8 @@ a {
 .pool-rail-price-label,
 .pool-rail-tvl-row,
 .pool-rail-liquidity-heading,
-.pool-rail-reserves > div,
-.pool-rail-stats > div {
+.pool-rail-reserves > dl > div,
+.pool-rail-stats > dl > div {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -2905,6 +2930,7 @@ a {
 
 .pool-rail-price-block > small,
 .pool-rail-address,
+.pool-rail-data-source,
 .pool-rail-state small,
 .pool-rail-liquidity-heading small {
   color: var(--ink-60);
@@ -2964,6 +2990,71 @@ a {
   display: grid;
   gap: 10px;
   margin: 0;
+}
+
+.pool-rail-reserves > dl,
+.pool-rail-stats > dl {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+}
+
+.pool-rail-data-source {
+  display: block;
+  padding-top: 2px;
+  color: var(--ink-60);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.62rem;
+  line-height: 1.45;
+}
+
+.pool-rail-fees {
+  display: grid;
+  gap: 9px;
+}
+
+.pool-rail-fees-heading {
+  display: grid;
+  gap: 3px;
+}
+
+.pool-rail-fees-heading small,
+.pool-rail-fees > p {
+  margin: 0;
+  color: var(--ink-60);
+  font-size: 0.66rem;
+  line-height: 1.45;
+}
+
+.pool-rail-fees dl {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+
+.pool-rail-fees dl > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.pool-rail-fees dt,
+.pool-rail-fees dd {
+  margin: 0;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.68rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.pool-rail-fees dt {
+  color: var(--ink-60);
+}
+
+.pool-rail-fees .total {
+  padding-block: 6px;
+  border-block: 1px solid rgb(233 236 231 / 8%);
+  color: var(--bone-bright);
 }
 
 .pool-rail-reserves dt {

@@ -784,6 +784,9 @@ function mapCandle(value: Candle) {
     closeUsdE18: nullableBigIntString(value.closeUsdE18),
     volumeUsdE18: nullableBigIntString(value.volumeUsdE18),
     feesUsdE18: nullableBigIntString(value.feesUsdE18),
+    totalSwapFeesUsdE18: nullableBigIntString(value.totalSwapFeesUsdE18),
+    protocolSwapFeesUsdE18: nullableBigIntString(value.protocolSwapFeesUsdE18),
+    lpNetSwapFeesUsdE18: nullableBigIntString(value.lpNetSwapFeesUsdE18),
     tvlUsdE18: nullableBigIntString(value.tvlUsdE18),
     firstBlock: value.firstBlock.toString(),
     lastBlock: value.lastBlock.toString()

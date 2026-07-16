@@ -35,6 +35,23 @@ export interface VariableFeeParameters {
   timeOfLastUpdate: bigint;
 }
 
+export interface CurrentFeeRateInput {
+  activeId: bigint;
+  binStep: bigint;
+  blockTimestamp: bigint;
+  staticFees: StaticFeeParameters;
+  variableFees: VariableFeeParameters;
+}
+
+export interface CurrentFeeRates {
+  baseFeeRate: bigint;
+  variableFeeRate: bigint;
+  totalFeeRate: bigint;
+  protocolFeeRate: bigint;
+  lpNetFeeRate: bigint;
+  protocolShare: bigint;
+}
+
 export interface LiquidityReviewBinState {
   binId: bigint;
   priceQ128: bigint;
@@ -375,6 +392,51 @@ function totalFee(
   const result = baseFee + variableFee;
   if (result > LB_MAX_FEE) throw new Error("Pinned LB total fee exceeds the protocol maximum");
   return result;
+}
+
+/** Mirrors the pair's read-only current active-bin fee calculation at a pinned block. */
+export function quoteCurrentFeeRates(input: CurrentFeeRateInput): CurrentFeeRates {
+  const { activeId, binStep, blockTimestamp, staticFees, variableFees } = input;
+  assertUint(activeId, MAX_UINT24, "activeId");
+  assertUint(binStep, 65_535n, "binStep");
+  if (binStep === 0n) throw new Error("binStep must be greater than zero");
+  assertUint(blockTimestamp, (1n << 40n) - 1n, "blockTimestamp");
+  validateFeeParameters(staticFees, variableFees);
+  const maximumProduct = staticFees.maxVolatilityAccumulator * binStep;
+  const configuredMaximumFee = staticFees.baseFactor * binStep * 10_000_000_000n +
+    (staticFees.variableFeeControl === 0n ? 0n : (maximumProduct * maximumProduct * staticFees.variableFeeControl + 99n) / 100n);
+  if (configuredMaximumFee > LB_MAX_FEE) throw new Error("Configured LB maximum fee exceeds the protocol limit");
+  if (blockTimestamp < variableFees.timeOfLastUpdate) throw new Error("Pinned block timestamp predates the pair fee state");
+  const dt = blockTimestamp - variableFees.timeOfLastUpdate;
+  let idReference = variableFees.idReference;
+  let volatilityReference = variableFees.volatilityReference;
+  if (dt >= staticFees.filterPeriod) {
+    idReference = activeId;
+    volatilityReference = dt < staticFees.decayPeriod
+      ? variableFees.volatilityAccumulator * staticFees.reductionFactor / LB_BASIS_POINT_MAX
+      : 0n;
+  }
+  const deltaId = activeId > idReference ? activeId - idReference : idReference - activeId;
+  const volatilityAccumulator = min(
+    volatilityReference + deltaId * LB_BASIS_POINT_MAX,
+    staticFees.maxVolatilityAccumulator
+  );
+  const baseFee = staticFees.baseFactor * binStep * 10_000_000_000n;
+  const product = volatilityAccumulator * binStep;
+  const variableFee = staticFees.variableFeeControl === 0n
+    ? 0n
+    : (product * product * staticFees.variableFeeControl + 99n) / 100n;
+  const totalFeeRate = baseFee + variableFee;
+  if (totalFeeRate > LB_MAX_FEE) throw new Error("Pinned LB total fee exceeds the protocol maximum");
+  const protocolFeeRate = totalFeeRate * staticFees.protocolShare / LB_BASIS_POINT_MAX;
+  return {
+    baseFeeRate: baseFee,
+    variableFeeRate: variableFee,
+    totalFeeRate,
+    protocolFeeRate,
+    lpNetFeeRate: totalFeeRate - protocolFeeRate,
+    protocolShare: staticFees.protocolShare
+  };
 }
 
 function compositionFee(amountWithFees: bigint, fee: bigint): bigint {

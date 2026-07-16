@@ -60,8 +60,14 @@ export interface SwapAnalyticsEvent extends PairIdentity, PairMarketObservation 
   kind: "swap";
   amountInX: bigint;
   amountInY: bigint;
+  /** Legacy checkpoint field: the total trader-paid swap fee in token X. */
   feeX: bigint;
+  /** Legacy checkpoint field: the total trader-paid swap fee in token Y. */
   feeY: bigint;
+  /** Indexed protocol share of feeX. Missing on legacy checkpoints. */
+  protocolFeeX?: bigint | null;
+  /** Indexed protocol share of feeY. Missing on legacy checkpoints. */
+  protocolFeeY?: bigint | null;
   reserveX: bigint;
   reserveY: bigint;
 }
@@ -131,7 +137,12 @@ export interface Candle {
   lowUsdE18: bigint | null;
   closeUsdE18: bigint | null;
   volumeUsdE18: bigint | null;
+  /** @deprecated Total trader-paid swap fees. Use totalSwapFeesUsdE18. */
   feesUsdE18: bigint | null;
+  totalSwapFeesUsdE18: bigint | null;
+  protocolSwapFeesUsdE18: bigint | null;
+  lpNetSwapFeesUsdE18: bigint | null;
+  feeBreakdownComplete: boolean;
   tvlUsdE18: bigint | null;
   swapCount: number;
   status: AnalyticsStatus;
@@ -152,8 +163,15 @@ export interface PoolMetrics {
   tokenY: string;
   tvlUsdE18: bigint | null;
   volume24hUsdE18: bigint | null;
+  /** @deprecated Total trader-paid swap fees. Use totalSwapFees24hUsdE18. */
   fees24hUsdE18: bigint | null;
+  /** @deprecated Total trader-paid fee / TVL. Use lpNetSwapFeeToTvlE18 for LP economics. */
   feeToTvlE18: bigint | null;
+  totalSwapFees24hUsdE18: bigint | null;
+  protocolSwapFees24hUsdE18: bigint | null;
+  lpNetSwapFees24hUsdE18: bigint | null;
+  lpNetSwapFeeToTvlE18: bigint | null;
+  feeBreakdownComplete: boolean;
   priceUsdE18: bigint | null;
   asOfBlock: bigint;
   asOfTimestamp: number;

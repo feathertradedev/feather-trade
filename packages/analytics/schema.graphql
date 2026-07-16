@@ -28,8 +28,13 @@ type PoolMetrics {
   tokenY: ID!
   tvlUsdE18: BigInt
   volume24hUsdE18: BigInt
-  fees24hUsdE18: BigInt
-  feeToTvlE18: BigInt
+  fees24hUsdE18: BigInt @deprecated(reason: "Total trader-paid swap fees; use totalSwapFees24hUsdE18")
+  feeToTvlE18: BigInt @deprecated(reason: "Total trader-paid swap fee / TVL; use lpNetSwapFeeToTvlE18 for LP economics")
+  totalSwapFees24hUsdE18: BigInt
+  protocolSwapFees24hUsdE18: BigInt
+  lpNetSwapFees24hUsdE18: BigInt
+  lpNetSwapFeeToTvlE18: BigInt
+  feeBreakdownComplete: Boolean!
   priceUsdE18: BigInt
   asOfBlock: BigInt!
   asOfTimestamp: Int!
@@ -52,7 +57,11 @@ type Candle {
   lowUsdE18: BigInt
   closeUsdE18: BigInt
   volumeUsdE18: BigInt
-  feesUsdE18: BigInt
+  feesUsdE18: BigInt @deprecated(reason: "Total trader-paid swap fees; use totalSwapFeesUsdE18")
+  totalSwapFeesUsdE18: BigInt
+  protocolSwapFeesUsdE18: BigInt
+  lpNetSwapFeesUsdE18: BigInt
+  feeBreakdownComplete: Boolean!
   tvlUsdE18: BigInt
   swapCount: Int!
   status: AnalyticsStatus!

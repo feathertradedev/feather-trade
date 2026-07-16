@@ -36,9 +36,12 @@ try {
   assert.equal(metrics.pageInfo.pagesLoaded, 2);
   assert.deepEqual(metrics.rows.map((row) => row.pair), [pairB, pairA]);
   assert.equal(metrics.rows[0].lpFees24hUsdE18, null);
+  assert.equal(metrics.rows[0].feeBreakdownComplete, false);
   assert.equal(metrics.rows[0].volume24hUsdE18, "0");
   assert.equal(metrics.rows[1].lpFees24hUsdE18, "0");
-  assert.equal("protocolFees24hUsdE18" in metrics.rows[1], false);
+  assert.equal(metrics.rows[1].totalSwapFees24hUsdE18, "0");
+  assert.equal(metrics.rows[1].protocolSwapFees24hUsdE18, "0");
+  assert.equal(metrics.rows[1].feeBreakdownComplete, true);
 
   const capped = await loadPoolMetrics(endpoint, [pairA, pairB], undefined, { pageSize: 1, maxPages: 1 });
   assert.equal(capped.status, "PARTIAL");
@@ -55,6 +58,8 @@ try {
   assert.equal(candles.status, "PARTIAL");
   assert.deepEqual(candles.rows.map((row) => row.startTimestamp), [3_600, 7_200]);
   assert.equal(candles.rows[0].lpFeesUsdE18, "0");
+  assert.equal(candles.rows[0].totalSwapFeesUsdE18, "0");
+  assert.equal(candles.rows[0].protocolSwapFeesUsdE18, "0");
   assert.equal(candles.rows[1].openUsdE18, null);
   assert.deepEqual(candles.rows[1].missingPriceTokens, [tokenX]);
   assert.equal(candles.streamCursor, "7");
@@ -116,7 +121,9 @@ function metric(pair, status) {
   const partial = status === "PARTIAL";
   return {
     pair: pair.toUpperCase().replace("0X", "0x"), tokenX, tokenY, tvlUsdE18: partial ? null : "100", volume24hUsdE18: "0",
-    fees24hUsdE18: partial ? null : "0", feeToTvlE18: partial ? null : "0", priceUsdE18: partial ? null : "1",
+    totalSwapFees24hUsdE18: "0", protocolSwapFees24hUsdE18: partial ? null : "0",
+    lpNetSwapFees24hUsdE18: partial ? null : "0", lpNetSwapFeeToTvlE18: partial ? null : "0",
+    feeBreakdownComplete: !partial, priceUsdE18: partial ? null : "1",
     asOfBlock: "99", asOfTimestamp: 9_000, status, missingPriceTokens: partial ? [tokenX] : []
   };
 }
@@ -126,7 +133,8 @@ function candle(startTimestamp, status) {
   return {
     pair: pairA, interval: "HOUR", startTimestamp, endTimestamp: startTimestamp + 3_600,
     openUsdE18: partial ? null : "10", highUsdE18: partial ? null : "12", lowUsdE18: partial ? null : "9", closeUsdE18: partial ? null : "11",
-    volumeUsdE18: partial ? null : "0", feesUsdE18: partial ? null : "0", tvlUsdE18: partial ? null : "100",
+    volumeUsdE18: partial ? null : "0", totalSwapFeesUsdE18: "0", protocolSwapFeesUsdE18: partial ? null : "0",
+    lpNetSwapFeesUsdE18: partial ? null : "0", feeBreakdownComplete: !partial, tvlUsdE18: partial ? null : "100",
     swapCount: partial ? 0 : 1, status, missingPriceTokens: partial ? [tokenX] : [], firstBlock: "90", lastBlock: "99",
     firstBlockHash: `0x${"9".repeat(64)}`, lastBlockHash: `0x${"a".repeat(64)}`, finalized: true, revision: 3,
     priceSource: "active-bin-quote-usd", quoteToken: tokenY

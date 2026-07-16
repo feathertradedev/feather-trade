@@ -111,7 +111,9 @@ export interface MockRpcOptions {
   pairAddress?: string;
   pairBinStep?: string;
   pairRuntimeBinStep?: number;
+  pairRuntimeActiveId?: number;
   pairRuntimeTokenX?: Address;
+  pairRuntimeTokenXDecimals?: number;
   pairRuntimeTokenY?: Address;
   pairTokenX?: string;
   pairTokenXAfterReceipt?: string;
@@ -125,6 +127,7 @@ export interface MockRpcOptions {
   poolCount?: number;
   poolBinCount?: number;
   poolBinsMode?: "ready" | "error";
+  poolIndexerSnapshotMode?: "ready" | "error";
   quoteMode?: "ready" | "error" | "no-route";
   quoteDelayMs?: number;
   quoteDelayMsAfterReceipt?: number;
@@ -198,12 +201,14 @@ interface GraphRequest {
   variables?: {
     after?: string | null;
     asOfTimestamp?: number;
+    block?: number;
     first?: number;
     fromTimestamp?: number;
     id?: string;
     interval?: "ONE_MINUTE" | "FIVE_MINUTES" | "FIFTEEN_MINUTES" | "HOUR" | "FOUR_HOURS" | "DAY" | "WEEK";
     owner?: string;
     pair?: string;
+    pairId?: string;
     skip?: number;
     toTimestamp?: number;
   };
@@ -323,8 +328,11 @@ function mockAnalyticsResponse(body: GraphRequest, options: MockRpcOptions): Rec
       tokenY: metadata.tokenY.toLowerCase(),
       tvlUsdE18: partial ? null : String((500_000n - BigInt(index) * 10_000n) * 10n ** 18n),
       volume24hUsdE18: String((120_000n - BigInt(index) * 1_000n) * 10n ** 18n),
-      fees24hUsdE18: String((240n - BigInt(index)) * 10n ** 18n),
-      feeToTvlE18: partial ? null : "480000000000000",
+      totalSwapFees24hUsdE18: String((300n - BigInt(index)) * 10n ** 18n),
+      protocolSwapFees24hUsdE18: String((60n - BigInt(index)) * 10n ** 18n),
+      lpNetSwapFees24hUsdE18: String((240n - BigInt(index)) * 10n ** 18n),
+      lpNetSwapFeeToTvlE18: partial ? null : "480000000000000",
+      feeBreakdownComplete: true,
       priceUsdE18: "2500000000000000000",
       asOfBlock: String(options.analyticsAsOfBlock ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER),
       asOfTimestamp: 1_720_000_000,
@@ -360,7 +368,10 @@ function mockAnalyticsResponse(body: GraphRequest, options: MockRpcOptions): Rec
         lowUsdE18: partial && index === 0 ? null : (open - 2_000_000_000_000_000n).toString(),
         closeUsdE18: partial && index === 0 ? null : close.toString(),
         volumeUsdE18: String((10_000n + BigInt(index) * 100n) * 10n ** 18n),
-        feesUsdE18: String((20n + BigInt(index)) * 10n ** 18n),
+        totalSwapFeesUsdE18: String((25n + BigInt(index)) * 10n ** 18n),
+        protocolSwapFeesUsdE18: String(5n * 10n ** 18n),
+        lpNetSwapFeesUsdE18: String((20n + BigInt(index)) * 10n ** 18n),
+        feeBreakdownComplete: true,
         tvlUsdE18: String(500_000n * 10n ** 18n),
         swapCount: 20 + index,
         status: partial && index === 0 ? "PARTIAL" : "READY",
@@ -474,6 +485,25 @@ function mockGraphResponse(body: GraphRequest, options: MockRpcOptions): Record<
     };
   }
 
+  if (query.includes("PoolIndexerSnapshot")) {
+    if (options.poolIndexerSnapshotMode === "error") {
+      return { errors: [{ message: "Mock pool indexer snapshot failed" }] };
+    }
+    const requestedPair = typeof body.variables?.pairId === "string" ? body.variables.pairId : WNATIVE_USDC_PAIR;
+    return {
+      data: {
+        _meta: {
+          block: {
+            hash: options.indexerBlockHash ?? options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222",
+            number: Number(options.indexerBlockNumber ?? DEFAULT_BLOCK_NUMBER)
+          },
+          hasIndexingErrors: options.indexerHasErrors ?? false
+        },
+        pair: mockPairByAddress(options, requestedPair)
+      }
+    };
+  }
+
   if (query.includes("PairById")) {
     if (options.pairByIdMode === "error") return { errors: [{ message: "Mock pair lookup failed" }] };
     const pair = typeof body.variables?.id === "string" ? mockPairByAddress(options, body.variables.id) : null;
@@ -494,7 +524,20 @@ function mockGraphResponse(body: GraphRequest, options: MockRpcOptions): Record<
     const bins = Array.from({ length: count }, (_, index) => mockBin(options, index, count)).filter(
       (bin) => options.omitActivePoolBin !== true || bin.binId !== activeIdFor(options).toString()
     );
-    return { data: { bins } };
+    const requestedPair = typeof body.variables?.pairId === "string" ? body.variables.pairId : WNATIVE_USDC_PAIR;
+    return {
+      data: {
+        _meta: {
+          block: {
+            hash: options.indexerBlockHash ?? options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222",
+            number: Number(options.indexerBlockNumber ?? body.variables?.block ?? DEFAULT_BLOCK_NUMBER)
+          },
+          hasIndexingErrors: options.indexerHasErrors ?? false
+        },
+        pair: mockPairByAddress(options, requestedPair),
+        bins
+      }
+    };
   }
   if (query.includes("PairBins")) {
     const skip = body.variables?.skip ?? 0;
@@ -741,7 +784,11 @@ async function handleEthCall(
   }
 
   if (functionName === "decimals") {
-    return encodeFunctionResult({ abi: erc20Abi, functionName, result: 18 });
+    const tokenX = options.pairRuntimeTokenX ?? options.pairTokenX ?? WNATIVE;
+    const result = addressEquals(call.to ?? "", tokenX)
+      ? options.pairRuntimeTokenXDecimals ?? 18
+      : 18;
+    return encodeFunctionResult({ abi: erc20Abi, functionName, result });
   }
 
   if (functionName === "symbol") {
@@ -861,7 +908,9 @@ async function handleEthCall(
 
   if (functionName === "getActiveId") {
     const createdPair = options.createdPairAddress ?? CREATED_WETH_USDT_PAIR;
-    const result = state.creationConfirmed && addressEquals(call.to ?? "", createdPair) ? state.createdActiveId! : activeIdFor(options);
+    const result = state.creationConfirmed && addressEquals(call.to ?? "", createdPair)
+      ? state.createdActiveId!
+      : options.pairRuntimeActiveId ?? activeIdFor(options);
     return encodeFunctionResult({ abi: lbPairAbi, functionName, result });
   }
 

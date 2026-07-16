@@ -33,9 +33,11 @@ export interface PoolAnalyticsMetric {
   tokenY: Address;
   tvlUsdE18: string | null;
   volume24hUsdE18: string | null;
-  /** Existing analytics-schema fee value; LP-net only. No protocol-fee amount is inferred. */
+  totalSwapFees24hUsdE18: string | null;
+  protocolSwapFees24hUsdE18: string | null;
   lpFees24hUsdE18: string | null;
   feeToTvlE18: string | null;
+  feeBreakdownComplete: boolean;
   priceUsdE18: string | null;
   asOfBlock: string;
   asOfTimestamp: number;
@@ -53,8 +55,10 @@ export interface PairCandle {
   lowUsdE18: string | null;
   closeUsdE18: string | null;
   volumeUsdE18: string | null;
-  /** Existing analytics-schema fee value; LP-net only. No protocol-fee amount is inferred. */
+  totalSwapFeesUsdE18: string | null;
+  protocolSwapFeesUsdE18: string | null;
   lpFeesUsdE18: string | null;
+  feeBreakdownComplete: boolean;
   tvlUsdE18: string | null;
   swapCount: number;
   status: AnalyticsStatus;
@@ -170,7 +174,11 @@ export function isCandleStreamStale(lastActivityAt: number, now: number): boolea
 const POOL_METRICS_QUERY = `
   query WebPoolMetrics($first: Int!, $after: String, $asOfTimestamp: Int) {
     poolMetrics(first: $first, after: $after, asOfTimestamp: $asOfTimestamp) {
-      nodes { pair tokenX tokenY tvlUsdE18 volume24hUsdE18 fees24hUsdE18 feeToTvlE18 priceUsdE18 asOfBlock asOfTimestamp status missingPriceTokens }
+      nodes {
+        pair tokenX tokenY tvlUsdE18 volume24hUsdE18
+        totalSwapFees24hUsdE18 protocolSwapFees24hUsdE18 lpNetSwapFees24hUsdE18 lpNetSwapFeeToTvlE18 feeBreakdownComplete
+        priceUsdE18 asOfBlock asOfTimestamp status missingPriceTokens
+      }
       pageInfo { endCursor hasNextPage partial }
     }
   }
@@ -179,7 +187,11 @@ const POOL_METRICS_QUERY = `
 const PAIR_CANDLES_QUERY = `
   query WebPairCandles($pair: ID!, $interval: CandleInterval!, $fromTimestamp: Int!, $toTimestamp: Int!, $first: Int!, $after: String) {
     pairCandles(pair: $pair, interval: $interval, fromTimestamp: $fromTimestamp, toTimestamp: $toTimestamp, first: $first, after: $after) {
-      nodes { pair interval startTimestamp endTimestamp openUsdE18 highUsdE18 lowUsdE18 closeUsdE18 volumeUsdE18 feesUsdE18 tvlUsdE18 swapCount status missingPriceTokens firstBlock lastBlock firstBlockHash lastBlockHash finalized revision priceSource quoteToken }
+      nodes {
+        pair interval startTimestamp endTimestamp openUsdE18 highUsdE18 lowUsdE18 closeUsdE18 volumeUsdE18
+        totalSwapFeesUsdE18 protocolSwapFeesUsdE18 lpNetSwapFeesUsdE18 feeBreakdownComplete
+        tvlUsdE18 swapCount status missingPriceTokens firstBlock lastBlock firstBlockHash lastBlockHash finalized revision priceSource quoteToken
+      }
       pageInfo { endCursor hasNextPage partial }
       streamCursor
     }
@@ -356,13 +368,16 @@ function parsePoolMetric(value: unknown): PoolAnalyticsMetric {
     pair: parseAddress(row.pair), tokenX: parseAddress(row.tokenX), tokenY: parseAddress(row.tokenY),
     tvlUsdE18: parseNullableDecimal(row.tvlUsdE18, "tvlUsdE18"),
     volume24hUsdE18: parseNullableDecimal(row.volume24hUsdE18, "volume24hUsdE18"),
-    lpFees24hUsdE18: parseNullableDecimal(row.fees24hUsdE18, "fees24hUsdE18"),
-    feeToTvlE18: parseNullableDecimal(row.feeToTvlE18, "feeToTvlE18"),
+    totalSwapFees24hUsdE18: parseNullableDecimal(row.totalSwapFees24hUsdE18, "totalSwapFees24hUsdE18"),
+    protocolSwapFees24hUsdE18: parseNullableDecimal(row.protocolSwapFees24hUsdE18, "protocolSwapFees24hUsdE18"),
+    lpFees24hUsdE18: parseNullableDecimal(row.lpNetSwapFees24hUsdE18, "lpNetSwapFees24hUsdE18"),
+    feeToTvlE18: parseNullableDecimal(row.lpNetSwapFeeToTvlE18, "lpNetSwapFeeToTvlE18"),
+    feeBreakdownComplete: parseBoolean(row.feeBreakdownComplete, "feeBreakdownComplete"),
     priceUsdE18: parseNullableDecimal(row.priceUsdE18, "priceUsdE18"),
     asOfBlock: parseDecimal(row.asOfBlock, "asOfBlock"), asOfTimestamp: parseSafeInteger(row.asOfTimestamp, "asOfTimestamp"),
     status, missingPriceTokens
   };
-  if (status === "READY" && (missingPriceTokens.length > 0 || Object.values(result).some((item) => item === null))) {
+  if (status === "READY" && (!result.feeBreakdownComplete || missingPriceTokens.length > 0 || Object.values(result).some((item) => item === null))) {
     throw new Error(`READY pool metrics are incomplete for ${result.pair}`);
   }
   return result;
@@ -390,10 +405,13 @@ function parseCandle(value: unknown, pair: Address, interval: CandleInterval, fr
   if (BigInt(firstBlock) > BigInt(lastBlock)) throw new Error("Candle block range is reversed");
   const status = parseStatus(row.status);
   const missingPriceTokens = parseAddresses(row.missingPriceTokens, "missingPriceTokens");
-  if (status === "READY" && (missingPriceTokens.length > 0 || ohlc[0] === null)) throw new Error("READY candle is incomplete");
-  return {
+  const result: PairCandle = {
     pair, interval, startTimestamp, endTimestamp, openUsdE18: ohlc[0], highUsdE18: ohlc[1], lowUsdE18: ohlc[2], closeUsdE18: ohlc[3],
-    volumeUsdE18: parseNullableDecimal(row.volumeUsdE18, "volumeUsdE18"), lpFeesUsdE18: parseNullableDecimal(row.feesUsdE18, "feesUsdE18"),
+    volumeUsdE18: parseNullableDecimal(row.volumeUsdE18, "volumeUsdE18"),
+    totalSwapFeesUsdE18: parseNullableDecimal(row.totalSwapFeesUsdE18, "totalSwapFeesUsdE18"),
+    protocolSwapFeesUsdE18: parseNullableDecimal(row.protocolSwapFeesUsdE18, "protocolSwapFeesUsdE18"),
+    lpFeesUsdE18: parseNullableDecimal(row.lpNetSwapFeesUsdE18, "lpNetSwapFeesUsdE18"),
+    feeBreakdownComplete: parseBoolean(row.feeBreakdownComplete, "feeBreakdownComplete"),
     tvlUsdE18: parseNullableDecimal(row.tvlUsdE18, "tvlUsdE18"), swapCount: parseSafeInteger(row.swapCount, "swapCount"), status,
     missingPriceTokens,
     firstBlock,
@@ -405,6 +423,12 @@ function parseCandle(value: unknown, pair: Address, interval: CandleInterval, fr
     priceSource: parseString(row.priceSource, "priceSource"),
     quoteToken: parseAddress(row.quoteToken)
   };
+  if (status === "READY" && (
+    missingPriceTokens.length > 0 || ohlc[0] === null || !result.feeBreakdownComplete ||
+    result.volumeUsdE18 === null || result.totalSwapFeesUsdE18 === null ||
+    result.protocolSwapFeesUsdE18 === null || result.lpFeesUsdE18 === null || result.tvlUsdE18 === null
+  )) throw new Error("READY candle is incomplete");
+  return result;
 }
 
 function parseHealth(value: unknown): AnalyticsHealth {

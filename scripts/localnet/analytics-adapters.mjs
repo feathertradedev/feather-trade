@@ -28,7 +28,7 @@ const BLOCK_QUERY = `
       tokenY { id address }
     }
     swaps(first: 1000, block: { number: $block }, where: { blockNumber: $blockNumber }) {
-      id pair { id } activeId amountInX amountInY amountOutX amountOutY totalFeeX totalFeeY
+      id pair { id } activeId amountInX amountInY amountOutX amountOutY totalFeeX totalFeeY protocolFeeX protocolFeeY
       transactionHash
     }
     liquidityEvents(first: 1000, block: { number: $block }, where: { blockNumber: $blockNumber }) {
@@ -177,6 +177,13 @@ async function loadBlock(config, decimals, number) {
   for (const row of boundedRows(data.swaps, "swaps")) {
     const pair = requirePair(identities, row.pair?.id);
     const observation = await marketObservation(config, pair, safeNumber(row.activeId, "swap activeId"), number);
+    const feeX = unsigned(row.totalFeeX, "swap totalFeeX");
+    const feeY = unsigned(row.totalFeeY, "swap totalFeeY");
+    const protocolFeeX = unsigned(row.protocolFeeX, "swap protocolFeeX");
+    const protocolFeeY = unsigned(row.protocolFeeY, "swap protocolFeeY");
+    if (protocolFeeX > feeX || protocolFeeY > feeY) {
+      throw new Error(`Swap ${String(row.id)} protocol fee exceeds its total trader-paid fee`);
+    }
     ordered.push({
       order: eventOrder(row.id),
       event: {
@@ -185,8 +192,10 @@ async function loadBlock(config, decimals, number) {
         kind: "swap",
         amountInX: unsigned(row.amountInX, "swap amountInX"),
         amountInY: unsigned(row.amountInY, "swap amountInY"),
-        feeX: unsigned(row.totalFeeX, "swap totalFeeX"),
-        feeY: unsigned(row.totalFeeY, "swap totalFeeY")
+        feeX,
+        feeY,
+        protocolFeeX,
+        protocolFeeY
       }
     });
   }

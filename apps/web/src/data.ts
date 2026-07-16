@@ -1,7 +1,7 @@
 import { lbPairAbi } from "@robinhood-lb/sdk/abi";
 import type { DexRegistry } from "@robinhood-lb/sdk/registry";
 import type { TokenMetadata } from "@robinhood-lb/sdk/tokens";
-import { createPublicClient, formatUnits, http, isAddressEqual, type Address } from "viem";
+import { createPublicClient, formatUnits, http, isAddressEqual, type Address, type Hex } from "viem";
 
 import { isLocalnetRegistry } from "./config";
 
@@ -271,6 +271,45 @@ interface PairBinsGraph {
     totalSupply: string;
     updatedAtBlock: string;
   }>;
+}
+
+interface PairBinWindowGraph extends PairBinsGraph {
+  _meta?: {
+    block: {
+      number: number;
+      hash: string | null;
+    };
+    hasIndexingErrors: boolean;
+  };
+  pair: {
+    id: string;
+    address: string;
+    activeId: string | null;
+    binStep: string;
+    factory: { id: string };
+    reserveX?: string;
+    reserveY?: string;
+    tokenX: { address: string };
+    tokenY: { address: string };
+    updatedAtBlock?: string;
+  } | null;
+}
+
+export interface PoolBinWindowSnapshot {
+  activeId: bigint;
+  binStep: bigint;
+  blockHash: Hex;
+  blockNumber: bigint;
+  factory: Address;
+  tokenX: Address;
+  tokenY: Address;
+}
+
+export interface PoolIndexerSnapshot extends PoolBinWindowSnapshot {
+  reserveX: string;
+  reserveY: string;
+  source: "indexer-head";
+  updatedAtBlock: string;
 }
 
 export interface PaginatedRows<T> {
@@ -555,13 +594,53 @@ const POSITION_HISTORY_QUERY = `
 `;
 
 const PAIR_BIN_WINDOW_QUERY = `
-  query PairBinWindow($pair: String!, $minBin: BigInt!, $maxBin: BigInt!, $first: Int!) {
-    bins(first: $first, orderBy: binId, orderDirection: asc, where: { pair: $pair, binId_gte: $minBin, binId_lte: $maxBin }) {
+  query PairBinWindow($pair: String!, $pairId: ID!, $block: Int!, $minBin: BigInt!, $maxBin: BigInt!, $first: Int!) {
+    _meta(block: { number: $block }) {
+      block {
+        number
+        hash
+      }
+      hasIndexingErrors
+    }
+    pair(id: $pairId, block: { number: $block }) {
+      id
+      address
+      activeId
+      binStep
+      factory { id }
+      tokenX { address }
+      tokenY { address }
+    }
+    bins(first: $first, orderBy: binId, orderDirection: asc, block: { number: $block }, where: { pair: $pair, binId_gte: $minBin, binId_lte: $maxBin }) {
       id
       binId
       reserveX
       reserveY
       totalSupply
+      updatedAtBlock
+    }
+  }
+`;
+
+const POOL_INDEXER_SNAPSHOT_QUERY = `
+  query PoolIndexerSnapshot($pairId: ID!) {
+    _meta {
+      block {
+        number
+        hash
+      }
+      hasIndexingErrors
+    }
+    pair(id: $pairId) {
+      id
+      address
+      activeId
+      binStep
+      factory { id }
+      reserveX
+      reserveY
+      tokenX { address }
+      tokenY { address }
       updatedAtBlock
     }
   }
@@ -830,21 +909,28 @@ export async function loadPaginatedBinsForPair(
 export async function loadPoolBinWindow(
   registry: DexRegistry,
   pair: Address,
-  activeId: number,
+  snapshot: PoolBinWindowSnapshot,
   radius = 40,
   options: AppDataLoadOptions = {}
 ): Promise<BinRow[]> {
   if (registry.endpoints.indexerUrl === null) return [];
+  const activeId = Number(snapshot.activeId);
   if (!Number.isSafeInteger(activeId) || activeId < 0) throw new Error("Active bin must be a non-negative safe integer");
   if (!Number.isSafeInteger(radius) || radius < 0 || radius > 100) throw new Error("Bin window radius must be between 0 and 100");
+  const block = Number(snapshot.blockNumber);
+  if (!Number.isSafeInteger(block) || block < 0 || block > 2_147_483_647) {
+    throw new Error("Pinned bin window block must fit the GraphQL Int range");
+  }
 
   const minBin = Math.max(0, activeId - radius);
   const maxBin = activeId + radius;
-  const data = await fetchGraph<PairBinsGraph>(
+  const data = await fetchGraph<PairBinWindowGraph>(
     registry.endpoints.indexerUrl,
     PAIR_BIN_WINDOW_QUERY,
     {
+      block,
       pair: pair.toLowerCase(),
+      pairId: pair.toLowerCase(),
       minBin: minBin.toString(),
       maxBin: maxBin.toString(),
       first: maxBin - minBin + 1
@@ -852,7 +938,100 @@ export async function loadPoolBinWindow(
     normalizeGraphqlTimeout(options.graphqlTimeoutMs)
   );
 
+  assertPinnedPoolBinWindow(data, pair, snapshot);
+
   return data.bins.map((bin) => ({ ...bin }));
+}
+
+export async function loadPoolIndexerSnapshot(
+  registry: DexRegistry,
+  pool: PoolRow,
+  options: AppDataLoadOptions = {}
+): Promise<PoolIndexerSnapshot> {
+  if (registry.endpoints.indexerUrl === null) throw new Error("Pool indexer endpoint is unavailable");
+  const data = await fetchGraph<Omit<PairBinWindowGraph, "bins">>(
+    registry.endpoints.indexerUrl,
+    POOL_INDEXER_SNAPSHOT_QUERY,
+    { pairId: pool.address.toLowerCase() },
+    normalizeGraphqlTimeout(options.graphqlTimeoutMs)
+  );
+  if (!data._meta) throw new Error("Pool indexer snapshot did not include block metadata");
+  if (data._meta.hasIndexingErrors) throw new Error("Pool indexer snapshot reports indexing errors");
+  if (data._meta.block.hash === null || !/^0x[0-9a-f]{64}$/i.test(data._meta.block.hash)) {
+    throw new Error("Pool indexer snapshot did not include a canonical block hash");
+  }
+  if (!Number.isSafeInteger(data._meta.block.number) || data._meta.block.number < 0) {
+    throw new Error("Pool indexer snapshot block number is invalid");
+  }
+  if (data.pair === null) throw new Error("Selected pool is unavailable at the indexer snapshot");
+  if (!isAddressEqual(data.pair.address as Address, pool.address) || data.pair.id.toLowerCase() !== pool.address.toLowerCase()) {
+    throw new Error("Pool indexer snapshot pair identity differs from the selected market");
+  }
+  if (data.pair.activeId === null || !/^\d+$/.test(data.pair.activeId)) {
+    throw new Error("Pool indexer snapshot active ID is unavailable");
+  }
+  if (!/^\d+$/.test(data.pair.binStep) || data.pair.binStep !== pool.binStep) {
+    throw new Error("Pool indexer snapshot bin step differs from the selected market");
+  }
+  assertPinnedBinAddress(data.pair.factory.id, pool.factoryAddress, "factory");
+  assertPinnedBinAddress(data.pair.factory.id, registry.contracts.lbFactory, "registry factory");
+  assertPinnedBinAddress(data.pair.tokenX.address, pool.tokenXAddress, "token X");
+  assertPinnedBinAddress(data.pair.tokenY.address, pool.tokenYAddress, "token Y");
+  if (data.pair.reserveX === undefined || !/^\d+$/.test(data.pair.reserveX) ||
+    data.pair.reserveY === undefined || !/^\d+$/.test(data.pair.reserveY)) {
+    throw new Error("Pool indexer snapshot reserves are invalid");
+  }
+  if (data.pair.updatedAtBlock === undefined || !/^\d+$/.test(data.pair.updatedAtBlock)) {
+    throw new Error("Pool indexer snapshot update block is invalid");
+  }
+
+  return {
+    activeId: BigInt(data.pair.activeId),
+    binStep: BigInt(data.pair.binStep),
+    blockHash: data._meta.block.hash as Hex,
+    blockNumber: BigInt(data._meta.block.number),
+    factory: data.pair.factory.id as Address,
+    reserveX: data.pair.reserveX,
+    reserveY: data.pair.reserveY,
+    source: "indexer-head",
+    tokenX: data.pair.tokenX.address as Address,
+    tokenY: data.pair.tokenY.address as Address,
+    updatedAtBlock: data.pair.updatedAtBlock
+  };
+}
+
+function assertPinnedPoolBinWindow(
+  data: PairBinWindowGraph,
+  pairAddress: Address,
+  snapshot: PoolBinWindowSnapshot
+): void {
+  if (!data._meta) throw new Error("Pinned bin window response did not include indexer block metadata");
+  if (data._meta.hasIndexingErrors) throw new Error("Pinned bin window indexer reports indexing errors");
+  if (BigInt(data._meta.block.number) !== snapshot.blockNumber) {
+    throw new Error(`Pinned bin window indexer block ${data._meta.block.number} differs from RPC block ${snapshot.blockNumber}`);
+  }
+  if (data._meta.block.hash === null || data._meta.block.hash.toLowerCase() !== snapshot.blockHash.toLowerCase()) {
+    throw new Error("Pinned bin window indexer block hash differs from the RPC snapshot");
+  }
+  if (data.pair === null) throw new Error("Pinned bin window pair is unavailable at the RPC snapshot block");
+  if (!isAddressEqual(data.pair.address as Address, pairAddress) || data.pair.id.toLowerCase() !== pairAddress.toLowerCase()) {
+    throw new Error("Pinned bin window pair identity differs from the selected market");
+  }
+  if (data.pair.activeId === null || BigInt(data.pair.activeId) !== snapshot.activeId) {
+    throw new Error("Pinned bin window active ID differs from the RPC snapshot");
+  }
+  if (BigInt(data.pair.binStep) !== snapshot.binStep) {
+    throw new Error("Pinned bin window bin step differs from the RPC snapshot");
+  }
+  assertPinnedBinAddress(data.pair.factory.id, snapshot.factory, "factory");
+  assertPinnedBinAddress(data.pair.tokenX.address, snapshot.tokenX, "token X");
+  assertPinnedBinAddress(data.pair.tokenY.address, snapshot.tokenY, "token Y");
+}
+
+function assertPinnedBinAddress(actual: string, expected: Address, label: string): void {
+  if (!isAddressEqual(actual as Address, expected)) {
+    throw new Error(`Pinned bin window ${label} differs from the RPC snapshot`);
+  }
 }
 
 export function formatCompactAddress(value: string | null | undefined): string {
