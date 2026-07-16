@@ -1,11 +1,21 @@
 import { expect, test } from "@playwright/test";
+import { decodeFunctionData, type Hex } from "viem";
 
+import { lbRouterAbi } from "../../../packages/sdk/src/abi";
 import { installMockRpc, SECOND_WNATIVE_USDC_PAIR, USDC, WNATIVE, WNATIVE_USDC_PAIR } from "./fixtures/mock-rpc";
-import { installMockWallet, LOCALNET_CHAIN_ID } from "./fixtures/mock-wallet";
+import { installMockWallet, LOCALNET_CHAIN_ID, readMockWallet } from "./fixtures/mock-wallet";
+
+const ONE_TOKEN = 10n ** 18n;
 
 async function connectWallet(page: Parameters<typeof installMockRpc>[0]) {
   await page.getByTestId("wallet-connect-button").click();
   await expect(page.getByTestId("wallet-account-button")).toBeVisible();
+}
+
+async function submitReviewedSwap(page: Parameters<typeof installMockRpc>[0]) {
+  await page.getByTestId("swap-submit-button").click();
+  await expect(page.getByTestId("gas-review")).toBeVisible();
+  await page.getByTestId("swap-submit-button").click();
 }
 
 async function installMockCandleStream(page: Parameters<typeof installMockRpc>[0]) {
@@ -243,6 +253,12 @@ test("canonical pool tasks keep one selected pool while reusing swap and liquidi
   await expect(page.getByTestId("swap-market-chart")).toContainText("WNATIVE / USDC");
   await expect(tasks.getByRole("link", { name: "Swap" })).toHaveAttribute("aria-current", "page");
   await page.locator("#swap-amount").fill("2.75");
+  const routeDisclosure = page.getByTestId("swap-route-disclosure");
+  await expect(routeDisclosure).not.toHaveAttribute("open", "");
+  await expect(page.getByTestId("swap-route-mode-summary")).toHaveText("Exact selected pool");
+  await routeDisclosure.locator("summary").click();
+  await routeDisclosure.getByRole("button", { name: "Best route" }).click();
+  await expect(page.getByTestId("swap-route-mode-summary")).toHaveText("Best route");
 
   await tasks.getByRole("link", { name: "Create position" }).click();
   await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/create$`, "i"));
@@ -261,6 +277,8 @@ test("canonical pool tasks keep one selected pool while reusing swap and liquidi
 
   await tasks.getByRole("link", { name: "Swap" }).click();
   await expect(page.locator("#swap-amount")).toHaveValue("2.75");
+  await expect(page.getByTestId("swap-route-mode-summary")).toHaveText("Best route");
+  await expect(page.getByTestId("swap-route-disclosure")).not.toHaveAttribute("open", "");
   await tasks.getByRole("link", { name: "Create position" }).click();
   await expect(page.getByTestId("liquidity-amount-x")).toHaveValue("0.345");
 
@@ -419,6 +437,7 @@ test("pool-scoped swap presents a compact market task rail with its guarded acti
   const chart = page.getByTestId("swap-market-chart");
   const panel = page.getByTestId("swap-task-panel");
   const market = page.getByTestId("swap-market-lock");
+  const routeDisclosure = page.getByTestId("swap-route-disclosure");
   const action = page.getByTestId("swap-submit-button");
 
   await expect(chart).toBeVisible();
@@ -427,7 +446,17 @@ test("pool-scoped swap presents a compact market task rail with its guarded acti
   await expect(market).toContainText("10 bps/bin");
   await expect(page.getByTestId("swap-pool-search")).toHaveCount(0);
   await expect(panel.locator(".swap-asset-card")).toHaveCount(2);
+  await expect(routeDisclosure).not.toHaveAttribute("open", "");
+  await expect(page.getByTestId("swap-route-mode-summary")).toHaveText("Exact selected pool");
+  await expect(panel.getByRole("group", { name: "Swap routing choice" })).not.toBeVisible();
+  const routeSummary = routeDisclosure.locator("summary");
+  await routeSummary.focus();
+  await page.keyboard.press("Enter");
+  await expect(routeDisclosure).toHaveAttribute("open", "");
   await expect(panel.getByRole("group", { name: "Swap routing choice" })).toBeVisible();
+  await routeSummary.focus();
+  await page.keyboard.press("Enter");
+  await expect(routeDisclosure).not.toHaveAttribute("open", "");
   await expect(panel.getByRole("region", { name: "Trade quote" })).toBeVisible();
   await expect(page.getByTestId("swap-review-details")).toContainText("Market and approval review");
   await expect(action).toBeVisible();
@@ -443,6 +472,136 @@ test("pool-scoped swap presents a compact market task rail with its guarded acti
   expect(geometry).not.toBeNull();
   expect(geometry!.panelLeft).toBeGreaterThanOrEqual(geometry!.chartRight);
   expect(geometry!.actionBottom).toBeLessThanOrEqual(1000);
+});
+
+test("canonical pool swap submits through only its selected pair and bin step", async ({ page }) => {
+  const rpc = await installMockRpc(page, {
+    allowance: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    includePairs: true
+  });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+  await connectWallet(page);
+
+  const routeDisclosure = page.getByTestId("swap-route-disclosure");
+  await expect(routeDisclosure).not.toHaveAttribute("open", "");
+  await expect(page.getByTestId("swap-route-mode-summary")).toHaveText("Exact selected pool");
+  await routeDisclosure.locator("summary").click();
+  await expect(routeDisclosure.getByRole("button", { name: "Exact selected pool" })).toHaveAttribute("aria-pressed", "true");
+  await routeDisclosure.locator("summary").click();
+
+  const technicalReview = page.getByTestId("swap-review-details");
+  await technicalReview.locator("summary").click();
+  await expect(page.getByTestId("swap-selected-market-identity")).toContainText(`${WNATIVE_USDC_PAIR} · bin step 10`);
+  await expect(page.getByTestId("swap-route-steps").locator(".route-step")).toHaveCount(1);
+  expect(rpc.snapshot().ethCalls.some((call) => call.functionName === "getSwapOut")).toBe(true);
+  expect(rpc.snapshot().ethCalls.some((call) => call.functionName === "findBestPathFromAmountIn")).toBe(false);
+
+  await submitReviewedSwap(page);
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+  const transaction = (await readMockWallet(page)).sentTransactions[0] as { data: Hex };
+  const decoded = decodeFunctionData({ abi: lbRouterAbi, data: transaction.data });
+  expect(decoded.functionName).toBe("swapExactTokensForTokens");
+  if (decoded.functionName !== "swapExactTokensForTokens") throw new Error("Unexpected canonical pool swap function");
+  expect(decoded.args[2].tokenPath).toEqual([WNATIVE, USDC]);
+  expect(decoded.args[2].pairBinSteps).toEqual([10n]);
+  expect(decoded.args[2].versions).toEqual([3]);
+});
+
+test("canonical best-route disclosure invalidates an in-flight exact-pool review", async ({ page }) => {
+  const rpc = await installMockRpc(page, {
+    allowance: 5n * ONE_TOKEN,
+    balance: 5n * ONE_TOKEN,
+    includePairs: true,
+    quotePreferMultiHop: true,
+    simulationDelayMs: 500
+  });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+  await connectWallet(page);
+  await expect(page.getByTestId("swap-submit-button")).toBeEnabled();
+
+  await page.getByTestId("swap-submit-button").click();
+  await expect.poll(() => rpc.snapshot().ethCalls.filter((call) => call.functionName === "swapExactTokensForTokens").length).toBeGreaterThan(0);
+  const routeDisclosure = page.getByTestId("swap-route-disclosure");
+  await routeDisclosure.locator("summary").click();
+  await routeDisclosure.getByRole("button", { name: "Best route" }).click();
+
+  await expect(page.getByTestId("swap-route-mode-summary")).toHaveText("Best route");
+  await expect(page.getByTestId("swap-failure-state")).toContainText("Execution context changed during simulation; refresh the quote and try again");
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
+for (const viewport of [
+  { height: 1000, label: "desktop", width: 1600 },
+  { height: 900, label: "tablet", width: 900 },
+  { height: 760, label: "mobile", width: 320 }
+] as const) {
+  test(`canonical swap keeps its action and blocker reachable on ${viewport.label}`, async ({ page }) => {
+    await page.setViewportSize({ height: viewport.height, width: viewport.width });
+    await installMockRpc(page, { includePairs: true });
+    await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+
+    const routeDisclosure = page.getByTestId("swap-route-disclosure");
+    const actionDock = page.locator(".swap-action-dock");
+    const action = page.getByTestId("swap-submit-button");
+    const blocker = page.getByTestId("swap-failure-state");
+    await expect(routeDisclosure).not.toHaveAttribute("open", "");
+    await actionDock.scrollIntoViewIfNeeded();
+    await expect(action).toBeVisible();
+    await expect(action).toContainText("Connect wallet");
+    await expect(blocker).toBeVisible();
+    await expect(action).toBeInViewport();
+    await expect(blocker).toBeInViewport();
+    await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  });
+}
+
+test("canonical swap route disclosure and action remain keyboard-usable at 200 percent layout zoom", async ({ page }) => {
+  await page.setViewportSize({ height: 900, width: 640 });
+  await installMockRpc(page, { includePairs: true });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+  await page.evaluate(() => {
+    document.documentElement.style.zoom = "2";
+  });
+  await expect.poll(() => page.evaluate(() => ({ width: window.innerWidth, zoom: document.documentElement.style.zoom }))).toEqual({ width: 640, zoom: "2" });
+
+  const routeDisclosure = page.getByTestId("swap-route-disclosure");
+  const routeSummary = routeDisclosure.locator("summary");
+  await routeSummary.scrollIntoViewIfNeeded();
+  await routeSummary.focus();
+  await page.keyboard.press("Enter");
+  await expect(routeDisclosure).toHaveAttribute("open", "");
+  await page.keyboard.press("Tab");
+  await expect(routeDisclosure.getByRole("button", { name: "Exact selected pool" })).toBeFocused();
+  await page.keyboard.press("Tab");
+  const bestRoute = routeDisclosure.getByRole("button", { name: "Best route" });
+  await expect(bestRoute).toBeFocused();
+  await page.keyboard.press("Space");
+  await expect(page.getByTestId("swap-route-mode-summary")).toHaveText("Best route");
+  await routeSummary.focus();
+  await page.keyboard.press("Enter");
+  await expect(routeDisclosure).not.toHaveAttribute("open", "");
+
+  const actionDock = page.locator(".swap-action-dock");
+  await actionDock.scrollIntoViewIfNeeded();
+  await expect(page.getByTestId("swap-submit-button")).toBeInViewport();
+  await expect(page.getByTestId("swap-failure-state")).toBeInViewport();
+  await expect.poll(() => page.evaluate(() => {
+    const root = document.documentElement;
+    if (root.scrollWidth <= root.clientWidth) return [];
+    return [...document.body.querySelectorAll<HTMLElement>("*")]
+      .filter((element) => {
+        const rect = element.getBoundingClientRect();
+        return rect.right > root.clientWidth + 1 || rect.left < -1 || element.scrollWidth > element.clientWidth + 1;
+      })
+      .slice(0, 12)
+      .map((element) => {
+        const rect = element.getBoundingClientRect();
+        return `${element.tagName.toLowerCase()}.${element.className || "-"} rect=${rect.left.toFixed(0)}..${rect.right.toFixed(0)} own=${element.clientWidth}/${element.scrollWidth}`;
+      });
+  })).toEqual([]);
 });
 
 test("unified pool workspace preserves URL filters, analytics, actions, and accessible charts", async ({ page }) => {

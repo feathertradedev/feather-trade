@@ -3,27 +3,30 @@ import { decodeFunctionData, encodeAbiParameters, encodeEventTopics, encodeFunct
 
 import { erc20Abi, lbFactoryAbi, lbPairAbi, lbQuoterAbi, lbRouterAbi } from "../../../../packages/sdk/src/abi";
 import { LB_Q128, quoteAddLiquidityMath, type AddLiquidityMathQuote } from "../../../../packages/sdk/src/liquidity-review";
+import { localnetDefaultManifest } from "../../src/default-manifests";
 
 export const LOCALNET_RPC_URL = "http://127.0.0.1:8545";
 export const LOCALNET_INDEXER_URL = "http://127.0.0.1:8000/subgraphs/name/robinhood-lb/localnet";
 export const LOCALNET_ANALYTICS_URL = "http://127.0.0.1:8787/graphql";
-export const WNATIVE = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
-export const USDC = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512";
-export const USDT = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0";
-export const WETH = "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9";
+export const WNATIVE = localnetDefaultManifest.tokens.wnative;
+export const USDC = localnetDefaultManifest.tokens.usdc;
+export const USDT = localnetDefaultManifest.tokens.usdt;
+export const WETH = localnetDefaultManifest.tokens.weth;
 export const WNATIVE_USDC_PAIR = "0x4A47586912f0e03d9f3DCAa762fB8B659E52604b";
 export const SECOND_WNATIVE_USDC_PAIR = "0x2222222222222222222222222222222222222201";
 export const ALT_WNATIVE_USDC_PAIR = "0x1111111111111111111111111111111111111101";
 export const WNATIVE_USDT_PAIR = "0x1111111111111111111111111111111111111102";
 export const USDT_USDC_PAIR = "0x1111111111111111111111111111111111111103";
 export const WNATIVE_WETH_PAIR = "0x1111111111111111111111111111111111111104";
-export const WETH_USDC_PAIR = "0x1111111111111111111111111111111111111105";
+export const WETH_USDC_PAIR = localnetDefaultManifest.seededPools.wethUsdc.pair;
+export const WETH_USDC_BIN_STEP = localnetDefaultManifest.seededPools.wethUsdc.binStep;
+export const ALT_WETH_USDC_PAIR = "0x1111111111111111111111111111111111111105";
 export const CREATED_WETH_USDT_PAIR = "0x3333333333333333333333333333333333333301";
 export const LB_ROUTER = "0x0165878A594ca255338adfa4d48449f69242Eb8F";
 export const LB_FACTORY = "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9";
 export const DEFAULT_ACCOUNT = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
 
-const LOCALNET_CHAIN_ID = 31_337;
+const LOCALNET_CHAIN_ID = localnetDefaultManifest.chainId;
 const ACTIVE_ID = 8_388_608;
 const DEFAULT_BALANCE = 10_000_000_000_000_000_000n;
 const DEFAULT_ALLOWANCE = 10_000_000_000_000_000_000n;
@@ -1227,7 +1230,7 @@ function quotePairForLeg(tokenIn: Address, tokenOut: Address, alternateDirect: b
     [tokenPairKey(WNATIVE, USDT)]: WNATIVE_USDT_PAIR,
     [tokenPairKey(USDT, USDC)]: USDT_USDC_PAIR,
     [tokenPairKey(WNATIVE, WETH)]: WNATIVE_WETH_PAIR,
-    [tokenPairKey(WETH, USDC)]: WETH_USDC_PAIR
+    [tokenPairKey(WETH, USDC)]: alternateDirect ? ALT_WETH_USDC_PAIR : WETH_USDC_PAIR
   };
   const pair = pairs[key];
   if (pair === undefined) throw new Error(`No mock pair for ${tokenIn}/${tokenOut}`);
@@ -1242,7 +1245,7 @@ function quoteBinStepForLeg(tokenIn: Address, tokenOut: Address, alternateDirect
     [tokenPairKey(WNATIVE, USDT)]: 11n,
     [tokenPairKey(USDT, USDC)]: 12n,
     [tokenPairKey(WNATIVE, WETH)]: 13n,
-    [tokenPairKey(WETH, USDC)]: 14n
+    [tokenPairKey(WETH, USDC)]: alternateDirect ? 14n : BigInt(WETH_USDC_BIN_STEP)
   };
   const binStep = binSteps[key];
   if (binStep === undefined) throw new Error(`No mock bin step for ${tokenIn}/${tokenOut}`);
@@ -1314,7 +1317,13 @@ function allPairMetadata(options: MockRpcOptions) {
     { pair: WNATIVE_USDT_PAIR as Address, tokenX: WNATIVE as Address, tokenY: USDT as Address, binStep: 11 },
     { pair: USDT_USDC_PAIR as Address, tokenX: USDT as Address, tokenY: USDC as Address, binStep: 12 },
     { pair: WNATIVE_WETH_PAIR as Address, tokenX: WNATIVE as Address, tokenY: WETH as Address, binStep: 13 },
-    { pair: WETH_USDC_PAIR as Address, tokenX: WETH as Address, tokenY: USDC as Address, binStep: 14 },
+    {
+      pair: WETH_USDC_PAIR as Address,
+      tokenX: WETH as Address,
+      tokenY: USDC as Address,
+      binStep: WETH_USDC_BIN_STEP
+    },
+    { pair: ALT_WETH_USDC_PAIR as Address, tokenX: WETH as Address, tokenY: USDC as Address, binStep: 14 },
     { pair: SECOND_WNATIVE_USDC_PAIR as Address, tokenX: WNATIVE as Address, tokenY: USDC as Address, binStep: 11 }
   ];
 }

@@ -1050,7 +1050,7 @@ textarea {
   }
 }
 
-@media (max-width: 620px) {
+@media (max-width: 700px) {
   .app-header {
     position: relative;
     grid-template-columns: auto 1fr;
@@ -4936,7 +4936,7 @@ a {
 }
 
 .swap-task-header > div > span,
-.swap-market-lock span,
+.swap-route-pool > span,
 .swap-quote-heading span,
 .swap-quote-list dt,
 .swap-asset-heading > label,
@@ -4967,34 +4967,85 @@ a {
 }
 
 .swap-market-lock {
-  display: flex;
-  gap: 12px;
-  align-items: center;
-  justify-content: space-between;
   min-height: 48px;
-  padding: 8px 10px;
+  overflow: hidden;
   background: var(--carbon);
   border: 1px solid rgb(233 236 231 / 9%);
   border-radius: 8px;
 }
 
-.swap-market-lock > div {
+.swap-market-lock > summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 14px;
+  gap: 10px;
+  align-items: center;
+  min-height: 48px;
+  padding: 8px 10px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.swap-market-lock > summary::-webkit-details-marker {
+  display: none;
+}
+
+.swap-market-lock > summary::after {
+  color: var(--green);
+  content: "+";
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.78rem;
+  text-align: right;
+}
+
+.swap-market-lock[open] > summary::after {
+  content: "−";
+}
+
+.swap-route-pool,
+.swap-route-context {
   display: grid;
   min-width: 0;
   gap: 2px;
 }
 
-.swap-market-lock strong {
+.swap-route-pool > strong {
+  overflow: hidden;
   color: var(--bone);
   font-size: 0.82rem;
   font-weight: 550;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.swap-market-lock small {
-  flex: 0 0 auto;
+.swap-route-context {
+  justify-items: end;
+  text-align: right;
+}
+
+.swap-route-context small,
+.swap-route-context strong {
+  white-space: nowrap;
+}
+
+.swap-route-context small {
   color: var(--green);
   font-family: "IBM Plex Mono", ui-monospace, monospace;
-  font-size: 0.65rem;
+  font-size: 0.6rem;
+}
+
+.swap-route-context strong {
+  color: var(--ink-60);
+  font-size: 0.62rem;
+  font-weight: 500;
+}
+
+.swap-route-disclosure-body {
+  padding: 0 10px 9px;
+  border-top: 1px solid rgb(233 236 231 / 8%);
+}
+
+.swap-task-panel .swap-route-disclosure-body .swap-route-mode {
+  margin-top: 9px;
 }
 
 .swap-task-panel .field-label {

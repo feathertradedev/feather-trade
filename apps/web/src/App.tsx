@@ -2582,35 +2582,33 @@ function SwapView({
 
         <div className="swap-task-body">
           {workspaceMatchesPool ? (
-            <div className="swap-market-lock" data-testid="swap-market-lock">
-              <div>
-                <span>Selected pool</span>
-                <strong>{tokenSymbol(tokenX)} / {tokenSymbol(tokenY)}</strong>
+            <details className="swap-market-lock swap-route-disclosure" data-testid="swap-route-disclosure">
+              <summary data-testid="swap-market-lock">
+                <span className="swap-route-pool">
+                  <span>Selected pool</span>
+                  <strong>{tokenSymbol(tokenX)} / {tokenSymbol(tokenY)}</strong>
+                </span>
+                <span className="swap-route-context">
+                  <small>{selectedPool.binStep ?? "unknown"} bps/bin</small>
+                  <strong data-testid="swap-route-mode-summary">{routeMode === "exact-selected" ? "Exact selected pool" : "Best route"}</strong>
+                </span>
+              </summary>
+              <div className="swap-route-disclosure-body">
+                <SwapRouteModeControl onChange={setRouteMode} routeMode={routeMode} />
               </div>
-              <small>{selectedPool.binStep ?? "unknown"} bps/bin</small>
-            </div>
+            </details>
           ) : (
-            <PoolSelect
-              id="swap-pool"
-              label="Selected market"
-              onChange={onSelectedPoolChange}
-              pools={poolOptions}
-              selectedPoolId={selectedPoolId}
-            />
+            <>
+              <PoolSelect
+                id="swap-pool"
+                label="Selected market"
+                onChange={onSelectedPoolChange}
+                pools={poolOptions}
+                selectedPoolId={selectedPoolId}
+              />
+              <SwapRouteModeControl onChange={setRouteMode} routeMode={routeMode} />
+            </>
           )}
-
-          <fieldset className="routing-mode-control swap-route-mode">
-            <legend>Route</legend>
-            <div className="segmented" role="group" aria-label="Swap routing choice">
-              <button aria-pressed={routeMode === "exact-selected"} className={routeMode === "exact-selected" ? "segment active" : "segment"} onClick={() => setRouteMode("exact-selected")} type="button">
-                Exact selected pool
-              </button>
-              <button aria-pressed={routeMode === "best"} className={routeMode === "best" ? "segment active" : "segment"} onClick={() => setRouteMode("best")} type="button">
-                Best route
-              </button>
-            </div>
-            <p>{routeMode === "exact-selected" ? "Use only this pool and bin step." : "Compare supported direct and one-intermediary V2.2 routes."}</p>
-          </fieldset>
 
           {connected && selectedPoolHasWrapper && wrappedNativeToken ? (
             <fieldset className="routing-mode-control swap-native-mode" data-testid="swap-native-mode">
@@ -2857,6 +2855,29 @@ function SwapMarketRecovery({
         </button>
       )}
     </div>
+  );
+}
+
+function SwapRouteModeControl({
+  onChange,
+  routeMode
+}: {
+  onChange: (routeMode: "exact-selected" | "best") => void;
+  routeMode: "exact-selected" | "best";
+}) {
+  return (
+    <fieldset className="routing-mode-control swap-route-mode">
+      <legend>Route</legend>
+      <div className="segmented" role="group" aria-label="Swap routing choice">
+        <button aria-pressed={routeMode === "exact-selected"} className={routeMode === "exact-selected" ? "segment active" : "segment"} onClick={() => onChange("exact-selected")} type="button">
+          Exact selected pool
+        </button>
+        <button aria-pressed={routeMode === "best"} className={routeMode === "best" ? "segment active" : "segment"} onClick={() => onChange("best")} type="button">
+          Best route
+        </button>
+      </div>
+      <p>{routeMode === "exact-selected" ? "Use only this pool and bin step." : "Compare supported direct and one-intermediary V2.2 routes."}</p>
+    </fieldset>
   );
 }
 

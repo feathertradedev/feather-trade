@@ -13,6 +13,8 @@ import {
   WNATIVE,
   WNATIVE_WETH_PAIR,
   WETH,
+  WETH_USDC_BIN_STEP,
+  WETH_USDC_PAIR,
   WNATIVE_USDC_PAIR,
   type InstalledMockRpc,
   type MockRpcOptions
@@ -69,7 +71,7 @@ test("native ETH input suppresses approval, sends exact value, and reconciles ca
 test("native ETH input gas review requires exact value plus buffered gas and opens no wallet", async ({ page }) => {
   const amountIn = ONE_TOKEN;
   const bufferedGas = 2_500_000_000_000_000n;
-  await setupConnectedSwap(page, {
+  await setupConnectedNativeSwap(page, {
     estimatedGas: 2_000_000n,
     includePairs: true,
     nativeBalance: amountIn + bufferedGas - 1n
@@ -86,7 +88,7 @@ test("delayed native receipt reconciles against submitted quote after live quote
   const nativeBefore = 10n * ONE_TOKEN;
   const tokenBefore = 5n * ONE_TOKEN;
   const submittedTokenOut = 999n * ONE_TOKEN / 1_000n;
-  const rpc = await setupConnectedSwap(page, {
+  const rpc = await setupConnectedNativeSwap(page, {
     balance: tokenBefore,
     balanceAfterReceipt: tokenBefore + submittedTokenOut,
     includePairs: true,
@@ -776,7 +778,7 @@ test("insufficient-balance state blocks approval and swap submission", async ({ 
 test("approval-needed state enables approval but guards swap until allowance exists", async ({ page }) => {
   const rpc = await setupConnectedSwap(page, { allowance: 0n, balance: 5n * ONE_TOKEN });
 
-  await expect(page.getByTestId("swap-approve-button")).toContainText("Approve WNATIVE");
+  await expect(page.getByTestId("swap-approve-button")).toContainText("Approve WETH");
   await expect(page.getByTestId("swap-approve-button")).toBeEnabled();
   await expect(page.getByTestId("swap-submit-button")).toContainText("Approve first");
   await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
@@ -884,7 +886,7 @@ test("revoked allowance returns an approved swap to exact approval-required stat
   await expect(page.getByTestId("wallet-connect-button")).toBeVisible();
   await page.evaluate((account) => window.__mockWalletControl.setAccounts([account]), DEFAULT_ACCOUNT);
 
-  await expect(page.getByTestId("swap-approve-button")).toContainText("Approve WNATIVE");
+  await expect(page.getByTestId("swap-approve-button")).toContainText("Approve WETH");
   await expect(page.getByTestId("swap-approve-button")).toBeEnabled();
   await expect(page.getByTestId("swap-submit-button")).toContainText("Approve first");
   await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
@@ -985,13 +987,13 @@ test("post-approval snapshot refresh rejects a malformed token identity at an ot
   const quoteCallsBeforeApproval = swapQuoteCallCount(rpc);
   const walletReadsBeforeApproval = rpc.snapshot().ethCalls.filter((call) => ["allowance", "balanceOf"].includes(call.functionName)).length;
 
-  await expect(selectedMarket).toHaveAttribute("data-token-x", WNATIVE);
+  await expect(selectedMarket).toHaveAttribute("data-token-x", WETH);
   await clickReviewedAction(page, "swap-approve-button");
   await expect(page.getByTestId("swap-failure-state")).toContainText(
     "Refreshing balance, allowance, and quote after approval"
   );
   await expect(page.getByTestId("swap-failure-state")).toHaveClass(/\bpending\b/);
-  await expect(selectedMarket).toHaveAttribute("data-token-x", WNATIVE);
+  await expect(selectedMarket).toHaveAttribute("data-token-x", WETH);
   await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
 
   await expect(page.getByTestId("swap-market-recovery")).toContainText(
@@ -1036,7 +1038,7 @@ test("ready wallet state simulates and submits a guarded swap transaction", asyn
   await expect(page.getByTestId("swap-allowance-value")).toContainText("5");
   await expect(page.getByTestId("swap-submit-button")).toContainText("Swap");
   await expect(page.getByTestId("swap-submit-button")).toBeEnabled();
-  await expect(page.getByTestId("swap-selected-market-identity")).toContainText(`${WNATIVE_USDC_PAIR} · bin step 10`);
+  await expect(page.getByTestId("swap-selected-market-identity")).toContainText(`${WETH_USDC_PAIR} · bin step 10`);
 
   await clickReviewedAction(page, "swap-submit-button");
   await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
@@ -1134,7 +1136,7 @@ test("exact routing submits only through the selected pair and bin step", async 
   });
 
   await expect(page.getByRole("button", { name: "Exact selected pool" })).toHaveAttribute("aria-pressed", "true");
-  await expect(page.getByTestId("swap-selected-market-identity")).toContainText(`${WNATIVE_USDC_PAIR} · bin step 10`);
+  await expect(page.getByTestId("swap-selected-market-identity")).toContainText(`${WETH_USDC_PAIR} · bin step 10`);
   await expect(page.getByTestId("swap-route-steps").locator(".route-step")).toHaveCount(1);
   expect(rpc.snapshot().ethCalls.some((call) => call.functionName === "getSwapOut")).toBe(true);
   expect(rpc.snapshot().ethCalls.some((call) => call.functionName === "findBestPathFromAmountIn")).toBe(false);
@@ -1146,7 +1148,7 @@ test("exact routing submits only through the selected pair and bin step", async 
   const decoded = decodeFunctionData({ abi: lbRouterAbi, data: transaction.data });
   expect(decoded.functionName).toBe("swapExactTokensForTokens");
   if (decoded.functionName !== "swapExactTokensForTokens") throw new Error("Unexpected swap function");
-  expect(decoded.args[2].tokenPath).toEqual([WNATIVE, USDC]);
+  expect(decoded.args[2].tokenPath).toEqual([WETH, USDC]);
   expect(decoded.args[2].pairBinSteps).toEqual([10n]);
   expect(decoded.args[2].versions).toEqual([3]);
   assertTransactionMatchesSimulation(transaction, rpc, "swapExactTokensForTokens");
@@ -1189,7 +1191,7 @@ test("best direct quote may use a different V2.2 pool than the indexed market ro
   await expect(page.getByRole("button", { name: "Best route" })).toHaveAttribute("aria-pressed", "true");
 
   await expect(page.getByTestId("swap-route-steps").locator(".route-step")).toHaveCount(1);
-  await expect(page.getByTestId("swap-route-steps")).toContainText("0x1111...1101");
+  await expect(page.getByTestId("swap-route-steps")).toContainText("0x1111...1105");
   await expect(page.getByTestId("swap-submit-button")).toBeEnabled();
 
   await clickReviewedAction(page, "swap-submit-button");
@@ -1284,7 +1286,7 @@ test("Swap Max binds the exact token balance and invalidates an in-flight stale 
 test("native Swap Max reserves reviewed buffered gas and revalidates the exact final value", async ({ page }) => {
   const nativeBalance = 10n * ONE_TOKEN;
   const reserve = 625_000_000_000_000n;
-  const rpc = await setupConnectedSwap(page, { balance: 5n * ONE_TOKEN, nativeBalance });
+  const rpc = await setupConnectedNativeSwap(page, { balance: 5n * ONE_TOKEN, nativeBalance });
   await page.getByRole("button", { name: "ETH · native" }).click();
   await expect(page.getByTestId("swap-max-button")).toBeEnabled();
   const journalBeforeProbe = await page.evaluate(() => JSON.parse(window.localStorage.getItem("feather.transaction-journal.v1") ?? '{"records":[]}').records.length as number);
@@ -1300,7 +1302,7 @@ test("native Swap Max reserves reviewed buffered gas and revalidates the exact f
 });
 
 test("native Swap Max blocks stale non-maximum value when gas falls or balance rises", async ({ page }) => {
-  const rpc = await setupConnectedSwap(page, { balance: 5n * ONE_TOKEN, gasPrice: 2_000_000_000n, nativeBalance: 10n * ONE_TOKEN });
+  const rpc = await setupConnectedNativeSwap(page, { balance: 5n * ONE_TOKEN, gasPrice: 2_000_000_000n, nativeBalance: 10n * ONE_TOKEN });
   await page.getByRole("button", { name: "ETH · native" }).click();
   await page.getByTestId("swap-max-button").click();
   await expect(page.locator("#swap-amount")).toHaveValue("9.99875");
@@ -1312,7 +1314,7 @@ test("native Swap Max blocks stale non-maximum value when gas falls or balance r
 
 test("native Swap Max fails closed when gas rises and requires a fresh reserve", async ({ page }) => {
   const nativeBalance = 10n * ONE_TOKEN;
-  const rpc = await setupConnectedSwap(page, { balance: 5n * ONE_TOKEN, gasPrice: 1_000_000_000n, nativeBalance });
+  const rpc = await setupConnectedNativeSwap(page, { balance: 5n * ONE_TOKEN, gasPrice: 1_000_000_000n, nativeBalance });
   await page.getByRole("button", { name: "ETH · native" }).click();
   await page.getByTestId("swap-max-button").click();
   await expect(page.locator("#swap-amount")).toHaveValue("9.999375");
@@ -1326,7 +1328,7 @@ test("native Swap Max fails closed when gas rises and requires a fresh reserve",
 });
 
 test("native Max requires a positive probe amount and never bootstraps invalid input", async ({ page }) => {
-  await setupConnectedSwap(page, { nativeBalance: 10n * ONE_TOKEN });
+  await setupConnectedNativeSwap(page, { nativeBalance: 10n * ONE_TOKEN });
   await page.getByRole("button", { name: "ETH · native" }).click();
   await page.locator("#swap-amount").fill("");
   await expect(page.getByTestId("swap-native-max-guidance")).toContainText("positive ETH probe amount");
@@ -1346,7 +1348,7 @@ test("native liquidity Max requires a positive probe amount", async ({ page }) =
 });
 
 test("native Swap Max probe cannot populate after its route direction changes", async ({ page }) => {
-  await setupConnectedSwap(page, { balance: 5n * ONE_TOKEN, nativeBalance: 10n * ONE_TOKEN, simulationDelayMs: 600 });
+  await setupConnectedNativeSwap(page, { balance: 5n * ONE_TOKEN, nativeBalance: 10n * ONE_TOKEN, simulationDelayMs: 600 });
   await page.getByRole("button", { name: "ETH · native" }).click();
   await page.getByTestId("swap-max-button").click();
   await page.waitForTimeout(100);
@@ -1363,7 +1365,7 @@ test("Swap Max approval discloses and sends the exact raw balance", async ({ pag
   await page.getByTestId("swap-max-button").click();
   await expect(page.locator("#swap-amount")).toHaveValue("5.123456789012345678");
   await expect(page.locator("#swap-approval-details")).toContainText(`${balance.toString()}`);
-  await expect(page.locator("#swap-approval-details")).toContainText(WNATIVE);
+  await expect(page.locator("#swap-approval-details")).toContainText(WETH);
   await expect(page.locator("#swap-approval-details")).toContainText("standard-bool");
   await clickReviewedAction(page, "swap-approve-button");
 
@@ -3603,13 +3605,34 @@ test("connected portfolio renders a truthful empty state", async ({ page }) => {
 });
 
 async function setupConnectedSwap(page: Parameters<typeof installMockRpc>[0], rpcOptions: MockRpcOptions = {}, walletOptions: MockWalletOptions = {}): Promise<InstalledMockRpc> {
-  const rpc = await installMockRpc(page, rpcOptions);
+  const rpc = await installMockRpc(page, {
+    includePairs: true,
+    pairAddress: WETH_USDC_PAIR,
+    pairBinStep: String(WETH_USDC_BIN_STEP),
+    pairTokenX: WETH,
+    pairTokenY: USDC,
+    ...rpcOptions
+  });
   await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID, ...walletOptions });
   await page.goto("/#/swap");
   await connectWallet(page);
   await expect(page.getByTestId("swap-balance-value")).not.toHaveText("loading");
 
   return rpc;
+}
+
+async function setupConnectedNativeSwap(
+  page: Parameters<typeof installMockRpc>[0],
+  rpcOptions: MockRpcOptions = {},
+  walletOptions: MockWalletOptions = {}
+): Promise<InstalledMockRpc> {
+  return setupConnectedSwap(page, {
+    pairAddress: WNATIVE_USDC_PAIR,
+    pairBinStep: "10",
+    pairTokenX: WNATIVE,
+    pairTokenY: USDC,
+    ...rpcOptions
+  }, walletOptions);
 }
 
 async function setupConnectedLiquidity(page: Parameters<typeof installMockRpc>[0], rpcOptions: MockRpcOptions = {}, walletOptions: MockWalletOptions = {}): Promise<InstalledMockRpc> {
