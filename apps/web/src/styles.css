@@ -1562,7 +1562,10 @@ input[type="range"]:focus-visible {
   }
 
   .swap-chart-summary {
-    gap: 11px;
+    gap: 8px 11px;
+    flex-wrap: wrap;
+    overflow-x: hidden;
+    white-space: normal;
   }
 
   .swap-chart-footer {
@@ -6258,5 +6261,437 @@ a {
 
   .pool-owner-history-limit button {
     width: 100%;
+  }
+}
+
+/* Wave 5 responsive workspace: market, task, and owner data are independent
+   surfaces. Mobile shows one surface at a time; tablet keeps pool metadata in
+   a disclosure; desktop bounds every dense region to the available viewport. */
+.pool-mobile-workspace-nav,
+.pool-workspace-rail-toggle {
+  display: none;
+}
+
+.pool-workspace-rail-content {
+  display: contents;
+}
+
+.pool-positions-column {
+  min-width: 0;
+}
+
+.visually-hidden {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  overflow: hidden !important;
+  clip: rect(0 0 0 0) !important;
+  clip-path: inset(50%) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+
+.visually-hidden-table {
+  contain: inline-size layout paint;
+  transform: scale(0.001);
+  transform-origin: top left;
+}
+
+.visually-hidden-table table {
+  width: 1px;
+  table-layout: fixed;
+}
+
+.visually-hidden-table :is(caption, th, td) {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+:where([tabindex]):focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 3px;
+}
+
+.app-shell.route-focus-target:focus-visible {
+  outline: 0;
+}
+
+.pool-owner-history-row a {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+}
+
+@media (min-width: 1041px) {
+  .canonical-pool-workspace {
+    max-height: calc(100dvh - 94px);
+    overflow: hidden;
+  }
+
+  .canonical-pool-workspace .pool-workspace-body,
+  .canonical-pool-workspace .pool-workspace-task-content,
+  .canonical-pool-workspace .swap-workspace,
+  .canonical-pool-workspace .view-grid.two-col.liquidity-task-workspace {
+    min-height: 0;
+    height: 100%;
+  }
+
+  .canonical-pool-workspace .pool-workspace-body {
+    max-height: calc(100dvh - 220px);
+    align-items: stretch;
+  }
+
+  .canonical-pool-workspace .swap-workspace,
+  .canonical-pool-workspace .view-grid.two-col.liquidity-task-workspace {
+    grid-template-rows: minmax(280px, 3fr) minmax(190px, 2fr);
+    align-items: stretch;
+  }
+
+  .canonical-pool-workspace :is(.swap-market-column, .liquidity-market-column) {
+    grid-column: 1;
+    grid-row: 1;
+    min-height: 0;
+  }
+
+  .canonical-pool-workspace .pool-positions-column {
+    grid-column: 1;
+    grid-row: 2;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .canonical-pool-workspace :is(.swap-task-panel, .liquidity-task-panel) {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+    height: 100%;
+    min-height: 0;
+    max-height: none;
+  }
+
+  .canonical-pool-workspace .liquidity-task-panel#liquidity-add {
+    height: 100%;
+    min-height: 0;
+    max-height: none;
+  }
+
+  .canonical-pool-workspace .swap-chart-panel {
+    display: grid;
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    height: 100%;
+    min-height: 0;
+  }
+
+  .canonical-pool-workspace .swap-chart-stage {
+    height: auto;
+    min-height: 230px;
+  }
+
+  .canonical-pool-workspace .pool-workspace-owner-panel {
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    height: 100%;
+    min-height: 0;
+  }
+
+  .canonical-pool-workspace .pool-owner-panel-body {
+    min-height: 0;
+    overflow: auto;
+    scrollbar-color: rgb(233 236 231 / 18%) transparent;
+    scrollbar-width: thin;
+  }
+}
+
+@media (max-width: 1040px) {
+  .canonical-pool-workspace .pool-workspace-body {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .canonical-pool-workspace .pool-workspace-task-content {
+    order: 1;
+  }
+
+  .canonical-pool-workspace .pool-workspace-rail {
+    order: 2;
+    display: block;
+    max-height: none;
+    overflow: hidden;
+  }
+
+  .pool-workspace-rail-toggle {
+    display: flex;
+    width: 100%;
+    min-height: 58px;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    padding: 9px 14px;
+    border-bottom: 0;
+    color: var(--bone);
+    background: var(--panel);
+    text-align: left;
+  }
+
+  .pool-workspace-rail-toggle[aria-expanded="true"] {
+    border-bottom: 1px solid rgb(233 236 231 / 9%);
+  }
+
+  .pool-workspace-rail-toggle > span:first-child {
+    display: grid;
+    min-width: 0;
+    gap: 2px;
+  }
+
+  .pool-workspace-rail-toggle strong {
+    font-size: 0.78rem;
+  }
+
+  .pool-workspace-rail-toggle small,
+  .pool-workspace-rail-toggle > span:last-child {
+    overflow: hidden;
+    color: var(--ink-60);
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 0.62rem;
+    font-weight: 500;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .pool-workspace-rail-content:not([hidden]) {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .pool-workspace-rail-content > * {
+    border-right: 1px solid rgb(233 236 231 / 8%);
+    border-bottom: 1px solid rgb(233 236 231 / 8%);
+  }
+
+  .pool-workspace-rail-content > :nth-child(even) {
+    border-right: 0;
+  }
+
+  .pool-workspace-rail-content > .pool-rail-liquidity {
+    grid-column: 1 / -1;
+    border-right: 0;
+  }
+}
+
+@media (min-width: 721px) and (max-width: 1040px) {
+  .canonical-pool-workspace :is(.swap-workspace, .view-grid.two-col.liquidity-task-workspace) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto;
+  }
+
+  .canonical-pool-workspace :is(.swap-market-column, .liquidity-market-column) {
+    display: grid;
+    order: 1;
+    min-width: 0;
+  }
+
+  .canonical-pool-workspace :is(.swap-task-panel, .liquidity-task-panel),
+  .canonical-pool-workspace .liquidity-task-panel#liquidity-add {
+    position: static;
+    order: 2;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    width: 100%;
+    height: min(720px, calc(100dvh - 120px));
+    min-height: 520px;
+    max-height: 720px;
+    overflow: hidden;
+  }
+
+  .canonical-pool-workspace .pool-task-panel-scoped {
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+  }
+
+  .canonical-pool-workspace :is(.swap-task-body, .liquidity-task-body) {
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+
+  .canonical-pool-workspace .pool-positions-column {
+    order: 3;
+    min-width: 0;
+    min-height: 360px;
+    overflow: hidden;
+  }
+
+  .canonical-pool-workspace .pool-workspace-owner-panel {
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    min-height: 360px;
+    max-height: min(620px, calc(100dvh - 160px));
+  }
+
+  .canonical-pool-workspace .pool-owner-panel-body {
+    min-height: 0;
+    overflow: auto;
+    overscroll-behavior: contain;
+  }
+}
+
+@media (max-width: 720px) {
+  .pool-mobile-workspace-nav {
+    position: sticky;
+    z-index: 20;
+    top: 0;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    padding: 3px;
+    border: 1px solid var(--hairline);
+    background: color-mix(in srgb, var(--carbon) 94%, transparent);
+    backdrop-filter: blur(12px);
+  }
+
+  .pool-mobile-workspace-nav button {
+    position: relative;
+    min-width: 0;
+    min-height: 44px;
+    color: var(--ink-60);
+    background: transparent;
+    font-size: 0.72rem;
+    font-weight: 760;
+  }
+
+  .pool-mobile-workspace-nav button[aria-selected="true"] {
+    color: var(--bone-bright);
+    background: rgb(233 236 231 / 4%);
+    box-shadow: inset 0 -2px var(--green);
+  }
+
+  .canonical-pool-workspace .pool-workspace-body {
+    min-height: 0;
+  }
+
+  .canonical-pool-workspace .pool-workspace-task-content,
+  .canonical-pool-workspace :is(.swap-workspace, .view-grid.two-col.liquidity-task-workspace) {
+    display: block;
+    min-width: 0;
+  }
+
+  .canonical-pool-workspace[data-mobile-view="market"] :is(.swap-task-panel, .liquidity-task-panel, .pool-positions-column),
+  .canonical-pool-workspace[data-mobile-view="trade"] :is(.swap-market-column, .liquidity-market-column, .pool-positions-column, .pool-workspace-rail),
+  .canonical-pool-workspace[data-mobile-view="positions"] :is(.swap-market-column, .liquidity-market-column, .swap-task-panel, .liquidity-task-panel, .pool-workspace-rail) {
+    display: none !important;
+  }
+
+  .canonical-pool-workspace[data-mobile-view="market"] .pool-workspace-task-content {
+    order: 1;
+  }
+
+  .canonical-pool-workspace[data-mobile-view="market"] .pool-workspace-rail {
+    order: 2;
+    margin-top: 8px;
+  }
+
+  .canonical-pool-workspace :is(.swap-market-column, .liquidity-market-column) {
+    display: grid;
+    min-height: 0;
+  }
+
+  .canonical-pool-workspace .swap-chart-panel {
+    display: grid;
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    min-height: min(520px, calc(100dvh - 190px));
+    max-height: 680px;
+  }
+
+  .canonical-pool-workspace .swap-chart-stage {
+    height: auto;
+    min-height: 300px;
+  }
+
+  .canonical-pool-workspace :is(.swap-task-panel, .liquidity-task-panel),
+  .canonical-pool-workspace .liquidity-task-panel#liquidity-add {
+    position: relative;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    width: 100%;
+    height: clamp(340px, calc(100dvh - 370px), 560px);
+    min-height: 0;
+    max-height: 560px;
+    overflow: hidden;
+  }
+
+  .canonical-pool-workspace .pool-task-panel-scoped {
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+  }
+
+  .canonical-pool-workspace :is(.swap-task-body, .liquidity-task-body) {
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-color: rgb(233 236 231 / 18%) transparent;
+    scrollbar-width: thin;
+  }
+
+  .canonical-pool-workspace :is(.swap-action-dock, .liquidity-action-dock) {
+    position: static;
+    z-index: 12;
+    width: 100%;
+    max-height: min(46dvh, 360px);
+    overflow-y: auto;
+    border-top: 1px solid var(--hairline);
+    box-shadow: 0 -18px 38px rgb(0 0 0 / 42%);
+  }
+
+  .canonical-pool-workspace :is(.swap-action-dock, .liquidity-action-dock) :is(.primary-button, .secondary-button) {
+    /* Browser zoom can otherwise align a scroll target a fractional pixel
+       beyond the visual viewport. Keep a real gutter around primary actions. */
+    scroll-margin-block: 2px;
+  }
+
+  .canonical-pool-workspace .pool-positions-column {
+    height: clamp(340px, calc(100dvh - 370px), 560px);
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .canonical-pool-workspace .pool-workspace-owner-panel {
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    height: 100%;
+    min-height: 0;
+  }
+
+  .canonical-pool-workspace .pool-owner-panel-body {
+    min-height: 0;
+    overflow: auto;
+    overscroll-behavior: contain;
+    scrollbar-color: rgb(233 236 231 / 18%) transparent;
+    scrollbar-width: thin;
+  }
+
+  .pool-workspace-rail-content:not([hidden]) {
+    grid-template-columns: 1fr;
+  }
+
+  .pool-workspace-rail-content > * {
+    grid-column: 1;
+    border-right: 0;
+  }
+
+  .canonical-pool-workspace .swap-chart-header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .canonical-pool-workspace .swap-chart-intervals {
+    width: 100%;
+    max-width: 100%;
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+  }
+
+  .canonical-pool-workspace .swap-chart-intervals button {
+    flex: 1 0 44px;
   }
 }

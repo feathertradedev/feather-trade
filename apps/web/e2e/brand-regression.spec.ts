@@ -9,6 +9,10 @@ const screenshotOptions = {
   maxDiffPixelRatio: 0.001
 };
 
+test.beforeEach(async ({ page }) => {
+  await page.clock.setFixedTime("2026-07-12T14:00:00Z");
+});
+
 async function connectWallet(page: Parameters<typeof installMockRpc>[0]) {
   await page.getByTestId("wallet-connect-button").click();
   await expect(page.getByTestId("wallet-account-button")).toBeVisible();
@@ -17,6 +21,7 @@ async function connectWallet(page: Parameters<typeof installMockRpc>[0]) {
 test("canonical Feather landing desktop", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium");
   await installMockRpc(page, { includePairs: true });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.emulateMedia({ reducedMotion: "reduce" });
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Weightless liquidity." })).toBeVisible();
@@ -32,6 +37,7 @@ test("canonical Feather landing desktop", async ({ page }, testInfo) => {
 test("canonical Feather landing mobile", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile-chromium");
   await installMockRpc(page, { includePairs: true });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.emulateMedia({ reducedMotion: "reduce" });
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Weightless liquidity." })).toBeVisible();
@@ -41,6 +47,7 @@ test("canonical Feather landing mobile", async ({ page }, testInfo) => {
 test("canonical Feather swap desktop", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium");
   await installMockRpc(page, { includePairs: true });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/swap");
   await expect(page.getByTestId("swap-submit-button")).toBeVisible();
   await expect(page).toHaveScreenshot("feather-swap-desktop.png", screenshotOptions);
@@ -49,6 +56,7 @@ test("canonical Feather swap desktop", async ({ page }, testInfo) => {
 test("canonical Feather swap mobile", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile-chromium");
   await installMockRpc(page, { includePairs: true });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/swap");
   await expect(page.getByTestId("swap-submit-button")).toBeVisible();
   await expect(page).toHaveScreenshot("feather-swap-mobile.png", screenshotOptions);
@@ -57,6 +65,7 @@ test("canonical Feather swap mobile", async ({ page }, testInfo) => {
 test("canonical Feather pools desktop", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium");
   await installMockRpc(page, { includePairs: true });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/pools");
   await expect(page.locator(".panel-heading").filter({ hasText: "Pools" })).toBeVisible();
   await expect(page).toHaveScreenshot("feather-pools-desktop.png", screenshotOptions);
@@ -65,6 +74,7 @@ test("canonical Feather pools desktop", async ({ page }, testInfo) => {
 test("canonical Feather pools mobile", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile-chromium");
   await installMockRpc(page, { includePairs: true });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/pools");
   await expect(page.locator(".panel-heading").filter({ hasText: "Pools" })).toBeVisible();
   await expect(page).toHaveScreenshot("feather-pools-mobile.png", screenshotOptions);
@@ -72,28 +82,40 @@ test("canonical Feather pools mobile", async ({ page }, testInfo) => {
 
 test("canonical Feather pool workspace desktop", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium");
-  await page.clock.setFixedTime("2026-07-12T14:00:00Z");
   await installMockRpc(page, { includePairs: true });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/pools");
   await page.locator(".discovery-table .pair-name").first().click();
   await expect(page).toHaveURL(/#\/pools\/.+\/create\?returnTo=/);
+  await expect(page.getByRole("tablist", { name: "Pool workspace views" })).toBeHidden();
   await expect(page.getByTestId("swap-market-chart")).toBeVisible();
   await expect(page.getByTestId("pool-workspace-rail")).toBeVisible();
   await expect(page.getByTestId("liquidity-range-editor")).toBeVisible();
+  await expect(page.getByTestId("pool-workspace-owner-panel")).toBeVisible();
   await expect(page.getByRole("link", { name: "Market overview" })).toHaveCount(0);
+  await expect(page).toHaveScreenshot("feather-pool-detail-desktop.png", screenshotOptions);
 });
 
 test("canonical Feather pool workspace mobile", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile-chromium");
-  await page.clock.setFixedTime("2026-07-12T14:00:00Z");
   await installMockRpc(page, { includePairs: true });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/pools");
   await page.locator(".discovery-table .pair-name").first().click();
   await expect(page).toHaveURL(/#\/pools\/.+\/create\?returnTo=/);
+  const views = page.getByRole("tablist", { name: "Pool workspace views" });
+  await expect(views.getByRole("tab", { name: "Trade" })).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByTestId("swap-market-chart")).toBeHidden();
+  await expect(page.getByTestId("liquidity-range-editor")).toBeVisible();
+  await views.getByRole("tab", { name: "Market" }).click();
   await expect(page.getByTestId("swap-market-chart")).toBeVisible();
   await expect(page.getByTestId("pool-workspace-rail")).toBeVisible();
-  await expect(page.getByTestId("liquidity-range-editor")).toBeVisible();
+  await expect(page.getByTestId("liquidity-range-editor")).toBeHidden();
+  await views.getByRole("tab", { name: "Positions" }).click();
+  await expect(page.getByTestId("pool-workspace-owner-panel")).toBeVisible();
   await expect(page.getByRole("link", { name: "Market overview" })).toHaveCount(0);
+  await views.getByRole("tab", { name: "Trade" }).click();
+  await expect(page).toHaveScreenshot("feather-pool-detail-mobile.png", screenshotOptions);
 });
 
 test("canonical Feather liquidity desktop", async ({ page }, testInfo) => {

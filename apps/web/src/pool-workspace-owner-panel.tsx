@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useMemo, useState, type KeyboardEvent, type ReactNode } from "react";
 import { formatUnits } from "viem";
 
 import {
@@ -26,6 +26,22 @@ type HistoryPanelTab = "position" | "activity";
 
 const HISTORY_ROW_LIMIT = 12;
 
+function handleTablistKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  const tabs = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
+  const currentIndex = tabs.indexOf(document.activeElement as HTMLButtonElement);
+  if (currentIndex < 0 || tabs.length === 0) return;
+  event.preventDefault();
+  const nextIndex = event.key === "Home"
+    ? 0
+    : event.key === "End"
+      ? tabs.length - 1
+      : (currentIndex + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+  const nextTab = tabs[nextIndex]!;
+  nextTab.focus();
+  nextTab.click();
+}
+
 export function PoolWorkspaceOwnerPanel() {
   const workspace = usePoolWorkspace();
   const [activeTab, setActiveTab] = usePoolDraftState<OwnerPanelTab>("workspace.ownerPanelTab", "positions");
@@ -46,7 +62,7 @@ export function PoolWorkspaceOwnerPanel() {
   return (
     <section className="pool-workspace-owner-panel" data-testid="pool-workspace-owner-panel">
       <header className="pool-owner-panel-header">
-        <div aria-label="Wallet liquidity" className="pool-owner-tabs" role="tablist">
+        <div aria-label="Wallet liquidity" className="pool-owner-tabs" onKeyDown={handleTablistKeyDown} role="tablist">
           <button
             aria-controls="pool-owner-positions-panel"
             aria-selected={activeTab === "positions"}
@@ -54,6 +70,7 @@ export function PoolWorkspaceOwnerPanel() {
             id="pool-owner-positions-tab"
             onClick={() => setActiveTab("positions")}
             role="tab"
+            tabIndex={activeTab === "positions" ? 0 : -1}
             type="button"
           >
             Positions
@@ -65,6 +82,7 @@ export function PoolWorkspaceOwnerPanel() {
             id="pool-owner-history-tab"
             onClick={() => setActiveTab("history")}
             role="tab"
+            tabIndex={activeTab === "history" ? 0 : -1}
             type="button"
           >
             History
@@ -82,25 +100,26 @@ export function PoolWorkspaceOwnerPanel() {
         ) : null}
       </header>
 
-      {activeTab === "positions" ? (
-        <div
-          aria-labelledby="pool-owner-positions-tab"
-          className="pool-owner-panel-body"
-          id="pool-owner-positions-panel"
-          role="tabpanel"
-        >
-          <PositionPanelContent createHref={createHref} summary={summary} />
-        </div>
-      ) : (
-        <div
-          aria-labelledby="pool-owner-history-tab"
-          className="pool-owner-panel-body"
-          id="pool-owner-history-panel"
-          role="tabpanel"
-        >
-          <HistoryPanelContent />
-        </div>
-      )}
+      <div
+        aria-labelledby="pool-owner-positions-tab"
+        className="pool-owner-panel-body"
+        hidden={activeTab !== "positions"}
+        id="pool-owner-positions-panel"
+        role="tabpanel"
+        tabIndex={0}
+      >
+        <PositionPanelContent createHref={createHref} summary={summary} />
+      </div>
+      <div
+        aria-labelledby="pool-owner-history-tab"
+        className="pool-owner-panel-body"
+        hidden={activeTab !== "history"}
+        id="pool-owner-history-panel"
+        role="tabpanel"
+        tabIndex={0}
+      >
+        <HistoryPanelContent />
+      </div>
     </section>
   );
 }
@@ -304,7 +323,7 @@ function HistoryPanelContent() {
   return (
     <>
       <div className="pool-owner-history-toolbar">
-        <div aria-label="History view" className="pool-owner-history-tabs" role="tablist">
+        <div aria-label="History view" className="pool-owner-history-tabs" onKeyDown={handleTablistKeyDown} role="tablist">
           <button
             aria-controls="pool-position-history-view"
             aria-selected={activeTab === "position"}
@@ -312,6 +331,7 @@ function HistoryPanelContent() {
             id="pool-position-history-tab"
             onClick={() => setActiveTab("position")}
             role="tab"
+            tabIndex={activeTab === "position" ? 0 : -1}
             type="button"
           >
             Position history
@@ -323,21 +343,19 @@ function HistoryPanelContent() {
             id="pool-activity-tab"
             onClick={() => setActiveTab("activity")}
             role="tab"
+            tabIndex={activeTab === "activity" ? 0 : -1}
             type="button"
           >
             Pool activity
           </button>
         </div>
       </div>
-      {activeTab === "position" ? (
-        <div aria-labelledby="pool-position-history-tab" id="pool-position-history-view" role="tabpanel">
-          <PositionHistoryContent />
-        </div>
-      ) : (
-        <div aria-labelledby="pool-activity-tab" id="pool-activity-view" role="tabpanel">
-          <PoolActivityContent />
-        </div>
-      )}
+      <div aria-labelledby="pool-position-history-tab" hidden={activeTab !== "position"} id="pool-position-history-view" role="tabpanel" tabIndex={0}>
+        <PositionHistoryContent />
+      </div>
+      <div aria-labelledby="pool-activity-tab" hidden={activeTab !== "activity"} id="pool-activity-view" role="tabpanel" tabIndex={0}>
+        <PoolActivityContent />
+      </div>
     </>
   );
 }

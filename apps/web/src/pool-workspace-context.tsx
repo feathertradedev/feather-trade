@@ -407,8 +407,15 @@ export function PoolWorkspaceProvider({
   const activityPartial = Boolean(
     activityQuery.data?.pageInfo.capped || activityQuery.data?.pageInfo.failed
   );
-  const binsState: LoadState = registry.endpoints.indexerUrl === null || currentActiveId === null
+  const economicsPending = indexerSnapshotQuery.isLoading || economicsQuery.isLoading || indexerSnapshotQuery.isFetching || economicsQuery.isFetching;
+  const binsState: LoadState = registry.endpoints.indexerUrl === null
     ? "unavailable"
+    : currentActiveId === null
+      ? indexerSnapshotQuery.isError || economicsQuery.isError
+        ? "error"
+        : economicsPending
+          ? "loading"
+          : "unavailable"
     : binsQuery.isError
       ? "error"
       : binsQuery.isLoading
@@ -468,7 +475,7 @@ export function PoolWorkspaceProvider({
     ? "error"
     : economicsValue !== undefined
       ? "ready"
-      : indexerSnapshotQuery.isLoading || economicsQuery.isLoading || indexerSnapshotQuery.isFetching || economicsQuery.isFetching
+      : economicsPending
       ? "loading"
       : "unavailable";
   const indexerSnapshotState: LoadState = indexerSnapshotQuery.isError

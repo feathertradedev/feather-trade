@@ -14,6 +14,32 @@ async function connectWallet(page: Parameters<typeof installMockRpc>[0]) {
   await expect(page.getByTestId("wallet-account-button")).toBeVisible();
 }
 
+async function selectPoolWorkspaceView(
+  page: Parameters<typeof installMockRpc>[0],
+  view: "Market" | "Trade" | "Positions"
+) {
+  const tab = page
+    .getByRole("tablist", { name: "Pool workspace views" })
+    .getByRole("tab", { exact: true, name: view });
+  const mobileView = (page.viewportSize()?.width ?? Number.POSITIVE_INFINITY) <= 720;
+  if (mobileView) {
+    await expect(tab).toBeVisible();
+    await tab.click();
+    await expect(tab).toHaveAttribute("aria-selected", "true");
+  }
+  return mobileView;
+}
+
+async function expandPoolMetadata(page: Parameters<typeof installMockRpc>[0]) {
+  const mobileView = await selectPoolWorkspaceView(page, "Market");
+  const toggle = page.locator(".pool-workspace-rail-toggle");
+  if (mobileView) await expect(toggle).toBeVisible();
+  if (mobileView && await toggle.getAttribute("aria-expanded") === "false") {
+    await toggle.click();
+    await expect(toggle).toHaveAttribute("aria-expanded", "true");
+  }
+}
+
 async function submitReviewedSwap(page: Parameters<typeof installMockRpc>[0]) {
   await page.getByTestId("swap-submit-button").click();
   await expect(page.getByTestId("gas-review")).toBeVisible();
@@ -100,6 +126,7 @@ test("pool chart applies live candle replacements and exposes stream failure", a
   await installMockCandleStream(page);
   const rpc = await installMockRpc(page, { includePairs: true });
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+  await selectPoolWorkspaceView(page, "Market");
   const chart = page.getByTestId("swap-market-chart");
   await expect(chart.locator(".swap-chart-stream")).toHaveText("Live");
   await expect.poll(() => rpc.snapshot().graphRequests.some((request) => request.query.includes("WebPairCandles"))).toBe(true);
@@ -159,6 +186,7 @@ test("candle intervals remain usable without page overflow on a narrow mobile vi
   await page.setViewportSize({ width: 390, height: 844 });
   const rpc = await installMockRpc(page, { includePairs: true });
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+  await page.getByRole("tablist", { name: "Pool workspace views" }).getByRole("tab", { name: "Market" }).click();
 
   const chart = page.getByTestId("swap-market-chart");
   const intervals = chart.getByRole("group", { name: "Candle interval" });
@@ -176,6 +204,7 @@ test("an SSE candle crossing a 1m boundary appends without refetching historical
   await installMockCandleStream(page);
   const rpc = await installMockRpc(page, { includePairs: true });
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+  await selectPoolWorkspaceView(page, "Market");
   const chart = page.getByTestId("swap-market-chart");
   await chart.getByRole("button", { name: "1m", exact: true }).click();
   await expect(chart.locator(".swap-chart-stream")).toHaveText("Live");
@@ -230,6 +259,7 @@ test("an SSE candle crossing a 1m boundary appends without refetching historical
 test("canonical pool tasks keep one selected pool while reusing swap and liquidity engines", async ({ page }) => {
   await installMockRpc(page, { includePairs: true, includePositions: true });
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+  await expandPoolMetadata(page);
 
   const workspace = page.getByTestId("canonical-pool-workspace");
   const rail = page.getByTestId("pool-workspace-rail");
@@ -253,6 +283,7 @@ test("canonical pool tasks keep one selected pool while reusing swap and liquidi
   await priceFlip.click();
   await expect(rail.getByRole("button", { name: "Show price as USDC per WNATIVE" })).toBeVisible();
   await expect(page.getByTestId("swap-market-chart")).toContainText("WNATIVE / USDC");
+  await selectPoolWorkspaceView(page, "Trade");
   await expect(tasks.getByRole("link", { name: "Swap" })).toHaveAttribute("aria-current", "page");
   await page.locator("#swap-amount").fill("2.75");
   const routeDisclosure = page.getByTestId("swap-route-disclosure");
@@ -265,7 +296,9 @@ test("canonical pool tasks keep one selected pool while reusing swap and liquidi
   await tasks.getByRole("link", { name: "Create position" }).click();
   await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/create$`, "i"));
   await expect(workspace).toHaveAttribute("data-pool-id", WNATIVE_USDC_PAIR.toLowerCase());
+  await selectPoolWorkspaceView(page, "Market");
   await expect(page.getByTestId("swap-market-chart")).toBeVisible();
+  await selectPoolWorkspaceView(page, "Trade");
   await expect(page.locator("#liquidity-pair")).toHaveCount(0);
   await expect(page.locator("#liquidity-withdraw")).toHaveCount(0);
   await page.getByTestId("liquidity-amount-x").fill("0.345");
@@ -273,7 +306,9 @@ test("canonical pool tasks keep one selected pool while reusing swap and liquidi
   await tasks.getByRole("link", { name: "Manage" }).click();
   await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/manage$`, "i"));
   await expect(workspace).toHaveAttribute("data-pool-id", WNATIVE_USDC_PAIR.toLowerCase());
+  await selectPoolWorkspaceView(page, "Market");
   await expect(page.getByTestId("swap-market-chart")).toBeVisible();
+  await selectPoolWorkspaceView(page, "Trade");
   await expect(page.locator("#liquidity-add")).toHaveCount(0);
   await expect(page.locator("#liquidity-withdraw")).toBeVisible();
 
@@ -287,6 +322,7 @@ test("canonical pool tasks keep one selected pool while reusing swap and liquidi
   await expect(workspace.getByRole("link", { name: "Market overview" })).toHaveCount(0);
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/market`);
   await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/create\\?returnTo=`, "i"));
+  await selectPoolWorkspaceView(page, "Market");
   await expect(page.getByTestId("swap-market-chart")).toBeVisible();
   await expect(page.getByTestId("pool-workspace-state")).toHaveCount(0);
 });
@@ -296,20 +332,23 @@ test("pool workspace keeps truthful owner positions and history beneath the char
   await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
   await connectWallet(page);
+  const mobileView = await selectPoolWorkspaceView(page, "Positions");
 
   const workspace = page.getByTestId("canonical-pool-workspace");
   const panel = page.getByTestId("pool-workspace-owner-panel");
   const chart = page.getByTestId("swap-market-chart");
   await expect(panel).toBeVisible();
-  const geometry = await page.evaluate(() => {
-    const chartBox = document.querySelector<HTMLElement>('[data-testid="swap-market-chart"]')?.getBoundingClientRect();
-    const panelBox = document.querySelector<HTMLElement>('[data-testid="pool-workspace-owner-panel"]')?.getBoundingClientRect();
-    return chartBox && panelBox ? { chartBottom: chartBox.bottom, chartLeft: chartBox.left, chartRight: chartBox.right, panelLeft: panelBox.left, panelRight: panelBox.right, panelTop: panelBox.top } : null;
-  });
-  expect(geometry).not.toBeNull();
-  expect(geometry!.panelTop).toBeGreaterThanOrEqual(geometry!.chartBottom);
-  expect(Math.abs(geometry!.panelLeft - geometry!.chartLeft)).toBeLessThanOrEqual(1);
-  expect(Math.abs(geometry!.panelRight - geometry!.chartRight)).toBeLessThanOrEqual(1);
+  if (!mobileView) {
+    const geometry = await page.evaluate(() => {
+      const chartBox = document.querySelector<HTMLElement>('[data-testid="swap-market-chart"]')?.getBoundingClientRect();
+      const panelBox = document.querySelector<HTMLElement>('[data-testid="pool-workspace-owner-panel"]')?.getBoundingClientRect();
+      return chartBox && panelBox ? { chartBottom: chartBox.bottom, chartLeft: chartBox.left, chartRight: chartBox.right, panelLeft: panelBox.left, panelRight: panelBox.right, panelTop: panelBox.top } : null;
+    });
+    expect(geometry).not.toBeNull();
+    expect(geometry!.panelTop).toBeGreaterThanOrEqual(geometry!.chartBottom);
+    expect(Math.abs(geometry!.panelLeft - geometry!.chartLeft)).toBeLessThanOrEqual(1);
+    expect(Math.abs(geometry!.panelRight - geometry!.chartRight)).toBeLessThanOrEqual(1);
+  }
 
   await expect(panel.getByRole("tab", { name: "Positions" })).toHaveAttribute("aria-selected", "true");
   const position = panel.getByTestId("pool-position-summary");
@@ -327,17 +366,21 @@ test("pool workspace keeps truthful owner positions and history beneath the char
   await expect(panel).toContainText("Removed liquidity");
   await expect(panel).not.toContainText("Transaction history");
 
+  await selectPoolWorkspaceView(page, "Trade");
   await workspace.getByRole("link", { name: "Create position" }).first().click();
   await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/create$`, "i"));
+  await selectPoolWorkspaceView(page, "Positions");
   await expect(page.getByTestId("pool-workspace-owner-panel").getByRole("tab", { exact: true, name: "History" })).toHaveAttribute("aria-selected", "true");
   await page.getByTestId("pool-workspace-owner-panel").getByRole("tab", { name: "Positions" }).click();
   await page.getByTestId("pool-position-manage-link").click();
   await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/manage$`, "i"));
   await expect(page.locator(".position-option")).toHaveCount(1);
   await expect(page.locator(".position-option").first().locator('input[type="checkbox"]')).toBeChecked();
+  await selectPoolWorkspaceView(page, "Market");
   await expect(chart).toBeVisible();
 
   await page.setViewportSize({ height: 900, width: 320 });
+  await page.getByRole("tab", { name: "Positions" }).first().click();
   await expect(page.getByTestId("pool-workspace-owner-panel").getByRole("tab", { name: "Positions" })).toBeVisible();
   await expect(page.getByTestId("pool-workspace-owner-panel").getByRole("tab", { exact: true, name: "History" })).toBeVisible();
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
@@ -355,6 +398,7 @@ test("pool owner panel does not query before connection and exposes a real empty
   await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.reload();
   await connectWallet(page);
+  await selectPoolWorkspaceView(page, "Positions");
   await expect(panel).toContainText("No liquidity in this pool");
   await expect(panel.getByRole("link", { name: "Create position" })).toHaveAttribute("href", `#/pools/${WNATIVE_USDC_PAIR.toLowerCase()}/create`);
   await panel.getByRole("tab", { exact: true, name: "History" }).click();
@@ -484,6 +528,7 @@ test("owner history loads older pool rows without depending on the global activi
   await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
   await connectWallet(page);
+  await selectPoolWorkspaceView(page, "Positions");
 
   const panel = page.getByTestId("pool-workspace-owner-panel");
   await panel.getByRole("tab", { exact: true, name: "History" }).click();
@@ -503,6 +548,7 @@ test("pool activity is pair-scoped and switches between wallet-only and all acti
   await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
   await connectWallet(page);
+  await selectPoolWorkspaceView(page, "Positions");
 
   const panel = page.getByTestId("pool-workspace-owner-panel");
   await panel.getByRole("tab", { exact: true, name: "History" }).click();
@@ -540,6 +586,7 @@ test("wallet activity exposes partial owner-history pagination instead of presen
   await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
   await connectWallet(page);
+  await selectPoolWorkspaceView(page, "Positions");
 
   const panel = page.getByTestId("pool-workspace-owner-panel");
   await panel.getByRole("tab", { exact: true, name: "History" }).click();
@@ -555,6 +602,7 @@ test("mobile position selection opens a usable manage task with the exact bins p
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
   await connectWallet(page);
 
+  await page.getByRole("tab", { name: "Positions" }).first().click();
   const panel = page.getByTestId("pool-workspace-owner-panel");
   await panel.getByTestId("pool-position-manage-link").click();
   await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/manage$`, "i"));
@@ -567,9 +615,178 @@ test("mobile position selection opens a usable manage task with the exact bins p
   await expect(page.locator("#remove-percent")).toHaveValue("50");
   await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled();
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  expect(await page.evaluate(() => document.documentElement.scrollHeight)).toBeLessThan(4_000);
+});
+
+test("mobile workspace isolates Market, Trade, and Positions while preserving task drafts", async ({ page }) => {
+  await page.setViewportSize({ height: 760, width: 320 });
+  await installMockRpc(page, { includePairs: true, includePositions: true, lbApproved: true, positionHistoryCount: 48 });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
+  await connectWallet(page);
+
+  const workspace = page.getByTestId("canonical-pool-workspace");
+  const views = page.getByRole("tablist", { name: "Pool workspace views" });
+  const marketTab = views.getByRole("tab", { name: "Market" });
+  const tradeTab = views.getByRole("tab", { name: "Trade" });
+  const positionsTab = views.getByRole("tab", { name: "Positions" });
+
+  await expect(tradeTab).toHaveAttribute("aria-selected", "true");
+  await expect(marketTab).toHaveAttribute("aria-controls", "pool-mobile-market-panel pool-mobile-market-metadata");
+  await expect(page.locator("#pool-mobile-market-panel")).toHaveAttribute("role", "tabpanel");
+  await expect(page.locator("#liquidity-add")).toHaveAttribute("role", "tabpanel");
+  await expect(page.locator("#pool-mobile-positions-panel")).toHaveAttribute("role", "tabpanel");
+  await expect(page.getByTestId("liquidity-range-editor")).toBeVisible();
+  await expect(page.getByTestId("swap-market-chart")).toBeHidden();
+  await expect(page.getByTestId("pool-workspace-owner-panel")).toBeHidden();
+  await page.getByTestId("liquidity-amount-x").fill("0.25");
+  const createActionGeometry = await page.getByTestId("liquidity-add-button").evaluate((button) => {
+    const panel = button.closest<HTMLElement>("#liquidity-add")?.getBoundingClientRect();
+    const action = button.getBoundingClientRect();
+    return { actionBottom: action.bottom, actionTop: action.top, panelBottom: panel?.bottom, panelTop: panel?.top };
+  });
+  expect(createActionGeometry.actionBottom).toBeLessThanOrEqual(760);
+  expect(createActionGeometry.actionTop).toBeGreaterThanOrEqual(0);
+
+  await marketTab.click();
+  await expect(marketTab).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByTestId("swap-market-chart")).toBeVisible();
+  await expect(page.getByTestId("liquidity-range-editor")).toBeHidden();
+  const metadataToggle = page.getByRole("button", { name: /Pool market/ });
+  await expect(metadataToggle).toHaveAttribute("aria-expanded", "false");
+  await metadataToggle.click();
+  await expect(metadataToggle).toHaveAttribute("aria-expanded", "true");
+
+  await positionsTab.click();
+  await expect(page.getByTestId("pool-workspace-owner-panel")).toBeVisible();
+  await expect(page.getByTestId("swap-market-chart")).toBeHidden();
+  const ownerPositions = page.getByTestId("pool-workspace-owner-panel").getByRole("tab", { name: "Positions" });
+  await ownerPositions.focus();
+  await page.keyboard.press("ArrowRight");
+  await expect(page.getByTestId("pool-workspace-owner-panel").getByRole("tab", { exact: true, name: "History" })).toHaveAttribute("aria-selected", "true");
+  await page.keyboard.press("ArrowLeft");
+  await expect(ownerPositions).toHaveAttribute("aria-selected", "true");
+
+  await tradeTab.focus();
+  await page.keyboard.press("ArrowLeft");
+  await expect(marketTab).toHaveAttribute("aria-selected", "true");
+  await page.keyboard.press("End");
+  await expect(positionsTab).toHaveAttribute("aria-selected", "true");
+  await page.getByTestId("pool-position-manage-link").click();
+  await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/manage$`, "i"));
+  await expect(tradeTab).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByTestId("liquidity-remove-button")).toBeInViewport();
+
+  await page.getByRole("link", { name: "Create position" }).first().click();
+  await expect(page.getByTestId("liquidity-amount-x")).toHaveValue("0.25");
+  await expect.poll(() => page.evaluate(() => ({
+    height: document.documentElement.scrollHeight,
+    noOverflow: document.documentElement.scrollWidth <= document.documentElement.clientWidth
+  }))).toEqual({ height: expect.any(Number), noOverflow: true });
+  expect(await workspace.evaluate((element) => element.ownerDocument.documentElement.scrollHeight)).toBeLessThan(4_000);
+});
+
+test("mobile market view keeps the chart and pool metadata reachable without document overflow", async ({ page }) => {
+  await page.setViewportSize({ height: 760, width: 320 });
+  await installMockRpc(page, { includePairs: true, includePositions: true });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
+
+  const views = page.getByRole("tablist", { name: "Pool workspace views" });
+  const marketTab = views.getByRole("tab", { name: "Market" });
+  await marketTab.click();
+  await expect(marketTab).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByTestId("swap-market-chart")).toBeVisible();
+
+  const metadataToggle = page.getByRole("button", { name: /Pool market/ });
+  await metadataToggle.click();
+  await expect(metadataToggle).toHaveAttribute("aria-expanded", "true");
+  await expect(page.getByTestId("pool-workspace-rail")).toBeVisible();
+
+  expect(await page.evaluate(() => document.documentElement.scrollHeight)).toBeLessThan(4_000);
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+for (const width of [820, 1000] as const) {
+  test(`tablet prioritizes chart, task, and positions before collapsed metadata at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ height: 900, width });
+    await installMockRpc(page, { includePairs: true });
+    await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
+
+    const rail = page.getByTestId("pool-workspace-rail");
+    const toggle = rail.getByRole("button", { name: /Pool market/ });
+    await expect(page.getByRole("tablist", { name: "Pool workspace views" })).toHaveCount(0);
+    await expect(page.locator("#pool-mobile-market-panel[role=tabpanel], #liquidity-add[role=tabpanel], #pool-mobile-positions-panel[role=tabpanel]")).toHaveCount(0);
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    const geometry = await page.evaluate(() => {
+      const chart = document.querySelector<HTMLElement>('[data-testid="swap-market-chart"]')?.getBoundingClientRect();
+      const task = document.querySelector<HTMLElement>("#liquidity-add")?.getBoundingClientRect();
+      const positions = document.querySelector<HTMLElement>("#pool-mobile-positions-panel")?.getBoundingClientRect();
+      const rail = document.querySelector<HTMLElement>('[data-testid="pool-workspace-rail"]')?.getBoundingClientRect();
+      return chart && task && positions && rail ? {
+        chartBottom: chart.bottom,
+        chartTop: chart.top,
+        positionsBottom: positions.bottom,
+        positionsTop: positions.top,
+        railTop: rail.top,
+        taskBottom: task.bottom,
+        taskTop: task.top
+      } : null;
+    });
+    expect(geometry).not.toBeNull();
+    expect(geometry!.chartTop).toBeLessThan(geometry!.taskTop);
+    expect(geometry!.chartBottom).toBeLessThanOrEqual(geometry!.taskTop);
+    expect(geometry!.taskBottom).toBeLessThanOrEqual(geometry!.positionsTop);
+    expect(geometry!.positionsBottom).toBeLessThanOrEqual(geometry!.railTop);
+    await toggle.click();
+    await expect(rail.getByText("Current pool price")).toBeVisible();
+  });
+}
+
+test("pool task actions and invalid range fields expose announced safety state", async ({ page }) => {
+  await installMockRpc(page, { includePairs: true });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+
+  await expect(page.getByTestId("swap-submit-button")).toHaveAttribute("aria-describedby", "swap-failure-state");
+  await expect(page.locator("#swap-failure-state")).toHaveAttribute("role", /alert|status/);
+
+  await page.getByRole("link", { name: "Create position" }).first().click();
+  await expect(page.getByTestId("liquidity-add-button")).toHaveAttribute("aria-describedby", "liquidity-add-status");
+  const minimumPrice = page.getByLabel("Min USDC per WNATIVE");
+  await minimumPrice.fill("not-a-price");
+  await minimumPrice.blur();
+  await expect(minimumPrice).toHaveAttribute("aria-invalid", "true");
+  await expect(minimumPrice).toHaveAttribute("aria-errormessage", "liquidity-range-error");
+  await expect(page.locator("#liquidity-range-error")).toHaveAttribute("role", "alert");
+
+  await page.getByRole("link", { name: "Manage" }).first().click();
+  await expect(page.getByTestId("liquidity-remove-button")).toHaveAttribute("aria-describedby", "liquidity-remove-status");
+  await expect(page.locator("#liquidity-remove-status")).toHaveAttribute("role", /alert|status/);
+});
+
+test("mobile owner history stays internally scrollable when every bounded row is revealed", async ({ page }) => {
+  await page.setViewportSize({ height: 760, width: 320 });
+  await installMockRpc(page, { includePairs: true, includePositions: true, positionHistoryCount: 120 });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+  await connectWallet(page);
+  await page.getByRole("tablist", { name: "Pool workspace views" }).getByRole("tab", { name: "Positions" }).click();
+
+  const panel = page.getByTestId("pool-workspace-owner-panel");
+  await panel.getByRole("tab", { exact: true, name: "History" }).click();
+  const loadMore = panel.getByTestId("pool-history-load-more");
+  for (let pageIndex = 0; pageIndex < 12 && await loadMore.count() > 0; pageIndex += 1) await loadMore.click();
+  await expect(panel.getByTestId("pool-history-row")).toHaveCount(120);
+  const geometry = await page.evaluate(() => {
+    const body = document.querySelector<HTMLElement>("#pool-owner-history-panel");
+    return body ? { clientHeight: body.clientHeight, documentHeight: document.documentElement.scrollHeight, scrollHeight: body.scrollHeight } : null;
+  });
+  expect(geometry).not.toBeNull();
+  expect(geometry!.scrollHeight).toBeGreaterThan(geometry!.clientHeight);
+  expect(geometry!.documentHeight).toBeLessThan(4_000);
 });
 
 test("create position range editor layers exact distribution over indexed pool reserves", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
   await page.setViewportSize({ height: 1000, width: 1600 });
   await installMockRpc(page, {
     includePairs: true,
@@ -593,6 +810,18 @@ test("create position range editor layers exact distribution over indexed pool r
   await expect(editor).toContainText("Pool USDC");
   await expect(editor).toContainText("New position");
   await expect(chart.locator(".range-editor-bin > i")).not.toHaveCount(0);
+  const retainedActiveBin = chart.locator(`.range-editor-bin[data-bin-id="${TEST_ACTIVE_ID}"]`);
+  await retainedActiveBin.evaluate((element) => { element.setAttribute("data-retained-test-node", "true"); });
+  const motion = await chart.locator(".range-editor-bin > i").first().evaluate((element) => ({
+    animationDuration: getComputedStyle(element).animationDuration,
+    reduced: window.matchMedia("(prefers-reduced-motion: reduce)").matches,
+    transitionDuration: getComputedStyle(element).transitionDuration
+  }));
+  expect(motion.reduced).toBe(true);
+  for (const duration of [motion.animationDuration, motion.transitionDuration]) {
+    const milliseconds = Number.parseFloat(duration) * (duration.endsWith("ms") ? 1 : 1_000);
+    expect(milliseconds).toBeLessThanOrEqual(0.01);
+  }
   await expect(chart.getByRole("img")).toHaveCount(3);
   await expect(page.getByLabel("Min USDC per WNATIVE")).toBeVisible();
   await expect(page.getByLabel("Max USDC per WNATIVE")).toBeVisible();
@@ -617,6 +846,10 @@ test("create position range editor layers exact distribution over indexed pool r
   await lowerHandle.scrollIntoViewIfNeeded();
   const lowerHandleBox = await lowerHandle.boundingBox();
   expect(lowerHandleBox).not.toBeNull();
+  await lowerHandle.focus();
+  await page.keyboard.press("ArrowLeft");
+  await expect(lowerHandle).toHaveAttribute("aria-valuenow", "-2");
+  await expect(retainedActiveBin).toHaveAttribute("data-retained-test-node", "true");
   const lowerThumbX = lowerHandleBox!.x + lowerHandleBox!.width / 2;
   const thumbY = lowerHandleBox!.y + lowerHandleBox!.height / 2;
   await page.mouse.move(lowerThumbX, thumbY);
@@ -655,7 +888,7 @@ test("create position range editor layers exact distribution over indexed pool r
   await expect(editor).toContainText("69 bins selected");
   await page.getByLabel("Narrow preset bin count").fill("70");
   await page.getByTestId("liquidity-preset-narrow").click();
-  await expect(editor.getByRole("status")).toContainText("between 1 and 69 bins");
+  await expect(editor.getByRole("alert")).toContainText("between 1 and 69 bins");
   await expect(editor).toContainText("69 bins selected");
   const railGeometry = await page.evaluate(() => {
     const chartBox = document.querySelector<HTMLElement>('[data-testid="swap-market-chart"]')?.getBoundingClientRect();
@@ -833,6 +1066,7 @@ for (const viewport of [
     const actionBox = await add.boundingBox();
     expect(actionBox).not.toBeNull();
     expect(actionBox!.y + actionBox!.height).toBeLessThanOrEqual(viewport.height);
+    expect(await page.evaluate(() => document.documentElement.scrollHeight)).toBeLessThan(4_000);
     await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   });
 }
@@ -855,6 +1089,29 @@ test("create position remains operable at 200 percent layout scale", async ({ pa
   await add.scrollIntoViewIfNeeded();
   await expect(add).toBeVisible();
   const actionBox = await add.boundingBox();
+  expect(actionBox).not.toBeNull();
+  expect(actionBox!.y + actionBox!.height).toBeLessThanOrEqual(900);
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test("manage position remains operable at 200 percent layout scale", async ({ page }) => {
+  await page.setViewportSize({ height: 900, width: 640 });
+  await installMockRpc(page, { includePairs: true, includePositions: true, lbApproved: true });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/manage`);
+  await connectWallet(page);
+  await page.evaluate(() => { document.documentElement.style.zoom = "2"; });
+
+  const percentage = page.locator("#remove-percent-slider");
+  await percentage.focus();
+  await page.keyboard.press("ArrowLeft");
+  await expect(page.locator("#remove-percent")).toHaveValue("99.99");
+  await page.locator("#remove-percent").fill("50");
+  await expect(percentage).toHaveValue("50");
+  const remove = page.getByTestId("liquidity-remove-button");
+  await remove.scrollIntoViewIfNeeded();
+  await expect(remove).toBeVisible();
+  const actionBox = await remove.boundingBox();
   expect(actionBox).not.toBeNull();
   expect(actionBox!.y + actionBox!.height).toBeLessThanOrEqual(900);
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
@@ -985,6 +1242,7 @@ for (const viewport of [
     await expect(blocker).toBeVisible();
     await expect(action).toBeInViewport();
     await expect(blocker).toBeInViewport();
+    expect(await page.evaluate(() => document.documentElement.scrollHeight)).toBeLessThan(4_000);
     await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   });
 }
@@ -1082,6 +1340,7 @@ test("unified pool workspace preserves URL filters, analytics, actions, and acce
 
   await expect(page).toHaveURL(/#\/pools\/.+\/create\?returnTo=/);
   await expect(page.getByTestId("pool-workspace-state")).toHaveCount(0);
+  await expandPoolMetadata(page);
   await expect(page.getByTestId("swap-market-chart")).toBeVisible();
   await expect(page.getByTestId("pool-rail-liquidity-distribution").locator(".pool-rail-liquidity-bars > span")).toHaveCount(33);
   await expect(page.getByTestId("pool-detail-analytics-state")).toHaveCount(0);
@@ -1108,6 +1367,7 @@ test("pool economics uses one pinned active ID and labels every market data sour
     poolBinCount: 5
   });
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
+  await expandPoolMetadata(page);
 
   const fees = page.getByTestId("pool-fee-economics");
   await expect(fees).toContainText("Current active-bin fees");
@@ -1136,6 +1396,7 @@ test("pool economics uses one pinned active ID and labels every market data sour
 test("liquidity distribution rejects an indexed active ID that lags the pinned RPC snapshot", async ({ page }) => {
   await installMockRpc(page, { includePairs: true, pairRuntimeActiveId: 8_388_609, poolBinCount: 5 });
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
+  await expandPoolMetadata(page);
 
   await expect(page.getByTestId("pool-fee-economics")).toContainText("active ID differs from the indexer snapshot");
   await expect(page.locator(".pool-rail-price-block > strong")).toHaveText("Unavailable");
@@ -1148,6 +1409,7 @@ test("liquidity distribution rejects an indexed active ID that lags the pinned R
 test("normal indexer lag uses the indexed common block instead of failing against RPC latest", async ({ page }) => {
   await installMockRpc(page, { blockNumber: 50n, includePairs: true, indexerBlockNumber: 42n, poolBinCount: 5 });
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
+  await expandPoolMetadata(page);
 
   await expect(page.locator(".pool-rail-price-block")).toContainText("RPC block 42");
   await expect(page.locator(".pool-rail-price-block > strong")).not.toHaveText("Unavailable");
@@ -1158,6 +1420,7 @@ test("normal indexer lag uses the indexed common block instead of failing agains
 test("a background snapshot failure hides previously cached market economics", async ({ page }) => {
   const rpc = await installMockRpc(page, { includePairs: true, poolBinCount: 5 });
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
+  await expandPoolMetadata(page);
 
   await expect(page.locator(".pool-rail-price-block > strong")).not.toHaveText("Unavailable");
   await expect(page.getByTestId("pool-fee-economics")).toContainText("RPC block 42");
@@ -1172,6 +1435,7 @@ test("a background snapshot failure hides previously cached market economics", a
 test("pool market fails closed when pinned RPC identity differs from the indexed pool", async ({ page }) => {
   await installMockRpc(page, { includePairs: true, pairRuntimeBinStep: 11 });
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
+  await expandPoolMetadata(page);
 
   await expect(page.getByTestId("pool-fee-economics")).toContainText("differs from indexed bin step");
   await expect(page.locator(".pool-rail-price-block > strong")).toHaveText("Unavailable");
@@ -1185,6 +1449,7 @@ test("pool market fails closed when pinned RPC identity differs from the indexed
 test("pool market fails closed when pinned token decimals differ from allowlisted metadata", async ({ page }) => {
   await installMockRpc(page, { includePairs: true, pairRuntimeTokenXDecimals: 17 });
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
+  await expandPoolMetadata(page);
 
   await expect(page.getByTestId("pool-fee-economics")).toContainText("token X decimals");
   await expect(page.locator(".pool-rail-price-block > strong")).toHaveText("Unavailable");

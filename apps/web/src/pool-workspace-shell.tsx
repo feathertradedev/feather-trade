@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type KeyboardEvent, type ReactNode } from "react";
 
 import {
   formatExactPriceFraction,
@@ -12,11 +12,20 @@ import { buildCenteredBinDistribution, formatRatioPercentE18, workspaceMetricTil
 import { PoolWorkspaceProvider, usePoolWorkspace } from "./pool-workspace-context";
 import { parsePoolWorkspaceRoute, poolWorkspaceHref, type PoolWorkspaceTask } from "./pool-workspace-route";
 import type { EnvironmentKey } from "./config";
+import { useMediaQuery } from "./use-media-query";
 
 const ACTION_TASKS: ReadonlyArray<{ key: Exclude<PoolWorkspaceTask, "market">; label: string }> = [
   { key: "swap", label: "Swap" },
   { key: "create", label: "Create position" },
   { key: "manage", label: "Manage" }
+];
+
+type MobileWorkspaceView = "market" | "trade" | "positions";
+
+const MOBILE_WORKSPACE_VIEWS: ReadonlyArray<{ key: MobileWorkspaceView; label: string }> = [
+  { key: "market", label: "Market" },
+  { key: "trade", label: "Trade" },
+  { key: "positions", label: "Positions" }
 ];
 
 export function PoolWorkspaceShell({
@@ -39,9 +48,29 @@ export function PoolWorkspaceShell({
 
 function PoolWorkspaceScaffold({ children, pool, pools }: { children: ReactNode; pool: PoolRow; pools: PoolRow[] }) {
   const returnHref = returnHrefFromAction(window.location.hash);
+  const routeTask = parsePoolWorkspaceRoute(window.location.hash)?.task ?? "create";
+  const tradePanelId = routeTask === "swap" ? "swap-task-panel" : routeTask === "manage" ? "liquidity-withdraw" : "liquidity-add";
+  const mobileWorkspaceNavigation = useMediaQuery("(max-width: 720px)");
+  const [mobileView, setMobileView] = useState<MobileWorkspaceView>(() =>
+    routeTask === "market" ? "market" : "trade"
+  );
+
+  useEffect(() => {
+    const handleTaskNavigation = () => {
+      const task = parsePoolWorkspaceRoute(window.location.hash)?.task;
+      if (task === "swap" || task === "create" || task === "manage") setMobileView("trade");
+    };
+    window.addEventListener("hashchange", handleTaskNavigation);
+    return () => window.removeEventListener("hashchange", handleTaskNavigation);
+  }, []);
 
   return (
-    <section className="canonical-pool-workspace" data-pool-id={pool.id} data-testid="canonical-pool-workspace">
+    <section
+      className="canonical-pool-workspace"
+      data-mobile-view={mobileView}
+      data-pool-id={pool.id}
+      data-testid="canonical-pool-workspace"
+    >
       {returnHref === null ? null : <a className="back-link action-return-link" data-testid="pool-action-back" href={returnHref}>← Back to pools</a>}
       <header className="pool-workspace-header">
         <div className="pool-workspace-identity">
@@ -51,11 +80,66 @@ function PoolWorkspaceScaffold({ children, pool, pools }: { children: ReactNode;
         </div>
         <PoolBinStepSelector pool={pool} pools={pools} />
       </header>
+      {mobileWorkspaceNavigation ? <PoolMobileWorkspaceNav activeView={mobileView} onChange={setMobileView} tradePanelId={tradePanelId} /> : null}
       <div className="pool-workspace-body">
-        <PoolWorkspaceRail />
+        <PoolWorkspaceRail mobileWorkspaceNavigation={mobileWorkspaceNavigation} />
         <div className="pool-workspace-task-content">{children}</div>
       </div>
     </section>
+  );
+}
+
+function PoolMobileWorkspaceNav({
+  activeView,
+  onChange,
+  tradePanelId
+}: {
+  activeView: MobileWorkspaceView;
+  onChange: (view: MobileWorkspaceView) => void;
+  tradePanelId: string;
+}) {
+  const handleKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    const tabs = [...event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
+    const focusedIndex = tabs.indexOf(document.activeElement as HTMLButtonElement);
+    if (focusedIndex < 0) return;
+    event.preventDefault();
+    const nextIndex = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? MOBILE_WORKSPACE_VIEWS.length - 1
+        : (focusedIndex + (event.key === "ArrowRight" ? 1 : -1) + MOBILE_WORKSPACE_VIEWS.length) % MOBILE_WORKSPACE_VIEWS.length;
+    const nextView = MOBILE_WORKSPACE_VIEWS[nextIndex]!;
+    onChange(nextView.key);
+    document.getElementById(`pool-mobile-${nextView.key}-tab`)?.focus();
+  };
+
+  return (
+    <nav
+      aria-label="Pool workspace views"
+      className="pool-mobile-workspace-nav"
+      onKeyDown={handleKeyDown}
+      role="tablist"
+    >
+      {MOBILE_WORKSPACE_VIEWS.map((view) => (
+        <button
+          aria-controls={view.key === "trade"
+            ? tradePanelId
+            : view.key === "market"
+              ? "pool-mobile-market-panel pool-mobile-market-metadata"
+              : "pool-mobile-positions-panel"}
+          aria-selected={activeView === view.key}
+          id={`pool-mobile-${view.key}-tab`}
+          key={view.key}
+          onClick={() => onChange(view.key)}
+          role="tab"
+          tabIndex={activeView === view.key ? 0 : -1}
+          type="button"
+        >
+          {view.label}
+        </button>
+      ))}
+    </nav>
   );
 }
 
@@ -108,18 +192,29 @@ function PoolBinStepSelector({ pool, pools }: { pool: PoolRow; pools: PoolRow[] 
   );
 }
 
-function PoolWorkspaceRail() {
+function PoolWorkspaceRail({ mobileWorkspaceNavigation }: { mobileWorkspaceNavigation: boolean }) {
   const workspace = usePoolWorkspace();
   const metricTiles = workspaceMetricTiles(workspace.analytics.row.metric).map((tile) => workspace.economics.value === null
-    ? { ...tile, status: "UNAVAILABLE" as const, value: "Unavailable" }
+    ? workspace.economics.state === "loading"
+      ? { ...tile, status: "PARTIAL" as const, value: "Loading…" }
+      : { ...tile, status: "UNAVAILABLE" as const, value: "Unavailable" }
     : tile);
   const tvl = metricTiles.find((tile) => tile.key === "tvl")!;
   const volume = metricTiles.find((tile) => tile.key === "volume24h")!;
   const fees = metricTiles.find((tile) => tile.key === "lpFees24h")!;
   const feeToTvl = metricTiles.find((tile) => tile.key === "feeToTvl")!;
   const [inversePrice, setInversePrice] = useState(false);
+  const [detailsOpen, setDetailsOpen] = useState(() => !window.matchMedia("(max-width: 1040px)").matches);
+  useEffect(() => {
+    const query = window.matchMedia("(max-width: 1040px)");
+    const handleChange = (event: MediaQueryListEvent) => setDetailsOpen(!event.matches);
+    query.addEventListener("change", handleChange);
+    return () => query.removeEventListener("change", handleChange);
+  }, []);
   const currentActiveId = workspace.economics.value?.activeId.toString() ?? null;
-  const currentPrice = formatCurrentPoolPrice(workspace.pool, inversePrice, currentActiveId);
+  const currentPrice = workspace.economics.state === "loading"
+    ? "Loading…"
+    : formatCurrentPoolPrice(workspace.pool, inversePrice, currentActiveId);
   const baseSymbol = tokenSymbol(inversePrice ? workspace.pool.tokenY : workspace.pool.tokenX);
   const quoteSymbol = tokenSymbol(inversePrice ? workspace.pool.tokenX : workspace.pool.tokenY);
   const positionsLabel = workspace.walletAddress === null
@@ -134,7 +229,27 @@ function PoolWorkspaceRail() {
     : workspace.activity.state;
 
   return (
-    <aside className="pool-workspace-rail" data-testid="pool-workspace-rail">
+    <aside
+      aria-label="Pool market details"
+      aria-labelledby={mobileWorkspaceNavigation ? "pool-mobile-market-tab" : undefined}
+      className="pool-workspace-rail"
+      data-testid="pool-workspace-rail"
+      id="pool-mobile-market-metadata"
+    >
+      <button
+        aria-controls="pool-workspace-rail-details"
+        aria-expanded={detailsOpen}
+        className="pool-workspace-rail-toggle"
+        onClick={() => setDetailsOpen((current) => !current)}
+        type="button"
+      >
+        <span>
+          <strong>Pool market</strong>
+          <small>{currentPrice} {quoteSymbol} per {baseSymbol} · TVL {tvl.value}</small>
+        </span>
+        <span aria-hidden="true">{detailsOpen ? "Hide details" : "Show details"}</span>
+      </button>
+      <div className="pool-workspace-rail-content" hidden={!detailsOpen} id="pool-workspace-rail-details">
       <section className="pool-rail-section pool-rail-overview">
         <div className="pool-rail-pair-row">
           <div>
@@ -173,11 +288,11 @@ function PoolWorkspaceRail() {
         <dl aria-label="Pool token reserves">
           <div>
             <dt><i className="pool-token-dot token-x" />{tokenSymbol(workspace.pool.tokenX)}</dt>
-            <dd>{formatSnapshotReserve(workspace.indexerSnapshot.value?.reserveX, workspace.pool.tokenX, workspace.economics.value !== null)}</dd>
+            <dd>{formatSnapshotReserve(workspace.indexerSnapshot.value?.reserveX, workspace.pool.tokenX, workspace.economics.value !== null, workspace.indexerSnapshot.state === "loading" || workspace.economics.state === "loading")}</dd>
           </div>
           <div>
             <dt><i className="pool-token-dot token-y" />{tokenSymbol(workspace.pool.tokenY)}</dt>
-            <dd>{formatSnapshotReserve(workspace.indexerSnapshot.value?.reserveY, workspace.pool.tokenY, workspace.economics.value !== null)}</dd>
+            <dd>{formatSnapshotReserve(workspace.indexerSnapshot.value?.reserveY, workspace.pool.tokenY, workspace.economics.value !== null, workspace.indexerSnapshot.state === "loading" || workspace.economics.state === "loading")}</dd>
           </div>
         </dl>
         <small className="pool-rail-data-source">{indexedReserveSourceLabel(workspace)}</small>
@@ -209,6 +324,7 @@ function PoolWorkspaceRail() {
         <strong>{positionsLabel}</strong>
         <span>Pool activity</span>
         <strong>{activityLabel}</strong>
+      </div>
       </div>
     </aside>
   );
@@ -376,7 +492,8 @@ function indexedReserveSourceLabel(workspace: ReturnType<typeof usePoolWorkspace
   return `Indexed reserves · snapshot block ${snapshot.blockNumber} · last pool update block ${snapshot.updatedAtBlock}`;
 }
 
-function formatSnapshotReserve(value: string | undefined, token: PoolRow["tokenX"], decimalsVerified: boolean): string {
+function formatSnapshotReserve(value: string | undefined, token: PoolRow["tokenX"], decimalsVerified: boolean, loading: boolean): string {
+  if (loading) return "Loading…";
   return value === undefined || token === null || !decimalsVerified ? "Unavailable" : formatTokenAmount(value, token);
 }
 

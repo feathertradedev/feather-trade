@@ -268,6 +268,7 @@ import {
 } from "./pool-workspace-context";
 import { PoolWorkspaceShell, PoolWorkspaceTaskTabs } from "./pool-workspace-shell";
 import { PoolWorkspaceOwnerPanel } from "./pool-workspace-owner-panel";
+import { useMediaQuery } from "./use-media-query";
 
 const queryClient = new QueryClient();
 const SNAPSHOT_REFRESH_INTERVAL_MS = 10_000;
@@ -704,6 +705,12 @@ function DexShell() {
 
   useEffect(() => {
     window.scrollTo({ behavior: "auto", left: 0, top: 0 });
+    document.title = poolDetailId !== null
+      ? `Pool ${workspaceTask ?? "market"} | Feather`
+      : `${routes.find((route) => route.key === routeKey)?.label ?? "Feather"} | Feather`;
+    window.requestAnimationFrame(() => {
+      document.getElementById("app-route-content")?.focus({ preventScroll: true });
+    });
   }, [actionPoolId, liquiditySection, poolDetailId, portfolioAction, positionDetailId, routeKey, workspaceTask]);
 
   if (routeKey === "home") {
@@ -711,7 +718,7 @@ function DexShell() {
   }
 
   return (
-    <main className="shell app-shell">
+    <main className="shell app-shell route-focus-target" id="app-route-content" tabIndex={-1}>
       <header className="app-header">
         <BrandLockup />
         <nav className="nav-list" aria-label="Primary">
@@ -1579,6 +1586,7 @@ function SwapView({
   const poolWorkspace = useOptionalPoolWorkspace();
   const analyticsEndpoint = analyticsEndpointForRegistry(registry);
   const workspaceMatchesPool = poolWorkspace !== null && primaryPool !== null && isAddressEqual(poolWorkspace.pool.address, primaryPool.address);
+  const mobileWorkspaceNavigation = useMediaQuery("(max-width: 720px)") && workspaceMatchesPool;
   const candleInterval = workspaceMatchesPool ? poolWorkspace.analytics.candleInterval : standaloneCandleInterval;
   const standaloneCandleWindow = useMemo(() => {
     const end = candleBoundary(Math.floor(Date.now() / 1_000), candleInterval);
@@ -2557,7 +2565,13 @@ function SwapView({
 
   return (
     <div className="view-grid swap-workspace">
-      <div className="swap-market-column">
+      <div
+        aria-labelledby={mobileWorkspaceNavigation ? "pool-mobile-market-tab" : undefined}
+        className="swap-market-column"
+        id="pool-mobile-market-panel"
+        role={mobileWorkspaceNavigation ? "tabpanel" : undefined}
+        tabIndex={mobileWorkspaceNavigation ? -1 : undefined}
+      >
         <SwapMarketChart
           candles={swapCandlePage.rows}
           error={swapCandlePage.error}
@@ -2569,9 +2583,26 @@ function SwapView({
           status={swapCandlePage.status}
           streamState={workspaceMatchesPool ? poolWorkspace.analytics.candleStreamState : "unavailable"}
         />
-        {workspaceMatchesPool ? <PoolWorkspaceOwnerPanel /> : null}
       </div>
-      <section className={`tool-panel swap-task-panel${workspaceMatchesPool ? " pool-task-panel-scoped" : ""}`} data-testid="swap-task-panel">
+      {workspaceMatchesPool ? (
+        <div
+          aria-labelledby={mobileWorkspaceNavigation ? "pool-mobile-positions-tab" : undefined}
+          className="pool-positions-column"
+          id="pool-mobile-positions-panel"
+          role={mobileWorkspaceNavigation ? "tabpanel" : undefined}
+          tabIndex={mobileWorkspaceNavigation ? -1 : undefined}
+        >
+          <PoolWorkspaceOwnerPanel />
+        </div>
+      ) : null}
+      <section
+        aria-labelledby={mobileWorkspaceNavigation ? "pool-mobile-trade-tab" : undefined}
+        className={`tool-panel swap-task-panel${workspaceMatchesPool ? " pool-task-panel-scoped" : ""}`}
+        data-testid="swap-task-panel"
+        id={workspaceMatchesPool ? "swap-task-panel" : undefined}
+        role={mobileWorkspaceNavigation ? "tabpanel" : undefined}
+        tabIndex={mobileWorkspaceNavigation ? -1 : undefined}
+      >
         {workspaceMatchesPool ? <PoolWorkspaceTaskTabs task="swap" /> : null}
         <header className="swap-task-header">
           <div>
@@ -2767,7 +2798,7 @@ function SwapView({
               className="secondary-button wide"
               data-testid="swap-approve-button"
               type="button"
-              aria-describedby="swap-approval-details"
+              aria-describedby="swap-approval-details swap-failure-state"
               disabled={!canApprove || approvalWrite.isPending || approvalReceipt.isLoading || approvalSimulationPending}
               hidden={!connected}
               title={swapApprovalDisclosure}
@@ -2776,7 +2807,7 @@ function SwapView({
               {approvalSimulationPending || approvalWrite.isPending || approvalReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <CheckCircle2 size={18} />}
               <span>{needsApproval ? `Approve ${tokenSymbol(tokenIn)}` : "Approved"}</span>
             </button> : null}
-            <button className={`primary-button wide${!connected ? " swap-primary-only" : ""}`} data-testid="swap-submit-button" type="button" disabled={!canSwap} onClick={handleSwap}>
+            <button aria-describedby="swap-failure-state" className={`primary-button wide${!connected ? " swap-primary-only" : ""}`} data-testid="swap-submit-button" type="button" disabled={!canSwap} onClick={handleSwap}>
               {swapSimulationPending || swapWrite.isPending || swapReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <ArrowLeftRight size={18} />}
               <span>
                 {buttonLabel({
@@ -2913,6 +2944,7 @@ function SwapMarketChart({
   const seriesTimesRef = useRef(new Set<number>());
   const intervalCandles = useMemo(() => candles.filter((candle) => candle.interval === interval), [candles, interval]);
   const latestCandle = [...intervalCandles].reverse().find((candle) => candle.closeUsdE18 !== null) ?? null;
+  const accessibleCandles = intervalCandles.slice(-24);
   const historyState = loading
     ? "Loading"
     : status === "UNAVAILABLE"
@@ -3080,7 +3112,7 @@ function SwapMarketChart({
           ))}
         </div>
       </header>
-      <div className="swap-chart-summary" aria-live="polite">
+      <div className="swap-chart-summary">
         {latestCandle ? (
           <>
             <span>O {formatUsdE18(latestCandle.openUsdE18)}</span>
@@ -3092,8 +3124,28 @@ function SwapMarketChart({
         ) : <span>{emptyMessage}</span>}
       </div>
       <div className="swap-chart-stage">
-        <div aria-label={`${pairLabel} ${CANDLE_INTERVAL_LABELS[interval]} candlestick chart`} className="swap-chart-canvas" ref={containerRef} role="img" />
+        <div aria-describedby="pool-candle-chart-description" aria-label={`${pairLabel} ${CANDLE_INTERVAL_LABELS[interval]} candlestick chart`} className="swap-chart-canvas" ref={containerRef} role="img" />
         {intervalCandles.length === 0 ? <div className="swap-chart-empty"><span>{emptyMessage}</span></div> : null}
+      </div>
+      <div className="visually-hidden visually-hidden-table" id="pool-candle-chart-description">
+        <p>{pairLabel} {CANDLE_INTERVAL_LABELS[interval]} price history. {historyState}. {intervalCandles.length} candles are loaded; the table contains the latest {accessibleCandles.length}.</p>
+        <table>
+          <caption>Latest {pairLabel} candle data</caption>
+          <thead><tr><th>UTC start</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Volume</th><th>Status</th></tr></thead>
+          <tbody>
+            {accessibleCandles.map((candle) => (
+              <tr key={`${candle.startTimestamp}-${candle.revision}`}>
+                <th>{new Date(candle.startTimestamp * 1_000).toISOString()}</th>
+                <td>{formatUsdE18(candle.openUsdE18)}</td>
+                <td>{formatUsdE18(candle.highUsdE18)}</td>
+                <td>{formatUsdE18(candle.lowUsdE18)}</td>
+                <td>{formatUsdE18(candle.closeUsdE18)}</td>
+                <td>{formatUsdE18(candle.volumeUsdE18)}</td>
+                <td>{candle.status}{candle.finalized ? ", finalized" : ", updating"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
       <footer className="swap-chart-footer">
         <span>{CANDLE_LOOKBACK_LABELS[interval]} · {historyState}</span>
@@ -3500,6 +3552,7 @@ function SwapStateRows({
       aria-live={state.tone === "failure" ? "assertive" : "polite"}
       className={`state-row transaction-status ${state.tone}`}
       data-testid="swap-failure-state"
+      id="swap-failure-state"
       role={state.tone === "failure" ? "alert" : "status"}
     >
       {state.icon}
@@ -3980,7 +4033,7 @@ function LiquidityReceiptReview({
 }) {
   if (hash === null) return null;
   if (error !== null && error !== undefined) {
-    return <div className="state-row failure" data-testid="liquidity-receipt-review-error"><AlertTriangle size={16} /><span>Canonical receipt accounting failed closed: {getWriteError(error)}</span></div>;
+    return <div aria-atomic="true" className="state-row failure" data-testid="liquidity-receipt-review-error" role="alert"><AlertTriangle size={16} /><span>Canonical receipt accounting failed closed: {getWriteError(error)}</span></div>;
   }
   if (reconciliationJson === null) {
     return <div className="state-row" data-testid="liquidity-receipt-review-loading"><LoaderCircle className="spin" size={16} /><span>Reconciling canonical receipt {formatCompactAddress(hash)}</span></div>;
@@ -4034,7 +4087,7 @@ function NativeRemoveReceiptReview({
 }) {
   if (hash === null) return null;
   if (error !== null && error !== undefined) {
-    return <div className="state-row failure" data-testid="remove-receipt-review-error"><AlertTriangle size={16} /><span>Canonical native withdrawal accounting failed closed: {getWriteError(error)}</span></div>;
+    return <div aria-atomic="true" className="state-row failure" data-testid="remove-receipt-review-error" role="alert"><AlertTriangle size={16} /><span>Canonical native withdrawal accounting failed closed: {getWriteError(error)}</span></div>;
   }
   if (reconciliation === undefined) {
     return <div className="state-row" data-testid="remove-receipt-review-loading"><LoaderCircle className="spin" size={16} /><span>Reconciling canonical native withdrawal {formatCompactAddress(hash)}</span></div>;
@@ -5527,6 +5580,7 @@ function LiquidityView({
   const registry = registries[environmentKey];
   const poolWorkspace = useOptionalPoolWorkspace();
   const workspaceMatchesPool = poolWorkspace !== null && primaryPool !== null && isAddressEqual(poolWorkspace.pool.address, primaryPool.address);
+  const mobileWorkspaceNavigation = useMediaQuery("(max-width: 720px)") && workspaceMatchesPool;
   const portfolioEndpoint = analyticsEndpointForRegistry(registry);
   const localnetRegistry = isLocalnetRegistry(registry) ? registry : null;
   const account = useAccount();
@@ -8701,6 +8755,7 @@ function LiquidityView({
   const applyPairedFill = () => {
     if (!pairedFillCanApply || tokenX === null || tokenY === null) return;
     nativeAddMaxBindingRef.current = null;
+    pairedFillContextRef.current = pairedFillContextFingerprint;
     if (pairedFillSuggestion.pairedSide === "x") setAmountXInput(pairedFillInput);
     else setAmountYInput(pairedFillInput);
     setPairedFillApplication({
@@ -8733,7 +8788,13 @@ function LiquidityView({
         </section>
       ) : null}
       {workspaceMatchesPool ? (
-        <div className="liquidity-market-column">
+        <div
+          aria-labelledby={mobileWorkspaceNavigation ? "pool-mobile-market-tab" : undefined}
+          className="liquidity-market-column"
+          id="pool-mobile-market-panel"
+          role={mobileWorkspaceNavigation ? "tabpanel" : undefined}
+          tabIndex={mobileWorkspaceNavigation ? -1 : undefined}
+        >
           <SwapMarketChart
             candles={poolWorkspace?.analytics.candles.rows ?? []}
             error={poolWorkspace?.analytics.candles.error ?? null}
@@ -8745,11 +8806,27 @@ function LiquidityView({
             status={poolWorkspace?.analytics.candles.status ?? "UNAVAILABLE"}
             streamState={poolWorkspace?.analytics.candleStreamState ?? "unavailable"}
           />
+        </div>
+      ) : null}
+      {workspaceMatchesPool ? (
+        <div
+          aria-labelledby={mobileWorkspaceNavigation ? "pool-mobile-positions-tab" : undefined}
+          className="pool-positions-column"
+          id="pool-mobile-positions-panel"
+          role={mobileWorkspaceNavigation ? "tabpanel" : undefined}
+          tabIndex={mobileWorkspaceNavigation ? -1 : undefined}
+        >
           <PoolWorkspaceOwnerPanel />
         </div>
       ) : null}
       {!workspaceMatchesPool || initialSection !== "withdraw" ? (
-      <section className={workspaceMatchesPool ? "tool-panel liquidity-task-panel" : "tool-panel"} id="liquidity-add">
+      <section
+        aria-labelledby={mobileWorkspaceNavigation ? "pool-mobile-trade-tab" : undefined}
+        className={workspaceMatchesPool ? "tool-panel liquidity-task-panel" : "tool-panel"}
+        id="liquidity-add"
+        role={mobileWorkspaceNavigation ? "tabpanel" : undefined}
+        tabIndex={mobileWorkspaceNavigation ? -1 : undefined}
+      >
         {workspaceMatchesPool ? <PoolWorkspaceTaskTabs task="create" /> : null}
         <LiquidityTaskBody compact={workspaceMatchesPool}>
         {!workspaceMatchesPool ? (
@@ -9041,7 +9118,7 @@ function LiquidityView({
             data-testid="liquidity-approve-x-button"
             hidden={workspaceMatchesPool && !needsXApproval}
             type="button"
-            aria-describedby="liquidity-x-approval-details"
+            aria-describedby="liquidity-x-approval-details liquidity-add-status"
             disabled={!canApproveX}
             title={approvalDisclosure({ amount: amountX, spender: registry.contracts.lbRouter, tokenSymbol: tokenSymbol(tokenX) })}
             onClick={handleApproveX}
@@ -9054,7 +9131,7 @@ function LiquidityView({
             data-testid="liquidity-approve-y-button"
             hidden={workspaceMatchesPool && !needsYApproval}
             type="button"
-            aria-describedby="liquidity-y-approval-details"
+            aria-describedby="liquidity-y-approval-details liquidity-add-status"
             disabled={!canApproveY}
             title={approvalDisclosure({ amount: amountY, spender: registry.contracts.lbRouter, tokenSymbol: tokenSymbol(tokenY) })}
             onClick={handleApproveY}
@@ -9062,7 +9139,7 @@ function LiquidityView({
             {liquiditySimulationPending || approveYWrite.isPending || approveYReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <CheckCircle2 size={18} />}
             <span>{needsYApproval ? `Approve ${tokenSymbol(tokenY)}` : `${tokenSymbol(tokenY)} approved`}</span>
           </button> : null}
-          <button className="primary-button wide" data-testid="liquidity-add-button" type="button" disabled={!addReady} onClick={handleAddLiquidity}>
+          <button aria-describedby="liquidity-add-status" className="primary-button wide" data-testid="liquidity-add-button" type="button" disabled={!addReady} onClick={handleAddLiquidity}>
             {liquiditySimulationPending || addWrite.isPending || addReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <Droplets size={18} />}
             <span>{addButtonLabel === "Add liquidity" ? (liquidityAddReview?.executionFingerprint === addExecutionFingerprint ? "Confirm add liquidity" : "Review add liquidity") : addButtonLabel}</span>
           </button>
@@ -9099,8 +9176,15 @@ function LiquidityView({
       ) : null}
 
       {!workspaceMatchesPool || initialSection === "withdraw" ? (
-      <section className={workspaceMatchesPool ? "info-panel liquidity-task-panel" : "info-panel"} id="liquidity-withdraw">
+      <section
+        aria-labelledby={mobileWorkspaceNavigation ? "pool-mobile-trade-tab" : undefined}
+        className={workspaceMatchesPool ? "info-panel liquidity-task-panel" : "info-panel"}
+        id="liquidity-withdraw"
+        role={mobileWorkspaceNavigation ? "tabpanel" : undefined}
+        tabIndex={mobileWorkspaceNavigation ? -1 : undefined}
+      >
         {workspaceMatchesPool ? <PoolWorkspaceTaskTabs task="manage" /> : null}
+        <LiquidityTaskBody compact={workspaceMatchesPool}>
         <div className="panel-heading">
           <span>{fullExit ? "Full exit" : "Partial withdrawal"}</span>
           <StatusBadge
@@ -9225,12 +9309,29 @@ function LiquidityView({
           pair={pool?.pair ?? null}
         />
 
+        <dl className="contract-list">
+          <div>
+            <dt>Pair</dt>
+            <dd>{formatCompactAddress(pool?.pair ?? primaryPool?.address)}</dd>
+          </div>
+          <div>
+            <dt>Deposits Indexed</dt>
+            <dd>{primaryPool?.depositCount ?? "0"}</dd>
+          </div>
+          <div>
+            <dt>Updated</dt>
+            <dd>Block {primaryPool?.updatedAtBlock ?? "n/a"}</dd>
+          </div>
+        </dl>
+        </LiquidityTaskBody>
+
+        <div className={workspaceMatchesPool ? "liquidity-action-dock" : undefined}>
         <div className="action-stack">
           <button
             className="secondary-button wide"
             data-testid="liquidity-approve-lb-button"
             type="button"
-            aria-describedby="remove-lb-approval-details"
+            aria-describedby="remove-lb-approval-details liquidity-remove-status"
             disabled={!canApproveLb}
             title={`Approve every LB token ID in pair ${pool?.pair ?? "not selected"} for operator ${registry.contracts.lbRouter}`}
             onClick={handleApproveLb}
@@ -9238,7 +9339,7 @@ function LiquidityView({
             {liquiditySimulationPending || approveLbWrite.isPending || approveLbReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <CheckCircle2 size={18} />}
             <span>{liveLbApproved ? "Pair-wide LB operator approved" : "Approve pair-wide LB operator"}</span>
           </button>
-          <button className="primary-button wide" data-testid="liquidity-remove-button" type="button" disabled={!removeReady} onClick={handleRemoveLiquidity}>
+          <button aria-describedby="liquidity-remove-status" className="primary-button wide" data-testid="liquidity-remove-button" type="button" disabled={!removeReady} onClick={handleRemoveLiquidity}>
             {liquiditySimulationPending || removeWrite.isPending || removeReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <Droplets size={18} />}
             <span>{removeButtonLabel({ poolReady: removePoolReady, connected, fullExit, onWrongChain, invalidInput: removeInputError !== null, hasPosition: hasSelectedPositions, needsApproval: !liveLbApproved, insufficientGas: liquiditySimulationError?.startsWith("Insufficient ETH for gas") === true })}</span>
           </button>
@@ -9276,21 +9377,7 @@ function LiquidityView({
           hash={canonicalNativeRemoveHash}
           reconciliation={nativeRemoveReceiptReconciliationQuery.data}
         />
-
-        <dl className="contract-list">
-          <div>
-            <dt>Pair</dt>
-            <dd>{formatCompactAddress(pool?.pair ?? primaryPool?.address)}</dd>
-          </div>
-          <div>
-            <dt>Deposits Indexed</dt>
-            <dd>{primaryPool?.depositCount ?? "0"}</dd>
-          </div>
-          <div>
-            <dt>Updated</dt>
-            <dd>Block {primaryPool?.updatedAtBlock ?? "n/a"}</dd>
-          </div>
-        </dl>
+        </div>
       </section>
       ) : null}
 
@@ -9568,7 +9655,7 @@ function LiquidityRangeEditor({
       </div>
 
       <div className="range-editor-plot">
-        <div className="range-editor-chart" aria-label="Liquidity bin distribution">
+        <div aria-describedby="liquidity-range-chart-description" className="range-editor-chart" aria-label="Liquidity bin distribution" role="img">
           {visualBinIds.map((binId) => {
             const live = liveById.get(binId);
             const selected = selectedById.get(binId);
@@ -9600,6 +9687,32 @@ function LiquidityRangeEditor({
           })}
           {liveBinsState === "loading" ? <span className="range-editor-chart-state">Loading pool reserves</span> : null}
         </div>
+        <p className="visually-hidden" id="liquidity-range-chart-description">
+          Pool reserves and the proposed {strategy} position across bins {visualStart} through {visualEnd}. The active bin is {activeBin ?? "unavailable"}; the selected range is {lowerBinId ?? "invalid"} through {upperBinId ?? "invalid"}.
+        </p>
+        <div className="visually-hidden visually-hidden-table">
+          <table aria-label="Exact liquidity distribution data">
+            <caption>Pool reserves and proposed position weights by visible bin</caption>
+            <thead>
+              <tr><th>Bin</th><th>Pool {tokenXSymbol}</th><th>Pool {tokenYSymbol}</th><th>New {tokenXSymbol} weight</th><th>New {tokenYSymbol} weight</th></tr>
+            </thead>
+            <tbody>
+              {visualBinIds.map((binId) => {
+                const live = liveById.get(binId);
+                const selected = selectedById.get(binId);
+                return (
+                  <tr key={`${binId}-accessible`}>
+                    <th>{binId}{binId === activeBin ? " (active)" : ""}</th>
+                    <td>{live?.tokenX ?? "Outside indexed window"}</td>
+                    <td>{live?.tokenY ?? "Outside indexed window"}</td>
+                    <td>{selected?.xWeight ?? "0%"}</td>
+                    <td>{selected?.yWeight ?? "0%"}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
 
         <div
           className={["range-editor-axis-control", handlesAreClose ? "handles-close" : ""].filter(Boolean).join(" ")}
@@ -9613,6 +9726,8 @@ function LiquidityRangeEditor({
             const position = isLower ? lowerPosition : upperPosition;
             return (
               <button
+                aria-describedby={rangeError ? "liquidity-range-error" : undefined}
+                aria-invalid={rangeError ? true : undefined}
                 aria-label={`${isLower ? "Lower" : "Upper"} range handle`}
                 aria-valuemax={isLower ? upperDelta ?? sliderControlMax : sliderControlMax}
                 aria-valuemin={isLower ? sliderControlMin : lowerDelta ?? sliderControlMin}
@@ -9659,36 +9774,36 @@ function LiquidityRangeEditor({
         <div className="range-editor-price-grid">
           <label htmlFor="range-min-price">
             <span>Min {tokenYSymbol} per {tokenXSymbol}</span>
-            <input aria-label={`Min ${tokenYSymbol} per ${tokenXSymbol}`} id="range-min-price" inputMode="decimal" value={lowerPriceInput} onChange={(event) => onLowerPriceInput(event.target.value)} onBlur={onLowerPriceCommit} />
+            <input aria-errormessage={rangeError ? "liquidity-range-error" : undefined} aria-invalid={rangeError ? true : undefined} aria-label={`Min ${tokenYSymbol} per ${tokenXSymbol}`} id="range-min-price" inputMode="decimal" value={lowerPriceInput} onChange={(event) => onLowerPriceInput(event.target.value)} onBlur={onLowerPriceCommit} />
           </label>
           <label htmlFor="range-max-price">
             <span>Max {tokenYSymbol} per {tokenXSymbol}</span>
-            <input aria-label={`Max ${tokenYSymbol} per ${tokenXSymbol}`} id="range-max-price" inputMode="decimal" value={upperPriceInput} onChange={(event) => onUpperPriceInput(event.target.value)} onBlur={onUpperPriceCommit} />
+            <input aria-errormessage={rangeError ? "liquidity-range-error" : undefined} aria-invalid={rangeError ? true : undefined} aria-label={`Max ${tokenYSymbol} per ${tokenXSymbol}`} id="range-max-price" inputMode="decimal" value={upperPriceInput} onChange={(event) => onUpperPriceInput(event.target.value)} onBlur={onUpperPriceCommit} />
           </label>
         </div>
 
-        {rangeError ? <p className="range-editor-validation" role="status">{rangeError}</p> : null}
+        {rangeError ? <p aria-atomic="true" className="range-editor-validation" id="liquidity-range-error" role="alert">{rangeError}</p> : null}
 
         <details className="range-editor-advanced" open={advancedOpenByDefault ? true : undefined}>
           <summary>Advanced range controls</summary>
           <div className="range-editor-exact-grid">
             <label htmlFor="range-lower">
               <span>Lower delta</span>
-              <input id="range-lower" inputMode="numeric" value={lowerDeltaInput} onChange={(event) => onLowerDeltaInput(event.target.value)} />
+              <input aria-errormessage={rangeError ? "liquidity-range-error" : undefined} aria-invalid={rangeError ? true : undefined} id="range-lower" inputMode="numeric" value={lowerDeltaInput} onChange={(event) => onLowerDeltaInput(event.target.value)} />
             </label>
             <label htmlFor="range-upper">
               <span>Upper delta</span>
-              <input id="range-upper" inputMode="numeric" value={upperDeltaInput} onChange={(event) => onUpperDeltaInput(event.target.value)} />
+              <input aria-errormessage={rangeError ? "liquidity-range-error" : undefined} aria-invalid={rangeError ? true : undefined} id="range-upper" inputMode="numeric" value={upperDeltaInput} onChange={(event) => onUpperDeltaInput(event.target.value)} />
             </label>
             {!compact ? (
               <>
                 <label htmlFor="range-lower-bin">
                   <span>Lower bin</span>
-                  <input id="range-lower-bin" inputMode="numeric" value={lowerBinInput} onChange={(event) => onLowerBinInput(event.target.value)} />
+                  <input aria-errormessage={rangeError ? "liquidity-range-error" : undefined} aria-invalid={rangeError ? true : undefined} id="range-lower-bin" inputMode="numeric" value={lowerBinInput} onChange={(event) => onLowerBinInput(event.target.value)} />
                 </label>
                 <label htmlFor="range-upper-bin">
                   <span>Upper bin</span>
-                  <input id="range-upper-bin" inputMode="numeric" value={upperBinInput} onChange={(event) => onUpperBinInput(event.target.value)} />
+                  <input aria-errormessage={rangeError ? "liquidity-range-error" : undefined} aria-invalid={rangeError ? true : undefined} id="range-upper-bin" inputMode="numeric" value={upperBinInput} onChange={(event) => onUpperBinInput(event.target.value)} />
                 </label>
               </>
             ) : null}
@@ -9771,6 +9886,7 @@ function LiquidityStateRows({
       aria-live={state.tone === "failure" ? "assertive" : "polite"}
       className={`state-row transaction-status ${state.tone}`}
       data-testid={testId}
+      id={testId}
       role={state.tone === "failure" ? "alert" : "status"}
     >
       {state.icon}
