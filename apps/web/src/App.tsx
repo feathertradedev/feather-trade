@@ -6995,6 +6995,7 @@ function LiquidityView({
     }
     setSelectedPositionIds((currentIds) => {
       if (walletPositions.length === 0) {
+        if (walletPositionsQuery.isLoading || walletPositionsQuery.isFetching) return currentIds;
         return currentIds.length === 0 ? currentIds : [];
       }
 
@@ -7012,7 +7013,7 @@ function LiquidityView({
 
       return sameStringArray(currentIds, nextIds) ? currentIds : nextIds;
     });
-  }, [pool?.pair, portfolioAction, walletPositions]);
+  }, [pool?.pair, portfolioAction, walletPositions, walletPositionsQuery.isFetching, walletPositionsQuery.isLoading]);
 
   useEffect(() => {
     setLiquiditySimulationError(null);

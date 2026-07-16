@@ -43,6 +43,7 @@ export function handleSwap(event: SwapEvent): void {
 
   const swap = new Swap(eventId(event));
   swap.pair = pair.id;
+  swap.transactionFrom = event.transaction.from;
   swap.sender = event.params.sender;
   swap.to = event.params.to;
   swap.activeId = BigInt.fromI32(event.params.id);

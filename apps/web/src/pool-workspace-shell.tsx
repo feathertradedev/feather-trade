@@ -129,13 +129,9 @@ function PoolWorkspaceRail() {
       : workspace.positionsState === "partial"
         ? `${workspace.positions.length} bins · partial`
         : workspace.positionsState;
-  const historyLabel = workspace.walletAddress === null
-    ? "Connect wallet"
-    : workspace.historyState === "ready" || workspace.historyState === "empty"
-      ? `${workspace.history.length} events`
-      : workspace.historyState === "partial"
-        ? `${workspace.history.length} events · partial`
-        : workspace.historyState;
+  const activityLabel = workspace.activity.state === "ready" || workspace.activity.state === "empty"
+    ? `${workspace.activity.rows.length} events${workspace.activity.windowed ? " · recent" : ""}`
+    : workspace.activity.state;
 
   return (
     <aside className="pool-workspace-rail" data-testid="pool-workspace-rail">
@@ -211,8 +207,8 @@ function PoolWorkspaceRail() {
       <div className="pool-rail-position-state">
         <span>Your liquidity</span>
         <strong>{positionsLabel}</strong>
-        <span>Recent activity</span>
-        <strong>{historyLabel}</strong>
+        <span>Pool activity</span>
+        <strong>{activityLabel}</strong>
       </div>
     </aside>
   );

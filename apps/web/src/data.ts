@@ -125,6 +125,7 @@ export interface WalletPortfolioPage {
   health: {
     fresh: boolean;
     headBlock: string | null;
+    headHash: string | null;
     status: "READY" | "PARTIAL" | "UNAVAILABLE";
   };
 }
@@ -239,6 +240,7 @@ interface DashboardGraph {
     amountOutX: string;
     amountOutY: string;
     pair: { id: string };
+    transactionFrom: string;
     sender: string;
     to?: string;
   }>;
@@ -410,6 +412,7 @@ const SWAPS_PAGE_QUERY = `
       pair {
         id
       }
+      transactionFrom
       sender
       to
     }
@@ -548,6 +551,7 @@ const WALLET_PORTFOLIO_QUERY = `
     analyticsHealth {
       status
       headBlock
+      headHash
       fresh
     }
   }
@@ -624,6 +628,7 @@ const POOL_ACTIVITY_QUERY = `
       amountOutX
       amountOutY
       pair { id }
+      transactionFrom
       sender
       to
     }
@@ -648,7 +653,7 @@ const OWNER_POOL_ACTIVITY_QUERY = `
       first: $first
       orderBy: blockNumber
       orderDirection: desc
-      where: { pair: $pair, or: [{ sender: $owner }, { to: $owner }] }
+      where: { pair: $pair, or: [{ transactionFrom: $owner }, { sender: $owner }, { to: $owner }] }
     ) {
       id
       transactionHash
@@ -659,6 +664,7 @@ const OWNER_POOL_ACTIVITY_QUERY = `
       amountOutX
       amountOutY
       pair { id }
+      transactionFrom
       sender
       to
     }
@@ -852,6 +858,7 @@ export async function loadWalletPortfolio(endpoint: string, owner: Address): Pro
   const positions: PortfolioPositionRow[] = [];
   let after: string | null = null;
   let health: WalletPortfolioPage["health"] | null = null;
+  let partial = false;
 
   for (let page = 0; page < GRAPHQL_MAX_PAGES; page += 1) {
     const data: WalletPortfolioGraph = await fetchGraph<WalletPortfolioGraph>(
@@ -861,9 +868,14 @@ export async function loadWalletPortfolio(endpoint: string, owner: Address): Pro
       GRAPHQL_REQUEST_TIMEOUT_MS
     );
     health ??= data.analyticsHealth;
+    partial ||= data.walletPositions.pageInfo.partial;
     positions.push(...data.walletPositions.nodes);
     if (!data.walletPositions.pageInfo.hasNextPage) {
-      return { positions, pageInfo: data.walletPositions.pageInfo, health };
+      return {
+        positions,
+        pageInfo: { ...data.walletPositions.pageInfo, partial },
+        health
+      };
     }
     if (!data.walletPositions.pageInfo.endCursor || data.walletPositions.pageInfo.endCursor === after) {
       throw new Error("Analytics pagination cursor did not advance");
@@ -874,7 +886,7 @@ export async function loadWalletPortfolio(endpoint: string, owner: Address): Pro
   return {
     positions,
     pageInfo: { endCursor: after, hasNextPage: true, partial: true },
-    health: health ?? { fresh: false, headBlock: null, status: "UNAVAILABLE" }
+    health: health ?? { fresh: false, headBlock: null, headHash: null, status: "UNAVAILABLE" }
   };
 }
 
@@ -942,7 +954,7 @@ export async function loadPositionHistory(
   );
   const correlated = correlatePositionHistory(owner, pair, details.rows, transferBatchEvents);
   const missingDetails = correlated.unmatchedOperations > 0
-    ? `${correlated.unmatchedOperations} owner mint/burn event${correlated.unmatchedOperations === 1 ? " is" : "s are"} missing matching liquidity details`
+    ? `${correlated.unmatchedOperations} owner mint/burn event${correlated.unmatchedOperations === 1 ? " has" : "s have"} missing or ambiguous liquidity details`
     : null;
   const errors = [transferError, details.error, missingDetails].filter((value): value is string => value !== null);
   const rows = sortPositionHistory(correlated.rows);
@@ -1006,17 +1018,21 @@ export async function loadPoolActivity(
 
   const expectedPair = pair.toLowerCase();
   const expectedOwner = owner?.toLowerCase() ?? null;
-  const data = await fetchGraph<PoolActivityGraph>(
-    registry.endpoints.indexerUrl,
-    owner === null ? POOL_ACTIVITY_QUERY : OWNER_POOL_ACTIVITY_QUERY,
-    {
-      pair: expectedPair,
-      ...(expectedOwner === null ? {} : { owner: expectedOwner }),
-      first: POOL_ACTIVITY_LIMIT + 1
-    },
-    normalizeGraphqlTimeout(options.graphqlTimeoutMs)
-  );
-  const rows: ActivityRow[] = [
+  const timeoutMs = normalizeGraphqlTimeout(options.graphqlTimeoutMs);
+  const [data, ownerHistory] = await Promise.all([
+    fetchGraph<PoolActivityGraph>(
+      registry.endpoints.indexerUrl,
+      owner === null ? POOL_ACTIVITY_QUERY : OWNER_POOL_ACTIVITY_QUERY,
+      {
+        pair: expectedPair,
+        ...(expectedOwner === null ? {} : { owner: expectedOwner }),
+        first: POOL_ACTIVITY_LIMIT + 1
+      },
+      timeoutMs
+    ),
+    owner === null ? Promise.resolve(null) : loadPositionHistory(registry, owner, pair)
+  ]);
+  const directRows: ActivityRow[] = [
     ...data.swaps.map((swap) => {
       assertPoolActivityScope(swap, expectedPair, expectedOwner);
       return {
@@ -1027,7 +1043,7 @@ export async function loadPoolActivity(
         timestamp: swap.timestamp,
         amountX: BigInt(swap.amountInX) > 0n ? swap.amountInX : swap.amountOutX,
         amountY: BigInt(swap.amountInY) > 0n ? swap.amountInY : swap.amountOutY,
-        account: swap.sender,
+        account: swap.transactionFrom,
         pair: swap.pair.id
       };
     }),
@@ -1046,7 +1062,20 @@ export async function loadPoolActivity(
       };
     })
   ];
-  assertUniqueActivityRows(rows);
+  const ownerLiquidityRows: ActivityRow[] = ownerHistory?.rows
+    .filter((event) => event.type === "DEPOSIT" || event.type === "WITHDRAW")
+    .map((event) => ({
+      id: event.id,
+      type: event.type,
+      transactionHash: event.transactionHash,
+      blockNumber: event.blockNumber,
+      timestamp: event.timestamp,
+      amountX: event.amountX,
+      amountY: event.amountY,
+      account: owner,
+      pair
+    })) ?? [];
+  const rows = mergePoolActivityRows([...directRows, ...ownerLiquidityRows]);
   rows.sort((left, right) => {
     const blockOrder = BigInt(left.blockNumber) < BigInt(right.blockNumber)
       ? 1
@@ -1057,9 +1086,17 @@ export async function loadPoolActivity(
   });
   const windowed = data.swaps.length > POOL_ACTIVITY_LIMIT ||
     data.liquidityEvents.length > POOL_ACTIVITY_LIMIT ||
+    ownerHistory?.pageInfo.windowed === true ||
     rows.length > POOL_ACTIVITY_LIMIT;
   const bounded = rows.slice(0, POOL_ACTIVITY_LIMIT);
-  return { rows: bounded, pageInfo: poolActivityPaginationInfo(bounded.length, windowed) };
+  const pageInfo = poolActivityPaginationInfo(bounded.length, windowed);
+  if (ownerHistory !== null) {
+    pageInfo.capped = ownerHistory.pageInfo.capped;
+    pageInfo.failed = ownerHistory.pageInfo.failed;
+    if (ownerHistory.pageInfo.error) pageInfo.error = ownerHistory.pageInfo.error;
+    pageInfo.maxPages = ownerHistory.pageInfo.maxPages;
+  }
+  return { rows: bounded, pageInfo };
 }
 
 function correlatePositionHistory(
@@ -1102,14 +1139,17 @@ function correlatePositionHistory(
         : null;
     const binKey = positionHistoryBinKey(transfer.ids);
     const transactionHash = transfer.transactionHash.toLowerCase();
-    const matchIndex = operation === null
-      ? -1
-      : liquidity.findIndex((candidate, index) =>
-          !usedLiquidity.has(index) &&
-          candidate.operation === operation &&
-          candidate.transactionHash === transactionHash &&
-          candidate.binKey === binKey
-        );
+    const matchCandidates = operation === null
+      ? []
+      : liquidity
+          .map((candidate, index) => ({ candidate, index }))
+          .filter(({ candidate, index }) =>
+            !usedLiquidity.has(index) &&
+            candidate.operation === operation &&
+            candidate.transactionHash === transactionHash &&
+            candidate.binKey === binKey
+          );
+    const matchIndex = selectPositionHistoryLiquidityMatch(transfer, matchCandidates);
 
     if (matchIndex >= 0) {
       usedLiquidity.add(matchIndex);
@@ -1434,7 +1474,7 @@ async function loadIndexerState(registry: DexRegistry, timeoutMs: number): Promi
           timestamp: swap.timestamp,
           amountX: BigInt(swap.amountInX) > 0n ? swap.amountInX : swap.amountOutX,
           amountY: BigInt(swap.amountInY) > 0n ? swap.amountInY : swap.amountOutY,
-          account: swap.sender,
+          account: swap.transactionFrom,
           pair: swap.pair.id
         }),
         timeoutMs
@@ -1706,6 +1746,30 @@ function positionHistoryBinKey(ids: readonly string[]): string {
     .join(",");
 }
 
+function selectPositionHistoryLiquidityMatch(
+  transfer: PositionHistoryGraph["transferBatchEvents"][number],
+  candidates: readonly { candidate: { event: PositionHistoryGraph["liquidityEvents"][number] }; index: number }[]
+): number {
+  if (candidates.length === 1) return candidates[0]!.index;
+  if (candidates.length === 0) return -1;
+
+  const transferLogIndex = indexedEventLogIndex(transfer.id, transfer.transactionHash);
+  if (transferLogIndex === null) return -1;
+  const adjacent = candidates.filter(({ candidate }) => {
+    const liquidityLogIndex = indexedEventLogIndex(candidate.event.id, candidate.event.transactionHash);
+    return liquidityLogIndex !== null && liquidityLogIndex === transferLogIndex + 1n;
+  });
+  return adjacent.length === 1 ? adjacent[0]!.index : -1;
+}
+
+function indexedEventLogIndex(id: string, transactionHash: string): bigint | null {
+  const prefix = `${transactionHash.toLowerCase()}-`;
+  const normalizedId = id.toLowerCase();
+  if (!normalizedId.startsWith(prefix)) return null;
+  const suffix = normalizedId.slice(prefix.length);
+  return /^(0|[1-9]\d*)$/.test(suffix) ? BigInt(suffix) : null;
+}
+
 function assertUniqueHistoryRows(rows: readonly PositionHistoryRow[]): PositionHistoryRow[] {
   const ids = new Set<string>();
   return rows.map((row) => {
@@ -1717,7 +1781,7 @@ function assertUniqueHistoryRows(rows: readonly PositionHistoryRow[]): PositionH
 }
 
 function assertPoolActivityScope(
-  row: { pair: { id: string }; sender: string; to?: string },
+  row: { pair: { id: string }; sender: string; to?: string; transactionFrom?: string },
   expectedPair: string,
   expectedOwner: string | null
 ): void {
@@ -1726,6 +1790,7 @@ function assertPoolActivityScope(
   }
   if (
     expectedOwner !== null &&
+    row.transactionFrom?.toLowerCase() !== expectedOwner &&
     row.sender.toLowerCase() !== expectedOwner &&
     row.to?.toLowerCase() !== expectedOwner
   ) {
@@ -1733,13 +1798,24 @@ function assertPoolActivityScope(
   }
 }
 
-function assertUniqueActivityRows(rows: readonly ActivityRow[]): void {
-  const ids = new Set<string>();
+function mergePoolActivityRows(rows: readonly ActivityRow[]): ActivityRow[] {
+  const byId = new Map<string, ActivityRow>();
   for (const row of rows) {
     const id = row.id.toLowerCase();
-    if (id.length === 0 || ids.has(id)) throw new Error(`Pool activity returned duplicate event id: ${row.id}`);
-    ids.add(id);
+    if (id.length === 0) throw new Error("Pool activity returned an empty event id");
+    const previous = byId.get(id);
+    if (previous !== undefined && (
+      previous.type.toUpperCase() !== row.type.toUpperCase() ||
+      previous.transactionHash.toLowerCase() !== row.transactionHash.toLowerCase() ||
+      previous.blockNumber !== row.blockNumber ||
+      previous.amountX !== row.amountX ||
+      previous.amountY !== row.amountY
+    )) {
+      throw new Error(`Pool activity returned conflicting event id: ${row.id}`);
+    }
+    byId.set(id, row);
   }
+  return [...byId.values()];
 }
 
 function canonicalUnsignedInteger(value: string, label: string): string {

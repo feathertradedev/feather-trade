@@ -21,12 +21,17 @@ import {
 } from "./analytics-data";
 import { analyticsEndpointForRegistry, registries, type EnvironmentKey } from "./config";
 import {
+  loadPoolActivity,
   loadPaginatedPositionsForOwnerPair,
   loadPositionHistory,
   loadPoolBinWindow,
   loadPoolIndexerSnapshot,
+  loadWalletPortfolio,
+  selectWalletPortfolioPosition,
+  type ActivityRow,
   type BinRow,
   type LoadState,
+  type PortfolioPositionRow,
   type PoolIndexerSnapshot,
   type PoolRow,
   type PositionHistoryRow,
@@ -45,6 +50,14 @@ const WORKSPACE_REFRESH_INTERVAL_MS = 10_000;
 export type CandleStreamState = "connecting" | "live" | "stale" | "unavailable";
 
 export interface PoolWorkspaceContextValue {
+  activity: {
+    error: string | null;
+    rows: ActivityRow[];
+    setWalletOnly: Dispatch<SetStateAction<boolean>>;
+    state: LoadState;
+    walletOnly: boolean;
+    windowed: boolean;
+  };
   analytics: {
     candles: AnalyticsPage<PairCandle>;
     candleInterval: CandleInterval;
@@ -71,6 +84,13 @@ export interface PoolWorkspaceContextValue {
   binsState: LoadState;
   environmentKey: EnvironmentKey;
   pool: PoolRow;
+  portfolio: {
+    error: string | null;
+    headPinned: boolean;
+    partial: boolean;
+    position: PortfolioPositionRow | null;
+    state: LoadState;
+  };
   positions: PositionRow[];
   positionsError: string | null;
   positionsPartial: boolean;
@@ -105,6 +125,7 @@ export function PoolWorkspaceProvider({
   const queryClient = useQueryClient();
   const account = useAccount();
   const walletAddress = account.address ?? null;
+  const [poolActivityWalletOnly, setPoolActivityWalletOnly] = useState(true);
   const [candleInterval, setCandleInterval] = useState<CandleInterval>("HOUR");
   const [candleStreamState, setCandleStreamState] = useState<CandleStreamState>("connecting");
   const [candleStreamGeneration, setCandleStreamGeneration] = useState(0);
@@ -119,6 +140,10 @@ export function PoolWorkspaceProvider({
     [analyticsEndpoint, candleEnd, candleInterval, candleStart, candleStreamGeneration, environmentKey, pool.address]
   );
   const [draftValues, setDraftValues] = useState<Record<string, unknown>>({});
+
+  useEffect(() => {
+    setPoolActivityWalletOnly(true);
+  }, [pool.address, walletAddress]);
 
   const metricsQuery = useQuery({
     queryKey: ["canonicalPoolMetrics", environmentKey, analyticsEndpoint, pool.address],
@@ -304,6 +329,38 @@ export function PoolWorkspaceProvider({
     refetchOnWindowFocus: "always",
     retry: false
   });
+  const portfolioQuery = useQuery({
+    queryKey: ["canonicalPoolPortfolio", environmentKey, analyticsEndpoint, walletAddress, pool.address],
+    queryFn: async () => {
+      if (walletAddress === null || analyticsEndpoint === null) {
+        throw new Error("Wallet pool accounting is unavailable");
+      }
+      const page = await loadWalletPortfolio(analyticsEndpoint, walletAddress);
+      return {
+        page,
+        position: selectWalletPortfolioPosition(page, walletAddress, pool.address)
+      };
+    },
+    enabled: walletAddress !== null && analyticsEndpoint !== null,
+    refetchInterval: walletAddress !== null && analyticsEndpoint !== null ? WORKSPACE_REFRESH_INTERVAL_MS : false,
+    refetchOnWindowFocus: "always",
+    retry: false
+  });
+  const activityOwner = poolActivityWalletOnly ? walletAddress : null;
+  const activityQuery = useQuery({
+    queryKey: [
+      "canonicalPoolActivity",
+      environmentKey,
+      registry.endpoints.indexerUrl,
+      pool.address,
+      activityOwner
+    ],
+    queryFn: () => loadPoolActivity(registry, pool.address, activityOwner),
+    enabled: registry.endpoints.indexerUrl !== null,
+    refetchInterval: registry.endpoints.indexerUrl !== null ? WORKSPACE_REFRESH_INTERVAL_MS : false,
+    refetchOnWindowFocus: "always",
+    retry: false
+  });
 
   const metricPage: AnalyticsPage<PoolAnalyticsMetric> = metricsQuery.data ?? emptyAnalyticsPage(
     metricsQuery.isError ? "UNAVAILABLE" : "PARTIAL",
@@ -325,6 +382,31 @@ export function PoolWorkspaceProvider({
   const positionsPartial = Boolean(positionsQuery.data?.pageInfo.capped || positionsQuery.data?.pageInfo.failed);
   const history = historyQuery.data?.rows ?? [];
   const historyPartial = Boolean(historyQuery.data?.pageInfo.capped || historyQuery.data?.pageInfo.failed);
+  const portfolioPosition = portfolioQuery.data?.position ?? null;
+  const portfolioPage = portfolioQuery.data?.page;
+  const portfolioHeadPinned = portfolioPosition !== null &&
+    portfolioPage?.health.status === "READY" &&
+    portfolioPage.health.fresh &&
+    portfolioPage.health.headBlock !== null &&
+    portfolioPage.health.headHash !== null &&
+    portfolioPosition.asOfBlock !== null &&
+    portfolioPosition.asOfBlock === portfolioPage.health.headBlock &&
+    indexerSnapshot !== undefined &&
+    portfolioPosition.asOfBlock === indexerSnapshot.blockNumber.toString() &&
+    portfolioPage.health.headHash.toLowerCase() === indexerSnapshot.blockHash.toLowerCase() &&
+    economicsValue !== undefined &&
+    economicsValue.blockNumber === indexerSnapshot.blockNumber &&
+    economicsValue.blockHash.toLowerCase() === indexerSnapshot.blockHash.toLowerCase();
+  const portfolioPartial = Boolean(
+    portfolioPage?.pageInfo.partial ||
+    portfolioPage?.pageInfo.hasNextPage ||
+    (portfolioPage !== undefined && (portfolioPage.health.status !== "READY" || !portfolioPage.health.fresh)) ||
+    (portfolioPosition !== null && (portfolioPosition.status !== "READY" || !portfolioHeadPinned))
+  );
+  const activity = activityQuery.data?.rows ?? [];
+  const activityPartial = Boolean(
+    activityQuery.data?.pageInfo.capped || activityQuery.data?.pageInfo.failed
+  );
   const binsState: LoadState = registry.endpoints.indexerUrl === null || currentActiveId === null
     ? "unavailable"
     : binsQuery.isError
@@ -360,6 +442,28 @@ export function PoolWorkspaceProvider({
             : history.length > 0
               ? "ready"
               : "empty";
+  const portfolioState: LoadState = walletAddress === null || analyticsEndpoint === null
+    ? "unavailable"
+    : portfolioQuery.isError
+      ? "error"
+      : portfolioQuery.isLoading
+        ? "loading"
+        : portfolioPartial
+          ? "partial"
+          : portfolioPosition === null
+            ? "empty"
+            : "ready";
+  const activityState: LoadState = registry.endpoints.indexerUrl === null
+    ? "unavailable"
+    : activityQuery.isError
+      ? "error"
+      : activityPartial
+        ? "partial"
+        : activityQuery.isLoading
+          ? "loading"
+          : activity.length > 0
+            ? "ready"
+            : "empty";
   const economicsState: LoadState = indexerSnapshotQuery.isError || economicsQuery.isError
     ? "error"
     : economicsValue !== undefined
@@ -385,6 +489,14 @@ export function PoolWorkspaceProvider({
   }, []);
 
   const value = useMemo<PoolWorkspaceContextValue>(() => ({
+    activity: {
+      error: errorMessage(activityQuery.error) ?? activityQuery.data?.pageInfo.error ?? null,
+      rows: activity,
+      setWalletOnly: setPoolActivityWalletOnly,
+      state: activityState,
+      walletOnly: walletAddress !== null && poolActivityWalletOnly,
+      windowed: activityQuery.data?.pageInfo.windowed === true
+    },
     analytics: {
       candles,
       candleInterval,
@@ -416,6 +528,13 @@ export function PoolWorkspaceProvider({
       value: indexerSnapshot ?? null
     },
     pool,
+    portfolio: {
+      error: errorMessage(portfolioQuery.error),
+      headPinned: portfolioHeadPinned,
+      partial: portfolioPartial,
+      position: portfolioPosition,
+      state: portfolioState
+    },
     positions,
     positionsError: errorMessage(positionsQuery.error) ?? positionsQuery.data?.pageInfo.error ?? null,
     positionsPartial,
@@ -424,6 +543,11 @@ export function PoolWorkspaceProvider({
     setDraftValue,
     walletAddress
   }), [
+    activity,
+    activityQuery.data?.pageInfo.error,
+    activityQuery.data?.pageInfo.windowed,
+    activityQuery.error,
+    activityState,
     analyticsState,
     analyticsStateVisible,
     binsQuery.data,
@@ -449,6 +573,12 @@ export function PoolWorkspaceProvider({
     indexerSnapshotState,
     metricPage,
     pool,
+    poolActivityWalletOnly,
+    portfolioHeadPinned,
+    portfolioPartial,
+    portfolioPosition,
+    portfolioQuery.error,
+    portfolioState,
     positions,
     positionsPartial,
     positionsQuery.data?.pageInfo.error,

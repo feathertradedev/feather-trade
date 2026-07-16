@@ -5692,6 +5692,56 @@ a {
   min-height: clamp(240px, 28vh, 340px);
 }
 
+.pool-owner-history-toolbar {
+  display: flex;
+  min-height: 46px;
+  align-items: stretch;
+  justify-content: space-between;
+  padding: 0 16px;
+  border-bottom: 1px solid rgb(233 236 231 / 8%);
+  background: var(--carbon);
+}
+
+.pool-owner-history-tabs {
+  display: flex;
+  min-width: 0;
+  align-items: stretch;
+  gap: 18px;
+}
+
+.pool-owner-history-tab {
+  position: relative;
+  min-width: 0;
+  padding: 0 1px;
+  border: 0;
+  border-radius: 0;
+  color: var(--ink-45);
+  background: transparent;
+  font-size: 0.7rem;
+  font-weight: 720;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.pool-owner-history-tab::after {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 1px;
+  content: "";
+  background: transparent;
+}
+
+.pool-owner-history-tab:hover,
+.pool-owner-history-tab[aria-selected="true"] {
+  color: var(--bone-bright);
+}
+
+.pool-owner-history-tab[aria-selected="true"]::after {
+  background: var(--green);
+}
+
 .pool-owner-empty {
   display: grid;
   min-height: clamp(240px, 28vh, 340px);
@@ -5719,6 +5769,14 @@ a {
   color: #ef7772;
 }
 
+.pool-owner-empty.partial > strong {
+  color: var(--warn);
+}
+
+.pool-owner-empty.stale > strong {
+  color: #e7b668;
+}
+
 .pool-owner-empty-action {
   min-width: 128px;
   margin-top: 9px;
@@ -5740,6 +5798,10 @@ a {
   color: var(--warn);
 }
 
+.pool-owner-notice.stale {
+  color: #e7b668;
+}
+
 .pool-owner-notice.error {
   color: #ef7772;
 }
@@ -5748,6 +5810,10 @@ a {
   display: grid;
   gap: 22px;
   padding: 22px 18px 26px;
+}
+
+.pool-owner-position-summary {
+  display: contents;
 }
 
 .pool-owner-position-heading {
@@ -5797,13 +5863,33 @@ a {
   background: rgb(74 197 124 / 6%);
 }
 
+.pool-owner-position-heading > span.inactive {
+  border-color: rgb(233 236 231 / 16%);
+  color: var(--bone);
+}
+
+.pool-owner-position-heading > span.unknown {
+  border-color: rgb(231 182 104 / 28%);
+  color: #e7b668;
+  background: rgb(231 182 104 / 5%);
+}
+
+.pool-owner-position-heading > span.closed {
+  color: var(--ink-60);
+  background: rgb(233 236 231 / 3%);
+}
+
 .pool-owner-position-metrics {
   display: grid;
-  grid-template-columns: minmax(0, 1.55fr) minmax(140px, 0.65fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 1px;
   margin: 0;
   border: 1px solid rgb(233 236 231 / 9%);
   background: rgb(233 236 231 / 9%);
+}
+
+.pool-owner-position-metrics > .range {
+  grid-column: span 2;
 }
 
 .pool-owner-position-metrics > div {
@@ -5827,6 +5913,49 @@ a {
   font-variant-numeric: tabular-nums;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.pool-owner-accounting-note {
+  max-width: 74ch;
+  margin: -8px 0 0;
+  color: var(--ink-45);
+  font-size: 0.68rem;
+  line-height: 1.5;
+}
+
+.pool-owner-activity-heading {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 0 16px;
+  border-bottom: 1px solid rgb(233 236 231 / 8%);
+  color: var(--ink-60);
+  font-size: 0.68rem;
+}
+
+.pool-owner-activity-heading small {
+  color: var(--ink-45);
+  font-size: 0.64rem;
+}
+
+.pool-owner-activity-heading button {
+  min-height: 44px;
+  padding: 0 10px;
+  border: 1px solid rgb(233 236 231 / 12%);
+  border-radius: var(--pool-control-radius, 3px);
+  color: var(--ink-60);
+  background: transparent;
+  font-size: 0.66rem;
+  font-weight: 720;
+  cursor: pointer;
+}
+
+.pool-owner-activity-heading button[aria-pressed="true"] {
+  border-color: rgb(74 197 124 / 34%);
+  color: var(--green);
+  background: rgb(74 197 124 / 6%);
 }
 
 .pool-owner-history-list {
@@ -5869,11 +5998,37 @@ a {
 }
 
 .pool-owner-history-limit {
+  display: flex;
+  min-height: 48px;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 14px;
   margin: 0;
-  padding: 11px 16px;
+  padding: 4px 16px;
   color: var(--ink-45);
   font-size: 0.62rem;
   text-align: right;
+}
+
+.pool-owner-history-limit button {
+  min-height: 44px;
+  padding: 0 10px;
+  border: 1px solid rgb(233 236 231 / 12%);
+  border-radius: var(--pool-control-radius, 3px);
+  color: var(--green);
+  background: transparent;
+  font-size: 0.66rem;
+  font-weight: 720;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.pool-owner-history-limit button:hover,
+.pool-owner-history-limit button:focus-visible,
+.pool-owner-activity-heading button:hover,
+.pool-owner-activity-heading button:focus-visible {
+  border-color: rgb(74 197 124 / 40%);
+  color: var(--bone-bright);
 }
 
 .pool-owner-skeleton {
@@ -5893,6 +6048,12 @@ a {
 @keyframes pool-owner-skeleton {
   from { background-position: 100% 0; }
   to { background-position: -100% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pool-owner-skeleton span {
+    animation: none;
+  }
 }
 
 @media (min-width: 1041px) and (max-width: 1280px) {
@@ -5957,7 +6118,7 @@ a {
 
 @media (max-width: 720px) {
   .pool-owner-position-metrics {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .pool-owner-history-row {
@@ -5967,6 +6128,13 @@ a {
   .pool-owner-history-row > :nth-child(3),
   .pool-owner-history-row > :nth-child(4) {
     font-size: 0.62rem;
+  }
+
+  .pool-owner-activity-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    padding-top: 9px;
+    padding-bottom: 9px;
   }
 }
 
@@ -6035,8 +6203,21 @@ a {
     padding: 0 12px 8px;
   }
 
+  .pool-owner-history-toolbar {
+    padding: 0 12px;
+  }
+
   .pool-owner-tabs {
     min-height: 48px;
+  }
+
+  .pool-owner-history-tabs {
+    width: 100%;
+    gap: 12px;
+  }
+
+  .pool-owner-history-tab {
+    flex: 1;
   }
 
   .pool-owner-panel-action {
@@ -6047,6 +6228,18 @@ a {
     align-self: start;
   }
 
+  .pool-owner-position-metrics {
+    grid-template-columns: 1fr;
+  }
+
+  .pool-owner-position-metrics > .range {
+    grid-column: auto;
+  }
+
+  .pool-owner-activity-heading button {
+    width: 100%;
+  }
+
   .pool-owner-history-row {
     grid-template-columns: 1fr;
     gap: 5px;
@@ -6055,5 +6248,15 @@ a {
   .pool-owner-history-row > span,
   .pool-owner-history-row a {
     white-space: normal;
+  }
+
+  .pool-owner-history-limit {
+    align-items: stretch;
+    flex-direction: column;
+    text-align: left;
+  }
+
+  .pool-owner-history-limit button {
+    width: 100%;
   }
 }

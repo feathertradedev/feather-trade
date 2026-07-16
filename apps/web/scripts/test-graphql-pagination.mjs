@@ -58,8 +58,9 @@ const fixtures = {
     amountOutX: index % 2 === 0 ? "0" : "99",
     amountOutY: index % 2 === 0 ? "99" : "0",
     pair: { id: pairAddress },
-    sender: ownerAddress,
-    to: index === 0 ? recipientAddress : ownerAddress
+    transactionFrom: index === 0 ? recipientAddress : ownerAddress,
+    sender: index === 0 ? routerAddress : ownerAddress,
+    to: index === 0 ? routerAddress : ownerAddress
   })),
   liquidityEvents: range(116, (index) => ({
     id: `liquidity-${index}`,
@@ -226,6 +227,39 @@ try {
   assert.deepEqual(routerHistory.rows.find((row) => row.type === "WITHDRAW")?.amountX, "10");
   assert.deepEqual(routerHistory.rows.find((row) => row.type === "DEPOSIT")?.amountY, "200");
 
+  const originalHistoryLiquidity = fixtures.positionHistoryLiquidity;
+  const originalHistoryTransfers = fixtures.positionHistoryTransfers;
+  const ambiguousTransactionIndex = 0x8890;
+  const ambiguousTransactionHash = addressFromIndex(ambiguousTransactionIndex);
+  fixtures.positionHistoryLiquidity = [
+    historyLiquidityFixture(`${ambiguousTransactionHash}-7`, "DEPOSIT", ambiguousTransactionIndex, "45", ["104"], "111", "222", ownerAddress),
+    historyLiquidityFixture(`${ambiguousTransactionHash}-9`, "DEPOSIT", ambiguousTransactionIndex, "45", ["104"], "333", "444", ownerAddress)
+  ];
+  fixtures.positionHistoryTransfers = [
+    historyTransferFixture(`${ambiguousTransactionHash}-5`, ambiguousTransactionIndex, "45", zeroAddress, ownerAddress, ["104"])
+  ];
+  const ambiguousHistory = await loadPositionHistory(registry(), ownerAddress, pairAddress);
+  assert.equal(ambiguousHistory.pageInfo.failed, true);
+  assert.match(ambiguousHistory.pageInfo.error ?? "", /ambiguous liquidity details/i);
+  assert.equal(ambiguousHistory.rows[0]?.amountX, null);
+
+  fixtures.positionHistoryLiquidity[0] = historyLiquidityFixture(
+    `${ambiguousTransactionHash}-6`,
+    "DEPOSIT",
+    ambiguousTransactionIndex,
+    "45",
+    ["104"],
+    "111",
+    "222",
+    ownerAddress
+  );
+  const adjacentHistory = await loadPositionHistory(registry(), ownerAddress, pairAddress);
+  assert.equal(adjacentHistory.pageInfo.failed, false);
+  assert.equal(adjacentHistory.rows[0]?.amountX, "111");
+
+  fixtures.positionHistoryLiquidity = originalHistoryLiquidity;
+  fixtures.positionHistoryTransfers = originalHistoryTransfers;
+
   failPositionLiquidityDetails = true;
   const partialRouterHistory = await loadPositionHistory(registry(), ownerAddress, pairAddress);
   assert.equal(partialRouterHistory.pageInfo.failed, true);
@@ -234,8 +268,6 @@ try {
   assert.equal(partialRouterHistory.rows.find((row) => row.type === "WITHDRAW")?.amountX, null);
   failPositionLiquidityDetails = false;
 
-  const originalHistoryLiquidity = fixtures.positionHistoryLiquidity;
-  const originalHistoryTransfers = fixtures.positionHistoryTransfers;
   fixtures.positionHistoryLiquidity = range(101, (index) =>
     historyLiquidityFixture(`paged-liquidity-${index}`, "DEPOSIT", 0xa000 + index, String(1000 + index), [String(2000 + index)], "1", "2", ownerAddress)
   );
@@ -275,6 +307,16 @@ try {
   const recipientActivity = await loadPoolActivity(registry(), pairAddress, recipientAddress);
   assert.equal(recipientActivity.rows.length, 2);
   assert(recipientActivity.rows.every((row) => row.id.endsWith("-0")));
+  assert.equal(recipientActivity.rows.find((row) => row.type === "Swap")?.account, recipientAddress);
+  const originalSwaps = fixtures.swaps;
+  const originalLiquidityEvents = fixtures.liquidityEvents;
+  fixtures.swaps = [];
+  fixtures.liquidityEvents = [];
+  const routerOwnerActivity = await loadPoolActivity(registry(), pairAddress, ownerAddress);
+  assert.equal(routerOwnerActivity.rows.find((row) => row.id === "history-withdraw")?.type, "WITHDRAW");
+  assert.equal(routerOwnerActivity.rows.find((row) => row.id === "history-withdraw")?.amountX, "10");
+  fixtures.swaps = originalSwaps;
+  fixtures.liquidityEvents = originalLiquidityEvents;
   forcePoolActivityPair = otherPairAddress;
   await assert.rejects(() => loadPoolActivity(registry(), pairAddress), /another pair/);
   forcePoolActivityPair = null;
@@ -559,16 +601,20 @@ async function mockFetch(url, init) {
     if (failPositionHistoryAtSkip !== null && Number(variables.skip) >= failPositionHistoryAtSkip) {
       return jsonResponse({ errors: [{ message: "Synthetic position history page failed" }] });
     }
-    assert.equal(String(variables.owner), ownerAddress.toLowerCase());
+    const requestedOwner = String(variables.owner).toLowerCase();
     assert.equal(String(variables.pair), pairAddress.toLowerCase());
-    return jsonResponse({ data: { transferBatchEvents: page(fixtures.positionHistoryTransfers, variables) } });
+    const matchingTransfers = fixtures.positionHistoryTransfers.filter((event) =>
+      event.from.toLowerCase() === requestedOwner || event.to.toLowerCase() === requestedOwner
+    );
+    return jsonResponse({ data: { transferBatchEvents: page(matchingTransfers, variables) } });
   }
 
   if (query.includes("PoolActivity")) {
     assert.equal(String(variables.pair), pairAddress.toLowerCase());
     assert.equal(Number(variables.first), 101);
     const owner = variables.owner === undefined ? null : String(variables.owner).toLowerCase();
-    const belongsToOwner = (event) => owner === null || event.sender.toLowerCase() === owner || event.to.toLowerCase() === owner;
+    if (owner !== null) assert.match(query, /transactionFrom/);
+    const belongsToOwner = (event) => owner === null || event.transactionFrom?.toLowerCase() === owner || event.sender.toLowerCase() === owner || event.to.toLowerCase() === owner;
     const pair = forcePoolActivityPair ?? pairAddress;
     const swaps = fixtures.swaps.filter(belongsToOwner).slice(0, Number(variables.first)).map((event) => ({
       ...event,
@@ -709,7 +755,7 @@ function walletPortfolioPage(positions) {
   return {
     positions,
     pageInfo: { endCursor: null, hasNextPage: false, partial: false },
-    health: { fresh: true, headBlock: "1", status: "READY" }
+    health: { fresh: true, headBlock: "1", headHash: pinnedBlockHash, status: "READY" }
   };
 }
 

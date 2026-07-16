@@ -50,6 +50,8 @@ export interface MockRpcOptions {
   analyticsBinCount?: number;
   analyticsCandleGap?: boolean;
   analyticsAsOfBlock?: bigint;
+  analyticsHeadHash?: Hex;
+  analyticsBinOffset?: number;
   analyticsMode?: "ready" | "error";
   analyticsOutOfRange?: boolean;
   analyticsPartialHistory?: boolean;
@@ -123,8 +125,13 @@ export interface MockRpcOptions {
   pairTokenY?: string;
   pairByIdDelayMs?: number;
   pairByIdMode?: "ready" | "error";
+  poolActivityMode?: "ready" | "empty";
+  positionHistoryCount?: number;
+  positionHistoryFailAtSkip?: number;
   positionOwner?: Address;
   positionPair?: Address;
+  ownerPositionResponseOwner?: Address;
+  ownerPositionResponsePair?: Address;
   positionLiquidity?: bigint;
   priceQ128ByBin?: Readonly<Record<string, bigint>>;
   poolCount?: number;
@@ -214,6 +221,7 @@ interface GraphRequest {
     pairId?: string;
     skip?: number;
     toTimestamp?: number;
+    transactionHashes?: string[];
   };
 }
 
@@ -395,7 +403,7 @@ function mockAnalyticsResponse(body: GraphRequest, options: MockRpcOptions): Rec
     return { data: { analyticsHealth: mockAnalyticsHealth(options, partial) } };
   }
   const owner = body.variables?.owner ?? DEFAULT_ACCOUNT;
-  const binId = options.analyticsOutOfRange === true ? activeIdFor(options) + 10 : activeIdFor(options);
+  const binId = activeIdFor(options) + (options.analyticsBinOffset ?? (options.analyticsOutOfRange === true ? 10 : 0));
   const transferred = options.analyticsTransferred === true;
   const analyticsBins = transferred
     ? []
@@ -435,6 +443,7 @@ function mockAnalyticsResponse(body: GraphRequest, options: MockRpcOptions): Rec
       analyticsHealth: {
         fresh: true,
         headBlock: String(options.analyticsAsOfBlock ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER),
+        headHash: options.analyticsHeadHash ?? options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222",
         status: partial ? "PARTIAL" : "READY"
       },
       walletPositions: { nodes, pageInfo: { endCursor: null, hasNextPage: false, partial } }
@@ -446,7 +455,7 @@ function mockAnalyticsHealth(options: MockRpcOptions, partial: boolean): Record<
   return {
     status: partial ? "PARTIAL" : "READY",
     headBlock: String(options.analyticsAsOfBlock ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER),
-    headHash: options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222",
+    headHash: options.analyticsHeadHash ?? options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222",
     headTimestamp: 1_720_000_000,
     canonicalBlockCount: 42,
     reorgCount: 0,
@@ -551,41 +560,143 @@ function mockGraphResponse(body: GraphRequest, options: MockRpcOptions): Record<
     );
     return { data: { bins } };
   }
+  if (query.includes("PoolActivity") || query.includes("PairActivity")) {
+    const pair = typeof body.variables?.pair === "string" ? body.variables.pair.toLowerCase() : WNATIVE_USDC_PAIR.toLowerCase();
+    const owner = typeof body.variables?.owner === "string" ? body.variables.owner.toLowerCase() : null;
+    const otherAccount = "0x0000000000000000000000000000000000000002";
+    const swaps = options.poolActivityMode === "empty"
+      ? []
+      : [
+          {
+            id: "pool-swap-wallet",
+            transactionHash: `0x${"d1".padStart(64, "0")}`,
+            blockNumber: "42",
+            timestamp: "1720000300",
+            amountInX: "1000000000000000000",
+            amountInY: "0",
+            amountOutX: "0",
+            amountOutY: "2500000",
+            pair: { id: pair },
+            transactionFrom: DEFAULT_ACCOUNT,
+            sender: LB_ROUTER,
+            to: LB_ROUTER
+          },
+          {
+            id: "pool-swap-other",
+            transactionHash: `0x${"d2".padStart(64, "0")}`,
+            blockNumber: "41",
+            timestamp: "1720000240",
+            amountInX: "2000000000000000000",
+            amountInY: "0",
+            amountOutX: "0",
+            amountOutY: "5000000",
+            pair: { id: pair },
+            transactionFrom: otherAccount,
+            sender: otherAccount,
+            to: otherAccount
+          }
+        ].filter((event) => owner === null || event.transactionFrom.toLowerCase() === owner || event.sender.toLowerCase() === owner || event.to.toLowerCase() === owner);
+    const liquidityEvents = options.poolActivityMode === "empty"
+      ? []
+      : [
+          {
+            id: "liquidity-history-0",
+            type: "DEPOSIT",
+            transactionHash: `0x${"a0".padStart(64, "0")}`,
+            blockNumber: "1000",
+            timestamp: "1720000000",
+            amountX: "10000000000000000000",
+            amountY: "20000000000000000000",
+            pair: { id: pair },
+            sender: DEFAULT_ACCOUNT,
+            to: DEFAULT_ACCOUNT
+          },
+          {
+            id: "liquidity-history-1",
+            type: "WITHDRAW",
+            transactionHash: `0x${"a1".padStart(64, "0")}`,
+            blockNumber: "999",
+            timestamp: "1719999940",
+            amountX: "11000000000000000000",
+            amountY: "21000000000000000000",
+            pair: { id: pair },
+            sender: LB_ROUTER,
+            to: LB_ROUTER
+          },
+          {
+            id: "pool-liquidity-other",
+            type: "WITHDRAW",
+            transactionHash: `0x${"e2".padStart(64, "0")}`,
+            blockNumber: "39",
+            timestamp: "1720000120",
+            amountX: "1000000000000000000",
+            amountY: "2500000",
+            pair: { id: pair },
+            sender: otherAccount,
+            to: otherAccount
+          }
+        ].filter((event) => owner === null || event.sender.toLowerCase() === owner || event.to.toLowerCase() === owner);
+    return { data: { swaps, liquidityEvents } };
+  }
   if (query.includes("SwapsPage")) return { data: { swaps: [] } };
   if (query.includes("LiquidityEventsPage")) return { data: { liquidityEvents: [] } };
+  if (query.includes("PositionLiquidityDetails")) {
+    const pair = body.variables?.pair ?? WNATIVE_USDC_PAIR.toLowerCase();
+    const skip = body.variables?.skip ?? 0;
+    const first = body.variables?.first ?? 100;
+    const requestedHashes = new Set(body.variables?.transactionHashes ?? []);
+    const historyCount = options.includePositions === true ? options.positionHistoryCount ?? 2 : 0;
+    const matching = Array.from({ length: historyCount }, (_, index) => ({
+      id: `liquidity-history-${index}`,
+      type: index % 2 === 0 ? "DEPOSIT" : "WITHDRAW",
+      transactionHash: `0x${(0xa0 + index).toString(16).padStart(64, "0")}`,
+      blockNumber: String(1_000 - index),
+      timestamp: String(1_720_000_000 - index * 60),
+      amountX: String((10n + BigInt(index)) * 10n ** 18n),
+      amountY: String((20n + BigInt(index)) * 10n ** 18n),
+      ids: [String(activeIdFor(options) + index)],
+      pair: { id: pair },
+      sender: index % 2 === 0 ? DEFAULT_ACCOUNT : LB_ROUTER,
+      to: index % 2 === 0 ? DEFAULT_ACCOUNT : LB_ROUTER
+    })).filter((event) => requestedHashes.has(event.transactionHash.toLowerCase()));
+    return { data: { liquidityEvents: matching.slice(skip, skip + first) } };
+  }
   if (query.includes("PositionLiquidityHistory")) {
     const owner = body.variables?.owner ?? DEFAULT_ACCOUNT;
+    const pair = body.variables?.pair ?? WNATIVE_USDC_PAIR.toLowerCase();
+    const skip = body.variables?.skip ?? 0;
+    const first = body.variables?.first ?? 100;
+    if (options.positionHistoryFailAtSkip !== undefined && skip >= options.positionHistoryFailAtSkip) {
+      return { errors: [{ message: "Mock position history page failed" }] };
+    }
+    const historyCount = options.includePositions === true ? options.positionHistoryCount ?? 2 : 0;
+    const correlatedTransfers = Array.from(
+      { length: Math.max(0, Math.min(first, historyCount - skip)) },
+      (_, pageIndex) => {
+        const index = skip + pageIndex;
+        const deposit = index % 2 === 0;
+        const transactionHash = `0x${(0xa0 + index).toString(16).padStart(64, "0")}`;
+        const blockNumber = String(1_000 - index);
+        const timestamp = String(1_720_000_000 - index * 60);
+        const ids = [String(activeIdFor(options) + index)];
+        return {
+          id: `liquidity-history-transfer-${index}`,
+          transactionHash,
+          blockNumber,
+          timestamp,
+          sender: LB_ROUTER,
+          from: deposit ? "0x0000000000000000000000000000000000000000" : owner,
+          to: deposit ? owner : "0x0000000000000000000000000000000000000000",
+          ids,
+          pair: { id: pair }
+        };
+      }
+    );
     return {
       data: {
-        liquidityEvents: options.includePositions === true
-          ? [
-              {
-                id: "deposit-1",
-                type: "DEPOSIT",
-                transactionHash: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                blockNumber: "40",
-                timestamp: "1720000000",
-                amountX: "10000000000000000000",
-                amountY: "20000000000000000000",
-                ids: [String(activeIdFor(options))],
-                sender: owner,
-                to: owner
-              },
-              {
-                id: "withdraw-1",
-                type: "WITHDRAW",
-                transactionHash: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                blockNumber: "41",
-                timestamp: "1720000100",
-                amountX: "1000000000000000000",
-                amountY: "2000000000000000000",
-                ids: [String(activeIdFor(options))],
-                sender: owner,
-                to: owner
-              }
-            ]
-          : [],
-        transferBatchEvents: options.analyticsTransferred === true
+        transferBatchEvents: [
+          ...correlatedTransfers,
+          ...(options.analyticsTransferred === true && skip === 0
           ? [{
               id: "transfer-out-1",
               transactionHash: "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
@@ -594,9 +705,11 @@ function mockGraphResponse(body: GraphRequest, options: MockRpcOptions): Record<
               sender: owner,
               from: owner,
               to: "0x0000000000000000000000000000000000000002",
-              ids: [String(activeIdFor(options))]
+              ids: [String(activeIdFor(options))],
+              pair: { id: pair }
             }]
-          : []
+          : [])
+        ]
       }
     };
   }
@@ -608,8 +721,13 @@ function mockGraphResponse(body: GraphRequest, options: MockRpcOptions): Record<
 
     const count = shouldIncludeOwnerPairPosition(body, options) ? options.ownerPositionCount ?? 1 : 0;
     const first = body.variables?.first ?? count;
+    const responseOptions = {
+      ...options,
+      positionOwner: options.ownerPositionResponseOwner ?? options.positionOwner,
+      positionPair: options.ownerPositionResponsePair ?? options.positionPair
+    };
     const positions = Array.from({ length: Math.max(0, Math.min(first, count - skip)) }, (_, index) =>
-      mockPosition(options, skip + index)
+      mockPosition(responseOptions, skip + index)
     );
 
     return { data: { positions } };
