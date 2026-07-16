@@ -374,7 +374,8 @@ async function mockFetch(url, init) {
   if (query.includes("PairBinWindow")) {
     assert.equal(String(variables.pair), pairAddress.toLowerCase());
     assert.equal(String(variables.pairId), pairAddress.toLowerCase());
-    assert.equal(Number(variables.block), 123_456);
+    assert.equal(String(variables.blockHash), pinnedBlockHash);
+    assert.equal(query.match(/block: \{ hash: \$blockHash \}/g)?.length, 3);
     const minBin = BigInt(variables.minBin);
     const maxBin = BigInt(variables.maxBin);
     const bins = fixtures.bins

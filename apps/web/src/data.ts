@@ -594,15 +594,15 @@ const POSITION_HISTORY_QUERY = `
 `;
 
 const PAIR_BIN_WINDOW_QUERY = `
-  query PairBinWindow($pair: String!, $pairId: ID!, $block: Int!, $minBin: BigInt!, $maxBin: BigInt!, $first: Int!) {
-    _meta(block: { number: $block }) {
+  query PairBinWindow($pair: String!, $pairId: ID!, $blockHash: Bytes!, $minBin: BigInt!, $maxBin: BigInt!, $first: Int!) {
+    _meta(block: { hash: $blockHash }) {
       block {
         number
         hash
       }
       hasIndexingErrors
     }
-    pair(id: $pairId, block: { number: $block }) {
+    pair(id: $pairId, block: { hash: $blockHash }) {
       id
       address
       activeId
@@ -611,7 +611,7 @@ const PAIR_BIN_WINDOW_QUERY = `
       tokenX { address }
       tokenY { address }
     }
-    bins(first: $first, orderBy: binId, orderDirection: asc, block: { number: $block }, where: { pair: $pair, binId_gte: $minBin, binId_lte: $maxBin }) {
+    bins(first: $first, orderBy: binId, orderDirection: asc, block: { hash: $blockHash }, where: { pair: $pair, binId_gte: $minBin, binId_lte: $maxBin }) {
       id
       binId
       reserveX
@@ -917,9 +917,8 @@ export async function loadPoolBinWindow(
   const activeId = Number(snapshot.activeId);
   if (!Number.isSafeInteger(activeId) || activeId < 0) throw new Error("Active bin must be a non-negative safe integer");
   if (!Number.isSafeInteger(radius) || radius < 0 || radius > 100) throw new Error("Bin window radius must be between 0 and 100");
-  const block = Number(snapshot.blockNumber);
-  if (!Number.isSafeInteger(block) || block < 0 || block > 2_147_483_647) {
-    throw new Error("Pinned bin window block must fit the GraphQL Int range");
+  if (!/^0x[0-9a-f]{64}$/i.test(snapshot.blockHash)) {
+    throw new Error("Pinned bin window block hash is invalid");
   }
 
   const minBin = Math.max(0, activeId - radius);
@@ -928,7 +927,7 @@ export async function loadPoolBinWindow(
     registry.endpoints.indexerUrl,
     PAIR_BIN_WINDOW_QUERY,
     {
-      block,
+      blockHash: snapshot.blockHash,
       pair: pair.toLowerCase(),
       pairId: pair.toLowerCase(),
       minBin: minBin.toString(),
