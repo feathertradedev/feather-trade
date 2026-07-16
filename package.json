@@ -28,7 +28,7 @@
     "localstack:fixture:empty": "node scripts/localnet/fixture-state.cjs prepare-empty-owner",
     "localstack:fixture:reset-approvals": "node scripts/localnet/fixture-state.cjs reset-approvals",
     "localstack:fixture:wrong-chain": "node scripts/localnet/fixture-state.cjs wrong-chain-config",
-    "localstack:test": "bash -n scripts/localnet/stack.sh && node --check scripts/localnet/check-port-available.cjs && node --check scripts/localnet/check-stack-health.cjs && node --check scripts/localnet/fixture-state.cjs && node --check scripts/localnet/analytics-adapters.mjs && node scripts/localnet/test-check-stack-health.cjs && node scripts/localnet/test-fixture-state.cjs && node scripts/localnet/test-analytics-adapters.mjs",
+    "localstack:test": "bash -n scripts/localnet/stack.sh && node --check scripts/localnet/check-port-available.cjs && node --check scripts/localnet/check-stack-health.cjs && node --check scripts/localnet/fixture-state.cjs && node --check scripts/localnet/analytics-adapters.mjs && node scripts/localnet/test-stack-defaults.cjs && node scripts/localnet/test-check-stack-health.cjs && node scripts/localnet/test-fixture-state.cjs && node scripts/localnet/test-analytics-adapters.mjs",
     "robinhood:dry-run": "bash scripts/robinhood/dry-run.sh",
     "robinhood:deploy": "bash scripts/robinhood/deploy.sh",
     "robinhood:deploy:test": "node scripts/robinhood/test-deploy-wrapper.cjs",
@@ -79,6 +79,11 @@
     "analytics:build": "pnpm --filter @robinhood-lb/analytics build",
     "analytics:test": "pnpm --filter @robinhood-lb/analytics test",
     "analytics:typecheck": "pnpm --filter @robinhood-lb/analytics typecheck",
+    "market-activity:build": "pnpm --filter @robinhood-lb/dev-market-activity build",
+    "market-activity:typecheck": "pnpm --filter @robinhood-lb/dev-market-activity typecheck",
+    "market-activity:test": "pnpm --filter @robinhood-lb/dev-market-activity test",
+    "market-activity:seed": "pnpm sdk:build && pnpm market-activity:build && node --env-file-if-exists=.env packages/dev-market-activity/dist/src/cli.js seed",
+    "market-activity:start": "pnpm sdk:build && pnpm market-activity:build && node --env-file-if-exists=.env packages/dev-market-activity/dist/src/cli.js start",
     "e2e:localnet": "node scripts/e2e/run-localnet-transactions.cjs",
     "web:test:e2e:localnet": "node scripts/e2e/run-browser-localnet.cjs",
     "web:dev": "pnpm --filter @robinhood-lb/web dev",
@@ -125,7 +130,7 @@
     "indexer:deploy:goldsky:robinhood": "bash scripts/indexer/deploy-goldsky-robinhood.sh",
     "indexer:smoke:local": "bash scripts/indexer/smoke-local.sh",
     "indexer:smoke:robinhood": "bash scripts/indexer/smoke-robinhood.sh",
-    "build": "pnpm contracts:build && pnpm sdk:build && pnpm analytics:build && pnpm indexer:build && pnpm web:build",
+    "build": "pnpm contracts:build && pnpm sdk:build && pnpm analytics:build && pnpm market-activity:build && pnpm indexer:build && pnpm web:build",
     "test": "pnpm contracts:test"
   }
 }

@@ -16,6 +16,11 @@ const stackScript = path.join(root, "scripts/localnet/stack.sh");
 const hash = `0x${"22".repeat(32)}`;
 const factory = "0x1111111111111111111111111111111111111111";
 const pair = "0x2222222222222222222222222222222222222222";
+const weth = "0x3333333333333333333333333333333333333333";
+const usdc = "0x4444444444444444444444444444444444444444";
+const pairCreatedAtBlock = 18;
+const pairCreatedAtTimestamp = 1_700_000_012;
+const headTimestamp = 1_700_000_042;
 const manifestDir = fs.mkdtempSync(path.join(os.tmpdir(), "feather-stack-health-"));
 const manifestPath = path.join(manifestDir, "manifest.json");
 
@@ -25,26 +30,69 @@ main().finally(() => fs.rmSync(manifestDir, { recursive: true, force: true })).c
 });
 
 async function main() {
-  const state = { analyticsData: true, analyticsHash: hash, analyticsStatus: "READY", indexerData: true, webConfig: null };
+  const nextHash = `0x${"44".repeat(32)}`;
+  const state = {
+    analyticsData: true,
+    analyticsHash: hash,
+    analyticsStatus: "READY",
+    candlePriceSource: "active-bin-quote-usd",
+    candleQuoteToken: usdc,
+    candleFirstBlock: String(pairCreatedAtBlock),
+    hourCandles: true,
+    indexerData: true,
+    indexerPairCount: "1",
+    indexerTokenX: weth,
+    indexerTokenY: usdc,
+    metricTokenX: weth,
+    metricTokenY: usdc,
+    minuteCandles: true,
+    prices: availablePrices(),
+    rpcHead: 42,
+    webConfig: null
+  };
   const rpcServer = await serve(async (request, response, body) => {
     const payload = JSON.parse(body);
-    const result = payload.method === "eth_chainId"
-      ? "0x7a69"
-      : { number: "0x2a", hash };
+    let result;
+    if (payload.method === "eth_chainId") {
+      result = "0x7a69";
+    } else if (payload.params?.[0] === "0x2a") {
+      result = { number: "0x2a", hash };
+    } else {
+      result = { number: `0x${state.rpcHead.toString(16)}`, hash: state.rpcHead === 42 ? hash : nextHash };
+    }
     json(response, { jsonrpc: "2.0", id: payload.id, result });
   });
   const indexerServer = await serve(async (_request, response) => {
     json(response, { data: {
       _meta: { block: { number: 42, hash }, hasIndexingErrors: false },
-      factory: state.indexerData ? { id: factory, pairCount: "1" } : null,
-      pair: state.indexerData ? { id: pair, reserveX: "1", reserveY: "1" } : null
+      factory: state.indexerData ? { id: factory, pairCount: state.indexerPairCount } : null,
+      pair: state.indexerData ? {
+        id: pair,
+        reserveX: "1",
+        reserveY: "1",
+        createdAtBlock: String(pairCreatedAtBlock),
+        createdAtTimestamp: String(pairCreatedAtTimestamp),
+        tokenX: { id: state.indexerTokenX, address: state.indexerTokenX },
+        tokenY: { id: state.indexerTokenY, address: state.indexerTokenY }
+      } : null
     } });
   });
   const analyticsServer = await serve(async (_request, response, body) => {
     if (JSON.parse(body).query.includes("StackAnalyticsData")) {
       json(response, { data: {
-        poolMetrics: { nodes: state.analyticsData ? [{ pair, tvlUsdE18: "2", volume24hUsdE18: "1", fees24hUsdE18: "1", status: "READY", missingPriceTokens: [] }] : [] },
-        pairCandles: { nodes: state.analyticsData ? [{ pair, openUsdE18: "1", highUsdE18: "1", lowUsdE18: "1", closeUsdE18: "1", status: "READY", missingPriceTokens: [] }] : [] }
+        poolMetrics: { nodes: state.analyticsData ? [{
+          pair,
+          tokenX: state.metricTokenX,
+          tokenY: state.metricTokenY,
+          tvlUsdE18: "2",
+          volume24hUsdE18: "1",
+          fees24hUsdE18: "1",
+          priceUsdE18: "1",
+          status: "READY",
+          missingPriceTokens: []
+        }] : [] },
+        minuteCandles: { nodes: state.analyticsData && state.minuteCandles ? [candle("ONE_MINUTE", state)] : [] },
+        hourCandles: { nodes: state.analyticsData && state.hourCandles ? [candle("HOUR", state)] : [] }
       } });
       return;
     }
@@ -52,15 +100,15 @@ async function main() {
       status: state.analyticsStatus,
       headBlock: "42",
       headHash: state.analyticsHash,
-      headTimestamp: 2,
+      headTimestamp,
       fresh: true,
       partialEventCount: 0,
       backfillStatus: "complete",
       backfillError: null,
       coverageStartTimestamp: "1",
-      coverageThroughTimestamp: "2",
+      coverageThroughTimestamp: String(headTimestamp),
       missingPriceTokens: [],
-      prices: [{ token: "0x1111111111111111111111111111111111111111", status: "available" }]
+      prices: state.prices
     } } });
   });
   const webServer = await serve(async (request, response) => {
@@ -88,10 +136,11 @@ async function main() {
       chainId: 31_337,
       endpoints: { rpcUrl: endpoints.rpc, indexerUrl: endpoints.indexer },
       contracts: { lbFactory: factory },
-      seededPools: { wnativeUsdc: { pair } }
+      tokens: { weth, usdc },
+      seededPools: { wethUsdc: { pair, tokenX: weth, tokenY: usdc } }
     })}\n`);
     state.webConfig = {
-      VITE_ANALYTICS_LOCALNET_URL: endpoints.analytics,
+      VITE_ANALYTICS_LOCALNET_URL: `${endpoints.analytics}/graphql`,
       VITE_LOCALNET_INDEXER_URL: endpoints.indexer,
       VITE_LOCALNET_MANIFEST_PATH: manifestPath,
       VITE_LOCALNET_MANIFEST_SHA256: crypto.createHash("sha256").update(fs.readFileSync(manifestPath)).digest("hex"),
@@ -105,9 +154,30 @@ async function main() {
     assert.equal(result.checks.rpc.headBlock, 42);
     assert.equal(result.checks.indexer.headHash, hash);
     assert.equal(result.checks.analytics.status, "READY");
+    assert.equal(result.checks.analytics.pricesAvailable, 2);
+    assert.equal(result.checks.analytics.firstMinuteCandleBlock, pairCreatedAtBlock);
+    assert.equal(result.checks.analytics.firstMinuteCandleTimestamp, Math.floor(pairCreatedAtTimestamp / 60) * 60);
+    assert.equal(result.checks.analytics.minuteCandleCount, 1);
+    assert.equal(result.checks.analytics.hourCandleCount, 1);
     assert.equal(result.checks.web.status, 200);
 
+    state.rpcHead = 43;
+    const boundedLiveLag = await runHealth(endpoints);
+    assert.equal(boundedLiveLag.status, 0, `${boundedLiveLag.stderr}\n${boundedLiveLag.stdout}`);
+    assert.equal(JSON.parse(boundedLiveLag.stdout).checks.rpc.indexedHeadLagBlocks, 1);
+    state.rpcHead = 42;
+
     const originalManifest = fs.readFileSync(manifestPath, "utf8");
+    const extraPoolManifest = JSON.parse(originalManifest);
+    extraPoolManifest.seededPools.extra = { pair, tokenX: weth, tokenY: usdc };
+    fs.writeFileSync(manifestPath, `${JSON.stringify(extraPoolManifest)}\n`);
+    state.webConfig.VITE_LOCALNET_MANIFEST_SHA256 = crypto.createHash("sha256").update(fs.readFileSync(manifestPath)).digest("hex");
+    const extraSeededPool = await runHealth(endpoints);
+    assert.equal(extraSeededPool.status, 1);
+    assert.match(JSON.parse(extraSeededPool.stdout).errors[0].message, /MANIFEST/);
+    fs.writeFileSync(manifestPath, originalManifest);
+    state.webConfig.VITE_LOCALNET_MANIFEST_SHA256 = crypto.createHash("sha256").update(fs.readFileSync(manifestPath)).digest("hex");
+
     const mismatchedManifest = JSON.parse(originalManifest);
     mismatchedManifest.endpoints.indexerUrl = "http://127.0.0.1:1/subgraphs/name/other";
     fs.writeFileSync(manifestPath, `${JSON.stringify(mismatchedManifest)}\n`);
@@ -123,6 +193,66 @@ async function main() {
     assert.equal(missingIndexerData.status, 1);
     assert.match(JSON.parse(missingIndexerData.stdout).errors[0].message, /INDEXER_DATA/);
     state.indexerData = true;
+
+    state.indexerPairCount = "2";
+    const extraIndexedPair = await runHealth(endpoints);
+    assert.equal(extraIndexedPair.status, 1);
+    assert.match(JSON.parse(extraIndexedPair.stdout).errors[0].message, /INDEXER_DATA/);
+    state.indexerPairCount = "1";
+
+    state.indexerTokenX = usdc;
+    const wrongIndexedTokens = await runHealth(endpoints);
+    assert.equal(wrongIndexedTokens.status, 1);
+    assert.match(JSON.parse(wrongIndexedTokens.stdout).errors[0].message, /INDEXER_DATA/);
+    state.indexerTokenX = weth;
+
+    state.prices = availablePrices().slice(1);
+    const missingWethPrice = await runHealth(endpoints);
+    assert.equal(missingWethPrice.status, 1);
+    assert.match(JSON.parse(missingWethPrice.stdout).errors[0].message, /PRICE_NOT_READY/);
+    state.prices = availablePrices();
+
+    state.prices = [...availablePrices(), { token: factory, source: "fixed-test", status: "available" }];
+    const extraPricePolicy = await runHealth(endpoints);
+    assert.equal(extraPricePolicy.status, 1);
+    assert.match(JSON.parse(extraPricePolicy.stdout).errors[0].message, /PRICE_NOT_READY/);
+    state.prices = availablePrices();
+
+    state.metricTokenX = usdc;
+    const wrongMetricTokens = await runHealth(endpoints);
+    assert.equal(wrongMetricTokens.status, 1);
+    assert.match(JSON.parse(wrongMetricTokens.stdout).errors[0].message, /ANALYTICS_DATA/);
+    state.metricTokenX = weth;
+
+    state.minuteCandles = false;
+    const missingMinuteCandles = await runHealth(endpoints);
+    assert.equal(missingMinuteCandles.status, 1);
+    assert.match(JSON.parse(missingMinuteCandles.stdout).errors[0].message, /ANALYTICS_DATA/);
+    state.minuteCandles = true;
+
+    state.hourCandles = false;
+    const missingHourCandles = await runHealth(endpoints);
+    assert.equal(missingHourCandles.status, 1);
+    assert.match(JSON.parse(missingHourCandles.stdout).errors[0].message, /ANALYTICS_DATA/);
+    state.hourCandles = true;
+
+    state.candleQuoteToken = weth;
+    const wrongCandleQuote = await runHealth(endpoints);
+    assert.equal(wrongCandleQuote.status, 1);
+    assert.match(JSON.parse(wrongCandleQuote.stdout).errors[0].message, /ANALYTICS_DATA/);
+    state.candleQuoteToken = usdc;
+
+    state.candlePriceSource = "trusted-token-usd";
+    const wrongCandleSource = await runHealth(endpoints);
+    assert.equal(wrongCandleSource.status, 1);
+    assert.match(JSON.parse(wrongCandleSource.stdout).errors[0].message, /ANALYTICS_DATA/);
+    state.candlePriceSource = "active-bin-quote-usd";
+
+    state.candleFirstBlock = String(pairCreatedAtBlock + 1);
+    const lateFirstCandle = await runHealth(endpoints);
+    assert.equal(lateFirstCandle.status, 1);
+    assert.match(JSON.parse(lateFirstCandle.stdout).errors[0].message, /ANALYTICS_DATA/);
+    state.candleFirstBlock = String(pairCreatedAtBlock);
 
     state.analyticsData = false;
     const missingAnalyticsData = await runHealth(endpoints);
@@ -146,7 +276,7 @@ async function main() {
     const mismatchedWebConfig = await runHealth(endpoints);
     assert.equal(mismatchedWebConfig.status, 1);
     assert.match(JSON.parse(mismatchedWebConfig.stdout).errors[0].message, /WEB_CONFIG/);
-    state.webConfig.VITE_ANALYTICS_LOCALNET_URL = endpoints.analytics;
+    state.webConfig.VITE_ANALYTICS_LOCALNET_URL = `${endpoints.analytics}/graphql`;
 
     const help = childProcess.spawnSync("bash", [stackScript, "help"], { encoding: "utf8" });
     assert.equal(help.status, 0, help.stderr);
@@ -155,12 +285,41 @@ async function main() {
     const stackSource = fs.readFileSync(stackScript, "utf8");
     assert.ok(stackSource.indexOf("check-port-available.cjs") < stackSource.indexOf("nohup anvil"), "collision probe must run before Anvil launch");
     assert.ok((stackSource.match(/kill -0 \"\$anvil_pid\"/g) ?? []).length >= 3, "Anvil PID must be checked before, during, and after RPC readiness");
+    assert.ok(stackSource.indexOf("check-stack-health.cjs") < stackSource.indexOf("node \"$ROOT_DIR/packages/dev-market-activity/dist/src/cli.js\" start"), "continuous activity must start only after stable stack health");
+    assert.match(stackSource, /wait_market_activity/, "continuous activity startup must be health-gated");
   } finally {
     await Promise.all([rpcServer, indexerServer, analyticsServer, webServer].map(close));
   }
   assert.equal(await isLoopbackPortAvailable(occupiedRpcPort), true, "released RPC ports must become available");
 
-  console.log("Local full-stack health fixtures passed: exact parity, analytics readiness, fail-closed mismatch, and safe shell help.");
+  console.log("Local full-stack health fixtures passed: bounded canonical parity, analytics readiness, fail-closed mismatch, and safe shell help.");
+}
+
+function availablePrices() {
+  return [
+    { token: weth, source: "fixed-test", status: "available" },
+    { token: usdc, source: "fixed-test", status: "available" }
+  ];
+}
+
+function candle(interval, state) {
+  const price = "2000000000000000000000";
+  return {
+    pair,
+    interval,
+    startTimestamp: interval === "ONE_MINUTE"
+      ? Math.floor(pairCreatedAtTimestamp / 60) * 60
+      : Math.floor(pairCreatedAtTimestamp / 3_600) * 3_600,
+    openUsdE18: price,
+    highUsdE18: price,
+    lowUsdE18: price,
+    closeUsdE18: price,
+    status: "READY",
+    missingPriceTokens: [],
+    firstBlock: state.candleFirstBlock,
+    priceSource: state.candlePriceSource,
+    quoteToken: state.candleQuoteToken
+  };
 }
 
 function runHealth(endpoints) {

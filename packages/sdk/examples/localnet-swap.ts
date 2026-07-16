@@ -38,13 +38,13 @@ const walletClient = createWalletClient({
   transport: http(rpcUrl)
 });
 
-const wnative = findTokenBySymbol(registry.tokens, "WNATIVE");
+const weth = findTokenBySymbol(registry.tokens, "WETH");
 const usdc = findTokenBySymbol(registry.tokens, "USDC");
-if (wnative === null || usdc === null) throw new Error("Required localnet token identity is unavailable or ambiguous");
-const amountIn = parseUnits(process.env.SDK_EXAMPLE_SWAP_AMOUNT_IN ?? "0.01", wnative.decimals);
+if (weth === null || usdc === null) throw new Error("Required localnet token identity is unavailable or ambiguous");
+const amountIn = parseUnits(process.env.SDK_EXAMPLE_SWAP_AMOUNT_IN ?? "0.01", weth.decimals);
 const slippageBps = BigInt(process.env.SDK_EXAMPLE_SLIPPAGE_BPS ?? "50");
 const deadline = deadlineFromNow(Number(process.env.SDK_EXAMPLE_DEADLINE_MINUTES ?? "20"));
-const pool = registry.seededPools.wnativeUsdc;
+const pool = registry.seededPools.wethUsdc;
 const quote = await getBestExactInQuote(publicClient, registry, pool.tokenX, pool.tokenY, amountIn);
 const amountOut = getQuoteAmountOut(quote);
 const amountOutMin = calculateAmountOutMin(amountOut, slippageBps);
@@ -99,10 +99,10 @@ console.log(
       manifestPath,
       chainId: registry.chainId,
       account: account.address,
-      tokenIn: wnative.symbol,
+      tokenIn: weth.symbol,
       tokenOut: usdc.symbol,
       amountIn: amountIn.toString(),
-      amountInFormatted: formatUnits(amountIn, wnative.decimals),
+      amountInFormatted: formatUnits(amountIn, weth.decimals),
       amountOut: amountOut.toString(),
       amountOutFormatted: formatUnits(amountOut, usdc.decimals),
       amountOutMin: amountOutMin.toString(),

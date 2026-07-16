@@ -16,6 +16,7 @@ import type {
   AnalyticsHealth,
   BlockEnvelope,
   BlockSubmission,
+  Candle,
   CandleInterval,
   PriceSample,
   PriceSubmission,
@@ -25,6 +26,27 @@ import type {
 } from "./types.js";
 
 const MAX_REQUEST_BYTES = 5 * 1024 * 1024;
+const STREAM_HEARTBEAT_MS = 15_000;
+const MAX_STREAM_SUBSCRIBERS = 500;
+const DEFAULT_STREAM_REPLAY_SIZE = 2_048;
+
+type GraphqlCandleInterval =
+  | "ONE_MINUTE"
+  | "FIVE_MINUTES"
+  | "FIFTEEN_MINUTES"
+  | "HOUR"
+  | "FOUR_HOURS"
+  | "DAY"
+  | "WEEK";
+
+export interface CandleStreamEvent {
+  cursor: string;
+  type: "candle" | "reset";
+  pair: string | null;
+  interval: CandleInterval | null;
+  candle: Candle | null;
+  reason: string | null;
+}
 
 export class AnalyticsCheckpointStore {
   constructor(readonly path: string) {}
@@ -38,7 +60,7 @@ export class AnalyticsCheckpointStore {
     }
   }
 
-  async save(checkpoint: AnalyticsCheckpoint): Promise<void> {
+  async save(checkpoint: AnalyticsCheckpoint, _candles?: readonly Candle[]): Promise<void> {
     await mkdir(dirname(this.path), { recursive: true });
     const temporaryPath = `${this.path}.tmp-${process.pid}-${randomUUID()}`;
     await writeFile(temporaryPath, encodeTaggedJson(checkpoint), { encoding: "utf8", mode: 0o600 });
@@ -46,9 +68,16 @@ export class AnalyticsCheckpointStore {
   }
 }
 
+export interface AnalyticsStateStore {
+  load(): Promise<AnalyticsCheckpoint | null>;
+  save(checkpoint: AnalyticsCheckpoint, candles: readonly Candle[]): Promise<void>;
+  loadCandleEvents?(): Promise<CandleStreamEvent[]>;
+  appendCandleEvents?(events: readonly CandleStreamEvent[]): Promise<void>;
+}
+
 export interface AnalyticsApiServiceOptions {
   engine: AnalyticsEngine;
-  store?: AnalyticsCheckpointStore | null;
+  store?: AnalyticsStateStore | null;
   allowFixedTestPrices?: boolean;
   priceVerifier?: PriceSampleVerifier | null;
   positionSnapshotProvider?: PositionSnapshotProvider | null;
@@ -76,14 +105,90 @@ export interface PositionSnapshotProvider {
   load(owner: string, head: CanonicalHead): Promise<PositionSnapshotEvent[]>;
 }
 
+export class CandleStreamHub {
+  readonly #events: CandleStreamEvent[] = [];
+  readonly #subscribers = new Set<(event: CandleStreamEvent) => void>();
+  readonly #replaySize: number;
+  #sequence = 0;
+
+  constructor(replaySize = DEFAULT_STREAM_REPLAY_SIZE) {
+    if (!Number.isSafeInteger(replaySize) || replaySize <= 0) throw new Error("Candle stream replay size must be positive");
+    this.#replaySize = replaySize;
+  }
+
+  get cursor(): string {
+    return String(this.#sequence);
+  }
+
+  get subscriberCount(): number {
+    return this.#subscribers.size;
+  }
+
+  restore(events: readonly CandleStreamEvent[]): void {
+    if (this.#sequence !== 0 || this.#events.length !== 0) throw new Error("Candle stream can only be restored while empty");
+    const retained = events.slice(-this.#replaySize);
+    let previous = 0;
+    for (const event of retained) {
+      const cursor = Number(event.cursor);
+      if (!Number.isSafeInteger(cursor) || cursor <= previous) throw new Error("Persisted candle stream cursor is invalid");
+      previous = cursor;
+      this.#events.push(structuredClone(event));
+    }
+    this.#sequence = previous;
+  }
+
+  publishCandle(candle: Candle): CandleStreamEvent {
+    return this.#publish({
+      type: "candle",
+      pair: candle.pair,
+      interval: candle.interval,
+      candle,
+      reason: null
+    });
+  }
+
+  publishReset(reason: string): CandleStreamEvent {
+    return this.#publish({ type: "reset", pair: null, interval: null, candle: null, reason });
+  }
+
+  replay(after: string, pair: string, interval: CandleInterval): CandleStreamEvent[] | null {
+    if (!/^\d+$/.test(after)) return null;
+    const cursor = Number(after);
+    if (!Number.isSafeInteger(cursor) || cursor < 0 || cursor > this.#sequence) return null;
+    const oldest = this.#events[0] === undefined ? this.#sequence + 1 : Number(this.#events[0].cursor);
+    if (cursor < oldest - 1) return null;
+    return this.#events.filter((event) =>
+      Number(event.cursor) > cursor &&
+      (event.type === "reset" || event.pair === pair && event.interval === interval)
+    );
+  }
+
+  subscribe(listener: (event: CandleStreamEvent) => void): () => void {
+    if (this.#subscribers.size >= MAX_STREAM_SUBSCRIBERS) throw new Error("Candle stream subscriber limit reached");
+    this.#subscribers.add(listener);
+    return () => this.#subscribers.delete(listener);
+  }
+
+  #publish(input: Omit<CandleStreamEvent, "cursor">): CandleStreamEvent {
+    this.#sequence += 1;
+    const event = { ...input, cursor: String(this.#sequence) };
+    this.#events.push(event);
+    if (this.#events.length > this.#replaySize) this.#events.splice(0, this.#events.length - this.#replaySize);
+    for (const subscriber of this.#subscribers) subscriber(event);
+    return event;
+  }
+}
+
 export class AnalyticsApiService {
   readonly #engine: AnalyticsEngine;
   readonly #schema: GraphQLSchema;
-  readonly #store: AnalyticsCheckpointStore | null;
+  readonly #store: AnalyticsStateStore | null;
   readonly #allowFixedTestPrices: boolean;
   readonly #priceVerifier: PriceSampleVerifier | null;
   readonly #positionSnapshotProvider: PositionSnapshotProvider | null;
+  readonly #stream = new CandleStreamHub();
   readonly #mutations = new AsyncMutex();
+  #candleSnapshot = new Map<string, string>();
 
   private constructor(options: AnalyticsApiServiceOptions, schema: GraphQLSchema) {
     this.#engine = options.engine;
@@ -101,14 +206,24 @@ export class AnalyticsApiService {
     const service = new AnalyticsApiService(options, schema);
     const checkpoint = await service.#store?.load();
     if (checkpoint) service.#engine.restoreCheckpoint(checkpoint);
+    const persistedEvents = await service.#store?.loadCandleEvents?.();
+    if (persistedEvents && persistedEvents.length > 0) service.#stream.restore(persistedEvents);
+    service.#replaceCandleSnapshot();
     return service;
+  }
+
+  get candleStream(): CandleStreamHub {
+    return this.#stream;
   }
 
   async ingestBlock(submission: BlockSubmission): Promise<"appended" | "duplicate" | "reorg"> {
     const block = await this.#verifyBlock(submission);
     return this.#mutations.run(async () => {
       const result = this.#engine.ingestBlock(block);
-      if (result !== "duplicate") await this.#persistUnlocked();
+      if (result !== "duplicate") {
+        await this.#persistUnlocked();
+        await this.#publishCandleChanges(result === "reorg");
+      }
       return result;
     });
   }
@@ -133,6 +248,7 @@ export class AnalyticsApiService {
         });
       } finally {
         await this.#persistUnlocked();
+        await this.#publishCandleChanges(false);
       }
     });
   }
@@ -155,19 +271,21 @@ export class AnalyticsApiService {
           mapConnection(this.#engine.queryPoolMetrics(args), mapPoolMetrics),
         pairCandles: (args: {
           pair: string;
-          interval: "HOUR" | "DAY";
+          interval: GraphqlCandleInterval;
           fromTimestamp: number;
           toTimestamp: number;
           first: number;
           after?: string | null;
-        }) =>
-          mapConnection(
+        }) => ({
+          ...mapConnection(
             this.#engine.queryCandles({
               ...args,
-              interval: args.interval.toLowerCase() as CandleInterval
+              interval: candleIntervalFromGraphql(args.interval)
             }),
             mapCandle
           ),
+          streamCursor: this.#stream.cursor
+        }),
         walletPositions: async (args: { owner: string; first: number; after?: string | null }) =>
           mapConnection(await this.queryWalletPositions(args), mapWalletPosition),
         analyticsHealth: () => mapHealth(this.#engine.getHealth())
@@ -206,7 +324,27 @@ export class AnalyticsApiService {
   }
 
   async #persistUnlocked(): Promise<void> {
-    await this.#store?.save(this.#engine.exportCheckpoint());
+    await this.#store?.save(this.#engine.exportCheckpoint(), this.#engine.listCandles());
+  }
+
+  #replaceCandleSnapshot(): void {
+    this.#candleSnapshot = new Map(
+      this.#engine.listCandles().map((candle) => [candleKey(candle), candleFingerprint(candle)])
+    );
+  }
+
+  async #publishCandleChanges(reorg: boolean): Promise<void> {
+    const candles = this.#engine.listCandles();
+    const published: CandleStreamEvent[] = [];
+    if (reorg) published.push(this.#stream.publishReset("canonical-reorg"));
+    for (const candle of candles) {
+      const key = candleKey(candle);
+      const fingerprint = candleFingerprint(candle);
+      if (!reorg && this.#candleSnapshot.get(key) === fingerprint) continue;
+      if (!reorg) published.push(this.#stream.publishCandle(candle));
+    }
+    this.#candleSnapshot = new Map(candles.map((candle) => [candleKey(candle), candleFingerprint(candle)]));
+    if (published.length > 0) await this.#store?.appendCandleEvents?.(published);
   }
 
   async #verifyBlock(submission: BlockSubmission): Promise<BlockEnvelope> {
@@ -250,19 +388,21 @@ export async function startAnalyticsHttpServer(options: AnalyticsHttpServerOptio
   const server = createServer(async (request, response) => {
     try {
       const origin = request.headers.origin;
-      const graphqlCorsAllowed = request.url === "/graphql" && origin !== undefined && corsOrigins.has(origin);
-      if (graphqlCorsAllowed) {
+      const pathname = new URL(request.url ?? "/", "http://analytics.local").pathname;
+      const corsRoute = pathname === "/graphql" || pathname === "/events/candles";
+      const corsAllowed = corsRoute && origin !== undefined && corsOrigins.has(origin);
+      if (corsAllowed) {
         response.setHeader("access-control-allow-origin", origin);
         response.setHeader("vary", "Origin");
       }
       if (request.method === "OPTIONS") {
-        if (!graphqlCorsAllowed) {
+        if (!corsAllowed) {
           sendJson(response, 403, { error: "Origin is not allowed" });
           return;
         }
         response.writeHead(204, {
-          "access-control-allow-methods": "POST, OPTIONS",
-          "access-control-allow-headers": "content-type",
+          "access-control-allow-methods": "GET, POST, OPTIONS",
+          "access-control-allow-headers": "content-type, last-event-id",
           "access-control-max-age": "600",
           "cache-control": "no-store"
         });
@@ -298,12 +438,18 @@ async function routeRequest(
   service: AnalyticsApiService,
   ingestToken: string | null
 ): Promise<void> {
-  if (request.method !== "POST") {
-    sendJson(response, 405, { error: "POST required" });
+  const url = new URL(request.url ?? "/", "http://analytics.local");
+  if (request.method === "GET" && url.pathname === "/events/candles") {
+    await openCandleStream(request, response, service.candleStream, url);
     return;
   }
 
-  if (request.url === "/graphql") {
+  if (request.method !== "POST") {
+    sendJson(response, 405, { error: "POST or candle-stream GET required" });
+    return;
+  }
+
+  if (url.pathname === "/graphql") {
     const payload = JSON.parse(await readBody(request)) as { query?: unknown; variables?: unknown };
     if (typeof payload.query !== "string") {
       sendJson(response, 400, { error: "query must be a string" });
@@ -317,7 +463,7 @@ async function routeRequest(
     return;
   }
 
-  if (request.url === "/internal/blocks") {
+  if (url.pathname === "/internal/blocks") {
     if (ingestToken === null) {
       sendJson(response, 503, { error: "Block ingestion is disabled until ANALYTICS_INGEST_TOKEN is configured" });
       return;
@@ -333,6 +479,80 @@ async function routeRequest(
   }
 
   sendJson(response, 404, { error: "Not found" });
+}
+
+async function openCandleStream(
+  request: IncomingMessage,
+  response: ServerResponse,
+  stream: CandleStreamHub,
+  url: URL
+): Promise<void> {
+  const pair = url.searchParams.get("pair")?.toLowerCase() ?? "";
+  const intervalValue = url.searchParams.get("interval") ?? "";
+  if (!/^0x[0-9a-f]{40}$/.test(pair)) {
+    sendJson(response, 400, { error: "pair must be a canonical EVM address" });
+    return;
+  }
+  let interval: CandleInterval;
+  try {
+    interval = candleIntervalFromGraphql(intervalValue as GraphqlCandleInterval);
+  } catch {
+    sendJson(response, 400, { error: "interval is not supported" });
+    return;
+  }
+  const after = headerValue(request.headers["last-event-id"]) ?? url.searchParams.get("after") ?? stream.cursor;
+  const replay = stream.replay(after, pair, interval);
+
+  response.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-store",
+    connection: "keep-alive",
+    "x-accel-buffering": "no"
+  });
+  response.flushHeaders();
+
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    clearInterval(heartbeat);
+    unsubscribe?.();
+    if (!response.writableEnded) response.end();
+  };
+  const write = (event: CandleStreamEvent) => {
+    if (closed) return;
+    if (event.type !== "reset" && (event.pair !== pair || event.interval !== interval)) return;
+    const payload = event.type === "candle" && event.candle !== null
+      ? { cursor: event.cursor, candle: mapCandle(event.candle) }
+      : { cursor: event.cursor, reason: event.reason ?? "history-reset-required" };
+    const writable = response.write(`id: ${event.cursor}\nevent: ${event.type}\ndata: ${JSON.stringify(payload)}\n\n`);
+    if (!writable) close();
+  };
+  let unsubscribe: (() => void) | undefined;
+  const heartbeat = setInterval(() => {
+    if (!closed && !response.write(`event: heartbeat\ndata: ${JSON.stringify({ cursor: stream.cursor, timestamp: Date.now() })}\n\n`)) close();
+  }, STREAM_HEARTBEAT_MS);
+
+  if (replay === null) {
+    const cursor = stream.cursor;
+    response.write(`id: ${cursor}\nevent: reset\ndata: ${JSON.stringify({ cursor, reason: "stream-cursor-expired" })}\n\n`);
+  } else {
+    for (const event of replay) write(event);
+  }
+
+  try {
+    unsubscribe = stream.subscribe(write);
+  } catch (error) {
+    response.write(`event: reset\ndata: ${JSON.stringify({ cursor: stream.cursor, reason: error instanceof Error ? error.message : "subscriber-limit" })}\n\n`);
+    close();
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    request.once("close", resolve);
+    response.once("close", resolve);
+  });
+  close();
 }
 
 async function readBody(request: IncomingMessage): Promise<string> {
@@ -384,8 +604,21 @@ function mapPoolMetrics<T extends { status: string }>(value: T) {
   return { ...value, status: value.status.toUpperCase() };
 }
 
-function mapCandle<T extends { status: string; interval: string }>(value: T) {
-  return { ...value, status: value.status.toUpperCase(), interval: value.interval.toUpperCase() };
+function mapCandle(value: Candle) {
+  return {
+    ...value,
+    interval: candleIntervalToGraphql(value.interval),
+    status: value.status.toUpperCase(),
+    openUsdE18: nullableBigIntString(value.openUsdE18),
+    highUsdE18: nullableBigIntString(value.highUsdE18),
+    lowUsdE18: nullableBigIntString(value.lowUsdE18),
+    closeUsdE18: nullableBigIntString(value.closeUsdE18),
+    volumeUsdE18: nullableBigIntString(value.volumeUsdE18),
+    feesUsdE18: nullableBigIntString(value.feesUsdE18),
+    tvlUsdE18: nullableBigIntString(value.tvlUsdE18),
+    firstBlock: value.firstBlock.toString(),
+    lastBlock: value.lastBlock.toString()
+  };
 }
 
 function mapWalletPosition<T extends { status: string; bins: Array<{ status: string }> }>(value: T) {
@@ -402,6 +635,48 @@ function mapHealth<T extends { status: string }>(value: T) {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function candleIntervalFromGraphql(interval: GraphqlCandleInterval): CandleInterval {
+  switch (interval) {
+    case "ONE_MINUTE": return "minute";
+    case "FIVE_MINUTES": return "five-minutes";
+    case "FIFTEEN_MINUTES": return "fifteen-minutes";
+    case "HOUR": return "hour";
+    case "FOUR_HOURS": return "four-hours";
+    case "DAY": return "day";
+    case "WEEK": return "week";
+    default: throw new Error(`Unsupported candle interval ${String(interval)}`);
+  }
+}
+
+function candleIntervalToGraphql(interval: CandleInterval): GraphqlCandleInterval {
+  switch (interval) {
+    case "minute": return "ONE_MINUTE";
+    case "five-minutes": return "FIVE_MINUTES";
+    case "fifteen-minutes": return "FIFTEEN_MINUTES";
+    case "hour": return "HOUR";
+    case "four-hours": return "FOUR_HOURS";
+    case "day": return "DAY";
+    case "week": return "WEEK";
+  }
+}
+
+function candleKey(candle: Candle): string {
+  return `${candle.pair}:${candle.interval}:${candle.startTimestamp}`;
+}
+
+function candleFingerprint(candle: Candle): string {
+  return encodeTaggedJson(candle);
+}
+
+function headerValue(value: string | string[] | undefined): string | null {
+  if (typeof value === "string") return value;
+  return value?.[0] ?? null;
+}
+
+function nullableBigIntString(value: bigint | null): string | null {
+  return value === null ? null : value.toString();
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {

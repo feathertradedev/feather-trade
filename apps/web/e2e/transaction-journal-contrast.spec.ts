@@ -60,6 +60,8 @@ async function openPopulatedJournal(page: Page): Promise<Locator> {
 
   const journal = page.getByTestId("submitted-transaction-journal");
   await expect(journal).toContainText(/unknown-submission|reconciling/);
+  await page.locator(".operations-menu > summary").click();
+  await expect(journal).toBeVisible();
   return journal;
 }
 

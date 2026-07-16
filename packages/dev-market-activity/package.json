@@ -1,29 +1,21 @@
 {
-  "name": "@robinhood-lb/analytics",
+  "name": "@robinhood-lb/dev-market-activity",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./dist/src/index.d.ts",
-      "default": "./dist/src/index.js"
-    }
-  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "pnpm build && node --test dist/test/*.test.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "start": "node dist/src/server-cli.js"
+    "test": "pnpm build && node --test dist/test/*.test.js"
   },
   "dependencies": {
-    "graphql": "^16.11.0",
-    "pg": "^8.16.3"
+    "@robinhood-lb/sdk": "workspace:*",
+    "viem": "^2.54.6"
   },
   "devDependencies": {
     "@types/node": "^26.1.0",
-    "@types/pg": "^8.15.6",
     "typescript": "^6.0.3"
   }
 }

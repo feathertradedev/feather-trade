@@ -8,7 +8,10 @@ import {
   AnalyticsApiService,
   AnalyticsCheckpointStore,
   AnalyticsEngine,
+  CANDLE_INTERVALS,
+  CandleStreamHub,
   FULL_HISTORY_START_TIMESTAMP,
+  candleBoundary,
   runBackfill,
   startAnalyticsHttpServer,
   USD_SCALE,
@@ -38,7 +41,7 @@ test("serves GraphQL CORS only to exact configured browser origins", async () =>
     });
     assert.equal(allowed.status, 204);
     assert.equal(allowed.headers.get("access-control-allow-origin"), "https://app.testnet.example.com");
-    assert.equal(allowed.headers.get("access-control-allow-methods"), "POST, OPTIONS");
+    assert.equal(allowed.headers.get("access-control-allow-methods"), "GET, POST, OPTIONS");
 
     const disallowed = await fetch(endpoint, {
       method: "OPTIONS",
@@ -54,6 +57,60 @@ test("serves GraphQL CORS only to exact configured browser origins", async () =>
     });
     assert.equal(query.status, 200);
     assert.equal(query.headers.get("access-control-allow-origin"), "https://app.testnet.example.com");
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("hands historical queries to SSE replacements without losing open-candle revisions", async () => {
+  const streamPair = "0x00000000000000000000000000000000000000a1";
+  const service = await AnalyticsApiService.create({
+    engine: new AnalyticsEngine(policies, { assumeCompleteHistory: true }),
+    priceVerifier: testPriceVerifier()
+  });
+  const server = await startAnalyticsHttpServer({ service, host: "127.0.0.1", port: 0 });
+  try {
+    const address = server.address();
+    assert(address && typeof address === "object");
+    const base = `http://127.0.0.1:${address.port}`;
+    const historyResponse = await fetch(`${base}/graphql`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        query: "query($pair: ID!) { pairCandles(pair: $pair, interval: ONE_MINUTE, fromTimestamp: 600, toTimestamp: 660, first: 100) { streamCursor nodes { startTimestamp revision } } }",
+        variables: { pair: streamPair }
+      })
+    });
+    const history = await historyResponse.json() as { data: { pairCandles: { streamCursor: string; nodes: unknown[] } } };
+    assert.equal(history.data.pairCandles.streamCursor, "0");
+    assert.deepEqual(history.data.pairCandles.nodes, []);
+
+    await service.ingestBlock(submitBlock(block(1n, "0xb1", "0x00", 610, [{ ...marketSwap(USD_SCALE, UNIT), pair: streamPair }], [
+      price(TOKEN_X, "x-usd", USD_SCALE, 610, 1n),
+      price(TOKEN_Y, "y-usd", USD_SCALE, 610, 1n)
+    ])));
+    const first = await nextCandleEvent(base, streamPair, "0");
+    assert.equal(first.candle.startTimestamp, 600);
+    assert.equal(first.candle.finalized, false);
+
+    await service.ingestBlock(submitBlock(block(2n, "0xb2", "0xb1", 640, [{ ...marketSwap(2n * USD_SCALE, UNIT), pair: streamPair }], [
+      price(TOKEN_X, "x-usd", 2n * USD_SCALE, 640, 2n),
+      price(TOKEN_Y, "y-usd", USD_SCALE, 640, 2n)
+    ])));
+    const replacement = await nextCandleEvent(base, streamPair, first.cursor);
+    assert.equal(replacement.candle.startTimestamp, first.candle.startTimestamp);
+    assert(replacement.candle.revision > first.candle.revision);
+    assert.equal(replacement.candle.closeUsdE18, "2000000000000000000");
+
+    await service.ingestBlock(submitBlock(block(3n, "0xb3", "0xb2", 665, [{ ...marketSwap(3n * USD_SCALE, UNIT), pair: streamPair }], [
+      price(TOKEN_X, "x-usd", 3n * USD_SCALE, 665, 3n),
+      price(TOKEN_Y, "y-usd", USD_SCALE, 665, 3n)
+    ])));
+    const boundaryEvents = await nextCandleEvents(base, streamPair, replacement.cursor, 2);
+    assert.deepEqual(boundaryEvents.map((event) => [event.candle.startTimestamp, event.candle.finalized]), [[600, true], [660, false]]);
+
+    const replay = await nextCandleEvent(base, streamPair, boundaryEvents[0].cursor, { lastEventId: replacement.cursor });
+    assert.equal(replay.cursor, boundaryEvents[0].cursor);
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
@@ -106,6 +163,94 @@ test("builds exact 24h USD metrics and bounded OHLC candles", () => {
   assert.equal(candle.closeUsdE18, 3n * USD_SCALE);
   assert.equal(candle.volumeUsdE18, 20n * USD_SCALE);
   assert.equal(candle.swapCount, 1);
+});
+
+test("materializes minute candles, hierarchical rollups, revisions, finalization, and Monday weeks", () => {
+  const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  const monday = 4 * 86_400;
+  engine.ingestBlock(block(1n, "0x91", "0x00", monday + 10, [marketSwap(2n * USD_SCALE, UNIT)], [
+    price(TOKEN_X, "x-usd", 2n * USD_SCALE, monday + 10, 1n),
+    price(TOKEN_Y, "y-usd", USD_SCALE, monday + 10, 1n)
+  ]));
+  engine.ingestBlock(block(2n, "0x92", "0x91", monday + 40, [marketSwap(3n * USD_SCALE, 2n * UNIT)], [
+    price(TOKEN_X, "x-usd", 3n * USD_SCALE, monday + 40, 2n),
+    price(TOKEN_Y, "y-usd", USD_SCALE, monday + 40, 2n)
+  ]));
+  engine.ingestBlock(block(3n, "0x93", "0x92", monday + 70, [marketSwap(USD_SCALE, UNIT)], [
+    price(TOKEN_X, "x-usd", USD_SCALE, monday + 70, 3n),
+    price(TOKEN_Y, "y-usd", USD_SCALE, monday + 70, 3n)
+  ]));
+  engine.ingestBlock(block(4n, "0x94", "0x93", monday + 121, [], []));
+
+  const minutes = engine.queryCandles({ pair: PAIR, interval: "minute", fromTimestamp: monday, toTimestamp: monday + 120, first: 10 }).nodes;
+  assert.equal(minutes.length, 2);
+  assert.deepEqual(
+    [minutes[0].openUsdE18, minutes[0].highUsdE18, minutes[0].lowUsdE18, minutes[0].closeUsdE18],
+    [2n * USD_SCALE, 3n * USD_SCALE, 2n * USD_SCALE, 3n * USD_SCALE]
+  );
+  assert.equal(minutes[0].swapCount, 2);
+  assert.equal(minutes[0].revision, 4);
+  assert.equal(minutes[0].finalized, true);
+  assert.equal(minutes[0].firstBlockHash, "0x91");
+  assert.equal(minutes[0].lastBlockHash, "0x92");
+  assert.equal(minutes[1].finalized, true);
+  assert.equal(minutes[1].priceSource, "active-bin-quote-usd");
+  assert.equal(minutes[1].quoteToken, TOKEN_Y);
+
+  for (const interval of CANDLE_INTERVALS.filter((value) => value !== "minute")) {
+    const rows = engine.queryCandles({ pair: PAIR, interval, fromTimestamp: candleBoundary(monday, interval), toTimestamp: monday + 120, first: 10 }).nodes;
+    assert.equal(rows.length, 1, `${interval} rollup is present`);
+    assert.equal(rows[0].openUsdE18, 2n * USD_SCALE);
+    assert.equal(rows[0].highUsdE18, 3n * USD_SCALE);
+    assert.equal(rows[0].lowUsdE18, USD_SCALE);
+    assert.equal(rows[0].closeUsdE18, USD_SCALE);
+    assert.equal(rows[0].swapCount, 3);
+  }
+  assert.equal(candleBoundary(monday + 6 * 86_400, "week"), monday);
+  assert.equal(candleBoundary(monday + 7 * 86_400, "week"), monday + 7 * 86_400);
+  assert.throws(
+    () => engine.queryCandles({ pair: PAIR, interval: "minute", fromTimestamp: 0, toTimestamp: 500 * 60, first: 100 }),
+    /cannot span more than 500/
+  );
+
+  assert.equal(engine.ingestBlock(block(3n, "0x95", "0x92", monday + 70, [marketSwap(4n * USD_SCALE, UNIT)], [
+    price(TOKEN_X, "x-usd", 4n * USD_SCALE, monday + 70, 3n),
+    price(TOKEN_Y, "y-usd", USD_SCALE, monday + 70, 3n)
+  ])), "reorg");
+  const rebuiltHour = engine.queryCandles({ pair: PAIR, interval: "hour", fromTimestamp: monday, toTimestamp: monday, first: 10 }).nodes[0];
+  assert.equal(rebuiltHour.highUsdE18, 4n * USD_SCALE);
+  assert.equal(rebuiltHour.closeUsdE18, 4n * USD_SCALE);
+  assert.equal(rebuiltHour.lastBlockHash, "0x95");
+});
+
+test("replays bounded candle replacements and resets expired stream cursors", () => {
+  const stream = new CandleStreamHub(2);
+  const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  engine.ingestBlock(block(1n, "0xa1", "0x00", 60, [marketSwap(USD_SCALE, UNIT)], [
+    price(TOKEN_X, "x-usd", USD_SCALE, 60, 1n),
+    price(TOKEN_Y, "y-usd", USD_SCALE, 60, 1n)
+  ]));
+  const candle = engine.queryCandles({ pair: PAIR, interval: "minute", fromTimestamp: 60, toTimestamp: 60, first: 1 }).nodes[0];
+  const first = stream.publishCandle(candle);
+  const second = stream.publishCandle({ ...candle, revision: candle.revision + 1 });
+  assert.deepEqual(stream.replay(first.cursor, PAIR, "minute")?.map((event) => event.cursor), [second.cursor]);
+  stream.publishReset("canonical-reorg");
+  assert.equal(stream.replay("0", PAIR, "minute"), null);
+  assert.deepEqual(stream.replay(second.cursor, PAIR, "minute")?.map((event) => event.type), ["reset"]);
+});
+
+test("bounds candle stream subscribers and releases capacity on disconnect", () => {
+  const stream = new CandleStreamHub();
+  const unsubscribes = Array.from({ length: 500 }, () => stream.subscribe(() => undefined));
+  assert.equal(stream.subscriberCount, 500);
+  assert.throws(() => stream.subscribe(() => undefined), /subscriber limit/);
+  unsubscribes[0]!();
+  assert.equal(stream.subscriberCount, 499);
+  const unsubscribe = stream.subscribe(() => undefined);
+  assert.equal(stream.subscriberCount, 500);
+  unsubscribe();
+  for (const release of unsubscribes.slice(1)) release();
+  assert.equal(stream.subscriberCount, 0);
 });
 
 test("fails USD values partial when pricing is missing, stale, or outside confidence policy", () => {
@@ -640,6 +785,22 @@ function swap(amountInX: bigint, amountInY: bigint, feeX: bigint, feeY: bigint):
   return { ...identity(), kind: "swap", amountInX, amountInY, feeX, feeY, reserveX: 100n * UNIT, reserveY: 100n * UNIT };
 }
 
+function marketSwap(marketPriceQuoteE18: bigint, amountInX: bigint): AnalyticsEvent {
+  return {
+    ...identity(),
+    kind: "swap",
+    amountInX,
+    amountInY: 0n,
+    feeX: amountInX / 100n,
+    feeY: 0n,
+    reserveX: 100n * UNIT,
+    reserveY: 100n * UNIT,
+    marketPriceQuoteE18,
+    activeId: 8_388_608,
+    binStep: 10
+  };
+}
+
 function liquidity(kind: "deposit" | "withdraw", bins: Array<{ binId: string; liquidityDelta: bigint; amountX: bigint; amountY: bigint }>): AnalyticsEvent {
   return { ...identity(), kind, owner: OWNER, bins, reserveX: 100n * UNIT, reserveY: 100n * UNIT };
 }
@@ -683,4 +844,53 @@ function testPriceVerifier(): PriceSampleVerifier {
       return { ...sample, verifiedBy: "test-signature-verifier" };
     }
   };
+}
+
+async function nextCandleEvent(
+  base: string,
+  pair: string,
+  after: string,
+  options: { lastEventId?: string } = {}
+): Promise<{ cursor: string; candle: { startTimestamp: number; finalized: boolean; revision: number; closeUsdE18: string | null } }> {
+  return (await nextCandleEvents(base, pair, after, 1, options))[0]!;
+}
+
+async function nextCandleEvents(
+  base: string,
+  pair: string,
+  after: string,
+  count: number,
+  options: { lastEventId?: string } = {}
+): Promise<Array<{ cursor: string; candle: { startTimestamp: number; finalized: boolean; revision: number; closeUsdE18: string | null } }>> {
+  const controller = new AbortController();
+  const response = await fetch(`${base}/events/candles?pair=${pair}&interval=ONE_MINUTE&after=${after}`, {
+    headers: options.lastEventId ? { "last-event-id": options.lastEventId } : undefined,
+    signal: controller.signal
+  });
+  assert.equal(response.status, 200);
+  assert(response.body);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const events: Array<{ cursor: string; candle: { startTimestamp: number; finalized: boolean; revision: number; closeUsdE18: string | null } }> = [];
+  try {
+    while (events.length < count) {
+      const chunk = await reader.read();
+      if (chunk.done) throw new Error("Candle stream closed before the expected event arrived");
+      buffer += decoder.decode(chunk.value, { stream: true });
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const frame = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        if (frame.includes("event: candle")) {
+          const data = frame.split("\n").find((line) => line.startsWith("data: "))?.slice(6);
+          if (data) events.push(JSON.parse(data));
+        }
+        boundary = buffer.indexOf("\n\n");
+      }
+    }
+    return events;
+  } finally {
+    controller.abort();
+  }
 }

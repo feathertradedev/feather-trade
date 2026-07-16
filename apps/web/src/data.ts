@@ -24,6 +24,7 @@ export interface PaginationInfo {
   loadedCount: number;
   maxPages: number;
   pageSize: number;
+  windowed: boolean;
 }
 
 export interface RuntimeState {
@@ -726,14 +727,15 @@ export async function loadPositionHistory(
     } catch (error) {
       if (rows.length === 0) throw error;
       return {
-        rows: sortPositionHistory(rows),
+        rows: sortPositionHistory(coalescePositionHistory(rows)),
         pageInfo: {
           capped: false,
           error: error instanceof Error ? error.message : "Position history request failed",
           failed: true,
           loadedCount: rows.length,
           maxPages: GRAPHQL_MAX_PAGES,
-          pageSize: GRAPHQL_PAGE_SIZE
+          pageSize: GRAPHQL_PAGE_SIZE,
+          windowed: false
         }
       };
     }
@@ -756,31 +758,54 @@ export async function loadPositionHistory(
     );
     if (data.liquidityEvents.length < GRAPHQL_PAGE_SIZE && data.transferBatchEvents.length < GRAPHQL_PAGE_SIZE) {
       return {
-        rows: sortPositionHistory(rows),
+        rows: sortPositionHistory(coalescePositionHistory(rows)),
         pageInfo: {
           capped: false,
           failed: false,
           loadedCount: rows.length,
           maxPages: GRAPHQL_MAX_PAGES,
-          pageSize: GRAPHQL_PAGE_SIZE
+          pageSize: GRAPHQL_PAGE_SIZE,
+          windowed: false
         }
       };
     }
   }
   return {
-    rows: sortPositionHistory(rows),
+    rows: sortPositionHistory(coalescePositionHistory(rows)),
     pageInfo: {
       capped: true,
       failed: false,
       loadedCount: rows.length,
       maxPages: GRAPHQL_MAX_PAGES,
-      pageSize: GRAPHQL_PAGE_SIZE
+      pageSize: GRAPHQL_PAGE_SIZE,
+      windowed: false
     }
   };
 }
 
 function sortPositionHistory(rows: PositionHistoryRow[]): PositionHistoryRow[] {
   return rows.sort((left, right) => Number(BigInt(right.blockNumber) - BigInt(left.blockNumber)));
+}
+
+export function coalescePositionHistory(rows: readonly PositionHistoryRow[]): PositionHistoryRow[] {
+  const liquidityKeys = new Set(
+    rows
+      .filter((row) => row.type === "DEPOSIT" || row.type === "WITHDRAW")
+      .map(positionHistoryActionKey)
+  );
+  return rows.filter((row) => {
+    if (row.type !== "TRANSFER" && row.type !== "TRANSFER_IN" && row.type !== "TRANSFER_OUT") return true;
+    return !liquidityKeys.has(positionHistoryActionKey(row));
+  });
+}
+
+function positionHistoryActionKey(row: Pick<PositionHistoryRow, "binIds" | "transactionHash">): string {
+  const binIds = [...row.binIds].sort((left, right) => {
+    const leftValue = BigInt(left);
+    const rightValue = BigInt(right);
+    return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
+  }).join(",");
+  return `${row.transactionHash.toLowerCase()}:${binIds}`;
 }
 
 export async function loadPaginatedBinsForPair(
@@ -876,7 +901,7 @@ async function loadRuntimeState(registry: DexRegistry): Promise<RuntimeState> {
 
     if (isLocalnetRegistry(registry)) {
       seededActiveId = await client.readContract({
-        address: registry.seededPools.wnativeUsdc.pair,
+        address: registry.seededPools.wethUsdc.pair,
         abi: lbPairAbi,
         functionName: "getActiveId"
       });
@@ -931,8 +956,9 @@ async function loadIndexerState(registry: DexRegistry, timeoutMs: number): Promi
         map: (pair) => toPoolRow(registry, pair),
         timeoutMs
       }),
-      loadPaginatedGraphRows<Pick<DashboardGraph, "swaps">, DashboardGraph["swaps"][number], ActivityRow>({
+      loadRecentGraphRows<Pick<DashboardGraph, "swaps">, DashboardGraph["swaps"][number], ActivityRow>({
         endpoint: registry.endpoints.indexerUrl,
+        limit: GRAPHQL_ACTIVITY_RENDER_LIMIT,
         query: SWAPS_PAGE_QUERY,
         select: (data) => data.swaps,
         map: (swap) => ({
@@ -948,8 +974,9 @@ async function loadIndexerState(registry: DexRegistry, timeoutMs: number): Promi
         }),
         timeoutMs
       }),
-      loadPaginatedGraphRows<Pick<DashboardGraph, "liquidityEvents">, DashboardGraph["liquidityEvents"][number], ActivityRow>({
+      loadRecentGraphRows<Pick<DashboardGraph, "liquidityEvents">, DashboardGraph["liquidityEvents"][number], ActivityRow>({
         endpoint: registry.endpoints.indexerUrl,
+        limit: GRAPHQL_ACTIVITY_RENDER_LIMIT,
         query: LIQUIDITY_EVENTS_PAGE_QUERY,
         select: (data) => data.liquidityEvents,
         map: (event) => ({
@@ -1109,7 +1136,8 @@ async function loadPaginatedGraphRows<TData, TGraphRow, TRow>({
           failed: true,
           loadedCount: rows.length,
           maxPages: GRAPHQL_MAX_PAGES,
-          pageSize: GRAPHQL_PAGE_SIZE
+          pageSize: GRAPHQL_PAGE_SIZE,
+          windowed: false
         }
       };
     }
@@ -1125,7 +1153,8 @@ async function loadPaginatedGraphRows<TData, TGraphRow, TRow>({
           failed: false,
           loadedCount: rows.length,
           maxPages: GRAPHQL_MAX_PAGES,
-          pageSize: GRAPHQL_PAGE_SIZE
+          pageSize: GRAPHQL_PAGE_SIZE,
+          windowed: false
         }
       };
     }
@@ -1138,7 +1167,47 @@ async function loadPaginatedGraphRows<TData, TGraphRow, TRow>({
       failed: false,
       loadedCount: rows.length,
       maxPages: GRAPHQL_MAX_PAGES,
-      pageSize: GRAPHQL_PAGE_SIZE
+      pageSize: GRAPHQL_PAGE_SIZE,
+      windowed: false
+    }
+  };
+}
+
+async function loadRecentGraphRows<TData, TGraphRow, TRow>({
+  endpoint,
+  limit,
+  map,
+  query,
+  select,
+  timeoutMs,
+  variables = {}
+}: {
+  endpoint: string;
+  limit: number;
+  map: (row: TGraphRow) => TRow;
+  query: string;
+  select: (data: TData) => TGraphRow[];
+  timeoutMs: number;
+  variables?: Record<string, unknown>;
+}): Promise<PaginatedRows<TRow>> {
+  if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error("Recent activity limit must be a positive integer");
+  const data = await fetchGraph<TData>(
+    endpoint,
+    query,
+    { ...variables, first: limit + 1, skip: 0 },
+    timeoutMs
+  );
+  const graphRows = select(data);
+  const rows = graphRows.slice(0, limit).map(map);
+  return {
+    rows,
+    pageInfo: {
+      capped: false,
+      failed: false,
+      loadedCount: rows.length,
+      maxPages: 1,
+      pageSize: limit,
+      windowed: graphRows.length > limit
     }
   };
 }
@@ -1149,7 +1218,8 @@ function emptyPaginationInfo(): PaginationInfo {
     failed: false,
     loadedCount: 0,
     maxPages: GRAPHQL_MAX_PAGES,
-    pageSize: GRAPHQL_PAGE_SIZE
+    pageSize: GRAPHQL_PAGE_SIZE,
+    windowed: false
   };
 }
 

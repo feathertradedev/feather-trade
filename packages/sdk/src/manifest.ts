@@ -71,8 +71,7 @@ export interface LocalnetDeploymentManifest {
   supportedHooks?: SupportedHook[];
   supportedPairImplementations?: Address[];
   seededPools: {
-    wnativeUsdc: LocalnetSeededPoolManifest;
-    wethUsdc?: LocalnetSeededPoolManifest;
+    wethUsdc: LocalnetSeededPoolManifest;
   };
   constructorArgs: Record<string, unknown>;
   smoke: Record<string, unknown>;
@@ -142,10 +141,7 @@ function normalizeLocalnetManifest(value: Record<string, unknown>, path: string)
   const tokens = expectObject(value.tokens, "tokens");
   const preset = expectObject(value.factoryPreset, "factoryPreset");
   const seededPools = expectObject(value.seededPools, "seededPools");
-  const wnativeUsdc = expectObject(seededPools.wnativeUsdc, "seededPools.wnativeUsdc");
-  const wethUsdc = seededPools.wethUsdc === undefined
-    ? undefined
-    : expectObject(seededPools.wethUsdc, "seededPools.wethUsdc");
+  const wethUsdc = expectObject(seededPools.wethUsdc, "seededPools.wethUsdc");
   const environment = expectString(value.environment, "environment");
   const chainId = expectInteger(value.chainId, "chainId", { min: 1 });
   const deployer = expectAddress(value.deployer, "deployer", { allowZero: false });
@@ -179,10 +175,7 @@ function normalizeLocalnetManifest(value: Record<string, unknown>, path: string)
     supportedHooks: normalizeSupportedHooks(value.supportedHooks),
     supportedPairImplementations: normalizeSupportedPairImplementations(value.supportedPairImplementations, normalizedContracts.lbPairImplementation),
     seededPools: {
-      wnativeUsdc: normalizeLocalnetSeededPool(wnativeUsdc, "seededPools.wnativeUsdc"),
-      ...(wethUsdc === undefined
-        ? {}
-        : { wethUsdc: normalizeLocalnetSeededPool(wethUsdc, "seededPools.wethUsdc") })
+      wethUsdc: normalizeLocalnetSeededPool(wethUsdc, "seededPools.wethUsdc")
     },
     constructorArgs,
     smoke: expectObject(value.smoke, "smoke")

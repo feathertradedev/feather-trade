@@ -1,14 +1,20 @@
-import { useQuery } from "@tanstack/react-query";
-import { createContext, useCallback, useContext, useMemo, useState, type Dispatch, type ReactNode, type SetStateAction } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState, type Dispatch, type ReactNode, type SetStateAction } from "react";
 import { useAccount } from "wagmi";
 
 import type { DexRegistry } from "@robinhood-lb/sdk/registry";
 
 import {
+  CANDLE_LOOKBACK_SECONDS,
+  candleBoundary,
+  candleStreamUrl,
+  isCandleStreamStale,
   loadAnalyticsHealth,
   loadPairCandles,
   loadPoolMetrics,
+  parseCandleStreamPayload,
   type AnalyticsPage,
+  type CandleInterval,
   type PairCandle,
   type PoolAnalyticsMetric
 } from "./analytics-data";
@@ -25,20 +31,26 @@ import {
 } from "./data";
 import {
   joinPoolWorkspaceRows,
+  shouldShowWorkspaceAnalyticsState,
   workspaceAnalyticsState,
   type PoolWorkspaceRow,
   type WorkspaceAnalyticsState
 } from "./pool-workspace";
 
 const WORKSPACE_REFRESH_INTERVAL_MS = 10_000;
+export type CandleStreamState = "connecting" | "live" | "stale" | "unavailable";
 
 export interface PoolWorkspaceContextValue {
   analytics: {
     candles: AnalyticsPage<PairCandle>;
+    candleInterval: CandleInterval;
+    candleStreamState: CandleStreamState;
     candlesLoading: boolean;
+    setCandleInterval: Dispatch<SetStateAction<CandleInterval>>;
     metricPage: AnalyticsPage<PoolAnalyticsMetric>;
     row: PoolWorkspaceRow;
     state: WorkspaceAnalyticsState;
+    stateVisible: boolean;
   };
   bins: BinRow[];
   binsError: string | null;
@@ -72,11 +84,17 @@ export function PoolWorkspaceProvider({
 }) {
   const registry = registries[environmentKey];
   const analyticsEndpoint = analyticsEndpointForRegistry(registry);
+  const queryClient = useQueryClient();
   const account = useAccount();
   const walletAddress = account.address ?? null;
-  const currentHourBoundary = Math.floor(Date.now() / 3_600_000) * 3_600;
-  const candleEnd = currentHourBoundary - 3_600;
-  const candleStart = candleEnd - 7 * 24 * 3_600;
+  const [candleInterval, setCandleInterval] = useState<CandleInterval>("HOUR");
+  const [candleStreamState, setCandleStreamState] = useState<CandleStreamState>("connecting");
+  const candleEnd = candleBoundary(Math.floor(Date.now() / 1_000), candleInterval);
+  const candleStart = candleEnd - CANDLE_LOOKBACK_SECONDS[candleInterval];
+  const candleQueryKey = useMemo(
+    () => ["canonicalPoolCandles", environmentKey, analyticsEndpoint, pool.address, candleInterval, candleStart, candleEnd] as const,
+    [analyticsEndpoint, candleEnd, candleInterval, candleStart, environmentKey, pool.address]
+  );
   const [draftValues, setDraftValues] = useState<Record<string, unknown>>({});
 
   const metricsQuery = useQuery({
@@ -87,12 +105,75 @@ export function PoolWorkspaceProvider({
     retry: false
   });
   const candlesQuery = useQuery({
-    queryKey: ["canonicalPoolCandles", environmentKey, analyticsEndpoint, pool.address, candleStart, candleEnd],
-    queryFn: () => loadPairCandles(analyticsEndpoint, pool.address, "HOUR", candleStart, candleEnd),
-    refetchInterval: WORKSPACE_REFRESH_INTERVAL_MS,
+    queryKey: candleQueryKey,
+    queryFn: () => loadPairCandles(analyticsEndpoint, pool.address, candleInterval, candleStart, candleEnd),
+    placeholderData: (previous) => previous,
+    refetchInterval: false,
     refetchOnWindowFocus: "always",
     retry: false
   });
+
+  useEffect(() => {
+    if (candlesQuery.isPlaceholderData) {
+      setCandleStreamState("connecting");
+      return;
+    }
+    const cursor = candlesQuery.data?.streamCursor;
+    if (analyticsEndpoint === null || cursor === null || cursor === undefined || typeof EventSource === "undefined") {
+      setCandleStreamState("unavailable");
+      return;
+    }
+
+    let lastActivityAt = Date.now();
+    setCandleStreamState("connecting");
+    const source = new EventSource(candleStreamUrl(analyticsEndpoint, pool.address, candleInterval, cursor));
+    const noteActivity = () => {
+      lastActivityAt = Date.now();
+      setCandleStreamState("live");
+    };
+    const onCandle = (event: MessageEvent<string>) => {
+      try {
+        const update = parseCandleStreamPayload(JSON.parse(event.data), pool.address, candleInterval);
+        queryClient.setQueryData<AnalyticsPage<PairCandle>>(candleQueryKey, (current) => {
+          if (current === undefined) return current;
+          const byTimestamp = new Map(current.rows.map((candle) => [candle.startTimestamp, candle]));
+          const previous = byTimestamp.get(update.candle.startTimestamp);
+          if (previous === undefined || update.candle.revision >= previous.revision) {
+            byTimestamp.set(update.candle.startTimestamp, update.candle);
+          }
+          return {
+            ...current,
+            rows: [...byTimestamp.values()]
+              .sort((left, right) => left.startTimestamp - right.startTimestamp)
+              .slice(-500)
+          };
+        });
+        noteActivity();
+      } catch {
+        setCandleStreamState("stale");
+      }
+    };
+    const onReset = () => {
+      setCandleStreamState("connecting");
+      source.close();
+      void queryClient.invalidateQueries({ queryKey: candleQueryKey });
+    };
+    source.addEventListener("candle", onCandle as EventListener);
+    source.addEventListener("heartbeat", noteActivity);
+    source.addEventListener("reset", onReset);
+    source.onopen = noteActivity;
+    source.onerror = () => {
+      setCandleStreamState(isCandleStreamStale(lastActivityAt, Date.now()) ? "stale" : "connecting");
+    };
+    const staleTimer = window.setInterval(() => {
+      if (isCandleStreamStale(lastActivityAt, Date.now())) setCandleStreamState("stale");
+    }, 5_000);
+
+    return () => {
+      window.clearInterval(staleTimer);
+      source.close();
+    };
+  }, [analyticsEndpoint, candleInterval, candleQueryKey, candlesQuery.data?.streamCursor, candlesQuery.isPlaceholderData, pool.address, queryClient]);
   const healthQuery = useQuery({
     queryKey: ["canonicalPoolAnalyticsHealth", environmentKey, analyticsEndpoint],
     queryFn: () => loadAnalyticsHealth(analyticsEndpoint),
@@ -142,6 +223,10 @@ export function PoolWorkspaceProvider({
   const analyticsState = metricsQuery.isPending || healthQuery.isPending
     ? { status: "PARTIAL" as const, label: "Loading application analytics", detail: "Pool metrics and freshness are being resolved." }
     : workspaceAnalyticsState(row.analyticsStatus, healthQuery.data?.value ?? null);
+  const analyticsStateVisible = !metricsQuery.isPending && shouldShowWorkspaceAnalyticsState(
+    row.analyticsStatus,
+    healthQuery.data?.value ?? null
+  );
   const candles: AnalyticsPage<PairCandle> = candlesQuery.data ?? emptyAnalyticsPage(
     candlesQuery.isError ? "UNAVAILABLE" : "PARTIAL",
     errorMessage(candlesQuery.error)
@@ -198,10 +283,14 @@ export function PoolWorkspaceProvider({
   const value = useMemo<PoolWorkspaceContextValue>(() => ({
     analytics: {
       candles,
-      candlesLoading: candlesQuery.isLoading,
+      candleInterval,
+      candleStreamState,
+      candlesLoading: candlesQuery.isLoading || candlesQuery.isPlaceholderData,
       metricPage,
       row,
-      state: analyticsState
+      setCandleInterval,
+      state: analyticsState,
+      stateVisible: analyticsStateVisible
     },
     bins: binsQuery.data ?? [],
     binsError: errorMessage(binsQuery.error),
@@ -209,12 +298,12 @@ export function PoolWorkspaceProvider({
     draftValues,
     environmentKey,
     history,
-    historyError: errorMessage(historyQuery.error),
+    historyError: errorMessage(historyQuery.error) ?? historyQuery.data?.pageInfo.error ?? null,
     historyPartial,
     historyState,
     pool,
     positions,
-    positionsError: errorMessage(positionsQuery.error),
+    positionsError: errorMessage(positionsQuery.error) ?? positionsQuery.data?.pageInfo.error ?? null,
     positionsPartial,
     positionsState,
     registry,
@@ -222,21 +311,27 @@ export function PoolWorkspaceProvider({
     walletAddress
   }), [
     analyticsState,
+    analyticsStateVisible,
     binsQuery.data,
     binsQuery.error,
     binsState,
     candles,
+    candleInterval,
+    candleStreamState,
     candlesQuery.isLoading,
+    candlesQuery.isPlaceholderData,
     draftValues,
     environmentKey,
     history,
     historyPartial,
+    historyQuery.data?.pageInfo.error,
     historyQuery.error,
     historyState,
     metricPage,
     pool,
     positions,
     positionsPartial,
+    positionsQuery.data?.pageInfo.error,
     positionsQuery.error,
     positionsState,
     registry,
@@ -279,9 +374,11 @@ function emptyAnalyticsPage<T>(status: "PARTIAL" | "UNAVAILABLE", error: string 
     rows: [],
     status,
     error,
-    pageInfo: { endCursor: null, hasNextPage: false, partial: true, pagesLoaded: 0 }
+    pageInfo: { endCursor: null, hasNextPage: false, partial: true, pagesLoaded: 0 },
+    streamCursor: null
   };
 }
+
 
 function errorMessage(error: unknown): string | null {
   return error instanceof Error ? error.message : null;

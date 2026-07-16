@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-import { installMockRpc, WNATIVE_USDC_PAIR } from "./fixtures/mock-rpc";
+import { installMockRpc, USDC, WNATIVE, WNATIVE_USDC_PAIR } from "./fixtures/mock-rpc";
 import { installMockWallet, LOCALNET_CHAIN_ID } from "./fixtures/mock-wallet";
 
 async function connectWallet(page: Parameters<typeof installMockRpc>[0]) {
@@ -8,17 +8,120 @@ async function connectWallet(page: Parameters<typeof installMockRpc>[0]) {
   await expect(page.getByTestId("wallet-account-button")).toBeVisible();
 }
 
-test("swap workspace renders selected-pool hourly candles with Lightweight Charts", async ({ page }) => {
+async function installMockCandleStream(page: Parameters<typeof installMockRpc>[0]) {
+  await page.addInitScript(() => {
+    type TestWindow = Window & {
+      __testEmitCandle: (payload: unknown) => void;
+      __testFailCandleStream: () => void;
+    };
+    let latest: TestEventSource | null = null;
+    class TestEventSource extends EventTarget {
+      onerror: ((event: Event) => void) | null = null;
+      onopen: ((event: Event) => void) | null = null;
+      readyState = 0;
+      readonly url: string;
+
+      constructor(url: string | URL) {
+        super();
+        this.url = String(url);
+        latest = this;
+        window.setTimeout(() => {
+          this.readyState = 1;
+          this.onopen?.(new Event("open"));
+        }, 0);
+      }
+
+      close() {
+        this.readyState = 2;
+      }
+    }
+
+    Object.defineProperty(window, "EventSource", { configurable: true, value: TestEventSource });
+    const testWindow = window as unknown as TestWindow;
+    testWindow.__testEmitCandle = (payload) => latest?.dispatchEvent(new MessageEvent("candle", { data: JSON.stringify(payload) }));
+    testWindow.__testFailCandleStream = () => {
+      const originalNow = Date.now;
+      Date.now = () => originalNow() + 46_000;
+      latest?.onerror?.(new Event("error"));
+      Date.now = originalNow;
+    };
+  });
+}
+
+test("swap workspace renders all candle timeframes with Lightweight Charts", async ({ page }) => {
   const rpc = await installMockRpc(page, { includePairs: true });
 
   await page.goto("/#/swap");
   const chart = page.getByTestId("swap-market-chart");
   await expect(chart).toContainText("WNATIVE / USDC");
   await expect(chart.locator(".swap-chart-summary")).toContainText("Vol $");
+  await expect(chart.locator(".swap-chart-footer")).toContainText("14D history · History ready");
   await expect(chart.getByRole("link", { name: "Charting by TradingView" })).toBeVisible();
   await expect.poll(() => rpc.snapshot().graphQueries.some((query) => query.includes("WebPairCandles"))).toBe(true);
   const candleRequest = rpc.snapshot().graphRequests.find((request) => request.query.includes("WebPairCandles"));
   expect(candleRequest?.variables?.interval).toBe("HOUR");
+  const intervals = chart.getByRole("group", { name: "Candle interval" });
+  const intervalPositions = await intervals.getByRole("button").evaluateAll((buttons) => buttons.map((button) => {
+    const bounds = button.getBoundingClientRect();
+    return { left: Math.round(bounds.left), top: Math.round(bounds.top) };
+  }));
+  expect(new Set(intervalPositions.map(({ top }) => top)).size).toBe(1);
+  expect(intervalPositions.every(({ left }, index) => index === 0 || left > intervalPositions[index - 1]!.left)).toBe(true);
+  for (const [label, value] of [["1m", "ONE_MINUTE"], ["5m", "FIVE_MINUTES"], ["15m", "FIFTEEN_MINUTES"], ["1h", "HOUR"], ["4h", "FOUR_HOURS"], ["1d", "DAY"], ["1w", "WEEK"]] as const) {
+    await intervals.getByRole("button", { name: label, exact: true }).click();
+    await expect.poll(() => rpc.snapshot().graphRequests.some((request) => request.query.includes("WebPairCandles") && request.variables?.interval === value)).toBe(true);
+    await expect(intervals.getByRole("button", { name: label, exact: true })).toHaveAttribute("aria-pressed", "true");
+  }
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test("pool chart applies live candle replacements and exposes stream failure", async ({ page }) => {
+  await installMockCandleStream(page);
+  const rpc = await installMockRpc(page, { includePairs: true });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+  const chart = page.getByTestId("swap-market-chart");
+  await expect(chart.locator(".swap-chart-stream")).toHaveText("Live");
+  await expect.poll(() => rpc.snapshot().graphRequests.some((request) => request.query.includes("WebPairCandles"))).toBe(true);
+  const candleRequest = rpc.snapshot().graphRequests.findLast((request) => request.query.includes("WebPairCandles"));
+  const startTimestamp = candleRequest?.variables?.toTimestamp;
+  expect(startTimestamp).toBeDefined();
+
+  await page.evaluate((payload) => {
+    (window as unknown as Window & { __testEmitCandle: (value: unknown) => void }).__testEmitCandle(payload);
+  }, {
+    cursor: "999",
+    candle: {
+      pair: WNATIVE_USDC_PAIR.toLowerCase(),
+      interval: "HOUR",
+      startTimestamp,
+      endTimestamp: startTimestamp! + 3_600,
+      openUsdE18: "2400000000000000000000",
+      highUsdE18: "2700000000000000000000",
+      lowUsdE18: "2300000000000000000000",
+      closeUsdE18: "2600000000000000000000",
+      volumeUsdE18: "123000000000000000000",
+      feesUsdE18: "246000000000000000",
+      tvlUsdE18: "500000000000000000000000",
+      swapCount: 99,
+      status: "READY",
+      missingPriceTokens: [],
+      firstBlock: "100",
+      lastBlock: "101",
+      firstBlockHash: `0x${"1".repeat(64)}`,
+      lastBlockHash: `0x${"2".repeat(64)}`,
+      finalized: false,
+      revision: 999,
+      priceSource: "active-bin-quote-usd",
+      quoteToken: USDC.toLowerCase(),
+      tokenX: WNATIVE.toLowerCase()
+    }
+  });
+  await expect(chart.locator(".swap-chart-summary")).toContainText("C $2,600.00");
+
+  await page.evaluate(() => {
+    (window as unknown as Window & { __testFailCandleStream: () => void }).__testFailCandleStream();
+  });
+  await expect(chart.locator(".swap-chart-stream")).toHaveText("Stream stale");
 });
 
 test("canonical pool tasks keep one selected pool while reusing swap and liquidity engines", async ({ page }) => {
@@ -31,7 +134,7 @@ test("canonical pool tasks keep one selected pool while reusing swap and liquidi
   await expect(workspace).toHaveAttribute("data-pool-id", WNATIVE_USDC_PAIR.toLowerCase());
   await expect(rail).toContainText("$500,000");
   await expect(rail).toContainText("local fixture");
-  await expect(page.getByTestId("pool-workspace-state")).toContainText("Current through block 42");
+  await expect(page.getByTestId("pool-workspace-state")).toHaveCount(0);
   await expect(rail).not.toContainText("Network");
   await expect(rail).not.toContainText("Indexer");
   const distribution = page.getByTestId("pool-rail-liquidity-distribution");
@@ -74,7 +177,77 @@ test("canonical pool tasks keep one selected pool while reusing swap and liquidi
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/market`);
   await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/create\\?returnTo=`, "i"));
   await expect(page.getByTestId("swap-market-chart")).toBeVisible();
-  await expect(page.getByTestId("pool-workspace-state")).toContainText("Current through block 42");
+  await expect(page.getByTestId("pool-workspace-state")).toHaveCount(0);
+});
+
+test("pool workspace keeps truthful owner positions and history beneath the chart", async ({ page }) => {
+  await installMockRpc(page, { includePairs: true, includePositions: true });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+  await connectWallet(page);
+
+  const workspace = page.getByTestId("canonical-pool-workspace");
+  const panel = page.getByTestId("pool-workspace-owner-panel");
+  const chart = page.getByTestId("swap-market-chart");
+  await expect(panel).toBeVisible();
+  const geometry = await page.evaluate(() => {
+    const chartBox = document.querySelector<HTMLElement>('[data-testid="swap-market-chart"]')?.getBoundingClientRect();
+    const panelBox = document.querySelector<HTMLElement>('[data-testid="pool-workspace-owner-panel"]')?.getBoundingClientRect();
+    return chartBox && panelBox ? { chartBottom: chartBox.bottom, chartLeft: chartBox.left, chartRight: chartBox.right, panelLeft: panelBox.left, panelRight: panelBox.right, panelTop: panelBox.top } : null;
+  });
+  expect(geometry).not.toBeNull();
+  expect(geometry!.panelTop).toBeGreaterThanOrEqual(geometry!.chartBottom);
+  expect(Math.abs(geometry!.panelLeft - geometry!.chartLeft)).toBeLessThanOrEqual(1);
+  expect(Math.abs(geometry!.panelRight - geometry!.chartRight)).toBeLessThanOrEqual(1);
+
+  await expect(panel.getByRole("tab", { name: "Positions" })).toHaveAttribute("aria-selected", "true");
+  const position = panel.getByTestId("pool-position-summary");
+  await expect(position).toContainText("WNATIVE / USDC");
+  await expect(position).toContainText("1 active bin");
+  await expect(position).toContainText("In range");
+  await expect(position).toContainText("USDC per WNATIVE");
+  await expect(position).toContainText("Indexed liquidity");
+  await expect(panel).not.toContainText("Limit Orders");
+
+  await panel.getByRole("tab", { name: "History" }).click();
+  await expect(panel.getByRole("tab", { name: "History" })).toHaveAttribute("aria-selected", "true");
+  await expect(panel.getByTestId("pool-history-row")).toHaveCount(2);
+  await expect(panel).toContainText("Added liquidity");
+  await expect(panel).toContainText("Removed liquidity");
+  await expect(panel).not.toContainText("Transaction history");
+
+  await workspace.getByRole("link", { name: "Create position" }).first().click();
+  await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/create$`, "i"));
+  await expect(page.getByTestId("pool-workspace-owner-panel").getByRole("tab", { name: "History" })).toHaveAttribute("aria-selected", "true");
+  await page.getByTestId("pool-workspace-owner-panel").getByRole("tab", { name: "Positions" }).click();
+  await page.getByTestId("pool-position-manage-link").click();
+  await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/manage$`, "i"));
+  await expect(page.locator(".position-option")).toHaveCount(1);
+  await expect(page.locator(".position-option").first().locator('input[type="checkbox"]')).toBeChecked();
+  await expect(chart).toBeVisible();
+
+  await page.setViewportSize({ height: 900, width: 320 });
+  await expect(page.getByTestId("pool-workspace-owner-panel").getByRole("tab", { name: "Positions" })).toBeVisible();
+  await expect(page.getByTestId("pool-workspace-owner-panel").getByRole("tab", { name: "History" })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test("pool owner panel does not query before connection and exposes a real empty state", async ({ page }) => {
+  const rpc = await installMockRpc(page, { includePairs: true, includePositions: false });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+
+  const panel = page.getByTestId("pool-workspace-owner-panel");
+  await expect(panel).toContainText("No wallet connected");
+  expect(rpc.snapshot().graphQueries.some((query) => query.includes("OwnerPairPositions"))).toBe(false);
+  expect(rpc.snapshot().graphQueries.some((query) => query.includes("PositionLiquidityHistory"))).toBe(false);
+
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
+  await page.reload();
+  await connectWallet(page);
+  await expect(panel).toContainText("No liquidity in this pool");
+  await expect(panel.getByRole("link", { name: "Create position" })).toHaveAttribute("href", `#/pools/${WNATIVE_USDC_PAIR.toLowerCase()}/create`);
+  await panel.getByRole("tab", { name: "History" }).click();
+  await expect(panel).toContainText("No position history yet");
 });
 
 test("create position range editor layers exact distribution over indexed pool reserves", async ({ page }) => {
@@ -202,7 +375,7 @@ test("unified pool workspace preserves URL filters, analytics, actions, and acce
   await expect(page).toHaveURL(/q=WNATIVE/);
   await expect(page).toHaveURL(/sort=tvl/);
   await expect(page).toHaveURL(/mine=1/);
-  await expect(page.getByTestId("pool-analytics-state")).toContainText("Current through block 42");
+  await expect(page.getByTestId("pool-analytics-state")).toHaveCount(0);
   expect(analyticsUrls.length).toBeGreaterThan(0);
   expect(analyticsUrls.every((url) => url === "http://127.0.0.1:8787/graphql")).toBe(true);
   await expect(page.locator(".workspace-table-metric").filter({ hasText: "$500,000" })).toBeVisible();
@@ -227,7 +400,7 @@ test("unified pool workspace preserves URL filters, analytics, actions, and acce
   await poolLink.click();
 
   await expect(page).toHaveURL(/#\/pools\/.+\/create\?returnTo=/);
-  await expect(page.getByTestId("pool-workspace-state")).toContainText("Current through block 42");
+  await expect(page.getByTestId("pool-workspace-state")).toHaveCount(0);
   await expect(page.getByTestId("swap-market-chart")).toBeVisible();
   await expect(page.getByTestId("pool-rail-liquidity-distribution").locator(".pool-rail-liquidity-bars > span")).toHaveCount(33);
   await expect(page.getByTestId("pool-detail-analytics-state")).toHaveCount(0);

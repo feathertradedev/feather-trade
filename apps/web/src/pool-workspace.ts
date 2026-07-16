@@ -7,7 +7,7 @@ import type {
   PairCandle,
   PoolAnalyticsMetric
 } from "./analytics-data";
-import type { BinRow, PoolRow } from "./data";
+import type { BinRow, PoolRow, PositionRow } from "./data";
 
 export type PoolEconomicSort = "tvl" | "volume24h" | "lpFees24h" | "feeToTvl";
 
@@ -62,6 +62,16 @@ export interface BinDistributionPoint {
   tokenXHeight: number;
   tokenYHeight: number;
   lbSupplyHeight: number;
+}
+
+export interface PoolPositionSummary {
+  binCount: number;
+  inActiveBin: boolean;
+  latestBlock: string;
+  liquidity: string;
+  maxBinId: string;
+  minBinId: string;
+  positionIds: string[];
 }
 
 export function joinPoolWorkspaceRows<T extends PoolRow>(
@@ -142,8 +152,10 @@ export function workspaceAnalyticsState(
 ): WorkspaceAnalyticsState {
   if (health === null) {
     return pageStatus === "UNAVAILABLE"
-      ? { status: "UNAVAILABLE", label: "Analytics unavailable", detail: "No application analytics health response is available." }
-      : { status: "PARTIAL", label: "Metrics loaded · health unavailable", detail: "Metric values are shown with unknown freshness." };
+      ? { status: "UNAVAILABLE", label: "Pool metrics unavailable", detail: "Analytics could not load for this pool." }
+      : pageStatus === "PARTIAL"
+        ? { status: "PARTIAL", label: "Pool metrics incomplete", detail: "Some values may be missing." }
+        : { status: "PARTIAL", label: "Data freshness unavailable", detail: "The latest indexed block could not be verified." };
   }
 
   const status = weakestStatus(pageStatus, health.status, health.fresh ? "READY" : "PARTIAL");
@@ -158,9 +170,17 @@ export function workspaceAnalyticsState(
   if (health.missingPriceTokens.length > 0) details.push(`${health.missingPriceTokens.length} token price${health.missingPriceTokens.length === 1 ? "" : "s"} unavailable`);
   return {
     status,
-    label: status === "UNAVAILABLE" ? "Analytics unavailable" : "Analytics partial",
+    label: status === "UNAVAILABLE" ? "Pool metrics unavailable" : "Pool data delayed",
     detail: details.length > 0 ? details.join(" · ") : "Some application analytics are incomplete."
   };
+}
+
+export function shouldShowWorkspaceAnalyticsState(
+  pageStatus: AnalyticsStatus,
+  health: AnalyticsHealth | null
+): boolean {
+  if (pageStatus !== "READY") return true;
+  return health !== null && workspaceAnalyticsState(pageStatus, health).status !== "READY";
 }
 
 export function buildCandleChartModel(
@@ -265,6 +285,30 @@ export function buildCenteredBinDistribution(
   }
 
   return buildBinDistribution(centered, activeId, tokenXDecimals, tokenYDecimals);
+}
+
+export function summarizePoolPosition(
+  positions: readonly PositionRow[],
+  activeId: string | null
+): PoolPositionSummary | null {
+  const positive = positions
+    .filter((position) => BigInt(position.liquidity) > 0n)
+    .sort((left, right) => compareDecimalStrings(left.binId, right.binId));
+  if (positive.length === 0) return null;
+
+  const latestBlock = positive.reduce(
+    (latest, position) => compareDecimalStrings(position.updatedAtBlock, latest) > 0 ? position.updatedAtBlock : latest,
+    "0"
+  );
+  return {
+    binCount: positive.length,
+    inActiveBin: activeId !== null && positive.some((position) => position.binId === activeId),
+    latestBlock,
+    liquidity: positive.reduce((total, position) => total + BigInt(position.liquidity), 0n).toString(),
+    maxBinId: positive.at(-1)!.binId,
+    minBinId: positive[0]!.binId,
+    positionIds: positive.map((position) => position.id)
+  };
 }
 
 export function formatUsdE18(value: string | null): string {

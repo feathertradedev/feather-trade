@@ -42,7 +42,9 @@ async function main() {
 
 async function inspect(options, manifest, manifestText) {
   const factory = manifest.contracts.lbFactory.toLowerCase();
-  const pair = manifest.seededPools.wnativeUsdc.pair.toLowerCase();
+  const pair = manifest.seededPools.wethUsdc.pair.toLowerCase();
+  const weth = manifest.seededPools.wethUsdc.tokenX.toLowerCase();
+  const usdc = manifest.seededPools.wethUsdc.tokenY.toLowerCase();
   const manifestSha256 = crypto.createHash("sha256").update(manifestText).digest("hex");
   const [rpcChainId, rpcBlock, indexer, analytics, web] = await Promise.all([
     rpc(options.rpcUrl, "eth_chainId", []),
@@ -50,17 +52,21 @@ async function inspect(options, manifest, manifestText) {
     graphql(options.indexerUrl, `query StackIndexerHealth($factory: ID!, $pair: ID!) {
       _meta { block { number hash } hasIndexingErrors }
       factory(id: $factory) { id pairCount }
-      pair(id: $pair) { id reserveX reserveY }
+      pair(id: $pair) {
+        id reserveX reserveY createdAtBlock createdAtTimestamp
+        tokenX { id address }
+        tokenY { id address }
+      }
     }`, { factory, pair }),
     graphql(`${options.analyticsUrl.replace(/\/$/, "")}/graphql`, `query StackAnalyticsHealth {
       analyticsHealth {
         status headBlock headHash headTimestamp fresh partialEventCount backfillStatus backfillError
         coverageStartTimestamp coverageThroughTimestamp missingPriceTokens
-        prices { token status }
+        prices { token source status }
       }
     }`),
     fetchWeb(options.webUrl, {
-      analyticsUrl: options.analyticsUrl,
+      analyticsUrl: `${options.analyticsUrl.replace(/\/$/, "")}/graphql`,
       indexerUrl: options.indexerUrl,
       manifestPath: options.manifest,
       manifestSha256,
@@ -88,14 +94,35 @@ async function inspect(options, manifest, manifestText) {
     throw coded("MANIFEST_ENDPOINT", "Manifest indexer endpoint does not match the owned stack indexer");
   }
   if (indexerMeta?.hasIndexingErrors !== false) throw coded("INDEXER_ERRORS", "Indexer metadata reports errors or is incomplete");
-  if (indexer?.factory?.id?.toLowerCase() !== factory || BigInt(indexer.factory.pairCount ?? "0") < 1n) {
-    throw coded("INDEXER_DATA", "Indexer does not contain the manifest factory");
+  if (indexer?.factory?.id?.toLowerCase() !== factory || unsignedBigInt(indexer.factory.pairCount, "factory pair count") !== 1n) {
+    throw coded("INDEXER_DATA", "Indexer must contain exactly one WETH/USDC pair for the manifest factory");
   }
   if (indexer?.pair?.id?.toLowerCase() !== pair || BigInt(indexer.pair.reserveX ?? "0") <= 0n || BigInt(indexer.pair.reserveY ?? "0") <= 0n) {
     throw coded("INDEXER_DATA", "Indexer does not contain the funded manifest seeded pair");
   }
-  if (rpcNumber !== indexerNumber || rpcNumber !== analyticsNumber || rpcHash !== indexerHash || rpcHash !== analyticsHash) {
-    throw coded("HEAD_MISMATCH", "RPC, indexer, and analytics heads do not match exactly");
+  const pairCreatedAtBlock = integer(indexer.pair.createdAtBlock, "WETH/USDC creation block");
+  const pairCreatedAtTimestamp = integer(indexer.pair.createdAtTimestamp, "WETH/USDC creation timestamp");
+  if (
+    indexedTokenAddress(indexer.pair.tokenX, "indexed tokenX") !== weth ||
+    indexedTokenAddress(indexer.pair.tokenY, "indexed tokenY") !== usdc
+  ) {
+    throw coded("INDEXER_DATA", "Indexed pair token identity does not match manifest WETH/USDC");
+  }
+  if (indexerNumber !== analyticsNumber || indexerHash !== analyticsHash) {
+    throw coded("HEAD_MISMATCH", "Indexer and analytics canonical heads do not match exactly");
+  }
+  const rpcLeadBlocks = rpcNumber - indexerNumber;
+  if (rpcLeadBlocks < 0 || rpcLeadBlocks > 1) {
+    throw coded("HEAD_MISMATCH", "RPC head must match or lead the indexed analytics head by exactly one block");
+  }
+  if (rpcLeadBlocks === 0 && rpcHash !== indexerHash) {
+    throw coded("HEAD_MISMATCH", "RPC, indexer, and analytics hashes differ at the shared head");
+  }
+  if (rpcLeadBlocks === 1) {
+    const indexedRpcBlock = await rpc(options.rpcUrl, "eth_getBlockByNumber", [`0x${indexerNumber.toString(16)}`, false]);
+    if (normalizeHash(indexedRpcBlock?.hash, "RPC indexed-head hash") !== indexerHash) {
+      throw coded("HEAD_MISMATCH", "Indexed analytics head is not canonical on RPC");
+    }
   }
   if (analyticsHealth?.status !== "READY" || analyticsHealth?.fresh !== true) {
     throw coded("ANALYTICS_NOT_READY", "Analytics is not READY and fresh");
@@ -113,31 +140,59 @@ async function inspect(options, manifest, manifestText) {
   if (!Array.isArray(analyticsHealth?.missingPriceTokens) || analyticsHealth.missingPriceTokens.length !== 0) {
     throw coded("MISSING_PRICES", "Analytics reports missing price tokens");
   }
-  if (!Array.isArray(analyticsHealth?.prices) || analyticsHealth.prices.length === 0 || analyticsHealth.prices.some((price) => price?.status !== "available")) {
-    throw coded("PRICE_NOT_READY", "Analytics price policies are not all available");
+  const prices = analyticsHealth?.prices;
+  const expectedPriceTokens = [weth, usdc].sort();
+  const actualPriceTokens = Array.isArray(prices)
+    ? prices.map((price) => normalizeAddress(price?.token, "analytics price token", "PRICE_NOT_READY")).sort()
+    : [];
+  if (
+    !Array.isArray(prices) ||
+    prices.length !== 2 ||
+    new Set(actualPriceTokens).size !== 2 ||
+    actualPriceTokens.some((token, index) => token !== expectedPriceTokens[index]) ||
+    prices.some((price) => price?.source !== "fixed-test" || price?.status !== "available")
+  ) {
+    throw coded("PRICE_NOT_READY", "Analytics must expose exactly the available fixed-test WETH and USDC price policies");
   }
 
   const analyticsData = await graphql(`${options.analyticsUrl.replace(/\/$/, "")}/graphql`, `query StackAnalyticsData(
-    $pair: ID!, $from: Int!, $to: Int!
+    $pair: ID!, $minuteFrom: Int!, $hourFrom: Int!, $to: Int!
   ) {
     poolMetrics(first: 100) {
-      nodes { pair tvlUsdE18 volume24hUsdE18 fees24hUsdE18 status missingPriceTokens }
+      nodes { pair tokenX tokenY tvlUsdE18 volume24hUsdE18 fees24hUsdE18 priceUsdE18 status missingPriceTokens }
     }
-    pairCandles(pair: $pair, interval: HOUR, fromTimestamp: $from, toTimestamp: $to, first: 100) {
-      nodes { pair openUsdE18 highUsdE18 lowUsdE18 closeUsdE18 status missingPriceTokens }
+    minuteCandles: pairCandles(pair: $pair, interval: ONE_MINUTE, fromTimestamp: $minuteFrom, toTimestamp: $to, first: 100) {
+      nodes { pair interval startTimestamp openUsdE18 highUsdE18 lowUsdE18 closeUsdE18 status missingPriceTokens firstBlock priceSource quoteToken }
     }
-  }`, { pair, from: Math.max(0, analyticsTimestamp - 86_400), to: analyticsTimestamp });
+    hourCandles: pairCandles(pair: $pair, interval: HOUR, fromTimestamp: $hourFrom, toTimestamp: $to, first: 100) {
+      nodes { pair interval openUsdE18 highUsdE18 lowUsdE18 closeUsdE18 status missingPriceTokens priceSource quoteToken }
+    }
+  }`, {
+    pair,
+    minuteFrom: Math.max(0, pairCreatedAtTimestamp - 60),
+    hourFrom: Math.max(0, analyticsTimestamp - 86_400),
+    to: analyticsTimestamp
+  });
   const metric = analyticsData?.poolMetrics?.nodes?.find((row) => row?.pair?.toLowerCase() === pair);
-  if (!metric || metric.status !== "READY" || [metric.tvlUsdE18, metric.volume24hUsdE18, metric.fees24hUsdE18].some((value) => value == null) || metric.missingPriceTokens?.length !== 0) {
+  if (
+    !metric ||
+    normalizeAddress(metric.tokenX, "analytics metric tokenX", "ANALYTICS_DATA") !== weth ||
+    normalizeAddress(metric.tokenY, "analytics metric tokenY", "ANALYTICS_DATA") !== usdc ||
+    metric.status !== "READY" ||
+    [metric.tvlUsdE18, metric.volume24hUsdE18, metric.fees24hUsdE18, metric.priceUsdE18].some((value) => value == null) ||
+    metric.missingPriceTokens?.length !== 0
+  ) {
     throw coded("ANALYTICS_DATA", "Analytics seeded-pair metrics are not complete and READY");
   }
-  const candles = analyticsData?.pairCandles?.nodes;
-  if (!Array.isArray(candles) || candles.length === 0 || candles.some((row) =>
-    row?.pair?.toLowerCase() !== pair || row.status !== "READY" ||
-    [row.openUsdE18, row.highUsdE18, row.lowUsdE18, row.closeUsdE18].some((value) => value == null) ||
-    row.missingPriceTokens?.length !== 0
-  )) {
-    throw coded("ANALYTICS_DATA", "Analytics seeded-pair candles are empty or incomplete");
+  const minuteCandles = requireReadyCandles(analyticsData?.minuteCandles?.nodes, { pair, interval: "ONE_MINUTE", quoteToken: usdc });
+  const hourCandles = requireReadyCandles(analyticsData?.hourCandles?.nodes, { pair, interval: "HOUR", quoteToken: usdc });
+  const firstMinuteCandle = [...minuteCandles].sort((left, right) => left.startTimestamp - right.startTimestamp)[0];
+  const expectedFirstMinute = Math.floor(pairCreatedAtTimestamp / 60) * 60;
+  if (
+    integer(firstMinuteCandle?.startTimestamp, "first WETH/USDC candle timestamp") !== expectedFirstMinute ||
+    unsignedBigInt(firstMinuteCandle?.firstBlock, "first WETH/USDC candle block") !== BigInt(pairCreatedAtBlock)
+  ) {
+    throw coded("ANALYTICS_DATA", "The first WETH/USDC candle must begin at the pool creation block");
   }
 
   return {
@@ -148,8 +203,16 @@ async function inspect(options, manifest, manifestText) {
       indexerUrl: options.indexerUrl,
       sha256: manifestSha256
     },
-    rpc: { chainId, headBlock: rpcNumber, headHash: rpcHash },
-    indexer: { headBlock: indexerNumber, headHash: indexerHash, hasIndexingErrors: false, factory, seededPair: pair },
+    rpc: { chainId, headBlock: rpcNumber, headHash: rpcHash, indexedHeadLagBlocks: rpcLeadBlocks },
+    indexer: {
+      headBlock: indexerNumber,
+      headHash: indexerHash,
+      hasIndexingErrors: false,
+      factory,
+      seededPair: pair,
+      pairCreatedAtBlock,
+      pairCreatedAtTimestamp
+    },
     analytics: {
       headBlock: analyticsNumber,
       headHash: analyticsHash,
@@ -158,9 +221,12 @@ async function inspect(options, manifest, manifestText) {
       headTimestamp: analyticsTimestamp,
       partialEventCount: analyticsHealth.partialEventCount,
       backfillStatus: analyticsHealth.backfillStatus,
-      pricesAvailable: analyticsHealth.prices.length,
+      pricesAvailable: prices.length,
       seededPair: pair,
-      candleCount: candles.length
+      firstMinuteCandleBlock: Number(firstMinuteCandle.firstBlock),
+      firstMinuteCandleTimestamp: firstMinuteCandle.startTimestamp,
+      minuteCandleCount: minuteCandles.length,
+      hourCandleCount: hourCandles.length
     },
     web: { ...web, configuredAnalyticsUrl: options.analyticsUrl }
   };
@@ -199,8 +265,44 @@ function validateManifest(manifest) {
     throw coded("MANIFEST", "Manifest is not a localnet deployment manifest");
   }
   if (!Number.isSafeInteger(manifest.chainId) || manifest.chainId <= 0) throw coded("MANIFEST", "Manifest chain ID is invalid");
-  if (!/^0x[0-9a-fA-F]{40}$/.test(manifest?.contracts?.lbFactory ?? "")) throw coded("MANIFEST", "Manifest factory address is invalid");
-  if (!/^0x[0-9a-fA-F]{40}$/.test(manifest?.seededPools?.wnativeUsdc?.pair ?? "")) throw coded("MANIFEST", "Manifest seeded pair address is invalid");
+  normalizeAddress(manifest?.contracts?.lbFactory, "manifest factory", "MANIFEST");
+  const seededPoolNames = manifest?.seededPools && typeof manifest.seededPools === "object"
+    ? Object.keys(manifest.seededPools)
+    : [];
+  if (seededPoolNames.length !== 1 || seededPoolNames[0] !== "wethUsdc") {
+    throw coded("MANIFEST", "Manifest must define exactly one seededPools.wethUsdc market");
+  }
+  const weth = normalizeAddress(manifest?.tokens?.weth, "manifest WETH", "MANIFEST");
+  const usdc = normalizeAddress(manifest?.tokens?.usdc, "manifest USDC", "MANIFEST");
+  const pool = manifest.seededPools.wethUsdc;
+  normalizeAddress(pool?.pair, "manifest WETH/USDC pair", "MANIFEST");
+  if (
+    normalizeAddress(pool?.tokenX, "manifest WETH/USDC tokenX", "MANIFEST") !== weth ||
+    normalizeAddress(pool?.tokenY, "manifest WETH/USDC tokenY", "MANIFEST") !== usdc
+  ) {
+    throw coded("MANIFEST", "Manifest WETH/USDC pool token identity is invalid");
+  }
+}
+
+function requireReadyCandles(rows, expected) {
+  if (!Array.isArray(rows) || rows.length === 0 || rows.some((row) =>
+    row?.pair?.toLowerCase() !== expected.pair ||
+    row.interval !== expected.interval ||
+    row.status !== "READY" ||
+    [row.openUsdE18, row.highUsdE18, row.lowUsdE18, row.closeUsdE18].some((value) => !reasonableWethUsdPrice(value)) ||
+    row.missingPriceTokens?.length !== 0 ||
+    row.priceSource !== "active-bin-quote-usd" ||
+    normalizeAddress(row.quoteToken, `${expected.interval} candle quote token`, "ANALYTICS_DATA") !== expected.quoteToken
+  )) {
+    throw coded("ANALYTICS_DATA", `Analytics ${expected.interval} WETH/USDC candles are empty, incomplete, or use the wrong price provenance`);
+  }
+  return rows;
+}
+
+function reasonableWethUsdPrice(value) {
+  if (typeof value !== "string" || !/^(0|[1-9]\d*)$/.test(value)) return false;
+  const price = BigInt(value);
+  return price >= 100n * 10n ** 18n && price <= 10_000n * 10n ** 18n;
 }
 
 async function rpc(endpoint, method, params) {
@@ -304,6 +406,20 @@ function integer(value, label) {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed < 0) throw coded("HEAD_INVALID", `${label} is invalid`);
   return parsed;
+}
+
+function unsignedBigInt(value, label) {
+  if (typeof value !== "string" || !/^(0|[1-9]\d*)$/.test(value)) throw coded("INDEXER_DATA", `${label} is invalid`);
+  return BigInt(value);
+}
+
+function indexedTokenAddress(token, label) {
+  return normalizeAddress(token?.address ?? token?.id, label, "INDEXER_DATA");
+}
+
+function normalizeAddress(value, label, code) {
+  if (!/^0x[0-9a-fA-F]{40}$/.test(value ?? "")) throw coded(code, `${label} is invalid`);
+  return value.toLowerCase();
 }
 
 function normalizeHash(value, label) {

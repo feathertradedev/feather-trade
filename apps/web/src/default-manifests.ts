@@ -42,13 +42,6 @@ export const localnetDefaultManifest = {
     variableFeeControl: 40_000
   },
   seededPools: {
-    wnativeUsdc: {
-      activeId: 8_388_608,
-      binStep: 10,
-      pair: "0x4A47586912f0e03d9f3DCAa762fB8B659E52604b",
-      tokenX: "0x5FbDB2315678afecb367f032d93F642f64180aa3",
-      tokenY: "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
-    },
     wethUsdc: {
       activeId: 8_396_213,
       binStep: 10,
@@ -68,11 +61,11 @@ export const localnetDefaultManifest = {
     routerWNative: "0x5FbDB2315678afecb367f032d93F642f64180aa3"
   },
   smoke: {
-    liquidityAmountX: "100000000000000000000",
-    liquidityAmountY: "100000000000000000000",
-    swapAmountIn: 1_000_000_000_000_000_000,
-    swapAmountOut: 999_000_000_000_000_000,
-    swapTokenIn: "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+    liquidityAmountX: "10000000000000000",
+    liquidityAmountY: "20000000000000000000",
+    swapAmountIn: 1_000_000_000_000_000,
+    swapAmountOut: 1_998_594_640_439_506_130,
+    swapTokenIn: "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9",
     swapTokenOut: "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
   }
 } as const satisfies LocalnetDeploymentManifest;

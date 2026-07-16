@@ -1,8 +1,16 @@
 import { isAddress, type Address } from "viem";
 
 export type AnalyticsStatus = "READY" | "PARTIAL" | "UNAVAILABLE";
-export type CandleInterval = "HOUR" | "DAY";
+export type CandleInterval =
+  | "ONE_MINUTE"
+  | "FIVE_MINUTES"
+  | "FIFTEEN_MINUTES"
+  | "HOUR"
+  | "FOUR_HOURS"
+  | "DAY"
+  | "WEEK";
 export type BackfillStatus = "unavailable" | "running" | "complete" | "partial" | "capped";
+export const CANDLE_STREAM_STALE_AFTER_MS = 45_000;
 
 export interface AnalyticsPageInfo {
   endCursor: string | null;
@@ -16,6 +24,7 @@ export interface AnalyticsPage<T> {
   status: AnalyticsStatus;
   pageInfo: AnalyticsPageInfo;
   error: string | null;
+  streamCursor: string | null;
 }
 
 export interface PoolAnalyticsMetric {
@@ -52,6 +61,12 @@ export interface PairCandle {
   missingPriceTokens: Address[];
   firstBlock: string;
   lastBlock: string;
+  firstBlockHash: string;
+  lastBlockHash: string;
+  finalized: boolean;
+  revision: number;
+  priceSource: string;
+  quoteToken: Address;
 }
 
 export interface PriceHealth {
@@ -99,6 +114,58 @@ const DEFAULT_PAGE_SIZE = 100;
 const DEFAULT_MAX_PAGES = 5;
 const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_TIMEOUT_MS = 60_000;
+const MONDAY_EPOCH_OFFSET_SECONDS = 4 * 86_400;
+
+export const CANDLE_INTERVAL_SECONDS: Readonly<Record<CandleInterval, number>> = {
+  ONE_MINUTE: 60,
+  FIVE_MINUTES: 5 * 60,
+  FIFTEEN_MINUTES: 15 * 60,
+  HOUR: 3_600,
+  FOUR_HOURS: 4 * 3_600,
+  DAY: 86_400,
+  WEEK: 7 * 86_400
+};
+
+export const CANDLE_INTERVAL_LABELS: Readonly<Record<CandleInterval, string>> = {
+  ONE_MINUTE: "1m",
+  FIVE_MINUTES: "5m",
+  FIFTEEN_MINUTES: "15m",
+  HOUR: "1h",
+  FOUR_HOURS: "4h",
+  DAY: "1d",
+  WEEK: "1w"
+};
+
+export const CANDLE_LOOKBACK_SECONDS: Readonly<Record<CandleInterval, number>> = {
+  ONE_MINUTE: 6 * 3_600,
+  FIVE_MINUTES: 24 * 3_600,
+  FIFTEEN_MINUTES: 3 * 86_400,
+  HOUR: 14 * 86_400,
+  FOUR_HOURS: 60 * 86_400,
+  DAY: 365 * 86_400,
+  WEEK: 3 * 365 * 86_400
+};
+
+export const CANDLE_LOOKBACK_LABELS: Readonly<Record<CandleInterval, string>> = {
+  ONE_MINUTE: "6H history",
+  FIVE_MINUTES: "24H history",
+  FIFTEEN_MINUTES: "3D history",
+  HOUR: "14D history",
+  FOUR_HOURS: "60D history",
+  DAY: "1Y history",
+  WEEK: "3Y history"
+};
+
+export function candleBoundary(timestamp: number, interval: CandleInterval): number {
+  const seconds = CANDLE_INTERVAL_SECONDS[interval];
+  if (interval !== "WEEK") return Math.floor(timestamp / seconds) * seconds;
+  return Math.floor((timestamp - MONDAY_EPOCH_OFFSET_SECONDS) / seconds) * seconds + MONDAY_EPOCH_OFFSET_SECONDS;
+}
+
+export function isCandleStreamStale(lastActivityAt: number, now: number): boolean {
+  if (!Number.isFinite(lastActivityAt) || !Number.isFinite(now)) throw new Error("Candle stream timestamps must be finite");
+  return now - lastActivityAt >= CANDLE_STREAM_STALE_AFTER_MS;
+}
 
 const POOL_METRICS_QUERY = `
   query WebPoolMetrics($first: Int!, $after: String, $asOfTimestamp: Int) {
@@ -112,8 +179,9 @@ const POOL_METRICS_QUERY = `
 const PAIR_CANDLES_QUERY = `
   query WebPairCandles($pair: ID!, $interval: CandleInterval!, $fromTimestamp: Int!, $toTimestamp: Int!, $first: Int!, $after: String) {
     pairCandles(pair: $pair, interval: $interval, fromTimestamp: $fromTimestamp, toTimestamp: $toTimestamp, first: $first, after: $after) {
-      nodes { pair interval startTimestamp endTimestamp openUsdE18 highUsdE18 lowUsdE18 closeUsdE18 volumeUsdE18 feesUsdE18 tvlUsdE18 swapCount status missingPriceTokens firstBlock lastBlock }
+      nodes { pair interval startTimestamp endTimestamp openUsdE18 highUsdE18 lowUsdE18 closeUsdE18 volumeUsdE18 feesUsdE18 tvlUsdE18 swapCount status missingPriceTokens firstBlock lastBlock firstBlockHash lastBlockHash finalized revision priceSource quoteToken }
       pageInfo { endCursor hasNextPage partial }
+      streamCursor
     }
   }
 `;
@@ -131,6 +199,7 @@ const ANALYTICS_HEALTH_QUERY = `
 interface GraphConnection {
   nodes: unknown;
   pageInfo: unknown;
+  streamCursor?: unknown;
 }
 
 export async function loadPoolMetrics(
@@ -169,7 +238,7 @@ export async function loadPairCandles(
   options: AnalyticsLoadOptions = {}
 ): Promise<AnalyticsPage<PairCandle>> {
   const canonicalPair = parseAddress(pair);
-  if (interval !== "HOUR" && interval !== "DAY") throw new Error("Unsupported candle interval");
+  if (!CANDLE_INTERVAL_SECONDS[interval]) throw new Error("Unsupported candle interval");
   parseSafeInteger(fromTimestamp, "fromTimestamp");
   parseSafeInteger(toTimestamp, "toTimestamp");
   if (fromTimestamp > toTimestamp) throw new Error("Candle range is reversed");
@@ -184,6 +253,35 @@ export async function loadPairCandles(
     (row) => `${row.startTimestamp.toString().padStart(16, "0")}:${row.pair}`,
     options
   );
+}
+
+export function candleStreamUrl(
+  endpoint: string,
+  pair: Address,
+  interval: CandleInterval,
+  after: string
+): string {
+  const url = new URL(endpoint);
+  url.pathname = url.pathname.endsWith("/graphql")
+    ? `${url.pathname.slice(0, -"/graphql".length)}/events/candles`
+    : `${url.pathname.replace(/\/+$/, "")}/events/candles`;
+  url.search = "";
+  url.searchParams.set("pair", parseAddress(pair));
+  url.searchParams.set("interval", interval);
+  url.searchParams.set("after", after);
+  return url.toString();
+}
+
+export function parseCandleStreamPayload(
+  value: unknown,
+  pair: Address,
+  interval: CandleInterval
+): { cursor: string; candle: PairCandle } {
+  const payload = asRecord(value);
+  return {
+    cursor: parseString(payload.cursor, "stream cursor"),
+    candle: parseCandle(payload.candle, parseAddress(pair), interval, 0, Number.MAX_SAFE_INTEGER)
+  };
 }
 
 export async function loadAnalyticsHealth(
@@ -235,11 +333,11 @@ async function loadConnection<T>(
       }
       partial ||= connection.pageInfo.partial || rows.some((row) => rowStatus(row) !== "READY");
       if (!connection.pageInfo.hasNextPage) {
-        return resultPage(rows, partial ? "PARTIAL" : "READY", connection.pageInfo, pageNumber + 1, null);
+        return resultPage(rows, partial ? "PARTIAL" : "READY", connection.pageInfo, pageNumber + 1, null, connection.streamCursor);
       }
       const next = connection.pageInfo.endCursor;
       if (next === null || next === after) {
-        return resultPage(rows, "PARTIAL", connection.pageInfo, pageNumber + 1, `${field} pagination cursor did not advance`);
+        return resultPage(rows, "PARTIAL", connection.pageInfo, pageNumber + 1, `${field} pagination cursor did not advance`, connection.streamCursor);
       }
       after = next;
     } catch (error) {
@@ -277,8 +375,8 @@ function parseCandle(value: unknown, pair: Address, interval: CandleInterval, fr
   if (row.interval !== interval) throw new Error("pairCandles returned the wrong interval");
   const startTimestamp = parseSafeInteger(row.startTimestamp, "startTimestamp");
   const endTimestamp = parseSafeInteger(row.endTimestamp, "endTimestamp");
-  const seconds = interval === "HOUR" ? 3_600 : 86_400;
-  if (startTimestamp < from || startTimestamp > to || startTimestamp % seconds !== 0 || endTimestamp !== startTimestamp + seconds) {
+  const seconds = CANDLE_INTERVAL_SECONDS[interval];
+  if (startTimestamp < from || startTimestamp > to || !isCandleBoundary(startTimestamp, interval) || endTimestamp !== startTimestamp + seconds) {
     throw new Error(`Invalid ${interval} candle boundary at ${startTimestamp}`);
   }
   const ohlc = ["openUsdE18", "highUsdE18", "lowUsdE18", "closeUsdE18"].map((key) => parseNullableDecimal(row[key], key));
@@ -297,7 +395,15 @@ function parseCandle(value: unknown, pair: Address, interval: CandleInterval, fr
     pair, interval, startTimestamp, endTimestamp, openUsdE18: ohlc[0], highUsdE18: ohlc[1], lowUsdE18: ohlc[2], closeUsdE18: ohlc[3],
     volumeUsdE18: parseNullableDecimal(row.volumeUsdE18, "volumeUsdE18"), lpFeesUsdE18: parseNullableDecimal(row.feesUsdE18, "feesUsdE18"),
     tvlUsdE18: parseNullableDecimal(row.tvlUsdE18, "tvlUsdE18"), swapCount: parseSafeInteger(row.swapCount, "swapCount"), status,
-    missingPriceTokens, firstBlock, lastBlock
+    missingPriceTokens,
+    firstBlock,
+    lastBlock,
+    firstBlockHash: parseHash(row.firstBlockHash, "firstBlockHash"),
+    lastBlockHash: parseHash(row.lastBlockHash, "lastBlockHash"),
+    finalized: parseBoolean(row.finalized, "finalized"),
+    revision: parseSafeInteger(row.revision, "revision"),
+    priceSource: parseString(row.priceSource, "priceSource"),
+    quoteToken: parseAddress(row.quoteToken)
   };
 }
 
@@ -316,8 +422,8 @@ function parseHealth(value: unknown): AnalyticsHealth {
     missingPriceTokens: parseAddresses(row.missingPriceTokens, "missingPriceTokens"), fresh: parseBoolean(row.fresh, "fresh"),
     headLagSeconds: parseNullableInteger(row.headLagSeconds, "headLagSeconds"), maxHeadLagSeconds: parseSafeInteger(row.maxHeadLagSeconds, "maxHeadLagSeconds"),
     backfillStatus: backfillStatus as BackfillStatus, backfillCursor: parseNullableString(row.backfillCursor, "backfillCursor"),
-    backfillError: parseNullableString(row.backfillError, "backfillError"), coverageStartTimestamp: parseNullableDecimal(row.coverageStartTimestamp, "coverageStartTimestamp"),
-    coverageThroughTimestamp: parseNullableDecimal(row.coverageThroughTimestamp, "coverageThroughTimestamp"), prices
+    backfillError: parseNullableString(row.backfillError, "backfillError"), coverageStartTimestamp: parseNullableSignedDecimal(row.coverageStartTimestamp, "coverageStartTimestamp"),
+    coverageThroughTimestamp: parseNullableSignedDecimal(row.coverageThroughTimestamp, "coverageThroughTimestamp"), prices
   };
 }
 
@@ -327,10 +433,10 @@ function truthfulHealthStatus(health: AnalyticsHealth): AnalyticsStatus {
   return health.status === "READY" && ready ? "READY" : "PARTIAL";
 }
 
-function parseConnection(value: unknown): { nodes: unknown[]; pageInfo: { endCursor: string | null; hasNextPage: boolean; partial: boolean } } {
+function parseConnection(value: unknown): { nodes: unknown[]; pageInfo: { endCursor: string | null; hasNextPage: boolean; partial: boolean }; streamCursor: string | null } {
   const connection = asRecord(value) as unknown as GraphConnection;
   const pageInfo = asRecord(connection.pageInfo);
-  return { nodes: asArray(connection.nodes, "nodes"), pageInfo: { endCursor: parseNullableString(pageInfo.endCursor, "endCursor"), hasNextPage: parseBoolean(pageInfo.hasNextPage, "hasNextPage"), partial: parseBoolean(pageInfo.partial, "partial") } };
+  return { nodes: asArray(connection.nodes, "nodes"), pageInfo: { endCursor: parseNullableString(pageInfo.endCursor, "endCursor"), hasNextPage: parseBoolean(pageInfo.hasNextPage, "hasNextPage"), partial: parseBoolean(pageInfo.partial, "partial") }, streamCursor: connection.streamCursor === undefined ? null : parseNullableString(connection.streamCursor, "streamCursor") };
 }
 
 async function fetchGraph(endpoint: string, query: string, variables: Record<string, unknown>, timeoutMs: number): Promise<unknown> {
@@ -349,8 +455,8 @@ async function fetchGraph(endpoint: string, query: string, variables: Record<str
   } finally { clearTimeout(timeout); }
 }
 
-function resultPage<T>(rows: T[], status: AnalyticsStatus, pageInfo: { endCursor: string | null; hasNextPage: boolean; partial: boolean }, pagesLoaded: number, error: string | null): AnalyticsPage<T> {
-  return { rows, status, pageInfo: { ...pageInfo, partial: pageInfo.partial || status !== "READY", pagesLoaded }, error };
+function resultPage<T>(rows: T[], status: AnalyticsStatus, pageInfo: { endCursor: string | null; hasNextPage: boolean; partial: boolean }, pagesLoaded: number, error: string | null, streamCursor: string | null = null): AnalyticsPage<T> {
+  return { rows, status, pageInfo: { ...pageInfo, partial: pageInfo.partial || status !== "READY", pagesLoaded }, error, streamCursor };
 }
 function unavailablePage<T>(error: string): AnalyticsPage<T> { return resultPage([], "UNAVAILABLE", { endCursor: null, hasNextPage: false, partial: true }, 0, error); }
 function rowStatus(value: unknown): AnalyticsStatus { const status = asRecord(value).status; return parseStatus(status); }
@@ -360,10 +466,13 @@ function parseAddresses(value: unknown, label: string): Address[] { const rows =
 function assertUnique(values: readonly string[], label: string): void { if (new Set(values).size !== values.length) throw new Error(`Duplicate ${label} address`); }
 function parseDecimal(value: unknown, label: string): string { if (typeof value !== "string" || !/^(0|[1-9]\d*)$/.test(value)) throw new Error(`Invalid ${label}`); return value; }
 function parseNullableDecimal(value: unknown, label: string): string | null { return value === null ? null : parseDecimal(value, label); }
+function parseSignedDecimal(value: unknown, label: string): string { if (typeof value !== "string" || !/^(0|-?[1-9]\d*)$/.test(value)) throw new Error(`Invalid ${label}`); return value; }
+function parseNullableSignedDecimal(value: unknown, label: string): string | null { return value === null ? null : parseSignedDecimal(value, label); }
 function parseSafeInteger(value: unknown, label: string): number { if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new Error(`Invalid ${label}`); return value; }
 function parseNullableInteger(value: unknown, label: string): number | null { return value === null ? null : parseSafeInteger(value, label); }
 function parseString(value: unknown, label: string): string { if (typeof value !== "string") throw new Error(`Invalid ${label}`); return value; }
 function parseNullableString(value: unknown, label: string): string | null { return value === null ? null : parseString(value, label); }
+function parseHash(value: unknown, label: string): string { if (typeof value !== "string" || !/^0x[0-9a-fA-F]+$/.test(value)) throw new Error(`Invalid ${label}`); return value.toLowerCase(); }
 function parseBoolean(value: unknown, label: string): boolean { if (typeof value !== "boolean") throw new Error(`Invalid ${label}`); return value; }
 function asRecord(value: unknown): Record<string, unknown> { if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("Expected analytics object"); return value as Record<string, unknown>; }
 function asArray(value: unknown, label: string): unknown[] { if (!Array.isArray(value)) throw new Error(`Invalid ${label}`); return value; }
@@ -375,3 +484,9 @@ function normalizeBoundedPositive(value: number | undefined, fallback: number, m
 }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : "Analytics request failed"; }
 function joinErrors(left: string | null, right: string): string { return left === null ? right : `${left}; ${right}`; }
+
+function isCandleBoundary(timestamp: number, interval: CandleInterval): boolean {
+  const seconds = CANDLE_INTERVAL_SECONDS[interval];
+  if (interval !== "WEEK") return timestamp % seconds === 0;
+  return (timestamp - MONDAY_EPOCH_OFFSET_SECONDS) % seconds === 0;
+}

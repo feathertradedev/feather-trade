@@ -1,6 +1,14 @@
 export type Hex = `0x${string}`;
 export type AnalyticsStatus = "ready" | "partial" | "unavailable";
-export type CandleInterval = "hour" | "day";
+export type CandleInterval =
+  | "minute"
+  | "five-minutes"
+  | "fifteen-minutes"
+  | "hour"
+  | "four-hours"
+  | "day"
+  | "week";
+export type CandlePriceSource = "active-bin-quote-usd" | "trusted-token-usd" | "mixed";
 export type PriceSource = "chainlink-data-streams" | "fixed-test";
 export type BackfillStatus = "unavailable" | "running" | "complete" | "partial" | "capped";
 
@@ -35,13 +43,20 @@ export interface PairIdentity {
   decimalsY: number;
 }
 
-export interface PairSnapshotEvent extends PairIdentity {
+export interface PairMarketObservation {
+  /** Active-bin token-Y-per-token-X price, normalized to 18 decimals. */
+  marketPriceQuoteE18?: bigint | null;
+  activeId?: number | null;
+  binStep?: number | null;
+}
+
+export interface PairSnapshotEvent extends PairIdentity, PairMarketObservation {
   kind: "pair-snapshot";
   reserveX: bigint;
   reserveY: bigint;
 }
 
-export interface SwapAnalyticsEvent extends PairIdentity {
+export interface SwapAnalyticsEvent extends PairIdentity, PairMarketObservation {
   kind: "swap";
   amountInX: bigint;
   amountInY: bigint;
@@ -58,7 +73,7 @@ export interface PositionBinChange {
   amountY: bigint;
 }
 
-export interface LiquidityAnalyticsEvent extends PairIdentity {
+export interface LiquidityAnalyticsEvent extends PairIdentity, PairMarketObservation {
   kind: "deposit" | "withdraw";
   owner: string;
   bins: PositionBinChange[];
@@ -123,6 +138,12 @@ export interface Candle {
   missingPriceTokens: string[];
   firstBlock: bigint;
   lastBlock: bigint;
+  firstBlockHash: Hex;
+  lastBlockHash: Hex;
+  finalized: boolean;
+  revision: number;
+  priceSource: CandlePriceSource;
+  quoteToken: string;
 }
 
 export interface PoolMetrics {

@@ -8,7 +8,9 @@ import type {
   BlockEnvelope,
   Candle,
   CandleInterval,
+  CandlePriceSource,
   Connection,
+  Hex,
   LiquidityAnalyticsEvent,
   PairIdentity,
   PoolMetrics,
@@ -22,14 +24,31 @@ import type {
 
 const HOUR_SECONDS = 60 * 60;
 const DAY_SECONDS = 24 * HOUR_SECONDS;
+const MINUTE_SECONDS = 60;
+const WEEK_SECONDS = 7 * DAY_SECONDS;
+const MONDAY_EPOCH_OFFSET_SECONDS = 4 * DAY_SECONDS;
 const MAX_PAGE_SIZE = 100;
+const MAX_CANDLE_POINTS = 500;
+const USD_SCALE = 10n ** 18n;
 export const FULL_HISTORY_START_TIMESTAMP = Number.MIN_SAFE_INTEGER;
+
+export const CANDLE_INTERVALS: readonly CandleInterval[] = [
+  "minute",
+  "five-minutes",
+  "fifteen-minutes",
+  "hour",
+  "four-hours",
+  "day",
+  "week"
+];
 
 interface PairState extends PairIdentity {
   reserveX: bigint;
   reserveY: bigint;
   tvlUsdE18: bigint | null;
   priceUsdE18: bigint | null;
+  priceSource: CandlePriceSource;
+  quoteToken: string;
   missingPriceTokens: Set<string>;
   updatedAtBlock: bigint;
   updatedAtTimestamp: number;
@@ -61,6 +80,11 @@ interface MutableCandle {
   missingPriceTokens: Set<string>;
   firstBlock: bigint;
   lastBlock: bigint;
+  firstBlockHash: Hex;
+  lastBlockHash: Hex;
+  revision: number;
+  priceSource: CandlePriceSource | null;
+  quoteToken: string;
 }
 
 interface MutablePositionBin {
@@ -324,6 +348,14 @@ export class AnalyticsEngine {
     after?: string | null;
   }): Connection<Candle> {
     const pair = normalize(input.pair);
+    const intervalSeconds = candleIntervalSeconds(input.interval);
+    if (!Number.isSafeInteger(input.fromTimestamp) || !Number.isSafeInteger(input.toTimestamp) || input.fromTimestamp > input.toTimestamp) {
+      throw new Error("Candle timestamp range is invalid");
+    }
+    if (Math.floor(input.toTimestamp / intervalSeconds) - Math.floor(input.fromTimestamp / intervalSeconds) + 1 > MAX_CANDLE_POINTS) {
+      throw new Error(`Candle query cannot span more than ${MAX_CANDLE_POINTS} ${input.interval} buckets`);
+    }
+    const headTimestamp = this.#blocks.at(-1)?.timestamp ?? null;
     const rows = [...this.#candles.values()]
       .filter(
         (candle) =>
@@ -333,7 +365,7 @@ export class AnalyticsEngine {
           candle.startTimestamp <= input.toTimestamp
       )
       .sort((a, b) => a.startTimestamp - b.startTimestamp)
-      .map(finalizeCandle);
+      .map((candle) => finalizeCandle(candle, headTimestamp));
     return paginate(
       rows,
       input.first,
@@ -341,6 +373,17 @@ export class AnalyticsEngine {
       this.#blocks.at(-1)?.hash ?? "empty",
       !this.#historyCovers(input.fromTimestamp, input.toTimestamp)
     );
+  }
+
+  listCandles(): Candle[] {
+    const headTimestamp = this.#blocks.at(-1)?.timestamp ?? null;
+    return [...this.#candles.values()]
+      .sort((left, right) =>
+        left.pair.localeCompare(right.pair) ||
+        left.interval.localeCompare(right.interval) ||
+        left.startTimestamp - right.startTimestamp
+      )
+      .map((candle) => finalizeCandle(candle, headTimestamp));
   }
 
   queryWalletPositions(input: { owner: string; first: number; after?: string | null }): Connection<WalletPairPosition> {
@@ -373,11 +416,12 @@ export class AnalyticsEngine {
 
     for (const block of this.#blocks) {
       for (const sample of block.prices) this.#priceBook.apply(sample, block.timestamp);
-      for (const event of block.events) this.#applyEvent(event, block.number, block.timestamp);
+      for (const event of block.events) this.#applyEvent(event, block.number, block.hash, block.timestamp);
     }
+    this.#buildCandleRollups();
   }
 
-  #applyEvent(event: AnalyticsEvent, blockNumber: bigint, timestamp: number): void {
+  #applyEvent(event: AnalyticsEvent, blockNumber: bigint, blockHash: Hex, timestamp: number): void {
     this.#eventIsPartial = false;
     if (event.kind === "position-snapshot") {
       this.#applyPositionSnapshot(event, blockNumber, timestamp);
@@ -385,9 +429,9 @@ export class AnalyticsEngine {
       this.#applyPositionTransfer(event);
     } else {
       const pair = this.#updatePair(event, blockNumber, timestamp);
-      this.#updateCandlesForSnapshot(pair, blockNumber, timestamp);
+      this.#updateCandlesForSnapshot(pair, blockNumber, blockHash, timestamp);
 
-      if (event.kind === "swap") this.#applySwap(event, pair, blockNumber, timestamp);
+      if (event.kind === "swap") this.#applySwap(event, pair, blockNumber, blockHash, timestamp);
       if (event.kind === "deposit" || event.kind === "withdraw") this.#applyLiquidity(event, timestamp);
     }
     if (this.#eventIsPartial) this.#partialEventCount += 1;
@@ -400,13 +444,25 @@ export class AnalyticsEngine {
 
     const reserves = valueAmounts(identity, event.reserveX, event.reserveY, this.#priceBook, timestamp);
     const tokenXPrice = this.#priceBook.get(identity.tokenX, timestamp);
+    const tokenYPrice = this.#priceBook.get(identity.tokenY, timestamp);
+    const observedQuotePrice = event.marketPriceQuoteE18 ?? null;
+    const activeBinPrice = observedQuotePrice === null || tokenYPrice.priceUsdE18 === null
+      ? null
+      : (observedQuotePrice * tokenYPrice.priceUsdE18) / USD_SCALE;
+    const priceUsdE18 = activeBinPrice ?? tokenXPrice.priceUsdE18;
+    const priceSource: CandlePriceSource = activeBinPrice === null ? "trusted-token-usd" : "active-bin-quote-usd";
+    const priceMissing = priceUsdE18 !== null
+      ? new Set<string>()
+      : new Set([observedQuotePrice === null ? identity.tokenX : identity.tokenY]);
     const pair: PairState = {
       ...identity,
       reserveX: event.reserveX,
       reserveY: event.reserveY,
       tvlUsdE18: reserves.totalUsdE18,
-      priceUsdE18: tokenXPrice.priceUsdE18,
-      missingPriceTokens: union(reserves.missingPriceTokens, tokenXPrice.priceUsdE18 === null ? new Set([identity.tokenX]) : new Set()),
+      priceUsdE18,
+      priceSource,
+      quoteToken: identity.tokenY,
+      missingPriceTokens: union(reserves.missingPriceTokens, priceMissing),
       updatedAtBlock: blockNumber,
       updatedAtTimestamp: timestamp
     };
@@ -416,7 +472,7 @@ export class AnalyticsEngine {
     return pair;
   }
 
-  #applySwap(event: SwapAnalyticsEvent, pair: PairState, blockNumber: bigint, timestamp: number): void {
+  #applySwap(event: SwapAnalyticsEvent, pair: PairState, blockNumber: bigint, blockHash: Hex, timestamp: number): void {
     const volume = valueAmounts(pair, event.amountInX, event.amountInY, this.#priceBook, timestamp);
     const fees = valueAmounts(pair, event.feeX, event.feeY, this.#priceBook, timestamp);
     const missing = union(volume.missingPriceTokens, fees.missingPriceTokens, pair.missingPriceTokens);
@@ -429,35 +485,35 @@ export class AnalyticsEngine {
     });
     this.#recordPartial(missing);
 
-    for (const interval of ["hour", "day"] as const) {
-      const candle = this.#getCandle(pair, interval, blockNumber, timestamp);
-      candle.swapCount += 1;
-      if (volume.totalUsdE18 === null) candle.missingVolumeValue = true;
-      else candle.volumeUsdE18 += volume.totalUsdE18;
-      if (fees.totalUsdE18 === null) candle.missingFeeValue = true;
-      else candle.feesUsdE18 += fees.totalUsdE18;
-      addAll(candle.missingPriceTokens, missing);
+    const candle = this.#getCandle(pair, "minute", blockNumber, blockHash, timestamp);
+    candle.swapCount += 1;
+    candle.revision += 1;
+    if (volume.totalUsdE18 === null) candle.missingVolumeValue = true;
+    else candle.volumeUsdE18 += volume.totalUsdE18;
+    if (fees.totalUsdE18 === null) candle.missingFeeValue = true;
+    else candle.feesUsdE18 += fees.totalUsdE18;
+    addAll(candle.missingPriceTokens, missing);
+  }
+
+  #updateCandlesForSnapshot(pair: PairState, blockNumber: bigint, blockHash: Hex, timestamp: number): void {
+    const candle = this.#getCandle(pair, "minute", blockNumber, blockHash, timestamp);
+    candle.tvlUsdE18 = pair.tvlUsdE18;
+    candle.lastBlock = blockNumber;
+    candle.lastBlockHash = blockHash;
+    candle.revision += 1;
+    candle.priceSource = mergePriceSource(candle.priceSource, pair.priceSource);
+    addAll(candle.missingPriceTokens, pair.missingPriceTokens);
+    if (pair.priceUsdE18 !== null) {
+      candle.openUsdE18 ??= pair.priceUsdE18;
+      candle.highUsdE18 = candle.highUsdE18 === null || pair.priceUsdE18 > candle.highUsdE18 ? pair.priceUsdE18 : candle.highUsdE18;
+      candle.lowUsdE18 = candle.lowUsdE18 === null || pair.priceUsdE18 < candle.lowUsdE18 ? pair.priceUsdE18 : candle.lowUsdE18;
+      candle.closeUsdE18 = pair.priceUsdE18;
     }
   }
 
-  #updateCandlesForSnapshot(pair: PairState, blockNumber: bigint, timestamp: number): void {
-    for (const interval of ["hour", "day"] as const) {
-      const candle = this.#getCandle(pair, interval, blockNumber, timestamp);
-      candle.tvlUsdE18 = pair.tvlUsdE18;
-      candle.lastBlock = blockNumber;
-      addAll(candle.missingPriceTokens, pair.missingPriceTokens);
-      if (pair.priceUsdE18 !== null) {
-        candle.openUsdE18 ??= pair.priceUsdE18;
-        candle.highUsdE18 = candle.highUsdE18 === null || pair.priceUsdE18 > candle.highUsdE18 ? pair.priceUsdE18 : candle.highUsdE18;
-        candle.lowUsdE18 = candle.lowUsdE18 === null || pair.priceUsdE18 < candle.lowUsdE18 ? pair.priceUsdE18 : candle.lowUsdE18;
-        candle.closeUsdE18 = pair.priceUsdE18;
-      }
-    }
-  }
-
-  #getCandle(pair: PairState, interval: CandleInterval, blockNumber: bigint, timestamp: number): MutableCandle {
-    const seconds = interval === "hour" ? HOUR_SECONDS : DAY_SECONDS;
-    const startTimestamp = Math.floor(timestamp / seconds) * seconds;
+  #getCandle(pair: PairState, interval: CandleInterval, blockNumber: bigint, blockHash: Hex, timestamp: number): MutableCandle {
+    const seconds = candleIntervalSeconds(interval);
+    const startTimestamp = candleBoundary(timestamp, interval);
     const key = `${pair.pair}:${interval}:${startTimestamp}`;
     let candle = this.#candles.get(key);
     if (!candle) {
@@ -478,11 +534,67 @@ export class AnalyticsEngine {
         missingFeeValue: false,
         missingPriceTokens: new Set(),
         firstBlock: blockNumber,
-        lastBlock: blockNumber
+        lastBlock: blockNumber,
+        firstBlockHash: blockHash,
+        lastBlockHash: blockHash,
+        revision: 0,
+        priceSource: null,
+        quoteToken: pair.quoteToken
       };
       this.#candles.set(key, candle);
     }
     return candle;
+  }
+
+  #buildCandleRollups(): void {
+    const minutes = [...this.#candles.values()]
+      .filter((candle) => candle.interval === "minute")
+      .sort((left, right) => left.startTimestamp - right.startTimestamp);
+
+    const rollup = (sources: readonly MutableCandle[], intervals: readonly CandleInterval[]) => {
+      for (const interval of intervals) for (const source of sources) {
+        const startTimestamp = candleBoundary(source.startTimestamp, interval);
+        const key = `${source.pair}:${interval}:${startTimestamp}`;
+        let rollup = this.#candles.get(key);
+        if (!rollup) {
+          rollup = {
+            pair: source.pair,
+            interval,
+            startTimestamp,
+            endTimestamp: startTimestamp + candleIntervalSeconds(interval),
+            openUsdE18: null,
+            highUsdE18: null,
+            lowUsdE18: null,
+            closeUsdE18: null,
+            volumeUsdE18: 0n,
+            feesUsdE18: 0n,
+            tvlUsdE18: null,
+            swapCount: 0,
+            missingVolumeValue: false,
+            missingFeeValue: false,
+            missingPriceTokens: new Set(),
+            firstBlock: source.firstBlock,
+            lastBlock: source.lastBlock,
+            firstBlockHash: source.firstBlockHash,
+            lastBlockHash: source.lastBlockHash,
+            revision: 0,
+            priceSource: null,
+            quoteToken: source.quoteToken
+          };
+          this.#candles.set(key, rollup);
+        }
+        mergeCandleIntoRollup(rollup, source);
+      }
+    };
+    rollup(minutes, ["five-minutes", "fifteen-minutes", "hour"]);
+    const hours = [...this.#candles.values()]
+      .filter((candle) => candle.interval === "hour")
+      .sort((left, right) => left.startTimestamp - right.startTimestamp);
+    rollup(hours, ["four-hours", "day"]);
+    const days = [...this.#candles.values()]
+      .filter((candle) => candle.interval === "day")
+      .sort((left, right) => left.startTimestamp - right.startTimestamp);
+    rollup(days, ["week"]);
   }
 
   #applyLiquidity(event: LiquidityAnalyticsEvent, timestamp: number): void {
@@ -753,7 +865,7 @@ function getOrCreatePositionBin(
   return bin;
 }
 
-function finalizeCandle(candle: MutableCandle): Candle {
+function finalizeCandle(candle: MutableCandle, headTimestamp: number | null): Candle {
   const partial =
     candle.missingVolumeValue ||
     candle.missingFeeValue ||
@@ -776,8 +888,66 @@ function finalizeCandle(candle: MutableCandle): Candle {
     status: partial ? "partial" : "ready",
     missingPriceTokens: [...candle.missingPriceTokens].sort(),
     firstBlock: candle.firstBlock,
-    lastBlock: candle.lastBlock
+    lastBlock: candle.lastBlock,
+    firstBlockHash: candle.firstBlockHash,
+    lastBlockHash: candle.lastBlockHash,
+    finalized: headTimestamp !== null && headTimestamp >= candle.endTimestamp,
+    revision: candle.revision,
+    priceSource: candle.priceSource ?? "trusted-token-usd",
+    quoteToken: candle.quoteToken
   };
+}
+
+function mergeCandleIntoRollup(rollup: MutableCandle, source: MutableCandle): void {
+  rollup.openUsdE18 ??= source.openUsdE18;
+  if (source.highUsdE18 !== null) {
+    rollup.highUsdE18 = rollup.highUsdE18 === null || source.highUsdE18 > rollup.highUsdE18
+      ? source.highUsdE18
+      : rollup.highUsdE18;
+  }
+  if (source.lowUsdE18 !== null) {
+    rollup.lowUsdE18 = rollup.lowUsdE18 === null || source.lowUsdE18 < rollup.lowUsdE18
+      ? source.lowUsdE18
+      : rollup.lowUsdE18;
+  }
+  if (source.closeUsdE18 !== null) rollup.closeUsdE18 = source.closeUsdE18;
+  rollup.volumeUsdE18 += source.volumeUsdE18;
+  rollup.feesUsdE18 += source.feesUsdE18;
+  rollup.swapCount += source.swapCount;
+  rollup.tvlUsdE18 = source.tvlUsdE18;
+  rollup.missingVolumeValue ||= source.missingVolumeValue;
+  rollup.missingFeeValue ||= source.missingFeeValue;
+  addAll(rollup.missingPriceTokens, source.missingPriceTokens);
+  rollup.lastBlock = source.lastBlock;
+  rollup.lastBlockHash = source.lastBlockHash;
+  rollup.revision += source.revision;
+  rollup.priceSource = mergePriceSource(rollup.priceSource, source.priceSource ?? "trusted-token-usd");
+}
+
+function mergePriceSource(
+  current: CandlePriceSource | null,
+  next: CandlePriceSource
+): CandlePriceSource {
+  if (current === null || current === next) return next;
+  return "mixed";
+}
+
+export function candleIntervalSeconds(interval: CandleInterval): number {
+  switch (interval) {
+    case "minute": return MINUTE_SECONDS;
+    case "five-minutes": return 5 * MINUTE_SECONDS;
+    case "fifteen-minutes": return 15 * MINUTE_SECONDS;
+    case "hour": return HOUR_SECONDS;
+    case "four-hours": return 4 * HOUR_SECONDS;
+    case "day": return DAY_SECONDS;
+    case "week": return WEEK_SECONDS;
+  }
+}
+
+export function candleBoundary(timestamp: number, interval: CandleInterval): number {
+  const seconds = candleIntervalSeconds(interval);
+  if (interval !== "week") return Math.floor(timestamp / seconds) * seconds;
+  return Math.floor((timestamp - MONDAY_EPOCH_OFFSET_SECONDS) / seconds) * seconds + MONDAY_EPOCH_OFFSET_SECONDS;
 }
 
 function finalizePosition(
@@ -931,6 +1101,19 @@ function validateBlock(block: BlockEnvelope): void {
   if (!Number.isSafeInteger(block.timestamp) || block.timestamp < 0) throw new Error("Block timestamp must be a non-negative integer");
   if (!/^0x[0-9a-fA-F]+$/.test(block.hash) || !/^0x[0-9a-fA-F]+$/.test(block.parentHash)) {
     throw new Error("Block hashes must be hex strings");
+  }
+  for (const event of block.events) {
+    if ("marketPriceQuoteE18" in event && event.marketPriceQuoteE18 !== undefined && event.marketPriceQuoteE18 !== null && event.marketPriceQuoteE18 <= 0n) {
+      throw new Error("Active-bin market price must be positive when present");
+    }
+    if ("activeId" in event && event.activeId !== undefined && event.activeId !== null &&
+      (!Number.isSafeInteger(event.activeId) || event.activeId < 0 || event.activeId > 0xff_ff_ff)) {
+      throw new Error("Active ID must fit uint24 when present");
+    }
+    if ("binStep" in event && event.binStep !== undefined && event.binStep !== null &&
+      (!Number.isSafeInteger(event.binStep) || event.binStep <= 0 || event.binStep > 0xff_ff)) {
+      throw new Error("Bin step must fit a nonzero uint16 when present");
+    }
   }
 }
 

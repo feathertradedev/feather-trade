@@ -1,9 +1,8 @@
 # Localnet Deployment Manifests
 
-`pnpm localnet:up` writes `latest.json` in this directory after starting Anvil if needed and deploying the LB v2.2 local stack. It creates two real pools:
+`pnpm localnet:up` writes `latest.json` in this directory after starting Anvil if needed and deploying the LB v2.2 local stack. It creates one real pool:
 
-- `WNATIVE/USDC` is the single-bin native-token smoke pool used by transaction and indexer checks.
-- `WETH/USDC` is the frontend reference pool. It is funded across 31 on-chain bins with a center-weighted curve around an approximately $2,000 active price.
+- `WETH/USDC` is the transaction, market-activity, indexer, and frontend reference pool. It is funded across on-chain bins around an approximately $2,000 active price.
 
 The deployment runs the WETH/USDC seeder automatically. To add the same distribution to an already-running local deployment, run `pnpm localnet:seed:liquidity`. Re-running the seeder adds liquidity to the existing curve; it does not replace or fabricate indexed data.
 
@@ -34,7 +33,7 @@ The manifest shape is stable for Wave 1 consumers:
 | `chainId`, `startBlock`, deployed `contracts.*`, deployed `tokens.*`, seeded pool addresses, and `smoke.swapAmountOut` | Chain-derived from the target RPC and executed transactions. |
 | `deployer`, `ownership.*`, and owner/fee constructor args | Derived from `LOCALNET_PRIVATE_KEY` or the default Anvil key. |
 | Legacy router/factory constructor args | Generated zero addresses for the Wave 1 local-only V2.2 path. |
-| `smoke.liquidityAmountX`, `smoke.liquidityAmountY`, and `smoke.swapAmountIn` | Generated script constants used to seed and smoke-test the WNATIVE/USDC pool. |
+| `smoke.liquidityAmountX`, `smoke.liquidityAmountY`, and `smoke.swapAmountIn` | Generated script constants used to seed and smoke-test the WETH/USDC pool. |
 
 Localnet manifests are meant for SDK examples, frontend defaults during local development, and local subgraph generation. Use `LOCALNET_MANIFEST_PATH` when a consumer needs a non-default manifest path.
 

@@ -26,6 +26,7 @@ WEB_URL="http://127.0.0.1:$WEB_PORT"
 MANIFEST_PATH="$ROOT_DIR/deployments/localnet/latest.json"
 ANVIL_PID_FILE="$STATE_DIR/anvil.pid"
 ANALYTICS_PID_FILE="$STATE_DIR/analytics.pid"
+MARKET_ACTIVITY_PID_FILE="$STATE_DIR/market-activity.pid"
 WEB_PID_FILE="$STATE_DIR/web.pid"
 STACK_ENV_FILE="$STATE_DIR/stack.env"
 
@@ -85,6 +86,7 @@ stop_pid() {
 stop_stack() {
   mkdir -p "$STATE_DIR"
   stop_pid "$WEB_PID_FILE"
+  stop_pid "$MARKET_ACTIVITY_PID_FILE"
   stop_pid "$ANALYTICS_PID_FILE"
   "${COMPOSE[@]}" down --volumes --remove-orphans >"$STATE_DIR/compose-down.log" 2>&1 || true
   stop_pid "$ANVIL_PID_FILE"
@@ -114,6 +116,22 @@ wait_analytics() {
   return 1
 }
 
+wait_market_activity() {
+  local pid
+  pid="$(cat "$MARKET_ACTIVITY_PID_FILE")"
+  for _ in $(seq 1 40); do
+    if ! kill -0 "$pid" >/dev/null 2>&1; then
+      echo "Continuous market activity exited during startup." >&2
+      tail -20 "$STATE_DIR/market-activity.log" >&2 || true
+      return 1
+    fi
+    if [ -s "$STATE_DIR/market-activity.log" ]; then return; fi
+    sleep 0.25
+  done
+  echo "Continuous market activity did not report startup progress." >&2
+  return 1
+}
+
 write_stack_env() {
   umask 077
   {
@@ -122,6 +140,8 @@ write_stack_env() {
     printf 'LOCALNET_MANIFEST_PATH=%q\n' "$MANIFEST_PATH"
     printf 'INDEXER_LOCAL_ENDPOINT=%q\n' "$INDEXER_URL"
     printf 'ANALYTICS_LOCAL_ENDPOINT=%q\n' "$ANALYTICS_URL"
+    printf 'MARKET_ACTIVITY_RPC_URL=%q\n' "$RPC_URL"
+    printf 'MARKET_ACTIVITY_MANIFEST_PATH=%q\n' "$MANIFEST_PATH"
     printf 'FEATHER_WEB_URL=%q\n' "$WEB_URL"
     printf 'FEATHER_STACK_COMPOSE_PROJECT=%q\n' "$COMPOSE_PROJECT_NAME"
   } >"$STACK_ENV_FILE"
@@ -186,7 +206,7 @@ start_stack() {
   "${COMPOSE[@]}" up -d >"$STATE_DIR/compose-up.log" 2>&1
   wait_http "Graph Node admin" "$GRAPH_ADMIN_URL"
   (cd "$ROOT_DIR" && pnpm indexer:deploy:local) >"$STATE_DIR/indexer-deploy.log" 2>&1
-  (cd "$ROOT_DIR" && pnpm sdk:example:localnet:swap) >"$STATE_DIR/seed-swap.log" 2>&1
+  (cd "$ROOT_DIR" && pnpm sdk:build && pnpm market-activity:build) >"$STATE_DIR/market-activity-build.log" 2>&1
 
   [ -f "$PRICE_POLICIES" ] || { echo "Missing local analytics policies: $PRICE_POLICIES" >&2; exit 1; }
   [ -f "$BLOCK_SOURCE_MODULE" ] || { echo "Missing local analytics block-source adapter: $BLOCK_SOURCE_MODULE" >&2; exit 1; }
@@ -196,6 +216,7 @@ start_stack() {
     ANALYTICS_HOST=127.0.0.1 \
     ANALYTICS_PORT="$ANALYTICS_PORT" \
     ANALYTICS_STATE_PATH="$STATE_DIR/analytics/checkpoint.json" \
+    ANALYTICS_DATABASE_URL="postgres://graph-node:graph-node@127.0.0.1:$POSTGRES_PORT/graph-node" \
     ANALYTICS_PRICE_POLICIES="$PRICE_POLICIES" \
     ANALYTICS_BLOCK_SOURCE_MODULE="$BLOCK_SOURCE_MODULE" \
     ANALYTICS_POSITION_SNAPSHOT_MODULE="$POSITION_SNAPSHOT_MODULE" \
@@ -216,7 +237,7 @@ start_stack() {
     VITE_LOCALNET_MANIFEST_SHA256="$manifest_sha256" \
     VITE_LOCALNET_RPC_URL="$RPC_URL" \
     VITE_LOCALNET_INDEXER_URL="$INDEXER_URL" \
-    VITE_ANALYTICS_LOCALNET_URL="$ANALYTICS_URL" \
+    VITE_ANALYTICS_LOCALNET_URL="$ANALYTICS_URL/graphql" \
     pnpm --dir "$ROOT_DIR/apps/web" exec vite --host 127.0.0.1 --port "$WEB_PORT" --strictPort \
     >"$STATE_DIR/web.log" 2>&1 </dev/null &
   echo "$!" >"$WEB_PID_FILE"
@@ -231,6 +252,17 @@ start_stack() {
     --indexer-url "$INDEXER_URL" \
     --analytics-url "$ANALYTICS_URL" \
     --web-url "$WEB_URL") | tee "$STATE_DIR/health.json"
+
+  # Establish one stable, fully validated analytics checkpoint before the
+  # continuous trader begins advancing the local chain.
+  nohup env \
+    MARKET_ACTIVITY_RPC_URL="$RPC_URL" \
+    MARKET_ACTIVITY_PRIVATE_KEY="${MARKET_ACTIVITY_PRIVATE_KEY:-${LOCALNET_PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}}" \
+    MARKET_ACTIVITY_MANIFEST_PATH="$MANIFEST_PATH" \
+    node "$ROOT_DIR/packages/dev-market-activity/dist/src/cli.js" start \
+    >"$STATE_DIR/market-activity.log" 2>&1 </dev/null &
+  echo "$!" >"$MARKET_ACTIVITY_PID_FILE"
+  wait_market_activity
 
   START_FAILED=0
   trap - EXIT INT TERM

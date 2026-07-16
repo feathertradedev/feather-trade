@@ -8,8 +8,8 @@ import {
   decodePackedAmounts
 } from "./analytics-adapters.mjs";
 
-const PAIR = "0x4a47586912f0e03d9f3dcaa762fb8b659e52604b";
-const TOKEN_X = "0x5fbdb2315678afecb367f032d93f642f64180aa3";
+const PAIR = "0xbf57b75d71d91e13c97693e4e5b850b0be638dac";
+const TOKEN_X = "0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9";
 const TOKEN_Y = "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512";
 const OWNER = "0x3729a6a9ced02c9d0a86ec9834b28825b212abf3";
 const RECIPIENT = "0xac76bb7bf95e0240c78ff9908fcb24e21f6e89ce";
@@ -20,9 +20,11 @@ const OTHER_HASH = `0x${"22".repeat(32)}`;
 const TX_SWAP = `0x${"aa".repeat(32)}`;
 const TX_DEPOSIT = `0x${"bb".repeat(32)}`;
 const TX_TRANSFER = `0x${"cc".repeat(32)}`;
+const GET_PRICE_FROM_ID_SELECTOR = "0x4c7cffbd";
+const Q128 = 1n << 128n;
 
 test("local analytics adapters produce exact canonical blocks and head-pinned positions", async () => {
-  const state = { graphHeadHash: HASH_1 };
+  const state = { graphHeadHash: HASH_1, graphHeadNumber: 1 };
   const rpcServer = createServer((request, response) => void handleJson(request, response, (payload) => rpc(payload)));
   const graphServer = createServer((request, response) => void handleJson(request, response, (payload) => graph(payload, state)));
   await Promise.all([listen(rpcServer), listen(graphServer)]);
@@ -43,7 +45,7 @@ test("local analytics adapters produce exact canonical blocks and head-pinned po
     assert.deepEqual(page.blocks.map((block) => block.number), [0n, 1n]);
     assert.equal(page.blocks[1].hash, HASH_1);
     assert.equal(page.blocks[1].parentHash, HASH_0);
-    assert.equal(page.blocks[1].prices.length, 4);
+    assert.deepEqual(page.blocks[1].prices.map((price) => price.token), [TOKEN_X, TOKEN_Y]);
     assert(page.blocks[1].prices.every((price) =>
       price.source === "fixed-test" &&
       price.priceUsdE18 === 1_000_000_000_000_000_000n &&
@@ -60,6 +62,9 @@ test("local analytics adapters produce exact canonical blocks and head-pinned po
       tokenY: TOKEN_Y,
       decimalsX: 18,
       decimalsY: 18,
+      activeId: 8_388_609,
+      binStep: 10,
+      marketPriceQuoteE18: 1_000_000_000_000_000_000n,
       reserveX: 1_005n,
       reserveY: 1_993n,
       kind: "swap",
@@ -101,6 +106,13 @@ test("local analytics adapters produce exact canonical blocks and head-pinned po
 
     assert.deepEqual(decodePackedAmounts(pack(9n, 13n)), { amountX: 9n, amountY: 13n });
 
+    state.graphHeadNumber = 2;
+    state.graphHeadHash = OTHER_HASH;
+    const advancedIndexer = await createBlockSource(options);
+    const advancedPage = await advancedIndexer.fetchPage(null);
+    assert.deepEqual(advancedPage.blocks.map((block) => block.number), [0n, 1n]);
+
+    state.graphHeadNumber = 1;
     state.graphHeadHash = OTHER_HASH;
     const mismatched = await createBlockSource(options);
     await assert.rejects(() => mismatched.fetchPage(null), /RPC\/indexer head hash mismatch/);
@@ -120,13 +132,16 @@ function rpc(payload) {
     if (number === 1) return rpcResult(payload, { number: "0x1", hash: HASH_1, parentHash: HASH_0, timestamp: "0x65" });
     return rpcResult(payload, null);
   }
-  if (payload.method === "eth_call") return rpcResult(payload, `0x${18n.toString(16).padStart(64, "0")}`);
+  if (payload.method === "eth_call") {
+    const data = payload.params[0]?.data;
+    return rpcResult(payload, `0x${(typeof data === "string" && data.startsWith(GET_PRICE_FROM_ID_SELECTOR) ? Q128 : 18n).toString(16).padStart(64, "0")}`);
+  }
   throw new Error(`Unexpected RPC method ${payload.method}`);
 }
 
 function graph(payload, state) {
   if (payload.query.includes("LocalAnalyticsHead")) {
-    return { data: { _meta: meta(1, state.graphHeadHash) } };
+    return { data: { _meta: meta(state.graphHeadNumber, state.graphHeadHash) } };
   }
   if (payload.query.includes("LocalAnalyticsPositions")) {
     return {
@@ -159,6 +174,7 @@ function graph(payload, state) {
           amountOutY: "7",
           totalFeeX: "1",
           totalFeeY: "0",
+          activeId: "8388609",
           transactionHash: TX_SWAP
         }],
         liquidityEvents: [{
@@ -200,7 +216,9 @@ function pairIdentity() {
     id: PAIR,
     address: PAIR,
     tokenX: { id: TOKEN_X, address: TOKEN_X },
-    tokenY: { id: TOKEN_Y, address: TOKEN_Y }
+    tokenY: { id: TOKEN_Y, address: TOKEN_Y },
+    activeId: "8388608",
+    binStep: "10"
   };
 }
 

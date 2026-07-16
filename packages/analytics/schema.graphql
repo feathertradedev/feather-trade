@@ -7,8 +7,13 @@ enum AnalyticsStatus {
 }
 
 enum CandleInterval {
+  ONE_MINUTE
+  FIVE_MINUTES
+  FIFTEEN_MINUTES
   HOUR
+  FOUR_HOURS
   DAY
+  WEEK
 }
 
 type PageInfo {
@@ -54,11 +59,18 @@ type Candle {
   missingPriceTokens: [ID!]!
   firstBlock: BigInt!
   lastBlock: BigInt!
+  firstBlockHash: String!
+  lastBlockHash: String!
+  finalized: Boolean!
+  revision: Int!
+  priceSource: String!
+  quoteToken: ID!
 }
 
 type CandleConnection {
   nodes: [Candle!]!
   pageInfo: PageInfo!
+  streamCursor: String!
 }
 
 type PositionBinAccounting {

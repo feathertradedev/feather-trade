@@ -21,7 +21,7 @@ contract LocalnetDeployScript is Script {
         0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80;
 
     uint256 private constant FLASHLOAN_FEE = 5e12;
-    uint24 private constant ID_ONE = 8_388_608;
+    uint24 private constant WETH_USDC_ACTIVE_ID = 8_396_213;
     uint16 private constant DEFAULT_BIN_STEP = 10;
     uint16 private constant DEFAULT_BASE_FACTOR = 10_000;
     uint16 private constant DEFAULT_FILTER_PERIOD = 30;
@@ -33,9 +33,9 @@ contract LocalnetDeployScript is Script {
     bool private constant DEFAULT_OPEN_STATE = true;
     uint256 private constant DISTRIBUTION_PRECISION = 1e18;
     uint256 private constant TOKEN_MINT_AMOUNT = 1_000 ether;
-    uint256 private constant LIQUIDITY_AMOUNT_X = 100 ether;
-    uint256 private constant LIQUIDITY_AMOUNT_Y = 100 ether;
-    uint256 private constant SWAP_AMOUNT_IN = 1 ether;
+    uint256 private constant LIQUIDITY_AMOUNT_X = 0.01 ether;
+    uint256 private constant LIQUIDITY_AMOUNT_Y = 20 ether;
+    uint256 private constant SWAP_AMOUNT_IN = 0.001 ether;
     string private constant DEFAULT_LOCALNET_RPC_URL = "http://127.0.0.1:8545";
     string private constant DEFAULT_LOCALNET_INDEXER_URL = "http://127.0.0.1:8000/subgraphs/name/robinhood-lb/localnet";
     string private constant DEFAULT_LOCALNET_API_URL = "http://127.0.0.1:3001";
@@ -51,7 +51,7 @@ contract LocalnetDeployScript is Script {
         LBPair pairImplementation;
         LBRouter router;
         LBQuoter quoter;
-        LBPair wnativeUsdcPair;
+        LBPair wethUsdcPair;
         uint256 swapAmountOut;
     }
 
@@ -92,15 +92,17 @@ contract LocalnetDeployScript is Script {
         _configureFactory(deployment);
         _mintAndApprove(deployment);
 
-        deployment.wnativeUsdcPair = LBPair(
-            address(deployment.factory.createLBPair(deployment.wnative, deployment.usdc, ID_ONE, DEFAULT_BIN_STEP))
+        deployment.wethUsdcPair = LBPair(
+            address(
+                deployment.factory.createLBPair(deployment.weth, deployment.usdc, WETH_USDC_ACTIVE_ID, DEFAULT_BIN_STEP)
+            )
         );
         _addSmokeLiquidity(deployment);
         deployment.swapAmountOut = _executeSmokeSwap(deployment);
 
         vm.stopBroadcast();
 
-        if (address(deployment.wnativeUsdcPair).code.length == 0) revert("LOCALNET_PAIR_NOT_DEPLOYED");
+        if (address(deployment.wethUsdcPair).code.length == 0) revert("LOCALNET_PAIR_NOT_DEPLOYED");
         if (deployment.swapAmountOut == 0) revert("LOCALNET_SWAP_ZERO_OUT");
 
         _writeManifest(manifestPath, deployment);
@@ -109,7 +111,7 @@ contract LocalnetDeployScript is Script {
         console.log("LBFactory:", address(deployment.factory));
         console.log("LBRouter:", address(deployment.router));
         console.log("LBQuoter:", address(deployment.quoter));
-        console.log("WNATIVE/USDC pair:", address(deployment.wnativeUsdcPair));
+        console.log("WETH/USDC pair:", address(deployment.wethUsdcPair));
         console.log("Smoke swap amount out:", deployment.swapAmountOut);
     }
 
@@ -154,14 +156,14 @@ contract LocalnetDeployScript is Script {
         distributionY[0] = DISTRIBUTION_PRECISION;
 
         ILBRouter.LiquidityParameters memory liquidityParameters = ILBRouter.LiquidityParameters({
-            tokenX: deployment.wnative,
+            tokenX: deployment.weth,
             tokenY: deployment.usdc,
             binStep: DEFAULT_BIN_STEP,
             amountX: LIQUIDITY_AMOUNT_X,
             amountY: LIQUIDITY_AMOUNT_Y,
             amountXMin: 0,
             amountYMin: 0,
-            activeIdDesired: ID_ONE,
+            activeIdDesired: WETH_USDC_ACTIVE_ID,
             idSlippage: 0,
             deltaIds: deltaIds,
             distributionX: distributionX,
@@ -181,7 +183,7 @@ contract LocalnetDeployScript is Script {
 
         pairBinSteps[0] = DEFAULT_BIN_STEP;
         versions[0] = ILBRouter.Version.V2_2;
-        tokenPath[0] = deployment.wnative;
+        tokenPath[0] = deployment.weth;
         tokenPath[1] = deployment.usdc;
 
         ILBRouter.Path memory path =
@@ -278,12 +280,12 @@ contract LocalnetDeployScript is Script {
 
     function _writePool(string memory manifestPath, Deployment memory deployment) private {
         string memory poolObject = "localnet-pool";
-        vm.serializeAddress(poolObject, "pair", address(deployment.wnativeUsdcPair));
-        vm.serializeAddress(poolObject, "tokenX", address(deployment.wnative));
+        vm.serializeAddress(poolObject, "pair", address(deployment.wethUsdcPair));
+        vm.serializeAddress(poolObject, "tokenX", address(deployment.weth));
         vm.serializeAddress(poolObject, "tokenY", address(deployment.usdc));
-        vm.serializeUint(poolObject, "activeId", ID_ONE);
+        vm.serializeUint(poolObject, "activeId", WETH_USDC_ACTIVE_ID);
         string memory poolJson = vm.serializeUint(poolObject, "binStep", DEFAULT_BIN_STEP);
-        vm.writeJson(poolJson, manifestPath, ".seededPools.wnativeUsdc");
+        vm.writeJson(poolJson, manifestPath, ".seededPools.wethUsdc");
     }
 
     function _writeConstructorArgs(string memory manifestPath, Deployment memory deployment) private {
@@ -302,7 +304,7 @@ contract LocalnetDeployScript is Script {
 
     function _writeSmoke(string memory manifestPath, Deployment memory deployment) private {
         string memory smokeObject = "localnet-smoke";
-        vm.serializeAddress(smokeObject, "swapTokenIn", address(deployment.wnative));
+        vm.serializeAddress(smokeObject, "swapTokenIn", address(deployment.weth));
         vm.serializeAddress(smokeObject, "swapTokenOut", address(deployment.usdc));
         vm.serializeUint(smokeObject, "liquidityAmountX", LIQUIDITY_AMOUNT_X);
         vm.serializeUint(smokeObject, "liquidityAmountY", LIQUIDITY_AMOUNT_Y);

@@ -188,11 +188,8 @@
             "seededPools": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["wnativeUsdc"],
+              "required": ["wethUsdc"],
               "properties": {
-                "wnativeUsdc": {
-                  "$ref": "#/$defs/localnetSeededPool"
-                },
                 "wethUsdc": {
                   "$ref": "#/$defs/localnetSeededPool"
                 }

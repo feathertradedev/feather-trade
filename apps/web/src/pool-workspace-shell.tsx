@@ -157,11 +157,13 @@ function PoolWorkspaceRail() {
         <div><dt>Current bin</dt><dd>{workspace.pool.activeId ?? "Unavailable"}</dd></div>
       </dl>
 
-      <div className={`pool-rail-state ${workspace.analytics.state.status.toLowerCase()}`} data-testid="pool-workspace-state" role="status">
-        <span>{workspace.analytics.state.label}</span>
-        {workspace.analytics.state.detail ? <small>{workspace.analytics.state.detail}</small> : null}
-        {workspace.analytics.row.analyticsIssue ? <small>{workspace.analytics.row.analyticsIssue}</small> : null}
-      </div>
+      {workspace.analytics.stateVisible ? (
+        <div className={`pool-rail-state ${workspace.analytics.state.status.toLowerCase()}`} data-testid="pool-workspace-state" role="status">
+          <span>{workspace.analytics.state.label}</span>
+          {workspace.analytics.state.detail ? <small>{workspace.analytics.state.detail}</small> : null}
+          {workspace.analytics.row.analyticsIssue ? <small>{workspace.analytics.row.analyticsIssue}</small> : null}
+        </div>
+      ) : null}
 
       <div className="pool-rail-position-state">
         <span>Your liquidity</span>

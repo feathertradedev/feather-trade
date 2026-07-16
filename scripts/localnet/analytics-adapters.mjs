@@ -4,6 +4,9 @@ import { fileURLToPath } from "node:url";
 
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const UINT128_MASK = (1n << 128n) - 1n;
+const Q128 = 1n << 128n;
+const USD_SCALE = 10n ** 18n;
+const GET_PRICE_FROM_ID_SELECTOR = "0x4c7cffbd";
 const DEFAULT_RPC_URL = "http://127.0.0.1:8545";
 const DEFAULT_INDEXER_URL = "http://127.0.0.1:8000/subgraphs/name/robinhood-lb/localnet";
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -20,12 +23,12 @@ const BLOCK_QUERY = `
   query LocalAnalyticsBlock($block: Int!, $blockNumber: BigInt!) {
     _meta(block: { number: $block }) { block { number hash } hasIndexingErrors }
     pairs(first: 1000, block: { number: $block }) {
-      id address reserveX reserveY
+      id address reserveX reserveY activeId binStep
       tokenX { id address }
       tokenY { id address }
     }
     swaps(first: 1000, block: { number: $block }, where: { blockNumber: $blockNumber }) {
-      id pair { id } amountInX amountInY amountOutX amountOutY totalFeeX totalFeeY
+      id pair { id } activeId amountInX amountInY amountOutX amountOutY totalFeeX totalFeeY
       transactionHash
     }
     liquidityEvents(first: 1000, block: { number: $block }, where: { blockNumber: $blockNumber }) {
@@ -173,10 +176,12 @@ async function loadBlock(config, decimals, number) {
 
   for (const row of boundedRows(data.swaps, "swaps")) {
     const pair = requirePair(identities, row.pair?.id);
+    const observation = await marketObservation(config, pair, safeNumber(row.activeId, "swap activeId"), number);
     ordered.push({
       order: eventOrder(row.id),
       event: {
         ...pair,
+        ...observation,
         kind: "swap",
         amountInX: unsigned(row.amountInX, "swap amountInX"),
         amountInY: unsigned(row.amountInY, "swap amountInY"),
@@ -303,19 +308,21 @@ async function assertLocalChain(config) {
 
 async function waitForExactHead(config) {
   const deadline = Date.now() + config.syncTimeoutMs;
+  const rpcNumber = hexQuantity(await rpc(config, "eth_blockNumber", []), "eth_blockNumber");
+  const rpcBlock = await rpc(config, "eth_getBlockByNumber", [quantity(rpcNumber), false]);
+  assertRpcBlock(rpcBlock, rpcNumber);
+  const rpcHash = hash(rpcBlock.hash, "RPC head hash");
   while (true) {
-    const rpcNumber = hexQuantity(await rpc(config, "eth_blockNumber", []), "eth_blockNumber");
-    const rpcBlock = await rpc(config, "eth_getBlockByNumber", [quantity(rpcNumber), false]);
-    assertRpcBlock(rpcBlock, rpcNumber);
     const data = await graph(config, HEAD_QUERY, {});
     const meta = parseGraphMeta(data._meta);
     if (meta.hasIndexingErrors) throw new Error("Indexer reports indexing errors");
-    if (meta.number > rpcNumber) throw new Error(`Indexer head ${meta.number} is ahead of RPC head ${rpcNumber}`);
     if (meta.number === rpcNumber) {
-      const rpcHash = hash(rpcBlock.hash, "RPC head hash");
       if (meta.hash !== rpcHash) throw new Error(`RPC/indexer head hash mismatch at block ${rpcNumber}`);
       return { number: rpcNumber, hash: rpcHash };
     }
+    // The local chain can advance while the indexer catches the captured
+    // target. Per-block loads below still verify the canonical target hash.
+    if (meta.number > rpcNumber) return { number: rpcNumber, hash: rpcHash };
     if (Date.now() >= deadline) throw new Error(`Indexer did not reach RPC head ${rpcNumber} before timeout`);
     await delay(Math.min(config.pollIntervalMs, 250), config.signal);
   }
@@ -325,13 +332,33 @@ async function pairIdentity(config, decimals, row, blockNumber) {
   const pair = address(row?.address ?? row?.id, "pair address");
   const tokenX = address(row?.tokenX?.address ?? row?.tokenX?.id, "tokenX address");
   const tokenY = address(row?.tokenY?.address ?? row?.tokenY?.id, "tokenY address");
-  return {
+  const identity = {
     pair,
     tokenX,
     tokenY,
     decimalsX: await tokenDecimals(config, decimals, tokenX, blockNumber),
     decimalsY: await tokenDecimals(config, decimals, tokenY, blockNumber)
   };
+  if (row?.binStep === undefined || row?.binStep === null) return identity;
+  const activeId = row?.activeId === null || row?.activeId === undefined ? null : safeNumber(row.activeId, "pair activeId");
+  const binStep = safeNumber(row?.binStep, "pair binStep");
+  return {
+    ...identity,
+    ...(activeId === null ? { activeId: null, binStep, marketPriceQuoteE18: null } : await marketObservation(config, { ...identity, binStep }, activeId, blockNumber))
+  };
+}
+
+async function marketObservation(config, pair, activeId, blockNumber) {
+  const binStep = safeNumber(pair.binStep, "pair binStep");
+  if (activeId > 0xff_ff_ff || binStep <= 0 || binStep > 0xff_ff) throw new Error("Pair market identity is out of range");
+  const calldata = `${GET_PRICE_FROM_ID_SELECTOR}${BigInt(activeId).toString(16).padStart(64, "0")}`;
+  const result = await rpc(config, "eth_call", [{ to: pair.pair, data: calldata }, quantity(blockNumber)]);
+  const priceQ128 = unsigned(result, `active-bin price for ${pair.pair}`);
+  if (priceQ128 === 0n) throw new Error(`Active-bin price is zero for ${pair.pair}`);
+  const marketPriceQuoteE18 = (priceQ128 * (10n ** BigInt(pair.decimalsX)) * USD_SCALE) /
+    (Q128 * (10n ** BigInt(pair.decimalsY)));
+  if (marketPriceQuoteE18 === 0n) throw new Error(`Normalized active-bin price is zero for ${pair.pair}`);
+  return { activeId, binStep, marketPriceQuoteE18 };
 }
 
 async function tokenDecimals(config, cache, token, blockNumber) {

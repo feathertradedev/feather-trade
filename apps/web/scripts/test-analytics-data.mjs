@@ -18,7 +18,7 @@ try {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = mockFetch;
   const { normalizeAnalyticsEndpoint } = await server.ssrLoadModule("/src/analytics-endpoint.ts");
-  const { loadAnalyticsHealth, loadPairCandles, loadPoolMetrics } = await server.ssrLoadModule("/src/analytics-data.ts");
+  const { CANDLE_STREAM_STALE_AFTER_MS, isCandleStreamStale, loadAnalyticsHealth, loadPairCandles, loadPoolMetrics } = await server.ssrLoadModule("/src/analytics-data.ts");
 
   assert.equal(normalizeAnalyticsEndpoint(" https://analytics.example.test/graphql/ "), endpoint);
   assert.equal(normalizeAnalyticsEndpoint(undefined), null);
@@ -27,6 +27,9 @@ try {
   assert.equal(normalizeAnalyticsEndpoint("ws://analytics.example.test/graphql"), null);
   assert.equal(normalizeAnalyticsEndpoint("https://user:secret@analytics.example.test/graphql"), null);
   assert.equal(normalizeAnalyticsEndpoint("https://analytics.example.test/graphql#fragment"), null);
+  assert.equal(CANDLE_STREAM_STALE_AFTER_MS, 45_000);
+  assert.equal(isCandleStreamStale(1_000, 45_999), false);
+  assert.equal(isCandleStreamStale(1_000, 46_000), true);
 
   const metrics = await loadPoolMetrics(endpoint, [pairB.toUpperCase().replace("0X", "0x"), pairA], undefined, { pageSize: 1 });
   assert.equal(metrics.status, "PARTIAL");
@@ -54,12 +57,14 @@ try {
   assert.equal(candles.rows[0].lpFeesUsdE18, "0");
   assert.equal(candles.rows[1].openUsdE18, null);
   assert.deepEqual(candles.rows[1].missingPriceTokens, [tokenX]);
+  assert.equal(candles.streamCursor, "7");
 
   const health = await loadAnalyticsHealth(endpoint);
   assert.equal(health.value?.status, "PARTIAL");
   assert.equal(health.status, "PARTIAL");
   assert.equal(health.value?.fresh, false);
   assert.equal(health.value?.backfillStatus, "running");
+  assert.equal(health.value?.coverageStartTimestamp, "-9007199254740991");
   assert.deepEqual(health.value?.missingPriceTokens, [tokenX]);
 
   const unavailable = await loadPoolMetrics(null, [pairA]);
@@ -92,7 +97,7 @@ async function mockFetch(url, init) {
   if (query.includes("WebPairCandles")) {
     const after = variables.after ?? null;
     const nodes = after === null ? [candle(3_600, "READY")] : [candle(7_200, "PARTIAL")];
-    return response({ data: { pairCandles: connection(nodes, after === null ? "candles-1" : "candles-2", after === null, after !== null) } });
+    return response({ data: { pairCandles: { ...connection(nodes, after === null ? "candles-1" : "candles-2", after === null, after !== null), streamCursor: "7" } } });
   }
 
   if (query.includes("WebAnalyticsHealth")) {
@@ -100,7 +105,7 @@ async function mockFetch(url, init) {
       status: "READY", headBlock: "99", headHash: `0x${"1".repeat(64)}`, headTimestamp: 9_000,
       canonicalBlockCount: 5, reorgCount: 0, partialEventCount: 0, missingPriceTokens: [tokenX.toUpperCase().replace("0X", "0x")],
       fresh: false, headLagSeconds: 120, maxHeadLagSeconds: 60, backfillStatus: "running", backfillCursor: "42", backfillError: null,
-      coverageStartTimestamp: "0", coverageThroughTimestamp: null,
+      coverageStartTimestamp: "-9007199254740991", coverageThroughTimestamp: null,
       prices: [{ token: tokenX, source: "chainlink", feedId: "feed-x", status: "stale", observedAt: 8_800, ageSeconds: 200 }]
     } } });
   }
@@ -122,7 +127,9 @@ function candle(startTimestamp, status) {
     pair: pairA, interval: "HOUR", startTimestamp, endTimestamp: startTimestamp + 3_600,
     openUsdE18: partial ? null : "10", highUsdE18: partial ? null : "12", lowUsdE18: partial ? null : "9", closeUsdE18: partial ? null : "11",
     volumeUsdE18: partial ? null : "0", feesUsdE18: partial ? null : "0", tvlUsdE18: partial ? null : "100",
-    swapCount: partial ? 0 : 1, status, missingPriceTokens: partial ? [tokenX] : [], firstBlock: "90", lastBlock: "99"
+    swapCount: partial ? 0 : 1, status, missingPriceTokens: partial ? [tokenX] : [], firstBlock: "90", lastBlock: "99",
+    firstBlockHash: `0x${"9".repeat(64)}`, lastBlockHash: `0x${"a".repeat(64)}`, finalized: true, revision: 3,
+    priceSource: "active-bin-quote-usd", quoteToken: tokenY
   };
 }
 

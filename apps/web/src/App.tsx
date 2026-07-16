@@ -232,17 +232,23 @@ import {
   type PoolDiscoveryState
 } from "./pool-discovery";
 import {
+  CANDLE_INTERVAL_LABELS,
+  CANDLE_LOOKBACK_LABELS,
+  CANDLE_LOOKBACK_SECONDS,
+  candleBoundary,
   loadAnalyticsHealth,
   loadPairCandles,
   loadPoolMetrics,
   type AnalyticsPage,
   type AnalyticsStatus,
+  type CandleInterval,
   type PairCandle,
   type PoolAnalyticsMetric
 } from "./analytics-data";
 import {
   buildCenteredBinDistribution,
   joinPoolWorkspaceRows,
+  shouldShowWorkspaceAnalyticsState,
   sortPoolWorkspaceRows,
   workspaceAnalyticsState,
   workspaceMetricTiles,
@@ -256,13 +262,16 @@ import {
 } from "./pool-workspace-route";
 import {
   useOptionalPoolWorkspace,
-  usePoolDraftState
+  usePoolDraftState,
+  type CandleStreamState
 } from "./pool-workspace-context";
 import { PoolWorkspaceShell, PoolWorkspaceTaskTabs } from "./pool-workspace-shell";
+import { PoolWorkspaceOwnerPanel } from "./pool-workspace-owner-panel";
 
 const queryClient = new QueryClient();
 const SNAPSHOT_REFRESH_INTERVAL_MS = 10_000;
 const SWAP_QUOTE_REFRESH_INTERVAL_MS = 10_000;
+const CHART_INTERVALS: readonly CandleInterval[] = ["ONE_MINUTE", "FIVE_MINUTES", "FIFTEEN_MINUTES", "HOUR", "FOUR_HOURS", "DAY", "WEEK"];
 const MAX_LIQUIDITY_BIN_ID = 16_777_215;
 const LB_PAIR_RESERVES_ABI = [{
   type: "function",
@@ -743,6 +752,18 @@ function DexShell() {
                 event.currentTarget.closest("details")?.removeAttribute("open");
                 setRouteKey("activity");
               }}>Activity</a>
+              {visibleJournalRecords.length > 0 ? (
+                <details className="transaction-journal" data-testid="submitted-transaction-journal">
+                  <summary>Your transactions ({visibleJournalRecords.length})</summary>
+                  <div>
+                    {visibleJournalRecords.map((transaction) => (
+                      <span data-transaction-hash={transaction.activeHash ?? undefined} key={transaction.id}>
+                        {transaction.reviewed.intent} · {transaction.activeHash ? formatCompactAddress(transaction.activeHash) : "hash pending"} · {transaction.status}
+                      </span>
+                    ))}
+                  </div>
+                </details>
+              ) : null}
             </div>
           </details>
           <WalletPanel activeChain={registry.chain} key={walletPanelKey} />
@@ -762,18 +783,6 @@ function DexShell() {
           </button>
         </header>
 
-        {visibleJournalRecords.length > 0 ? (
-          <details className="transaction-journal" data-testid="submitted-transaction-journal">
-            <summary>Transaction history ({visibleJournalRecords.length})</summary>
-            <div>
-              {visibleJournalRecords.map((transaction) => (
-                <span data-transaction-hash={transaction.activeHash ?? undefined} key={transaction.id}>
-                  {transaction.reviewed.intent} · {transaction.activeHash ? formatCompactAddress(transaction.activeHash) : "hash pending"} · {transaction.status} · {formatCompactAddress(transaction.reviewed.account)} · {transaction.reviewed.environment} · chain {transaction.reviewed.chainId}
-                </span>
-              ))}
-            </div>
-          </details>
-        ) : null}
         {snapshot?.indexer.message ? (
           <p
             className={`snapshot-message ${snapshot.indexer.status}`}
@@ -1229,7 +1238,7 @@ function ContentView({
   const poolIdsKey = pools.map((pool) => pool.id).join("|");
   const activeRegistry = registries[environmentKey];
   const preferredPoolAddress = isLocalnetRegistry(activeRegistry)
-    ? activeRegistry.seededPools.wethUsdc?.pair ?? null
+    ? activeRegistry.seededPools.wethUsdc.pair
     : null;
   const defaultPool = selectDefaultIndexedPool(pools, preferredPoolAddress);
   const dashboardActionPool =
@@ -1537,6 +1546,7 @@ function SwapView({
   const [routeMode, setRouteMode] = usePoolDraftState<"exact-selected" | "best">("swap.routeMode", "exact-selected");
   const [swapForY, setSwapForY] = usePoolDraftState("swap.swapForY", true);
   const [useNativeWrapper, setUseNativeWrapper] = usePoolDraftState("swap.useNativeWrapper", false);
+  const [standaloneCandleInterval, setStandaloneCandleInterval] = useState<CandleInterval>("HOUR");
   const [slippageInput, setSlippageInput] = usePoolDraftState("swap.slippage", "0.5");
   const [deadlineInput, setDeadlineInput] = usePoolDraftState("swap.deadline", "20");
   const [safetyNow, setSafetyNow] = useState(() => Date.now());
@@ -1568,16 +1578,17 @@ function SwapView({
   const poolWorkspace = useOptionalPoolWorkspace();
   const analyticsEndpoint = analyticsEndpointForRegistry(registry);
   const workspaceMatchesPool = poolWorkspace !== null && primaryPool !== null && isAddressEqual(poolWorkspace.pool.address, primaryPool.address);
-  const currentHourBoundary = Math.floor(Date.now() / 3_600_000) * 3_600;
-  const candleEnd = currentHourBoundary - 3_600;
-  const candleStart = candleEnd - 7 * 24 * 3_600;
+  const candleInterval = workspaceMatchesPool ? poolWorkspace.analytics.candleInterval : standaloneCandleInterval;
+  const candleEnd = candleBoundary(Math.floor(Date.now() / 1_000), candleInterval);
+  const candleStart = candleEnd - CANDLE_LOOKBACK_SECONDS[candleInterval];
   const swapCandlesQuery = useQuery({
-    queryKey: ["swapCandles", environmentKey, primaryPool?.address, candleStart, candleEnd],
+    queryKey: ["swapCandles", environmentKey, primaryPool?.address, candleInterval, candleStart, candleEnd],
     queryFn: () => {
       if (primaryPool === null) throw new Error("Swap candle target is unavailable");
-      return loadPairCandles(analyticsEndpoint, primaryPool.address, "HOUR", candleStart, candleEnd);
+      return loadPairCandles(analyticsEndpoint, primaryPool.address, candleInterval, candleStart, candleEnd);
     },
     enabled: primaryPool !== null && !workspaceMatchesPool,
+    placeholderData: (previous) => previous,
     refetchInterval: primaryPool !== null && !workspaceMatchesPool ? SNAPSHOT_REFRESH_INTERVAL_MS : false,
     refetchOnWindowFocus: "always",
     retry: false
@@ -2532,9 +2543,12 @@ function SwapView({
         rows: [],
         status: swapCandlesQuery.isError ? "UNAVAILABLE" : "PARTIAL",
         error: swapCandlesQuery.error instanceof Error ? swapCandlesQuery.error.message : null,
-        pageInfo: { endCursor: null, hasNextPage: false, partial: true, pagesLoaded: 0 }
+        pageInfo: { endCursor: null, hasNextPage: false, partial: true, pagesLoaded: 0 },
+        streamCursor: null
       };
-  const swapCandlesLoading = workspaceMatchesPool ? poolWorkspace.analytics.candlesLoading : swapCandlesQuery.isLoading;
+  const swapCandlesLoading = workspaceMatchesPool
+    ? poolWorkspace.analytics.candlesLoading
+    : swapCandlesQuery.isLoading || swapCandlesQuery.isPlaceholderData;
 
   return (
     <div className="view-grid swap-workspace">
@@ -2542,11 +2556,15 @@ function SwapView({
         <SwapMarketChart
           candles={swapCandlePage.rows}
           error={swapCandlePage.error}
+          interval={candleInterval}
           loading={swapCandlesLoading}
+          onIntervalChange={workspaceMatchesPool ? poolWorkspace.analytics.setCandleInterval : setStandaloneCandleInterval}
           pairAddress={primaryPool?.address ?? null}
           pairLabel={`${tokenSymbol(tokenX)} / ${tokenSymbol(tokenY)}`}
           status={swapCandlePage.status}
+          streamState={workspaceMatchesPool ? poolWorkspace.analytics.candleStreamState : "unavailable"}
         />
+        {workspaceMatchesPool ? <PoolWorkspaceOwnerPanel /> : null}
       </div>
       <section className={`tool-panel swap-task-panel${workspaceMatchesPool ? " pool-task-panel-scoped" : ""}`} data-testid="swap-task-panel">
         {workspaceMatchesPool ? <PoolWorkspaceTaskTabs task="swap" /> : null}
@@ -2841,24 +2859,43 @@ function SwapMarketRecovery({
 function SwapMarketChart({
   candles,
   error,
+  interval,
   loading,
+  onIntervalChange,
   pairAddress,
   pairLabel,
-  status
+  status,
+  streamState
 }: {
   candles: PairCandle[];
   error: string | null;
+  interval: CandleInterval;
   loading: boolean;
+  onIntervalChange: (interval: CandleInterval) => void;
   pairAddress: string | null;
   pairLabel: string;
   status: AnalyticsStatus;
+  streamState: CandleStreamState;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const fittedDataKeyRef = useRef<string | null>(null);
-  const latestCandle = [...candles].reverse().find((candle) => candle.closeUsdE18 !== null) ?? null;
+  const seriesIdentityRef = useRef<string | null>(null);
+  const seriesRevisionsRef = useRef(new Map<number, number>());
+  const seriesTimesRef = useRef(new Set<number>());
+  const intervalCandles = useMemo(() => candles.filter((candle) => candle.interval === interval), [candles, interval]);
+  const latestCandle = [...intervalCandles].reverse().find((candle) => candle.closeUsdE18 !== null) ?? null;
+  const historyState = loading
+    ? "Loading"
+    : status === "UNAVAILABLE"
+      ? "Analytics unavailable"
+      : status === "PARTIAL"
+        ? "Partial history"
+        : intervalCandles.length === 0
+          ? "No activity"
+          : "History ready";
 
   useEffect(() => {
     const container = containerRef.current;
@@ -2927,6 +2964,9 @@ function SwapMarketChart({
       chartRef.current = null;
       candleSeriesRef.current = null;
       volumeSeriesRef.current = null;
+      seriesIdentityRef.current = null;
+      seriesRevisionsRef.current.clear();
+      seriesTimesRef.current.clear();
     };
   }, []);
 
@@ -2935,9 +2975,9 @@ function SwapMarketChart({
     const volumeSeries = volumeSeriesRef.current;
     if (candleSeries === null || volumeSeries === null) return;
 
-    const ordered = [...candles].sort((left, right) => left.startTimestamp - right.startTimestamp);
-    const candleData: CandlestickData<UTCTimestamp>[] = [];
-    const volumeData: HistogramData<UTCTimestamp>[] = [];
+    if (loading && candles.length > 0 && intervalCandles.length === 0) return;
+    const ordered = [...intervalCandles].sort((left, right) => left.startTimestamp - right.startTimestamp);
+    const points: Array<{ candle: PairCandle; candleData: CandlestickData<UTCTimestamp>; volumeData: HistogramData<UTCTimestamp> }> = [];
     for (const candle of ordered) {
       const open = tradingChartValue(candle.openUsdE18);
       const high = tradingChartValue(candle.highUsdE18);
@@ -2945,28 +2985,50 @@ function SwapMarketChart({
       const close = tradingChartValue(candle.closeUsdE18);
       if (open === null || high === null || low === null || close === null) continue;
       const time = candle.startTimestamp as UTCTimestamp;
-      candleData.push({ close, high, low, open, time });
-      volumeData.push({
-        color: close >= open ? "rgba(74, 197, 124, 0.32)" : "rgba(229, 109, 112, 0.28)",
-        time,
-        value: tradingChartValue(candle.volumeUsdE18) ?? 0
+      points.push({
+        candle,
+        candleData: { close, high, low, open, time },
+        volumeData: {
+          color: close >= open ? "rgba(74, 197, 124, 0.32)" : "rgba(229, 109, 112, 0.28)",
+          time,
+          value: tradingChartValue(candle.volumeUsdE18) ?? 0
+        }
       });
     }
-    candleSeries.setData(candleData);
-    volumeSeries.setData(volumeData);
+    const identity = `${pairAddress ?? "none"}:${interval}`;
+    const nextTimes = new Set(points.map((point) => point.candle.startTimestamp));
+    const previousTimes = seriesTimesRef.current;
+    const previousMaximum = Math.max(...previousTimes, Number.NEGATIVE_INFINITY);
+    const requiresReset = seriesIdentityRef.current !== identity
+      || [...previousTimes].some((timestamp) => !nextTimes.has(timestamp))
+      || [...nextTimes].some((timestamp) => !previousTimes.has(timestamp) && timestamp < previousMaximum);
+    if (requiresReset) {
+      candleSeries.setData(points.map((point) => point.candleData));
+      volumeSeries.setData(points.map((point) => point.volumeData));
+    } else {
+      for (const point of points) {
+        if (seriesRevisionsRef.current.get(point.candle.startTimestamp) === point.candle.revision) continue;
+        const historicalUpdate = previousTimes.has(point.candle.startTimestamp);
+        candleSeries.update(point.candleData, historicalUpdate);
+        volumeSeries.update(point.volumeData, historicalUpdate);
+      }
+    }
+    seriesIdentityRef.current = identity;
+    seriesTimesRef.current = nextTimes;
+    seriesRevisionsRef.current = new Map(points.map((point) => [point.candle.startTimestamp, point.candle.revision]));
 
-    const fitKey = `${pairAddress ?? "none"}:${candleData[0]?.time ?? "empty"}`;
-    if (candleData.length > 0 && fittedDataKeyRef.current !== fitKey) {
+    const fitKey = `${identity}:${points[0]?.candle.startTimestamp ?? "empty"}`;
+    if (points.length > 0 && fittedDataKeyRef.current !== fitKey) {
       chartRef.current?.timeScale().fitContent();
       fittedDataKeyRef.current = fitKey;
     }
-  }, [candles, pairAddress]);
+  }, [candles, interval, intervalCandles, pairAddress]);
 
   const emptyMessage = loading
     ? "Loading price history"
     : status === "UNAVAILABLE" || error
       ? "Price history is not available yet"
-      : "No completed hourly candles yet";
+      : "No activity in this time window";
 
   return (
     <section
@@ -2978,7 +3040,19 @@ function SwapMarketChart({
           <span>Price chart</span>
           <strong>{pairLabel}</strong>
         </div>
-        <span className="swap-chart-interval">1H</span>
+        <div aria-label="Candle interval" className="swap-chart-intervals" role="group">
+          {CHART_INTERVALS.map((option) => (
+            <button
+              aria-pressed={option === interval}
+              className={option === interval ? "active" : undefined}
+              key={option}
+              onClick={() => onIntervalChange(option)}
+              type="button"
+            >
+              {CANDLE_INTERVAL_LABELS[option]}
+            </button>
+          ))}
+        </div>
       </header>
       <div className="swap-chart-summary" aria-live="polite">
         {latestCandle ? (
@@ -2992,12 +3066,13 @@ function SwapMarketChart({
         ) : <span>{emptyMessage}</span>}
       </div>
       <div className="swap-chart-stage">
-        <div aria-label={`${pairLabel} hourly candlestick chart`} className="swap-chart-canvas" ref={containerRef} role="img" />
-        {candles.length === 0 ? <div className="swap-chart-empty"><span>{emptyMessage}</span></div> : null}
+        <div aria-label={`${pairLabel} ${CANDLE_INTERVAL_LABELS[interval]} candlestick chart`} className="swap-chart-canvas" ref={containerRef} role="img" />
+        {intervalCandles.length === 0 ? <div className="swap-chart-empty"><span>{emptyMessage}</span></div> : null}
       </div>
       <footer className="swap-chart-footer">
-        <span>7D history</span>
-        <span>Hourly USD candles</span>
+        <span>{CANDLE_LOOKBACK_LABELS[interval]} · {historyState}</span>
+        <span className={`swap-chart-stream ${streamState}`}>{streamState === "live" ? "Live" : streamState === "connecting" ? "Connecting" : streamState === "stale" ? "Stream stale" : "Historical only"}</span>
+        <span>{latestCandle?.priceSource === "active-bin-quote-usd" ? "Pool price · trusted USD quote" : "Trusted USD price"}</span>
       </footer>
     </section>
   );
@@ -3205,7 +3280,7 @@ function buildPoolDescriptor({
   if (localnetRegistry !== null) {
     return buildSelectedPoolDescriptor({
       action,
-      poolKey: localnetRegistry.seededPools.wethUsdc === undefined ? "wnativeUsdc" : "wethUsdc",
+      poolKey: "wethUsdc",
       registry: localnetRegistry,
       runtime,
       source: "localnet-seeded"
@@ -4052,7 +4127,8 @@ function PoolsView({
     rows: [],
     status: metricsQuery.isError ? "UNAVAILABLE" : "PARTIAL",
     error: metricsQuery.error instanceof Error ? metricsQuery.error.message : null,
-    pageInfo: { endCursor: null, hasNextPage: false, partial: true, pagesLoaded: 0 }
+    pageInfo: { endCursor: null, hasNextPage: false, partial: true, pagesLoaded: 0 },
+    streamCursor: null
   };
   const workspaceRows = useMemo(() => joinPoolWorkspaceRows(pools, metricsPage), [metricsPage, pools]);
   const workspaceRowsByPair = useMemo(
@@ -4080,6 +4156,10 @@ function PoolsView({
   const analyticsState = metricsQuery.isPending || analyticsHealthQuery.isPending
     ? { status: "PARTIAL" as const, label: "Loading application analytics", detail: "Pool metrics and freshness are being resolved." }
     : workspaceAnalyticsState(metricsPage.status, analyticsHealthQuery.data?.value ?? null);
+  const analyticsStateVisible = !metricsQuery.isPending && shouldShowWorkspaceAnalyticsState(
+    metricsPage.status,
+    analyticsHealthQuery.data?.value ?? null
+  );
 
   useEffect(() => {
     const read = () => setDiscoveryState(parsePoolDiscoveryState(window.location.hash));
@@ -4130,11 +4210,13 @@ function PoolsView({
               : `Confirmed by RPC at block ${rpcOverlay.row.updatedAtBlock}; indexing is catching up. This empty pool cannot quote swaps.`}</span>
           </div>
         ) : null}
-        <div className={`workspace-analytics-state ${analyticsState.status.toLowerCase()}`} data-testid="pool-analytics-state" role="status">
-          <span>{analyticsState.label}</span>
-          {analyticsState.detail ? <small>{analyticsState.detail}</small> : null}
-          {metricsPage.error ? <small>{metricsPage.error}</small> : null}
-        </div>
+        {analyticsStateVisible ? (
+          <div className={`workspace-analytics-state ${analyticsState.status.toLowerCase()}`} data-testid="pool-analytics-state" role="status">
+            <span>{analyticsState.label}</span>
+            {analyticsState.detail ? <small>{analyticsState.detail}</small> : null}
+            {metricsPage.error ? <small>{metricsPage.error}</small> : null}
+          </div>
+        ) : null}
         <div className="pool-controls">
           <label>
             <span className="field-label">Search</span>
@@ -8436,11 +8518,15 @@ function LiquidityView({
           <SwapMarketChart
             candles={poolWorkspace?.analytics.candles.rows ?? []}
             error={poolWorkspace?.analytics.candles.error ?? null}
+            interval={poolWorkspace?.analytics.candleInterval ?? "HOUR"}
             loading={poolWorkspace?.analytics.candlesLoading ?? false}
+            onIntervalChange={poolWorkspace?.analytics.setCandleInterval ?? (() => undefined)}
             pairAddress={primaryPool?.address ?? null}
             pairLabel={`${tokenSymbol(tokenX)} / ${tokenSymbol(tokenY)}`}
             status={poolWorkspace?.analytics.candles.status ?? "UNAVAILABLE"}
+            streamState={poolWorkspace?.analytics.candleStreamState ?? "unavailable"}
           />
+          <PoolWorkspaceOwnerPanel />
         </div>
       ) : null}
       {!workspaceMatchesPool || initialSection !== "withdraw" ? (
@@ -10072,7 +10158,9 @@ function hasPartialActivity(snapshot: AppSnapshot | undefined): boolean {
 }
 
 function activityBadgeLabel(snapshot: AppSnapshot | undefined, count: number): string {
-  return hasPartialActivity(snapshot) ? `${count}+ events` : `${count} events`;
+  if (hasPartialActivity(snapshot)) return `${count}+ events`;
+  const windowed = snapshot?.indexer.pagination.swaps.windowed || snapshot?.indexer.pagination.liquidityEvents.windowed;
+  return windowed ? `Latest ${count} events` : `${count} events`;
 }
 
 function isPartialPagination(pageInfo: PaginationInfo | null | undefined): boolean {

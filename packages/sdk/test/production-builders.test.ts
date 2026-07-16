@@ -1443,7 +1443,7 @@ function baseLocalnetManifest(): LocalnetDeploymentManifest {
       open: true
     },
     seededPools: {
-      wnativeUsdc: {
+      wethUsdc: {
         pair: addresses.pair,
         tokenX: addresses.weth,
         tokenY: addresses.usdc,

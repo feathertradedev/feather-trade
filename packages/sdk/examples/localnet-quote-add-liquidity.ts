@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { formatUnits, isAddress, parseUnits, type Address } from "viem";
 
 import {
-  buildSeededWnativeUsdcAddLiquidityTransaction,
+  buildSeededWethUsdcAddLiquidityTransaction,
   createDexPublicClient,
   deadlineFromNow,
   findTokenBySymbol,
@@ -24,16 +24,16 @@ if (manifest.schemaVersion !== "lb.localnet.v1") {
 const registry = registryFromLocalnetManifest(manifest);
 const client = createDexPublicClient(registry.chain, process.env.LOCALNET_RPC_URL ?? registry.endpoints.rpcUrl);
 const account = accountFromEnvOrManifest(manifest.deployer);
-const wnative = findTokenBySymbol(registry.tokens, "WNATIVE");
+const weth = findTokenBySymbol(registry.tokens, "WETH");
 const usdc = findTokenBySymbol(registry.tokens, "USDC");
-if (wnative === null || usdc === null) throw new Error("Required localnet token identity is unavailable or ambiguous");
-const quoteAmountIn = parseUnits(process.env.SDK_EXAMPLE_SWAP_AMOUNT_IN ?? "1", wnative.decimals);
-const liquidityAmountX = parseUnits(process.env.SDK_EXAMPLE_LIQUIDITY_AMOUNT_X ?? "1", wnative.decimals);
+if (weth === null || usdc === null) throw new Error("Required localnet token identity is unavailable or ambiguous");
+const quoteAmountIn = parseUnits(process.env.SDK_EXAMPLE_SWAP_AMOUNT_IN ?? "1", weth.decimals);
+const liquidityAmountX = parseUnits(process.env.SDK_EXAMPLE_LIQUIDITY_AMOUNT_X ?? "1", weth.decimals);
 const liquidityAmountY = parseUnits(process.env.SDK_EXAMPLE_LIQUIDITY_AMOUNT_Y ?? "1", usdc.decimals);
 const deadline = deadlineFromNow(Number(process.env.SDK_EXAMPLE_DEADLINE_MINUTES ?? "20"));
 
 const quote = await getSwapOutQuote(client, registry, quoteAmountIn);
-const addLiquidityTx = buildSeededWnativeUsdcAddLiquidityTransaction(registry, {
+const addLiquidityTx = buildSeededWethUsdcAddLiquidityTransaction(registry, {
   amountX: liquidityAmountX,
   amountY: liquidityAmountY,
   to: account,
@@ -49,7 +49,7 @@ console.log(
       tokenIn: quote.tokenIn,
       tokenOut: quote.tokenOut,
       amountIn: quote.amountIn.toString(),
-      amountInFormatted: formatUnits(quote.amountIn, wnative.decimals),
+      amountInFormatted: formatUnits(quote.amountIn, weth.decimals),
       amountOut: quote.amountOut.toString(),
       amountOutFormatted: formatUnits(quote.amountOut, usdc.decimals),
       fee: quote.fee.toString(),

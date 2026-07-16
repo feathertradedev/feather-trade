@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { AnalyticsEngine } from "./engine.js";
+import { PostgresAnalyticsStore } from "./postgres-store.js";
 import {
   AnalyticsApiService,
   AnalyticsCheckpointStore,
@@ -21,7 +22,12 @@ const engine = new AnalyticsEngine(policies, {
   maxHeadLagSeconds: numberFromEnv("ANALYTICS_MAX_HEAD_LAG_SECONDS", 120),
   maxPositionSnapshotAgeSeconds: numberFromEnv("ANALYTICS_MAX_POSITION_SNAPSHOT_AGE_SECONDS", 300)
 });
-const store = new AnalyticsCheckpointStore(process.env.ANALYTICS_STATE_PATH ?? ".local/analytics/checkpoint.json");
+const store = process.env.ANALYTICS_DATABASE_URL
+  ? new PostgresAnalyticsStore({
+      connectionString: process.env.ANALYTICS_DATABASE_URL,
+      schema: process.env.ANALYTICS_DATABASE_SCHEMA ?? "feather_analytics"
+    })
+  : new AnalyticsCheckpointStore(process.env.ANALYTICS_STATE_PATH ?? ".local/analytics/checkpoint.json");
 const allowFixedTestPrices = booleanFromEnv("ANALYTICS_ALLOW_FIXED_TEST_PRICES", false);
 if (allowFixedTestPrices && process.env.ANALYTICS_ENVIRONMENT !== "localnet") {
   throw new Error("ANALYTICS_ALLOW_FIXED_TEST_PRICES requires ANALYTICS_ENVIRONMENT=localnet");

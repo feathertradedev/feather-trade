@@ -40,11 +40,11 @@ const walletClient = createWalletClient({
   chain: registry.chain,
   transport: http(rpcUrl)
 });
-const pool = registry.seededPools.wnativeUsdc;
-const wnative = findTokenBySymbol(registry.tokens, "WNATIVE");
+const pool = registry.seededPools.wethUsdc;
+const weth = findTokenBySymbol(registry.tokens, "WETH");
 const usdc = findTokenBySymbol(registry.tokens, "USDC");
-if (wnative === null || usdc === null) throw new Error("Required localnet token identity is unavailable or ambiguous");
-const amountX = parseUnits(process.env.SDK_EXAMPLE_LIQUIDITY_AMOUNT_X ?? "0.01", wnative.decimals);
+if (weth === null || usdc === null) throw new Error("Required localnet token identity is unavailable or ambiguous");
+const amountX = parseUnits(process.env.SDK_EXAMPLE_LIQUIDITY_AMOUNT_X ?? "0.01", weth.decimals);
 const amountY = parseUnits(process.env.SDK_EXAMPLE_LIQUIDITY_AMOUNT_Y ?? "1", usdc.decimals);
 const lowerDelta = Number(process.env.SDK_EXAMPLE_LIQUIDITY_LOWER_DELTA ?? "-1");
 const upperDelta = Number(process.env.SDK_EXAMPLE_LIQUIDITY_UPPER_DELTA ?? "1");
@@ -200,7 +200,7 @@ console.log(
       activeId: pool.activeId.toString(),
       range: { lowerDelta, upperDelta },
       amountX: amountX.toString(),
-      amountXFormatted: formatUnits(amountX, wnative.decimals),
+      amountXFormatted: formatUnits(amountX, weth.decimals),
       amountY: amountY.toString(),
       amountYFormatted: formatUnits(amountY, usdc.decimals),
       ids: ids.map((id) => id.toString()),

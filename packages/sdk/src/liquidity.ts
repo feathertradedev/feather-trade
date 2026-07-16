@@ -114,7 +114,7 @@ export async function getSwapOutQuote(
   registry: LocalnetDexRegistry,
   amountIn: bigint
 ): Promise<SwapOutQuote> {
-  const pool = registry.seededPools.wnativeUsdc;
+  const pool = registry.seededPools.wethUsdc;
   assertTokenActionAllowed(registry.tokens, [pool.tokenX, pool.tokenY], "swap");
   const [amountInLeft, amountOut, fee] = await client.readContract({
     address: registry.contracts.lbRouter,
@@ -196,11 +196,11 @@ export function assertSafeIdSlippage(value: bigint): void {
   }
 }
 
-export function buildSeededWnativeUsdcAddLiquidityTransaction(
+export function buildSeededWethUsdcAddLiquidityTransaction(
   registry: LocalnetDexRegistry,
   input: Omit<AddLiquidityCalldataInput, "tokenX" | "tokenY" | "binStep" | "activeIdDesired">
 ): BuiltTransaction {
-  const pool = registry.seededPools.wnativeUsdc;
+  const pool = registry.seededPools.wethUsdc;
 
   return buildAddLiquidityTransaction(registry, {
     ...input,
@@ -294,11 +294,11 @@ export function assertProtectedBurnMinimums(minimums: ProtectedBurnMinimums): vo
   }
 }
 
-export function buildSeededWnativeUsdcRemoveLiquidityTransaction(
+export function buildSeededWethUsdcRemoveLiquidityTransaction(
   registry: LocalnetDexRegistry,
   input: Omit<RemoveLiquidityCalldataInput, "tokenX" | "tokenY" | "binStep">
 ): BuiltTransaction {
-  const pool = registry.seededPools.wnativeUsdc;
+  const pool = registry.seededPools.wethUsdc;
 
   return buildRemoveLiquidityTransaction(registry, {
     ...input,

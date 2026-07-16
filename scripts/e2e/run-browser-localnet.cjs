@@ -55,7 +55,7 @@ async function main() {
 
     const manifest = readManifest();
     assertManifestMatchesBrowserLocalnet(manifest);
-    fundBrowserToken(rpcUrl, manifest.tokens.wnative, "wnative-browser-funding");
+    fundBrowserToken(rpcUrl, manifest.tokens.weth, "weth-browser-funding");
     fundBrowserToken(rpcUrl, manifest.tokens.usdc, "usdc-browser-funding");
 
     runStep(
@@ -207,16 +207,16 @@ function assertManifestMatchesBrowserLocalnet(manifest) {
     chainId,
     deployer: defaultAccount,
     router: "0x0165878a594ca255338adfa4d48449f69242eb8f",
-    pair: "0x4a47586912f0e03d9f3dcaa762fb8b659e52604b",
-    wnative: "0x5fbdb2315678afecb367f032d93f642f64180aa3",
+    pair: "0xbf57b75d71d91e13c97693e4e5b850b0be638dac",
+    weth: "0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9",
     usdc: "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512"
   };
   const actual = {
     chainId: manifest.chainId,
     deployer: String(manifest.deployer).toLowerCase(),
     router: String(manifest.contracts?.lbRouter).toLowerCase(),
-    pair: String(manifest.seededPools?.wnativeUsdc?.pair).toLowerCase(),
-    wnative: String(manifest.tokens?.wnative).toLowerCase(),
+    pair: String(manifest.seededPools?.wethUsdc?.pair).toLowerCase(),
+    weth: String(manifest.tokens?.weth).toLowerCase(),
     usdc: String(manifest.tokens?.usdc).toLowerCase()
   };
 

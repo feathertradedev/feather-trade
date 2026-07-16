@@ -42,7 +42,7 @@ const fixtures = {
     depositCount: String(index + 1),
     updatedAtBlock: String(10_000 - index)
   })),
-  swaps: range(137, (index) => ({
+  swaps: range(501, (index) => ({
     id: `swap-${index}`,
     transactionHash: addressFromIndex(0x7000 + index),
     blockNumber: String(20_000 - index * 2),
@@ -102,11 +102,15 @@ try {
   assert.equal(snapshot.indexer.positions.length, fixtures.positions.length);
   assert.equal(snapshot.indexer.activity.length, GRAPHQL_ACTIVITY_RENDER_LIMIT);
   assert.equal(snapshot.indexer.pagination.pools.loadedCount, fixtures.pairs.length);
-  assert.equal(snapshot.indexer.pagination.swaps.loadedCount, fixtures.swaps.length);
-  assert.equal(snapshot.indexer.pagination.liquidityEvents.loadedCount, fixtures.liquidityEvents.length);
+  assert.equal(snapshot.indexer.pagination.swaps.loadedCount, GRAPHQL_ACTIVITY_RENDER_LIMIT);
+  assert.equal(snapshot.indexer.pagination.liquidityEvents.loadedCount, GRAPHQL_ACTIVITY_RENDER_LIMIT);
   assert.equal(snapshot.indexer.pagination.positions.loadedCount, fixtures.positions.length);
   assert.equal(snapshot.indexer.pagination.pools.capped, false);
+  assert.equal(snapshot.indexer.pagination.swaps.capped, false);
+  assert.equal(snapshot.indexer.pagination.swaps.windowed, true);
+  assert.equal(snapshot.indexer.pagination.liquidityEvents.windowed, true);
   assert.equal(snapshot.indexer.status, "ready");
+  assert.equal(snapshot.indexer.message, null);
 
   const ownerPositions = await loadPaginatedPositionsForOwnerPair(registry(), ownerAddress, pairAddress);
   assert.equal(ownerPositions.rows.length, GRAPHQL_PAGE_SIZE * GRAPHQL_MAX_PAGES);
@@ -133,11 +137,12 @@ try {
   assert.equal(binWindow.at(-1)?.binId, "8388290");
 
   failSwapsAtSkip = 100;
-  const partialSnapshot = await loadAppSnapshot(registry());
-  assert.equal(partialSnapshot.indexer.status, "partial");
-  assert.equal(partialSnapshot.indexer.pagination.swaps.failed, true);
-  assert.equal(partialSnapshot.indexer.pagination.swaps.loadedCount, 100);
-  assert.match(partialSnapshot.indexer.message ?? "", /swaps failed after 100/);
+  const boundedActivitySnapshot = await loadAppSnapshot(registry());
+  assert.equal(boundedActivitySnapshot.indexer.status, "ready");
+  assert.equal(boundedActivitySnapshot.indexer.pagination.swaps.failed, false);
+  assert.equal(boundedActivitySnapshot.indexer.pagination.swaps.loadedCount, GRAPHQL_ACTIVITY_RENDER_LIMIT);
+  assert.equal(boundedActivitySnapshot.indexer.pagination.swaps.windowed, true);
+  assert.equal(boundedActivitySnapshot.indexer.message, null);
 
   failSwapsAtSkip = null;
   rpcChainId = 46_630;
@@ -222,12 +227,12 @@ try {
 
   hangQuery = "SwapsPage";
   hangAtSkip = 100;
-  const laterPageTimeoutSnapshot = await loadAppSnapshot(registry(), { graphqlTimeoutMs: 25 });
-  assert.equal(laterPageTimeoutSnapshot.indexer.status, "partial");
-  assert.equal(laterPageTimeoutSnapshot.indexer.pagination.swaps.failed, true);
-  assert.equal(laterPageTimeoutSnapshot.indexer.pagination.swaps.loadedCount, 100);
-  assert.match(laterPageTimeoutSnapshot.indexer.pagination.swaps.error ?? "", /timed out after 25ms/);
-  assert.match(laterPageTimeoutSnapshot.indexer.message ?? "", /timed out after 25ms/);
+  const abortedBeforeBoundedActivity = abortedGraphRequests;
+  const boundedActivityTimeoutSnapshot = await loadAppSnapshot(registry(), { graphqlTimeoutMs: 25 });
+  assert.equal(boundedActivityTimeoutSnapshot.indexer.status, "ready");
+  assert.equal(boundedActivityTimeoutSnapshot.indexer.pagination.swaps.failed, false);
+  assert.equal(boundedActivityTimeoutSnapshot.indexer.pagination.swaps.windowed, true);
+  assert.equal(abortedGraphRequests, abortedBeforeBoundedActivity);
 
   hangQuery = null;
   hangAtSkip = null;
@@ -237,7 +242,7 @@ try {
 
   globalThis.fetch = originalFetch;
   console.log(
-    `Pagination fixture passed: ${snapshot.indexer.pools.length} pools, ${snapshot.indexer.activity.length} rendered events, ${snapshot.indexer.positions.length} dashboard positions, ${ownerPositions.rows.length}+ owner positions, ${pairBins.rows.length}+ pair bins, partial page failure, unavailable/empty/error/stale indexer states.`
+    `Pagination fixture passed: ${snapshot.indexer.pools.length} pools, latest ${snapshot.indexer.activity.length} rendered events, ${snapshot.indexer.positions.length} dashboard positions, ${ownerPositions.rows.length}+ owner positions, ${pairBins.rows.length}+ pair bins, bounded activity, unavailable/empty/error/stale indexer states.`
   );
 } finally {
   await server.close();
@@ -268,7 +273,7 @@ function registry(environment = "robinhood") {
     ...(environment === "localnet"
       ? {
           seededPools: {
-            wnativeUsdc: {
+            wethUsdc: {
               activeId: 8_388_608,
               binStep: 10,
               pair: pairAddress,

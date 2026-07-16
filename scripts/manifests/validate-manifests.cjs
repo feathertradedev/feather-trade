@@ -126,13 +126,9 @@ function validateLocalnet(manifest, displayPath, errors) {
 
   const seededPools = validateObject(manifest.seededPools, `${displayPath}.seededPools`, errors);
   if (seededPools) {
-    rejectUnexpectedKeys(seededPools, new Set(["wnativeUsdc", "wethUsdc"]), `${displayPath}.seededPools`, errors);
+    rejectUnexpectedKeys(seededPools, new Set(["wethUsdc"]), `${displayPath}.seededPools`, errors);
   }
-  const wnativeUsdc = seededPools && validateObject(seededPools.wnativeUsdc, `${displayPath}.seededPools.wnativeUsdc`, errors);
-  validateSeededPool(wnativeUsdc, `${displayPath}.seededPools.wnativeUsdc`, errors);
-  const wethUsdc = seededPools?.wethUsdc === undefined
-    ? null
-    : validateObject(seededPools.wethUsdc, `${displayPath}.seededPools.wethUsdc`, errors);
+  const wethUsdc = seededPools && validateObject(seededPools.wethUsdc, `${displayPath}.seededPools.wethUsdc`, errors);
   validateSeededPool(wethUsdc, `${displayPath}.seededPools.wethUsdc`, errors);
 
   const smoke = validateObject(manifest.smoke, `${displayPath}.smoke`, errors);

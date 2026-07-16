@@ -201,7 +201,7 @@ interface GraphRequest {
     first?: number;
     fromTimestamp?: number;
     id?: string;
-    interval?: "HOUR" | "DAY";
+    interval?: "ONE_MINUTE" | "FIVE_MINUTES" | "FIFTEEN_MINUTES" | "HOUR" | "FOUR_HOURS" | "DAY" | "WEEK";
     owner?: string;
     pair?: string;
     skip?: number;
@@ -338,7 +338,15 @@ function mockAnalyticsResponse(body: GraphRequest, options: MockRpcOptions): Rec
     const from = body.variables?.fromTimestamp ?? 1_719_913_600;
     const to = body.variables?.toTimestamp ?? from + 23 * 3_600;
     const interval = body.variables?.interval ?? "HOUR";
-    const seconds = interval === "DAY" ? 86_400 : 3_600;
+    const seconds = {
+      ONE_MINUTE: 60,
+      FIVE_MINUTES: 300,
+      FIFTEEN_MINUTES: 900,
+      HOUR: 3_600,
+      FOUR_HOURS: 14_400,
+      DAY: 86_400,
+      WEEK: 604_800
+    }[interval];
     const nodes = Array.from({ length: Math.floor((to - from) / seconds) + 1 }, (_, index) => {
       const open = 2_400_000_000_000_000_000n + BigInt(index) * 2_000_000_000_000_000n;
       const close = open + 1_000_000_000_000_000n;
@@ -358,10 +366,16 @@ function mockAnalyticsResponse(body: GraphRequest, options: MockRpcOptions): Rec
         status: partial && index === 0 ? "PARTIAL" : "READY",
         missingPriceTokens: partial && index === 0 ? [WNATIVE.toLowerCase()] : [],
         firstBlock: String(100 + index),
-        lastBlock: String(100 + index)
+        lastBlock: String(100 + index),
+        firstBlockHash: `0x${(100 + index).toString(16).padStart(64, "0")}`,
+        lastBlockHash: `0x${(100 + index).toString(16).padStart(64, "0")}`,
+        finalized: index < Math.floor((to - from) / seconds),
+        revision: index + 1,
+        priceSource: "active-bin-quote-usd",
+        quoteToken: USDC.toLowerCase()
       };
     }).filter((_, index, candles) => options.analyticsCandleGap !== true || index !== Math.max(1, candles.length - 23));
-    return { data: { pairCandles: { nodes, pageInfo: { endCursor: null, hasNextPage: false, partial } } } };
+    return { data: { pairCandles: { nodes, pageInfo: { endCursor: null, hasNextPage: false, partial }, streamCursor: "0" } } };
   }
   if (query.includes("WebAnalyticsHealth")) {
     return { data: { analyticsHealth: mockAnalyticsHealth(options, partial) } };
@@ -430,7 +444,7 @@ function mockAnalyticsHealth(options: MockRpcOptions, partial: boolean): Record<
     backfillStatus: partial ? "partial" : "complete",
     backfillCursor: null,
     backfillError: null,
-    coverageStartTimestamp: "1719913600",
+    coverageStartTimestamp: "-9007199254740991",
     coverageThroughTimestamp: "1720000000",
     prices: [{ token: WNATIVE.toLowerCase(), source: "mock", feedId: "wnative-usd", status: partial ? "missing" : "available", observedAt: 1_720_000_000, ageSeconds: 0 }]
   };
