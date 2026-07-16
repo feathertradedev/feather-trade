@@ -10,6 +10,11 @@ const rpcUrl = "https://rpc.example.test";
 const factoryAddress = "0x1111111111111111111111111111111111111111";
 const pairAddress = "0x2222222222222222222222222222222222222222";
 const ownerAddress = "0x3333333333333333333333333333333333333333";
+const otherOwnerAddress = "0x3333333333333333333333333333333333333334";
+const otherPairAddress = "0x2222222222222222222222222222222222222223";
+const recipientAddress = "0x3333333333333333333333333333333333333335";
+const routerAddress = "0x3333333333333333333333333333333333333336";
+const zeroAddress = "0x0000000000000000000000000000000000000000";
 const tokenXAddress = "0x4444444444444444444444444444444444444444";
 const tokenYAddress = "0x5555555555555555555555555555555555555555";
 const pinnedBlockHash = `0x${"99".repeat(32)}`;
@@ -53,7 +58,8 @@ const fixtures = {
     amountOutX: index % 2 === 0 ? "0" : "99",
     amountOutY: index % 2 === 0 ? "99" : "0",
     pair: { id: pairAddress },
-    sender: ownerAddress
+    sender: ownerAddress,
+    to: index === 0 ? recipientAddress : ownerAddress
   })),
   liquidityEvents: range(116, (index) => ({
     id: `liquidity-${index}`,
@@ -64,12 +70,25 @@ const fixtures = {
     amountX: "100",
     amountY: "200",
     pair: { id: pairAddress },
-    sender: ownerAddress
+    sender: ownerAddress,
+    to: index === 0 ? recipientAddress : ownerAddress
   })),
+  positionHistoryLiquidity: [
+    historyLiquidityFixture("history-deposit", "DEPOSIT", 0x8801, "41", ["101", "100"], "100", "200", ownerAddress),
+    historyLiquidityFixture("history-withdraw", "WITHDRAW", 0x8802, "42", ["102"], "10", "20", routerAddress)
+  ],
+  positionHistoryTransfers: [
+    historyTransferFixture("history-mint", 0x8801, "41", zeroAddress, ownerAddress, ["100", "101"]),
+    historyTransferFixture("history-same-tx-transfer", 0x8801, "41", ownerAddress, recipientAddress, ["101", "100"]),
+    historyTransferFixture("history-burn", 0x8802, "42", ownerAddress, zeroAddress, ["102"])
+  ],
   positions: range(215, (index) => positionFixture(index)),
   ownerPositions: range(501, (index) => positionFixture(index + 1000))
 };
 let failSwapsAtSkip = null;
+let failPositionHistoryAtSkip = null;
+let failPositionLiquidityDetails = false;
+let forcePoolActivityPair = null;
 let forceSummaryGraphError = false;
 let hasIndexingErrors = false;
 let rpcBlockNumber = 123_460n;
@@ -89,7 +108,21 @@ try {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = mockFetch;
 
-  const { GRAPHQL_ACTIVITY_RENDER_LIMIT, GRAPHQL_MAX_PAGES, GRAPHQL_PAGE_SIZE, loadAppSnapshot, loadPaginatedBinsForPair, loadPaginatedPositionsForOwnerPair, loadPaginatedPositionsForOwnerPairAtBlock, loadPoolBinWindow, loadPoolIndexerSnapshot } =
+  const {
+    GRAPHQL_ACTIVITY_RENDER_LIMIT,
+    GRAPHQL_MAX_PAGES,
+    GRAPHQL_PAGE_SIZE,
+    POOL_ACTIVITY_LIMIT,
+    loadAppSnapshot,
+    loadPaginatedBinsForPair,
+    loadPaginatedPositionsForOwnerPair,
+    loadPaginatedPositionsForOwnerPairAtBlock,
+    loadPoolActivity,
+    loadPoolBinWindow,
+    loadPoolIndexerSnapshot,
+    loadPositionHistory,
+    selectWalletPortfolioPosition
+  } =
     await server.ssrLoadModule("/src/data.ts");
 
   const snapshot = await loadAppSnapshot(registry());
@@ -131,6 +164,120 @@ try {
   );
   assert.equal(pinnedOwnerPositions.rows.length, GRAPHQL_PAGE_SIZE * GRAPHQL_MAX_PAGES);
   assert.deepEqual(pinnedOwnerPositionBlocks, Array(GRAPHQL_MAX_PAGES).fill(123_456));
+
+  const originalOwnerPositions = fixtures.ownerPositions;
+  fixtures.ownerPositions = [positionFixture(1), positionFixture(2)];
+  fixtures.ownerPositions[0].owner = otherOwnerAddress;
+  await assert.rejects(
+    () => loadPaginatedPositionsForOwnerPair(registry(), ownerAddress, pairAddress),
+    /another owner/
+  );
+  fixtures.ownerPositions = [positionFixture(1), positionFixture(2)];
+  fixtures.ownerPositions[0].pair.id = otherPairAddress;
+  await assert.rejects(
+    () => loadPaginatedPositionsForOwnerPair(registry(), ownerAddress, pairAddress),
+    /another pair/
+  );
+  fixtures.ownerPositions = [positionFixture(1), positionFixture(2)];
+  fixtures.ownerPositions[1].id = fixtures.ownerPositions[0].id;
+  await assert.rejects(
+    () => loadPaginatedPositionsForOwnerPair(registry(), ownerAddress, pairAddress),
+    /duplicate position id/
+  );
+  fixtures.ownerPositions = [positionFixture(1), positionFixture(2)];
+  fixtures.ownerPositions[1].bin.binId = fixtures.ownerPositions[0].bin.binId;
+  await assert.rejects(
+    () => loadPaginatedPositionsForOwnerPairAtBlock(registry(), ownerAddress, pairAddress, 123_456n),
+    /duplicate position bin/
+  );
+  fixtures.ownerPositions = originalOwnerPositions;
+
+  const selectedPortfolio = selectWalletPortfolioPosition(
+    walletPortfolioPage([
+      portfolioPosition(ownerAddress, otherPairAddress),
+      portfolioPosition(ownerAddress, pairAddress)
+    ]),
+    ownerAddress,
+    pairAddress
+  );
+  assert.equal(selectedPortfolio?.pair, pairAddress);
+  assert.equal(selectWalletPortfolioPosition(walletPortfolioPage([portfolioPosition(ownerAddress, otherPairAddress)]), ownerAddress, pairAddress), null);
+  assert.throws(
+    () => selectWalletPortfolioPosition(
+      walletPortfolioPage([portfolioPosition(ownerAddress, otherPairAddress), portfolioPosition(otherOwnerAddress, pairAddress)]),
+      ownerAddress,
+      pairAddress
+    ),
+    /another owner/
+  );
+  assert.throws(
+    () => selectWalletPortfolioPosition(
+      walletPortfolioPage([portfolioPosition(ownerAddress, pairAddress), portfolioPosition(ownerAddress, pairAddress)]),
+      ownerAddress,
+      pairAddress
+    ),
+    /duplicate positions/
+  );
+
+  const routerHistory = await loadPositionHistory(registry(), ownerAddress, pairAddress);
+  assert.equal(routerHistory.pageInfo.failed, false);
+  assert.equal(routerHistory.pageInfo.capped, false);
+  assert.deepEqual(routerHistory.rows.map((row) => row.type), ["WITHDRAW", "DEPOSIT", "TRANSFER_OUT"]);
+  assert.deepEqual(routerHistory.rows.find((row) => row.type === "WITHDRAW")?.amountX, "10");
+  assert.deepEqual(routerHistory.rows.find((row) => row.type === "DEPOSIT")?.amountY, "200");
+
+  failPositionLiquidityDetails = true;
+  const partialRouterHistory = await loadPositionHistory(registry(), ownerAddress, pairAddress);
+  assert.equal(partialRouterHistory.pageInfo.failed, true);
+  assert.match(partialRouterHistory.pageInfo.error ?? "", /liquidity details/i);
+  assert.deepEqual(partialRouterHistory.rows.map((row) => row.type), ["WITHDRAW", "DEPOSIT", "TRANSFER_OUT"]);
+  assert.equal(partialRouterHistory.rows.find((row) => row.type === "WITHDRAW")?.amountX, null);
+  failPositionLiquidityDetails = false;
+
+  const originalHistoryLiquidity = fixtures.positionHistoryLiquidity;
+  const originalHistoryTransfers = fixtures.positionHistoryTransfers;
+  fixtures.positionHistoryLiquidity = range(101, (index) =>
+    historyLiquidityFixture(`paged-liquidity-${index}`, "DEPOSIT", 0xa000 + index, String(1000 + index), [String(2000 + index)], "1", "2", ownerAddress)
+  );
+  fixtures.positionHistoryTransfers = range(101, (index) =>
+    historyTransferFixture(`paged-transfer-${index}`, 0xa000 + index, String(1000 + index), zeroAddress, ownerAddress, [String(2000 + index)])
+  );
+  const pagedHistory = await loadPositionHistory(registry(), ownerAddress, pairAddress);
+  assert.equal(pagedHistory.rows.length, 101);
+  assert.equal(pagedHistory.pageInfo.failed, false);
+  assert.equal(pagedHistory.pageInfo.capped, false);
+  assert(pagedHistory.rows.every((row) => row.type === "DEPOSIT" && row.amountX === "1"));
+
+  failPositionHistoryAtSkip = GRAPHQL_PAGE_SIZE;
+  const partialPagedHistory = await loadPositionHistory(registry(), ownerAddress, pairAddress);
+  assert.equal(partialPagedHistory.rows.length, GRAPHQL_PAGE_SIZE);
+  assert.equal(partialPagedHistory.pageInfo.failed, true);
+  assert.match(partialPagedHistory.pageInfo.error ?? "", /history page failed/i);
+  failPositionHistoryAtSkip = null;
+
+  fixtures.positionHistoryLiquidity = range(GRAPHQL_PAGE_SIZE * GRAPHQL_MAX_PAGES, (index) =>
+    historyLiquidityFixture(`capped-liquidity-${index}`, "DEPOSIT", 0xb000 + index, String(2000 + index), [String(3000 + index)], "1", "2", ownerAddress)
+  );
+  fixtures.positionHistoryTransfers = range(GRAPHQL_PAGE_SIZE * GRAPHQL_MAX_PAGES, (index) =>
+    historyTransferFixture(`capped-transfer-${index}`, 0xb000 + index, String(2000 + index), zeroAddress, ownerAddress, [String(3000 + index)])
+  );
+  const cappedHistory = await loadPositionHistory(registry(), ownerAddress, pairAddress);
+  assert.equal(cappedHistory.rows.length, GRAPHQL_PAGE_SIZE * GRAPHQL_MAX_PAGES);
+  assert.equal(cappedHistory.pageInfo.capped, true);
+  assert.equal(cappedHistory.pageInfo.failed, false);
+  fixtures.positionHistoryLiquidity = originalHistoryLiquidity;
+  fixtures.positionHistoryTransfers = originalHistoryTransfers;
+
+  const poolActivity = await loadPoolActivity(registry(), pairAddress);
+  assert.equal(poolActivity.rows.length, POOL_ACTIVITY_LIMIT);
+  assert.equal(poolActivity.pageInfo.windowed, true);
+  assert(poolActivity.rows.every((row) => row.pair.toLowerCase() === pairAddress));
+  const recipientActivity = await loadPoolActivity(registry(), pairAddress, recipientAddress);
+  assert.equal(recipientActivity.rows.length, 2);
+  assert(recipientActivity.rows.every((row) => row.id.endsWith("-0")));
+  forcePoolActivityPair = otherPairAddress;
+  await assert.rejects(() => loadPoolActivity(registry(), pairAddress), /another pair/);
+  forcePoolActivityPair = null;
 
   const pairBins = await loadPaginatedBinsForPair(registry(), pairAddress);
   assert.equal(pairBins.rows.length, GRAPHQL_PAGE_SIZE * GRAPHQL_MAX_PAGES);
@@ -398,6 +545,42 @@ async function mockFetch(url, init) {
     });
   }
 
+  if (query.includes("PositionLiquidityDetails")) {
+    if (failPositionLiquidityDetails) {
+      return jsonResponse({ errors: [{ message: "Synthetic liquidity details failure" }] });
+    }
+    assert.match(query, /transactionHash_in:\s*\$transactionHashes/);
+    const hashes = new Set((variables.transactionHashes ?? []).map((hash) => String(hash).toLowerCase()));
+    const matching = fixtures.positionHistoryLiquidity.filter((event) => hashes.has(event.transactionHash.toLowerCase()));
+    return jsonResponse({ data: { liquidityEvents: page(matching, variables) } });
+  }
+
+  if (query.includes("PositionLiquidityHistory")) {
+    if (failPositionHistoryAtSkip !== null && Number(variables.skip) >= failPositionHistoryAtSkip) {
+      return jsonResponse({ errors: [{ message: "Synthetic position history page failed" }] });
+    }
+    assert.equal(String(variables.owner), ownerAddress.toLowerCase());
+    assert.equal(String(variables.pair), pairAddress.toLowerCase());
+    return jsonResponse({ data: { transferBatchEvents: page(fixtures.positionHistoryTransfers, variables) } });
+  }
+
+  if (query.includes("PoolActivity")) {
+    assert.equal(String(variables.pair), pairAddress.toLowerCase());
+    assert.equal(Number(variables.first), 101);
+    const owner = variables.owner === undefined ? null : String(variables.owner).toLowerCase();
+    const belongsToOwner = (event) => owner === null || event.sender.toLowerCase() === owner || event.to.toLowerCase() === owner;
+    const pair = forcePoolActivityPair ?? pairAddress;
+    const swaps = fixtures.swaps.filter(belongsToOwner).slice(0, Number(variables.first)).map((event) => ({
+      ...event,
+      pair: { id: pair }
+    }));
+    const liquidityEvents = fixtures.liquidityEvents.filter(belongsToOwner).slice(0, Number(variables.first)).map((event) => ({
+      ...event,
+      pair: { id: pair }
+    }));
+    return jsonResponse({ data: { liquidityEvents, swaps } });
+  }
+
   if (query.includes("PairBins")) {
     assert.equal(String(variables.pair), pairAddress.toLowerCase());
     return jsonResponse({ data: { bins: page(fixtures.bins, variables) } });
@@ -473,6 +656,60 @@ function positionFixture(index) {
     updatedAtBlock: String(30_000 - index),
     pair: { id: pairAddress },
     bin: { binId: String(index) }
+  };
+}
+
+function historyLiquidityFixture(id, type, transactionIndex, blockNumber, ids, amountX, amountY, to) {
+  return {
+    id,
+    type,
+    transactionHash: addressFromIndex(transactionIndex),
+    blockNumber,
+    timestamp: String(1_800_000_000 + Number(blockNumber)),
+    amountX,
+    amountY,
+    ids,
+    pair: { id: pairAddress },
+    sender: routerAddress,
+    to
+  };
+}
+
+function historyTransferFixture(id, transactionIndex, blockNumber, from, to, ids) {
+  return {
+    id,
+    transactionHash: addressFromIndex(transactionIndex),
+    blockNumber,
+    timestamp: String(1_800_000_000 + Number(blockNumber)),
+    sender: routerAddress,
+    from,
+    to,
+    ids,
+    pair: { id: pairAddress }
+  };
+}
+
+function portfolioPosition(owner, pair) {
+  return {
+    owner,
+    pair,
+    bins: [],
+    costBasisUsdE18: null,
+    currentValueUsdE18: null,
+    realizedPnlUsdE18: null,
+    unrealizedPnlUsdE18: null,
+    status: "UNAVAILABLE",
+    missingPriceTokens: [],
+    asOfBlock: null,
+    asOfTimestamp: null
+  };
+}
+
+function walletPortfolioPage(positions) {
+  return {
+    positions,
+    pageInfo: { endCursor: null, hasNextPage: false, partial: false },
+    health: { fresh: true, headBlock: "1", status: "READY" }
   };
 }
 
