@@ -2,7 +2,7 @@
 
 `pnpm localnet:up` writes `latest.json` in this directory after starting Anvil if needed and deploying the LB v2.2 local stack. It creates one real pool:
 
-- `WETH/USDC` is the transaction, market-activity, indexer, and frontend reference pool. It is funded across on-chain bins around an approximately $2,000 active price.
+- `WETH/USDC` is the transaction, market-activity, indexer, and frontend reference pool. The deploy smoke funds correctly single-sided liquidity from active ±8, and the automatic seeder extends the on-chain curve through active ±15 around an approximately $2,000 price. Local depth is intentionally bounded so the development trader visibly crosses bins while remaining inside its hard range.
 
 The deployment runs the WETH/USDC seeder automatically. To add the same distribution to an already-running local deployment, run `pnpm localnet:seed:liquidity`. Re-running the seeder adds liquidity to the existing curve; it does not replace or fabricate indexed data.
 

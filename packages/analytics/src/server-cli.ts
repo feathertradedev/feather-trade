@@ -8,6 +8,7 @@ import {
   AnalyticsApiService,
   AnalyticsCheckpointStore,
   startAnalyticsHttpServer,
+  type AnalyticsStateStore,
   type AnalyticsBlockSource,
   type PositionSnapshotProvider,
   type PriceSampleVerifier
@@ -22,7 +23,7 @@ const engine = new AnalyticsEngine(policies, {
   maxHeadLagSeconds: numberFromEnv("ANALYTICS_MAX_HEAD_LAG_SECONDS", 120),
   maxPositionSnapshotAgeSeconds: numberFromEnv("ANALYTICS_MAX_POSITION_SNAPSHOT_AGE_SECONDS", 300)
 });
-const store = process.env.ANALYTICS_DATABASE_URL
+const store: AnalyticsStateStore = process.env.ANALYTICS_DATABASE_URL
   ? new PostgresAnalyticsStore({
       connectionString: process.env.ANALYTICS_DATABASE_URL,
       schema: process.env.ANALYTICS_DATABASE_SCHEMA ?? "feather_analytics"
@@ -67,7 +68,7 @@ if (!coverageComplete) {
 }
 const host = process.env.ANALYTICS_HOST ?? "127.0.0.1";
 const port = numberFromEnv("ANALYTICS_PORT", 8787);
-await startAnalyticsHttpServer({
+const server = await startAnalyticsHttpServer({
   service,
   host,
   port,
@@ -76,8 +77,12 @@ await startAnalyticsHttpServer({
 });
 process.stdout.write(`Feather analytics listening on http://${host}:${port}\n`);
 if (blockSource?.followLive) {
-  void blockSource.followLive((block) => service.ingestBlock(block)).catch((error: unknown) => {
+  void blockSource.followLive((block) => service.ingestBlock(block)).catch(async (error: unknown) => {
     process.stderr.write(`Analytics live source failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    const closed = new Promise<void>((resolve) => server.close(() => resolve()));
+    server.closeAllConnections();
+    await closed;
+    await store.close?.();
     process.exitCode = 1;
   });
 }

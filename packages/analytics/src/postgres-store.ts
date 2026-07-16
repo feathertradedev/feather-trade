@@ -1,6 +1,6 @@
 import { Pool, type PoolClient } from "pg";
 
-import type { AnalyticsCheckpoint } from "./engine.js";
+import type { AnalyticsCheckpoint, AnalyticsCheckpointMetadata } from "./engine.js";
 import { decodeTaggedJson, encodeTaggedJson, type AnalyticsStateStore, type CandleStreamEvent } from "./service.js";
 import type { Candle } from "./types.js";
 
@@ -82,6 +82,56 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
            WHERE incoming.pair = stored.pair AND incoming.interval = stored.interval AND incoming.start_timestamp = stored.start_timestamp
          )`
       );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async appendCanonicalState(
+    metadata: AnalyticsCheckpointMetadata,
+    block: AnalyticsCheckpoint["blocks"][number],
+    candles: readonly Candle[]
+  ): Promise<void> {
+    await this.#initialize();
+    const client = await this.#pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `INSERT INTO ${this.#schema}.canonical_blocks (number, hash, parent_hash, timestamp, payload)
+         VALUES ($1, $2, $3, $4, $5::jsonb)
+         ON CONFLICT (number) DO UPDATE SET
+           hash = EXCLUDED.hash,
+           parent_hash = EXCLUDED.parent_hash,
+           timestamp = EXCLUDED.timestamp,
+           payload = EXCLUDED.payload`,
+        [block.number.toString(), block.hash, block.parentHash, block.timestamp, encodeTaggedJson(block)]
+      );
+      await client.query(
+        `INSERT INTO ${this.#schema}.checkpoint (singleton, payload, updated_at) VALUES (TRUE, $1::jsonb, NOW())
+         ON CONFLICT (singleton) DO UPDATE SET payload = EXCLUDED.payload, updated_at = EXCLUDED.updated_at`,
+        [encodeTaggedJson({ ...metadata, blocks: [] })]
+      );
+      if (candles.length > 0) {
+        await client.query(`CREATE TEMP TABLE incoming_analytics_candle_changes (pair TEXT, interval TEXT, start_timestamp BIGINT, finalized BOOLEAN, revision INTEGER, payload JSONB, PRIMARY KEY (pair, interval, start_timestamp)) ON COMMIT DROP`);
+        await client.query(
+          `INSERT INTO incoming_analytics_candle_changes
+           SELECT pair, interval, start_timestamp, finalized, revision, payload
+           FROM jsonb_to_recordset($1::jsonb) AS row(pair TEXT, interval TEXT, start_timestamp BIGINT, finalized BOOLEAN, revision INTEGER, payload JSONB)`,
+          [encodeRows(candles.map((candle) => ({ pair: candle.pair, interval: candle.interval, start_timestamp: candle.startTimestamp, finalized: candle.finalized, revision: candle.revision, payload: taggedValue(candle) })))]
+        );
+        await client.query(
+          `INSERT INTO ${this.#schema}.candles (pair, interval, start_timestamp, finalized, revision, payload)
+           SELECT pair, interval, start_timestamp, finalized, revision, payload FROM incoming_analytics_candle_changes
+           ON CONFLICT (pair, interval, start_timestamp) DO UPDATE SET
+             finalized = EXCLUDED.finalized,
+             revision = EXCLUDED.revision,
+             payload = EXCLUDED.payload`
+        );
+      }
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK");

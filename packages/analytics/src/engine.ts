@@ -135,6 +135,8 @@ export interface AnalyticsCheckpoint {
   };
 }
 
+export type AnalyticsCheckpointMetadata = Omit<AnalyticsCheckpoint, "blocks">;
+
 export interface CanonicalHead {
   number: bigint;
   hash: string;
@@ -153,6 +155,7 @@ export class AnalyticsEngine {
   #flows: FlowRow[] = [];
   #candles = new Map<string, MutableCandle>();
   #positions = new Map<string, MutableWalletPairPosition>();
+  #lastChangedCandleKeys = new Set<string>();
   #reorgCount = 0;
   #partialEventCount = 0;
   #eventIsPartial = false;
@@ -182,20 +185,21 @@ export class AnalyticsEngine {
     const existing = this.#blocks.find((candidate) => candidate.hash.toLowerCase() === block.hash.toLowerCase());
     if (existing) {
       if (existing.number !== block.number) throw new Error(`Block hash ${block.hash} changed number`);
+      this.#lastChangedCandleKeys = new Set();
       return "duplicate";
     }
 
     const head = this.#blocks.at(-1);
     if (!head) {
       this.#blocks.push(cloneBlock(block));
-      this.#rebuild();
+      this.#lastChangedCandleKeys = this.#applyCanonicalAppend(block, null);
       this.#advanceCoverage(block.timestamp);
       return "appended";
     }
 
     if (block.number === head.number + 1n && sameHash(block.parentHash, head.hash)) {
       this.#blocks.push(cloneBlock(block));
-      this.#rebuild();
+      this.#lastChangedCandleKeys = this.#applyCanonicalAppend(block, head.timestamp);
       this.#advanceCoverage(block.timestamp);
       return "appended";
     }
@@ -213,6 +217,7 @@ export class AnalyticsEngine {
     this.#blocks.splice(parentIndex + 1, this.#blocks.length, cloneBlock(block));
     this.#reorgCount += 1;
     this.#rebuild();
+    this.#lastChangedCandleKeys = new Set(this.#candles.keys());
     this.#advanceCoverage(block.timestamp);
     return "reorg";
   }
@@ -227,9 +232,15 @@ export class AnalyticsEngine {
 
   exportCheckpoint(): AnalyticsCheckpoint {
     return {
+      ...this.exportCheckpointMetadata(),
+      blocks: structuredClone(this.#blocks),
+    };
+  }
+
+  exportCheckpointMetadata(): AnalyticsCheckpointMetadata {
+    return {
       version: 1,
       reorgCount: this.#reorgCount,
-      blocks: structuredClone(this.#blocks),
       backfill: {
         status: this.#backfillStatus,
         cursor: this.#backfillCursor,
@@ -243,6 +254,11 @@ export class AnalyticsEngine {
   getCanonicalHead(): CanonicalHead | null {
     const head = this.#blocks.at(-1);
     return head ? { number: head.number, hash: head.hash, timestamp: head.timestamp } : null;
+  }
+
+  getCanonicalHeadEnvelope(): BlockEnvelope | null {
+    const head = this.#blocks.at(-1);
+    return head === undefined ? null : cloneBlock(head);
   }
 
   augmentHeadPositionSnapshots(expectedHead: CanonicalHead, snapshots: readonly PositionSnapshotEvent[]): void {
@@ -356,16 +372,13 @@ export class AnalyticsEngine {
       throw new Error(`Candle query cannot span more than ${MAX_CANDLE_POINTS} ${input.interval} buckets`);
     }
     const headTimestamp = this.#blocks.at(-1)?.timestamp ?? null;
-    const rows = [...this.#candles.values()]
-      .filter(
-        (candle) =>
-          candle.pair === pair &&
-          candle.interval === input.interval &&
-          candle.startTimestamp >= input.fromTimestamp &&
-          candle.startTimestamp <= input.toTimestamp
-      )
-      .sort((a, b) => a.startTimestamp - b.startTimestamp)
-      .map((candle) => finalizeCandle(candle, headTimestamp));
+    const rows: Candle[] = [];
+    let startTimestamp = candleBoundary(input.fromTimestamp, input.interval);
+    if (startTimestamp < input.fromTimestamp) startTimestamp += intervalSeconds;
+    for (let timestamp = startTimestamp; timestamp <= input.toTimestamp; timestamp += intervalSeconds) {
+      const candle = this.#candles.get(`${pair}:${input.interval}:${timestamp}`);
+      if (candle !== undefined) rows.push(finalizeCandle(candle, headTimestamp));
+    }
     return paginate(
       rows,
       input.first,
@@ -384,6 +397,20 @@ export class AnalyticsEngine {
         left.startTimestamp - right.startTimestamp
       )
       .map((candle) => finalizeCandle(candle, headTimestamp));
+  }
+
+  listLastChangedCandles(): Candle[] {
+    const headTimestamp = this.#blocks.at(-1)?.timestamp ?? null;
+    return [...this.#lastChangedCandleKeys]
+      .flatMap((key) => {
+        const candle = this.#candles.get(key);
+        return candle === undefined ? [] : [finalizeCandle(candle, headTimestamp)];
+      })
+      .sort((left, right) =>
+        left.pair.localeCompare(right.pair) ||
+        left.interval.localeCompare(right.interval) ||
+        left.startTimestamp - right.startTimestamp
+      );
   }
 
   queryWalletPositions(input: { owner: string; first: number; after?: string | null }): Connection<WalletPairPosition> {
@@ -414,11 +441,66 @@ export class AnalyticsEngine {
     this.#partialEventCount = 0;
     this.#missingPriceTokens = new Set();
 
-    for (const block of this.#blocks) {
-      for (const sample of block.prices) this.#priceBook.apply(sample, block.timestamp);
-      for (const event of block.events) this.#applyEvent(event, block.number, block.hash, block.timestamp);
-    }
+    for (const block of this.#blocks) this.#applyCanonicalBlock(block);
     this.#buildCandleRollups();
+  }
+
+  /**
+   * Canonical appends are applied once. Replaying the complete retained chain on
+   * every new block made ingestion quadratic and obscured the idempotency model.
+   * Reorgs still take the intentionally conservative full-rebuild path above.
+   */
+  #applyCanonicalAppend(block: BlockEnvelope, previousHeadTimestamp: number | null): Set<string> {
+    const changedKeys = this.#newlyFinalizedCandleKeys(previousHeadTimestamp, block.timestamp);
+    this.#applyCanonicalBlock(block);
+    const changedPairs = new Set(
+      block.events.flatMap((event) =>
+        event.kind === "position-snapshot" || event.kind === "position-transfer"
+          ? []
+          : [normalize(event.pair)]
+      )
+    );
+    for (const pair of changedPairs) {
+      changedKeys.add(`${pair}:minute:${candleBoundary(block.timestamp, "minute")}`);
+      this.#rebuildRollupBucket(pair, "five-minutes", "minute", block.timestamp);
+      changedKeys.add(`${pair}:five-minutes:${candleBoundary(block.timestamp, "five-minutes")}`);
+      this.#rebuildRollupBucket(pair, "fifteen-minutes", "minute", block.timestamp);
+      changedKeys.add(`${pair}:fifteen-minutes:${candleBoundary(block.timestamp, "fifteen-minutes")}`);
+      this.#rebuildRollupBucket(pair, "hour", "minute", block.timestamp);
+      changedKeys.add(`${pair}:hour:${candleBoundary(block.timestamp, "hour")}`);
+      this.#rebuildRollupBucket(pair, "four-hours", "hour", block.timestamp);
+      changedKeys.add(`${pair}:four-hours:${candleBoundary(block.timestamp, "four-hours")}`);
+      this.#rebuildRollupBucket(pair, "day", "hour", block.timestamp);
+      changedKeys.add(`${pair}:day:${candleBoundary(block.timestamp, "day")}`);
+      this.#rebuildRollupBucket(pair, "week", "day", block.timestamp);
+      changedKeys.add(`${pair}:week:${candleBoundary(block.timestamp, "week")}`);
+    }
+    return changedKeys;
+  }
+
+  #newlyFinalizedCandleKeys(previousHeadTimestamp: number | null, nextHeadTimestamp: number): Set<string> {
+    const keys = new Set<string>();
+    if (previousHeadTimestamp === null || nextHeadTimestamp <= previousHeadTimestamp) return keys;
+    for (const pair of this.#pairs.keys()) {
+      for (const interval of CANDLE_INTERVALS) {
+        const startTimestamp = candleBoundary(previousHeadTimestamp, interval);
+        const key = `${pair}:${interval}:${startTimestamp}`;
+        const candle = this.#candles.get(key);
+        if (
+          candle !== undefined &&
+          previousHeadTimestamp < candle.endTimestamp &&
+          nextHeadTimestamp >= candle.endTimestamp
+        ) {
+          keys.add(key);
+        }
+      }
+    }
+    return keys;
+  }
+
+  #applyCanonicalBlock(block: BlockEnvelope): void {
+    for (const sample of block.prices) this.#priceBook.apply(sample, block.timestamp);
+    for (const event of block.events) this.#applyEvent(event, block.number, block.hash, block.timestamp);
   }
 
   #applyEvent(event: AnalyticsEvent, blockNumber: bigint, blockHash: Hex, timestamp: number): void {
@@ -547,6 +629,12 @@ export class AnalyticsEngine {
   }
 
   #buildCandleRollups(): void {
+    // Rollups are derived views of the canonical one-minute base. Recreate them
+    // deterministically after every append/reorg so a source revision can never
+    // be counted twice and every dependent interval receives the same result.
+    for (const [key, candle] of this.#candles) {
+      if (candle.interval !== "minute") this.#candles.delete(key);
+    }
     const minutes = [...this.#candles.values()]
       .filter((candle) => candle.interval === "minute")
       .sort((left, right) => left.startTimestamp - right.startTimestamp);
@@ -557,30 +645,7 @@ export class AnalyticsEngine {
         const key = `${source.pair}:${interval}:${startTimestamp}`;
         let rollup = this.#candles.get(key);
         if (!rollup) {
-          rollup = {
-            pair: source.pair,
-            interval,
-            startTimestamp,
-            endTimestamp: startTimestamp + candleIntervalSeconds(interval),
-            openUsdE18: null,
-            highUsdE18: null,
-            lowUsdE18: null,
-            closeUsdE18: null,
-            volumeUsdE18: 0n,
-            feesUsdE18: 0n,
-            tvlUsdE18: null,
-            swapCount: 0,
-            missingVolumeValue: false,
-            missingFeeValue: false,
-            missingPriceTokens: new Set(),
-            firstBlock: source.firstBlock,
-            lastBlock: source.lastBlock,
-            firstBlockHash: source.firstBlockHash,
-            lastBlockHash: source.lastBlockHash,
-            revision: 0,
-            priceSource: null,
-            quoteToken: source.quoteToken
-          };
+          rollup = createRollupCandle(source, interval, startTimestamp);
           this.#candles.set(key, rollup);
         }
         mergeCandleIntoRollup(rollup, source);
@@ -595,6 +660,29 @@ export class AnalyticsEngine {
       .filter((candle) => candle.interval === "day")
       .sort((left, right) => left.startTimestamp - right.startTimestamp);
     rollup(days, ["week"]);
+  }
+
+  #rebuildRollupBucket(
+    pair: string,
+    interval: CandleInterval,
+    sourceInterval: CandleInterval,
+    timestamp: number
+  ): void {
+    const startTimestamp = candleBoundary(timestamp, interval);
+    const endTimestamp = startTimestamp + candleIntervalSeconds(interval);
+    const key = `${pair}:${interval}:${startTimestamp}`;
+    const sourceSeconds = candleIntervalSeconds(sourceInterval);
+    const sources: MutableCandle[] = [];
+    for (let sourceTimestamp = startTimestamp; sourceTimestamp < endTimestamp; sourceTimestamp += sourceSeconds) {
+      const source = this.#candles.get(`${pair}:${sourceInterval}:${sourceTimestamp}`);
+      if (source !== undefined) sources.push(source);
+    }
+    this.#candles.delete(key);
+    const first = sources[0];
+    if (first === undefined) return;
+    const rollup = createRollupCandle(first, interval, startTimestamp);
+    for (const source of sources) mergeCandleIntoRollup(rollup, source);
+    this.#candles.set(key, rollup);
   }
 
   #applyLiquidity(event: LiquidityAnalyticsEvent, timestamp: number): void {
@@ -922,6 +1010,37 @@ function mergeCandleIntoRollup(rollup: MutableCandle, source: MutableCandle): vo
   rollup.lastBlockHash = source.lastBlockHash;
   rollup.revision += source.revision;
   rollup.priceSource = mergePriceSource(rollup.priceSource, source.priceSource ?? "trusted-token-usd");
+}
+
+function createRollupCandle(
+  source: MutableCandle,
+  interval: CandleInterval,
+  startTimestamp: number
+): MutableCandle {
+  return {
+    pair: source.pair,
+    interval,
+    startTimestamp,
+    endTimestamp: startTimestamp + candleIntervalSeconds(interval),
+    openUsdE18: null,
+    highUsdE18: null,
+    lowUsdE18: null,
+    closeUsdE18: null,
+    volumeUsdE18: 0n,
+    feesUsdE18: 0n,
+    tvlUsdE18: null,
+    swapCount: 0,
+    missingVolumeValue: false,
+    missingFeeValue: false,
+    missingPriceTokens: new Set(),
+    firstBlock: source.firstBlock,
+    lastBlock: source.lastBlock,
+    firstBlockHash: source.firstBlockHash,
+    lastBlockHash: source.lastBlockHash,
+    revision: 0,
+    priceSource: null,
+    quoteToken: source.quoteToken
+  };
 }
 
 function mergePriceSource(

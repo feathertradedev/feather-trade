@@ -12,7 +12,9 @@ import {
   createSeededRandom,
   jitterIntervalMs,
   sampleTradeAmount,
-  safeDirectionCandidates
+  safeDirectionCandidates,
+  verifyMarketActivityMovement,
+  type MarketActivityConfig
 } from "../src/index.js";
 
 const range = { anchor: 100, hardRadius: 8, turnaroundRadius: 6 };
@@ -138,4 +140,13 @@ test("rejects mainnet and builds deterministic 15-day seed coverage", () => {
   for (let minute = denseStart; minute <= currentMinute; minute += 60) assert(denseMinutes.has(minute));
   const gaps = schedule.slice(1).map((timestamp, index) => timestamp - schedule[index]!);
   assert(new Set(gaps).size > 50, "historical activity should not follow one mechanical cadence");
+});
+
+test("movement verification honors an already-aborted signal before RPC or transactions", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    () => verifyMarketActivityMovement({ environment: "localnet" } as MarketActivityConfig, { signal: controller.signal }),
+    (error: unknown) => error instanceof DOMException && error.name === "AbortError"
+  );
 });

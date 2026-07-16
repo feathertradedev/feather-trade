@@ -8,7 +8,8 @@ The package provides:
 
 - trusted, policy-gated USD price samples;
 - exact 24-hour pool volume, fee, TVL, and fee/TVL metrics;
-- hourly and daily OHLC/volume/fee/TVL candles;
+- 1m, 5m, 15m, 1h, 4h, 1d, and Monday-aligned 1w OHLC/volume/fee/TVL candles;
+- bounded historical GraphQL pages plus resumable SSE candle replacements;
 - grouped owner/pair/bin balances with cost basis and realized/unrealized P&L;
 - parent-hash reorg rollback and deterministic replay;
 - resumable, capped backfill helpers and cursor-limited query methods; and
@@ -23,7 +24,13 @@ Run:
 ```sh
 pnpm analytics:typecheck
 pnpm analytics:test
+pnpm analytics:load
 ```
+
+The accepted boundaries, rollup DAG, mutable/finalized lifecycle, PostgreSQL
+retention/partition plan, SSE resume/backpressure behavior, reorg recovery,
+compatibility contract, and capacity targets are documented in
+[`docs/wave-5/candle-architecture.md`](../../docs/wave-5/candle-architecture.md).
 
 `AnalyticsApiService` implements `schema.graphql`, persists canonical blocks and
 coverage state through atomic checkpoints, restores on restart, and exposes a

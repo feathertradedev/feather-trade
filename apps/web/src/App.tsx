@@ -1579,8 +1579,12 @@ function SwapView({
   const analyticsEndpoint = analyticsEndpointForRegistry(registry);
   const workspaceMatchesPool = poolWorkspace !== null && primaryPool !== null && isAddressEqual(poolWorkspace.pool.address, primaryPool.address);
   const candleInterval = workspaceMatchesPool ? poolWorkspace.analytics.candleInterval : standaloneCandleInterval;
-  const candleEnd = candleBoundary(Math.floor(Date.now() / 1_000), candleInterval);
-  const candleStart = candleEnd - CANDLE_LOOKBACK_SECONDS[candleInterval];
+  const standaloneCandleWindow = useMemo(() => {
+    const end = candleBoundary(Math.floor(Date.now() / 1_000), candleInterval);
+    return { end, start: end - CANDLE_LOOKBACK_SECONDS[candleInterval] };
+  }, [candleInterval, environmentKey, primaryPool?.address]);
+  const candleEnd = standaloneCandleWindow.end;
+  const candleStart = standaloneCandleWindow.start;
   const swapCandlesQuery = useQuery({
     queryKey: ["swapCandles", environmentKey, primaryPool?.address, candleInterval, candleStart, candleEnd],
     queryFn: () => {

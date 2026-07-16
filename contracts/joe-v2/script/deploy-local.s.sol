@@ -32,9 +32,12 @@ contract LocalnetDeployScript is Script {
     uint24 private constant DEFAULT_MAX_VOLATILITY_ACCUMULATOR = 350_000;
     bool private constant DEFAULT_OPEN_STATE = true;
     uint256 private constant DISTRIBUTION_PRECISION = 1e18;
-    uint256 private constant TOKEN_MINT_AMOUNT = 1_000 ether;
-    uint256 private constant LIQUIDITY_AMOUNT_X = 0.01 ether;
-    uint256 private constant LIQUIDITY_AMOUNT_Y = 20 ether;
+    uint256 private constant TOKEN_MINT_AMOUNT = 100_000 ether;
+    uint256 private constant WNATIVE_MINT_AMOUNT = 1_000 ether;
+    uint256 private constant LIQUIDITY_AMOUNT_X = 15 ether;
+    uint256 private constant LIQUIDITY_AMOUNT_Y = 30_000 ether;
+    uint256 private constant LIQUIDITY_RADIUS = 8;
+    uint256 private constant LIQUIDITY_BIN_COUNT = LIQUIDITY_RADIUS * 2 + 1;
     uint256 private constant SWAP_AMOUNT_IN = 0.001 ether;
     string private constant DEFAULT_LOCALNET_RPC_URL = "http://127.0.0.1:8545";
     string private constant DEFAULT_LOCALNET_INDEXER_URL = "http://127.0.0.1:8000/subgraphs/name/robinhood-lb/localnet";
@@ -136,7 +139,7 @@ contract LocalnetDeployScript is Script {
     }
 
     function _mintAndApprove(Deployment memory deployment) private {
-        deployment.wnative.deposit{value: TOKEN_MINT_AMOUNT}();
+        deployment.wnative.deposit{value: WNATIVE_MINT_AMOUNT}();
         deployment.usdc.mint(deployment.deployer, TOKEN_MINT_AMOUNT);
         deployment.usdt.mint(deployment.deployer, TOKEN_MINT_AMOUNT);
         deployment.weth.mint(deployment.deployer, TOKEN_MINT_AMOUNT);
@@ -148,12 +151,21 @@ contract LocalnetDeployScript is Script {
     }
 
     function _addSmokeLiquidity(Deployment memory deployment) private {
-        int256[] memory deltaIds = new int256[](1);
-        uint256[] memory distributionX = new uint256[](1);
-        uint256[] memory distributionY = new uint256[](1);
+        int256[] memory deltaIds = new int256[](LIQUIDITY_BIN_COUNT);
+        uint256[] memory distributionX = new uint256[](LIQUIDITY_BIN_COUNT);
+        uint256[] memory distributionY = new uint256[](LIQUIDITY_BIN_COUNT);
+        uint256 oneSidedBinCount = LIQUIDITY_RADIUS + 1;
+        uint256 weight = DISTRIBUTION_PRECISION / oneSidedBinCount;
 
-        distributionX[0] = DISTRIBUTION_PRECISION;
-        distributionY[0] = DISTRIBUTION_PRECISION;
+        for (uint256 index = 0; index < LIQUIDITY_BIN_COUNT; index++) {
+            int256 delta = int256(index) - int256(LIQUIDITY_RADIUS);
+            deltaIds[index] = delta;
+            if (delta >= 0) distributionX[index] = weight;
+            if (delta <= 0) distributionY[index] = weight;
+        }
+        // Preserve exact 1e18 distribution totals despite integer division.
+        distributionX[LIQUIDITY_BIN_COUNT - 1] += DISTRIBUTION_PRECISION - weight * oneSidedBinCount;
+        distributionY[0] += DISTRIBUTION_PRECISION - weight * oneSidedBinCount;
 
         ILBRouter.LiquidityParameters memory liquidityParameters = ILBRouter.LiquidityParameters({
             tokenX: deployment.weth,

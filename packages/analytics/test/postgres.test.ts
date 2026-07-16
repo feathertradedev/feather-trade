@@ -4,6 +4,7 @@ import test from "node:test";
 import { Pool } from "pg";
 
 import {
+  AnalyticsApiService,
   AnalyticsEngine,
   PostgresAnalyticsStore,
   USD_SCALE,
@@ -51,22 +52,98 @@ test("persists canonical blocks, candles, and replay events in PostgreSQL", { sk
       binStep: 10
     }]
   };
-  engine.ingestBlock(block);
-  const candles = engine.listCandles();
-  await store.save(engine.exportCheckpoint(), candles);
-  await store.appendCandleEvents([{ cursor: "1", type: "candle", pair: PAIR, interval: "minute", candle: candles.find((candle) => candle.interval === "minute")!, reason: null }]);
-
-  const restored = await store.load();
-  assert.equal(restored?.blocks[0]?.hash, block.hash);
-  assert.equal(restored?.blocks[0]?.events[0]?.kind, "swap");
-  const events = await store.loadCandleEvents();
-  assert.equal(events[0]?.candle?.revision, 2);
-  await store.close();
-
   const cleanup = new Pool({ connectionString: DATABASE_URL });
   try {
-    await cleanup.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    engine.ingestBlock(block);
+    await store.save(engine.exportCheckpoint(), engine.listCandles());
+    const firstMinute = engine.listCandles().find((candle) => candle.interval === "minute")!;
+    await store.appendCandleEvents(Array.from({ length: 10 }, (_, index) => ({
+      cursor: String(index + 1),
+      type: "candle" as const,
+      pair: PAIR,
+      interval: "minute" as const,
+      candle: { ...firstMinute, revision: index + 1 },
+      reason: null
+    })));
+
+    const appended: BlockEnvelope = {
+      ...block,
+      number: 2n,
+      hash: `0x${"2".repeat(64)}`,
+      parentHash: block.hash,
+      timestamp: 120,
+      prices: block.prices.map((sample) => ({ ...sample, observedAt: 120, sequence: 2n })),
+      events: block.events.map((event) => event.kind === "swap"
+        ? { ...event, marketPriceQuoteE18: 2n * USD_SCALE }
+        : event)
+    };
+    const beforeAppend = new Map(engine.listCandles().map((candle) => [
+      `${candle.pair}:${candle.interval}:${candle.startTimestamp}`,
+      JSON.stringify(candle, (_key, value) => typeof value === "bigint" ? value.toString() : value)
+    ]));
+    engine.ingestBlock(appended);
+    const appendChanges = engine.listLastChangedCandles().filter((candle) =>
+      beforeAppend.get(`${candle.pair}:${candle.interval}:${candle.startTimestamp}`) !==
+      JSON.stringify(candle, (_key, value) => typeof value === "bigint" ? value.toString() : value)
+    );
+    assert(appendChanges.length > 0 && appendChanges.length <= 14);
+    await store.appendCanonicalState(engine.exportCheckpointMetadata(), appended, appendChanges);
+    const appendedPersistence = await cleanup.query<{ blocks: string; candles: string }>(`SELECT
+      (SELECT COUNT(*)::text FROM ${schema}.canonical_blocks) AS blocks,
+      (SELECT COUNT(*)::text FROM ${schema}.candles) AS candles`);
+    assert.equal(appendedPersistence.rows[0]?.blocks, "2");
+    assert.equal(appendedPersistence.rows[0]?.candles, String(engine.listCandles().length));
+
+    const replacement: BlockEnvelope = {
+      ...appended,
+      hash: `0x${"3".repeat(64)}`,
+      timestamp: 121,
+      prices: appended.prices.map((sample) => ({ ...sample, observedAt: 121 }))
+    };
+    assert.equal(engine.ingestBlock(replacement), "reorg");
+    await store.save(engine.exportCheckpoint(), engine.listCandles());
+    const expectedCandleCount = String(engine.listCandles().length);
+
+    const restored = await store.load();
+    assert.deepEqual(restored?.blocks.map((entry) => entry.hash), [block.hash, replacement.hash]);
+    assert.equal(restored?.blocks[0]?.events[0]?.kind, "swap");
+    assert.equal(restored?.reorgCount, 1);
+
+    const events = await store.loadCandleEvents();
+    assert.deepEqual(events.map((event) => event.cursor), ["3", "4", "5", "6", "7", "8", "9", "10"]);
+    assert.equal(events.at(-1)?.candle?.revision, 10);
+
+    const persisted = await cleanup.query<{
+      blocks: string;
+      candles: string;
+      orphaned: string;
+    }>(`SELECT
+      (SELECT COUNT(*)::text FROM ${schema}.canonical_blocks) AS blocks,
+      (SELECT COUNT(*)::text FROM ${schema}.candles) AS candles,
+      (SELECT COUNT(*)::text FROM ${schema}.canonical_blocks WHERE hash = $1) AS orphaned`, [appended.hash]);
+    assert.equal(persisted.rows[0]?.blocks, "2");
+    assert.equal(persisted.rows[0]?.candles, expectedCandleCount);
+    assert.equal(persisted.rows[0]?.orphaned, "0");
+
+    const restoredService = await AnalyticsApiService.create({
+      engine: new AnalyticsEngine(policies, { assumeCompleteHistory: true }),
+      store
+    });
+    assert.equal(restoredService.getHealth(121).headHash, replacement.hash);
+    assert.equal(restoredService.candleStream.cursor, "10");
+    const result = await restoredService.execute(`query($pair: ID!) {
+      pairCandles(pair: $pair, interval: ONE_MINUTE, fromTimestamp: 0, toTimestamp: 180, first: 100) {
+        nodes { startTimestamp lastBlockHash revision }
+        streamCursor
+      }
+    }`, { pair: PAIR });
+    assert.equal(result.errors, undefined);
+    const data = result.data as { pairCandles: { nodes: Array<{ lastBlockHash: string }>; streamCursor: string } };
+    assert.equal(data.pairCandles.streamCursor, "10");
+    assert(data.pairCandles.nodes.some((candle) => candle.lastBlockHash === replacement.hash));
   } finally {
+    await store.close();
+    await cleanup.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
     await cleanup.end();
   }
 });

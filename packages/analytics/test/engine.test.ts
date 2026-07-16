@@ -62,7 +62,7 @@ test("serves GraphQL CORS only to exact configured browser origins", async () =>
   }
 });
 
-test("hands historical queries to SSE replacements without losing open-candle revisions", async () => {
+test("GraphQL/SSE emits multiple open 1m revisions then finalizes and opens across the minute boundary", async () => {
   const streamPair = "0x00000000000000000000000000000000000000a1";
   const service = await AnalyticsApiService.create({
     engine: new AnalyticsEngine(policies, { assumeCompleteHistory: true }),
@@ -92,6 +92,7 @@ test("hands historical queries to SSE replacements without losing open-candle re
     const first = await nextCandleEvent(base, streamPair, "0");
     assert.equal(first.candle.startTimestamp, 600);
     assert.equal(first.candle.finalized, false);
+    assert.equal(first.candle.swapCount, 1);
 
     await service.ingestBlock(submitBlock(block(2n, "0xb2", "0xb1", 640, [{ ...marketSwap(2n * USD_SCALE, UNIT), pair: streamPair }], [
       price(TOKEN_X, "x-usd", 2n * USD_SCALE, 640, 2n),
@@ -101,6 +102,7 @@ test("hands historical queries to SSE replacements without losing open-candle re
     assert.equal(replacement.candle.startTimestamp, first.candle.startTimestamp);
     assert(replacement.candle.revision > first.candle.revision);
     assert.equal(replacement.candle.closeUsdE18, "2000000000000000000");
+    assert.equal(replacement.candle.swapCount, 2);
 
     await service.ingestBlock(submitBlock(block(3n, "0xb3", "0xb2", 665, [{ ...marketSwap(3n * USD_SCALE, UNIT), pair: streamPair }], [
       price(TOKEN_X, "x-usd", 3n * USD_SCALE, 665, 3n),
@@ -108,9 +110,26 @@ test("hands historical queries to SSE replacements without losing open-candle re
     ])));
     const boundaryEvents = await nextCandleEvents(base, streamPair, replacement.cursor, 2);
     assert.deepEqual(boundaryEvents.map((event) => [event.candle.startTimestamp, event.candle.finalized]), [[600, true], [660, false]]);
+    assert.deepEqual(boundaryEvents.map((event) => event.candle.swapCount), [2, 1]);
 
     const replay = await nextCandleEvent(base, streamPair, boundaryEvents[0].cursor, { lastEventId: replacement.cursor });
     assert.equal(replay.cursor, boundaryEvents[0].cursor);
+
+    const canonicalHistory = await service.execute(`query($pair: ID!) {
+      pairCandles(pair: $pair, interval: ONE_MINUTE, fromTimestamp: 600, toTimestamp: 660, first: 100) {
+        nodes { startTimestamp finalized revision swapCount }
+        streamCursor
+      }
+    }`, { pair: streamPair });
+    assert.equal(canonicalHistory.errors, undefined);
+    const canonicalData = canonicalHistory.data as {
+      pairCandles: { nodes: Array<{ finalized: boolean; revision: number; startTimestamp: number; swapCount: number }>; streamCursor: string };
+    };
+    assert.deepEqual(
+      canonicalData.pairCandles.nodes.map((candle) => [candle.startTimestamp, candle.finalized, candle.swapCount]),
+      [[600, true, 2], [660, false, 1]]
+    );
+    assert.equal(canonicalData.pairCandles.streamCursor, service.candleStream.cursor);
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
@@ -851,7 +870,7 @@ async function nextCandleEvent(
   pair: string,
   after: string,
   options: { lastEventId?: string } = {}
-): Promise<{ cursor: string; candle: { startTimestamp: number; finalized: boolean; revision: number; closeUsdE18: string | null } }> {
+): Promise<{ cursor: string; candle: { startTimestamp: number; finalized: boolean; revision: number; closeUsdE18: string | null; swapCount: number } }> {
   return (await nextCandleEvents(base, pair, after, 1, options))[0]!;
 }
 
@@ -861,7 +880,7 @@ async function nextCandleEvents(
   after: string,
   count: number,
   options: { lastEventId?: string } = {}
-): Promise<Array<{ cursor: string; candle: { startTimestamp: number; finalized: boolean; revision: number; closeUsdE18: string | null } }>> {
+): Promise<Array<{ cursor: string; candle: { startTimestamp: number; finalized: boolean; revision: number; closeUsdE18: string | null; swapCount: number } }>> {
   const controller = new AbortController();
   const response = await fetch(`${base}/events/candles?pair=${pair}&interval=ONE_MINUTE&after=${after}`, {
     headers: options.lastEventId ? { "last-event-id": options.lastEventId } : undefined,
@@ -872,7 +891,7 @@ async function nextCandleEvents(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  const events: Array<{ cursor: string; candle: { startTimestamp: number; finalized: boolean; revision: number; closeUsdE18: string | null } }> = [];
+  const events: Array<{ cursor: string; candle: { startTimestamp: number; finalized: boolean; revision: number; closeUsdE18: string | null; swapCount: number } }> = [];
   try {
     while (events.length < count) {
       const chunk = await reader.read();

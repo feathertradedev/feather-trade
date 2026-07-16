@@ -245,6 +245,17 @@ start_stack() {
   wait_analytics
   wait_http "Web" "$WEB_URL"
   write_stack_env
+
+  # Fail startup unless the local WETH/USDC fixture can move the active bin in
+  # both directions while the dev trader enforces its hard range.
+  env \
+    MARKET_ACTIVITY_RPC_URL="$RPC_URL" \
+    MARKET_ACTIVITY_PRIVATE_KEY="${MARKET_ACTIVITY_PRIVATE_KEY:-${LOCALNET_PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}}" \
+    MARKET_ACTIVITY_MANIFEST_PATH="$MANIFEST_PATH" \
+    MARKET_ACTIVITY_RANDOM_SEED="1723928558" \
+    node "$ROOT_DIR/packages/dev-market-activity/dist/src/cli.js" verify \
+    >"$STATE_DIR/market-activity-verification.log" 2>&1
+
   (cd "$ROOT_DIR" && node scripts/localnet/check-stack-health.cjs \
     --strict --json \
     --manifest "$MANIFEST_PATH" \

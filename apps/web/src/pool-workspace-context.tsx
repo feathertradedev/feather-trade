@@ -89,11 +89,16 @@ export function PoolWorkspaceProvider({
   const walletAddress = account.address ?? null;
   const [candleInterval, setCandleInterval] = useState<CandleInterval>("HOUR");
   const [candleStreamState, setCandleStreamState] = useState<CandleStreamState>("connecting");
-  const candleEnd = candleBoundary(Math.floor(Date.now() / 1_000), candleInterval);
-  const candleStart = candleEnd - CANDLE_LOOKBACK_SECONDS[candleInterval];
+  const [candleStreamGeneration, setCandleStreamGeneration] = useState(0);
+  const candleWindow = useMemo(() => {
+    const end = candleBoundary(Math.floor(Date.now() / 1_000), candleInterval);
+    return { end, start: end - CANDLE_LOOKBACK_SECONDS[candleInterval] };
+  }, [candleInterval, candleStreamGeneration, pool.address]);
+  const candleEnd = candleWindow.end;
+  const candleStart = candleWindow.start;
   const candleQueryKey = useMemo(
-    () => ["canonicalPoolCandles", environmentKey, analyticsEndpoint, pool.address, candleInterval, candleStart, candleEnd] as const,
-    [analyticsEndpoint, candleEnd, candleInterval, candleStart, environmentKey, pool.address]
+    () => ["canonicalPoolCandles", environmentKey, analyticsEndpoint, pool.address, candleInterval, candleStart, candleEnd, candleStreamGeneration] as const,
+    [analyticsEndpoint, candleEnd, candleInterval, candleStart, candleStreamGeneration, environmentKey, pool.address]
   );
   const [draftValues, setDraftValues] = useState<Record<string, unknown>>({});
 
@@ -156,7 +161,7 @@ export function PoolWorkspaceProvider({
     const onReset = () => {
       setCandleStreamState("connecting");
       source.close();
-      void queryClient.invalidateQueries({ queryKey: candleQueryKey });
+      setCandleStreamGeneration((generation) => generation + 1);
     };
     source.addEventListener("candle", onCandle as EventListener);
     source.addEventListener("heartbeat", noteActivity);
@@ -173,7 +178,7 @@ export function PoolWorkspaceProvider({
       window.clearInterval(staleTimer);
       source.close();
     };
-  }, [analyticsEndpoint, candleInterval, candleQueryKey, candlesQuery.data?.streamCursor, candlesQuery.isPlaceholderData, pool.address, queryClient]);
+  }, [analyticsEndpoint, candleInterval, candleQueryKey, candleStreamGeneration, candlesQuery.data?.streamCursor, candlesQuery.isPlaceholderData, pool.address, queryClient]);
   const healthQuery = useQuery({
     queryKey: ["canonicalPoolAnalyticsHealth", environmentKey, analyticsEndpoint],
     queryFn: () => loadAnalyticsHealth(analyticsEndpoint),

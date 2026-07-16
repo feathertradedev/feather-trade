@@ -64,6 +64,23 @@ interface SessionState {
   maximumObservedMovement: Record<TradeDirection, number>;
 }
 
+export interface MarketActivityVerificationOptions {
+  maxTrades?: number;
+  randomSeed?: number;
+  signal?: AbortSignal;
+}
+
+export interface MarketActivityVerificationResult {
+  anchorActiveId: number;
+  activeIds: number[];
+  downwardMoves: number;
+  hardRange: [number, number];
+  maximumActiveId: number;
+  minimumActiveId: number;
+  trades: number;
+  upwardMoves: number;
+}
+
 export async function startMarketActivity(config: MarketActivityConfig, signal?: AbortSignal): Promise<void> {
   const clients = createClients(config);
   const randomSeed = config.randomSeed ?? randomInt(0, 0x1_0000_0000);
@@ -108,6 +125,63 @@ export async function seedMarketActivity(config: MarketActivityConfig, signal?: 
     seeded += 1;
   }
   log({ event: "market-activity-seed-complete", transactions: seeded, throughTimestamp: wallClock, randomSeed });
+}
+
+/**
+ * Finite Anvil gate used by local-stack and CI fixtures. It proves that the
+ * selected WETH/USDC pool has traversable liquidity on both sides of the
+ * anchor, rather than merely accepting swaps that never change chart price.
+ */
+export async function verifyMarketActivityMovement(
+  config: MarketActivityConfig,
+  options: MarketActivityVerificationOptions = {}
+): Promise<MarketActivityVerificationResult> {
+  if (config.environment !== "localnet") throw new Error("Market activity movement verification is localnet-only");
+  const maxTrades = options.maxTrades ?? 40;
+  if (!Number.isSafeInteger(maxTrades) || maxTrades <= 0) throw new Error("Movement verification maxTrades must be positive");
+  options.signal?.throwIfAborted();
+  const randomSeed = options.randomSeed ?? config.randomSeed ?? 0x66_c0ffee;
+  const clients = createClients(config);
+  const state = await prepareSession(config, clients, createSeededRandom(randomSeed));
+  options.signal?.throwIfAborted();
+  const activeIds = [state.policy.anchor];
+  let downwardMoves = 0;
+  let upwardMoves = 0;
+
+  for (let trades = 0; trades < maxTrades; trades += 1) {
+    options.signal?.throwIfAborted();
+    // Prove downward traversal first, then deliberately traverse upward. The
+    // regular continuous mode remains organic and mean-reverting.
+    state.nextPreferred = downwardMoves === 0 ? "weth-to-usdc" : "usdc-to-weth";
+    const before = await readActiveId(config, clients.publicClient);
+    const executed = await executeNextTrade(config, clients, state);
+    if (!executed) throw new Error("Movement verification exhausted its bounded session budget");
+    options.signal?.throwIfAborted();
+    const after = await readActiveId(config, clients.publicClient);
+    assertWithinHardRange(after, state.policy);
+    activeIds.push(after);
+    if (after < before) downwardMoves += 1;
+    if (after > before) upwardMoves += 1;
+    if (downwardMoves > 0 && upwardMoves > 0) {
+      const result: MarketActivityVerificationResult = {
+        anchorActiveId: state.policy.anchor,
+        activeIds,
+        downwardMoves,
+        hardRange: [state.policy.anchor - state.policy.hardRadius, state.policy.anchor + state.policy.hardRadius],
+        maximumActiveId: Math.max(...activeIds),
+        minimumActiveId: Math.min(...activeIds),
+        trades: activeIds.length - 1,
+        upwardMoves
+      };
+      log({ event: "market-activity-movement-verified", randomSeed, ...result });
+      return result;
+    }
+  }
+
+  throw new Error(
+    `WETH/USDC active ID did not move in both directions within ${maxTrades} bounded trades ` +
+    `(down=${downwardMoves}, up=${upwardMoves}, observed=${activeIds.join(",")})`
+  );
 }
 
 export function buildHistoricalSchedule(nowTimestamp: number, randomSeed = DEFAULT_HISTORICAL_RANDOM_SEED): number[] {
@@ -242,7 +316,11 @@ async function executeNextTrade(config: MarketActivityConfig, clients: RuntimeCl
   const binsMoved = Math.abs(activeIdAfter - activeIdBefore);
   state.maximumObservedMovement[direction] = Math.max(state.maximumObservedMovement[direction], binsMoved);
   state.amounts[inputKey] = adaptAmount(state.amounts[inputKey], binsMoved);
-  state.nextPreferred = chooseOrganicDirection(activeIdAfter, direction, state.policy, state.random());
+  // Keep chewing through the current bin when a bounded trade did not move
+  // price. Once movement occurs, return to the organic mean-reverting walk.
+  state.nextPreferred = binsMoved === 0
+    ? direction
+    : chooseOrganicDirection(activeIdAfter, direction, state.policy, state.random());
   log({
     event: "market-activity-transaction",
     transactionHash: hash,

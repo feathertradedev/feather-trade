@@ -13,6 +13,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "load:test": "pnpm build && node --test dist/test/load.test.js",
     "test": "pnpm build && node --test dist/test/*.test.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "node dist/src/server-cli.js"

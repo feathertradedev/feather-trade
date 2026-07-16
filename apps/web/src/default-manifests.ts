@@ -61,8 +61,8 @@ export const localnetDefaultManifest = {
     routerWNative: "0x5FbDB2315678afecb367f032d93F642f64180aa3"
   },
   smoke: {
-    liquidityAmountX: "10000000000000000",
-    liquidityAmountY: "20000000000000000000",
+    liquidityAmountX: "15000000000000000000",
+    liquidityAmountY: "30000000000000000000000",
     swapAmountIn: 1_000_000_000_000_000,
     swapAmountOut: 1_998_594_640_439_506_130,
     swapTokenIn: "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9",

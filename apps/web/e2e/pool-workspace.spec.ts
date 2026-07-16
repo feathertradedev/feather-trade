@@ -12,7 +12,9 @@ async function installMockCandleStream(page: Parameters<typeof installMockRpc>[0
   await page.addInitScript(() => {
     type TestWindow = Window & {
       __testEmitCandle: (payload: unknown) => void;
+      __testAdvanceCandleClock: (milliseconds: number) => void;
       __testFailCandleStream: () => void;
+      __testResetCandleStream: () => void;
     };
     let latest: TestEventSource | null = null;
     class TestEventSource extends EventTarget {
@@ -39,11 +41,18 @@ async function installMockCandleStream(page: Parameters<typeof installMockRpc>[0
     Object.defineProperty(window, "EventSource", { configurable: true, value: TestEventSource });
     const testWindow = window as unknown as TestWindow;
     testWindow.__testEmitCandle = (payload) => latest?.dispatchEvent(new MessageEvent("candle", { data: JSON.stringify(payload) }));
+    const originalNow = Date.now;
+    testWindow.__testAdvanceCandleClock = (milliseconds) => {
+      Date.now = () => originalNow() + milliseconds;
+    };
     testWindow.__testFailCandleStream = () => {
       const originalNow = Date.now;
       Date.now = () => originalNow() + 46_000;
       latest?.onerror?.(new Event("error"));
       Date.now = originalNow;
+    };
+    testWindow.__testResetCandleStream = () => {
+      latest?.dispatchEvent(new MessageEvent("reset", { data: JSON.stringify({ cursor: "1000", reason: "canonical-reorg" }) }));
     };
   });
 }
@@ -118,10 +127,86 @@ test("pool chart applies live candle replacements and exposes stream failure", a
   });
   await expect(chart.locator(".swap-chart-summary")).toContainText("C $2,600.00");
 
+  const requestsBeforeReset = rpc.snapshot().graphRequests.filter((request) => request.query.includes("WebPairCandles")).length;
+  await page.evaluate(() => {
+    (window as unknown as Window & { __testResetCandleStream: () => void }).__testResetCandleStream();
+  });
+  await expect.poll(() => rpc.snapshot().graphRequests.filter((request) => request.query.includes("WebPairCandles")).length).toBeGreaterThan(requestsBeforeReset);
+  await expect(chart.locator(".swap-chart-stream")).toHaveText("Live");
+
   await page.evaluate(() => {
     (window as unknown as Window & { __testFailCandleStream: () => void }).__testFailCandleStream();
   });
   await expect(chart.locator(".swap-chart-stream")).toHaveText("Stream stale");
+});
+
+test("candle intervals remain usable without page overflow on a narrow mobile viewport", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const rpc = await installMockRpc(page, { includePairs: true });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+
+  const chart = page.getByTestId("swap-market-chart");
+  const intervals = chart.getByRole("group", { name: "Candle interval" });
+  await expect(intervals.getByRole("button")).toHaveCount(7);
+  for (const [label, value] of [["1m", "ONE_MINUTE"], ["5m", "FIVE_MINUTES"], ["15m", "FIFTEEN_MINUTES"], ["1h", "HOUR"], ["4h", "FOUR_HOURS"], ["1d", "DAY"], ["1w", "WEEK"]] as const) {
+    await intervals.getByRole("button", { name: label, exact: true }).click();
+    await expect.poll(() => rpc.snapshot().graphRequests.some((request) => request.query.includes("WebPairCandles") && request.variables?.interval === value)).toBe(true);
+    await expect(intervals.getByRole("button", { name: label, exact: true })).toHaveAttribute("aria-pressed", "true");
+    await expect(chart.locator(".swap-chart-canvas")).toBeVisible();
+  }
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test("an SSE candle crossing a 1m boundary appends without refetching historical GraphQL", async ({ page }) => {
+  await installMockCandleStream(page);
+  const rpc = await installMockRpc(page, { includePairs: true });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+  const chart = page.getByTestId("swap-market-chart");
+  await chart.getByRole("button", { name: "1m", exact: true }).click();
+  await expect(chart.locator(".swap-chart-stream")).toHaveText("Live");
+  const minuteRequests = () => rpc.snapshot().graphRequests.filter((request) =>
+    request.query.includes("WebPairCandles") && request.variables?.interval === "ONE_MINUTE"
+  );
+  await expect.poll(() => minuteRequests().length).toBe(1);
+  const startTimestamp = minuteRequests()[0]?.variables?.toTimestamp;
+  expect(startTimestamp).toBeDefined();
+
+  await page.evaluate(() => {
+    (window as unknown as Window & { __testAdvanceCandleClock: (milliseconds: number) => void }).__testAdvanceCandleClock(61_000);
+  });
+  await page.evaluate((payload) => {
+    (window as unknown as Window & { __testEmitCandle: (value: unknown) => void }).__testEmitCandle(payload);
+  }, {
+    cursor: "1001",
+    candle: {
+      pair: WNATIVE_USDC_PAIR.toLowerCase(),
+      interval: "ONE_MINUTE",
+      startTimestamp: startTimestamp! + 60,
+      endTimestamp: startTimestamp! + 120,
+      openUsdE18: "2600000000000000000000",
+      highUsdE18: "2750000000000000000000",
+      lowUsdE18: "2550000000000000000000",
+      closeUsdE18: "2700000000000000000000",
+      volumeUsdE18: "10000000000000000000",
+      feesUsdE18: "20000000000000000",
+      tvlUsdE18: "500000000000000000000000",
+      swapCount: 1,
+      status: "READY",
+      missingPriceTokens: [],
+      firstBlock: "102",
+      lastBlock: "102",
+      firstBlockHash: `0x${"3".repeat(64)}`,
+      lastBlockHash: `0x${"3".repeat(64)}`,
+      finalized: false,
+      revision: 1,
+      priceSource: "active-bin-quote-usd",
+      quoteToken: USDC.toLowerCase(),
+      tokenX: WNATIVE.toLowerCase()
+    }
+  });
+  await expect(chart.locator(".swap-chart-summary")).toContainText("C $2,700.00");
+  await page.waitForTimeout(250);
+  expect(minuteRequests()).toHaveLength(1);
 });
 
 test("canonical pool tasks keep one selected pool while reusing swap and liquidity engines", async ({ page }) => {

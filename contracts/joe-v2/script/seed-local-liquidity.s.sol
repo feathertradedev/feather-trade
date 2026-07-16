@@ -21,8 +21,8 @@ contract LocalnetLiquiditySeedScript is Script {
     uint16 private constant BIN_STEP = 10;
     int256 private constant CURVE_RADIUS = 15;
     uint256 private constant DISTRIBUTION_PRECISION = 1e18;
-    uint256 private constant WETH_AMOUNT = 100 ether;
-    uint256 private constant USDC_AMOUNT = 200_000 ether;
+    uint256 private constant WETH_AMOUNT = 30 ether;
+    uint256 private constant USDC_AMOUNT = 60_000 ether;
     string private constant DEFAULT_LOCALNET_MANIFEST_PATH = "/deployments/localnet/latest.json";
 
     function run() external returns (ILBPair pair) {
