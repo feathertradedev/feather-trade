@@ -40,6 +40,22 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
   }
 
   async save(checkpoint: AnalyticsCheckpoint, candles: readonly Candle[]): Promise<void> {
+    await this.#saveCanonicalState(checkpoint, candles, null);
+  }
+
+  async saveCanonicalStateAndCandleEvents(
+    checkpoint: AnalyticsCheckpoint,
+    candles: readonly Candle[],
+    events: readonly CandleStreamEvent[]
+  ): Promise<void> {
+    await this.#saveCanonicalState(checkpoint, candles, events);
+  }
+
+  async #saveCanonicalState(
+    checkpoint: AnalyticsCheckpoint,
+    candles: readonly Candle[],
+    events: readonly CandleStreamEvent[] | null
+  ): Promise<void> {
     await this.#initialize();
     const client = await this.#pool.connect();
     try {
@@ -82,6 +98,7 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
            WHERE incoming.pair = stored.pair AND incoming.interval = stored.interval AND incoming.start_timestamp = stored.start_timestamp
          )`
       );
+      if (events !== null) await this.#writeCandleEvents(client, events);
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK");
@@ -95,6 +112,24 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
     metadata: AnalyticsCheckpointMetadata,
     block: AnalyticsCheckpoint["blocks"][number],
     candles: readonly Candle[]
+  ): Promise<void> {
+    await this.#appendCanonicalState(metadata, block, candles, null);
+  }
+
+  async appendCanonicalStateAndCandleEvents(
+    metadata: AnalyticsCheckpointMetadata,
+    block: AnalyticsCheckpoint["blocks"][number],
+    candles: readonly Candle[],
+    events: readonly CandleStreamEvent[]
+  ): Promise<void> {
+    await this.#appendCanonicalState(metadata, block, candles, events);
+  }
+
+  async #appendCanonicalState(
+    metadata: AnalyticsCheckpointMetadata,
+    block: AnalyticsCheckpoint["blocks"][number],
+    candles: readonly Candle[],
+    events: readonly CandleStreamEvent[] | null
   ): Promise<void> {
     await this.#initialize();
     const client = await this.#pool.connect();
@@ -132,6 +167,7 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
              payload = EXCLUDED.payload`
         );
       }
+      if (events !== null) await this.#writeCandleEvents(client, events);
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK");
@@ -155,19 +191,7 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
     const client = await this.#pool.connect();
     try {
       await client.query("BEGIN");
-      for (const event of events) {
-        await client.query(
-          `INSERT INTO ${this.#schema}.candle_stream_events (cursor, pair, interval, event_type, payload)
-           VALUES ($1, $2, $3, $4, $5::jsonb)
-           ON CONFLICT (cursor) DO UPDATE SET pair = EXCLUDED.pair, interval = EXCLUDED.interval, event_type = EXCLUDED.event_type, payload = EXCLUDED.payload`,
-          [event.cursor, event.pair, event.interval, event.type, encodeTaggedJson(event)]
-        );
-      }
-      await client.query(
-        `DELETE FROM ${this.#schema}.candle_stream_events
-         WHERE cursor NOT IN (SELECT cursor FROM ${this.#schema}.candle_stream_events ORDER BY cursor DESC LIMIT $1)`,
-        [this.#replaySize]
-      );
+      await this.#writeCandleEvents(client, events);
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK");
@@ -194,6 +218,23 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
     } finally {
       client.release();
     }
+  }
+
+  async #writeCandleEvents(client: PoolClient, events: readonly CandleStreamEvent[]): Promise<void> {
+    if (events.length === 0) return;
+    for (const event of events) {
+      await client.query(
+        `INSERT INTO ${this.#schema}.candle_stream_events (cursor, pair, interval, event_type, payload)
+         VALUES ($1, $2, $3, $4, $5::jsonb)
+         ON CONFLICT (cursor) DO UPDATE SET pair = EXCLUDED.pair, interval = EXCLUDED.interval, event_type = EXCLUDED.event_type, payload = EXCLUDED.payload`,
+        [event.cursor, event.pair, event.interval, event.type, encodeTaggedJson(event)]
+      );
+    }
+    await client.query(
+      `DELETE FROM ${this.#schema}.candle_stream_events
+       WHERE cursor NOT IN (SELECT cursor FROM ${this.#schema}.candle_stream_events ORDER BY cursor DESC LIMIT $1)`,
+      [this.#replaySize]
+    );
   }
 }
 

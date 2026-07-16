@@ -272,6 +272,34 @@ test("bounds candle stream subscribers and releases capacity on disconnect", () 
   assert.equal(stream.subscriberCount, 0);
 });
 
+test("isolates failed candle subscribers after a durable batch commit", async () => {
+  const stream = new CandleStreamHub();
+  const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  engine.ingestBlock(block(1n, "0xa2", "0x00", 60, [marketSwap(USD_SCALE, UNIT)], [
+    price(TOKEN_X, "x-usd", USD_SCALE, 60, 1n),
+    price(TOKEN_Y, "y-usd", USD_SCALE, 60, 1n)
+  ]));
+  const candle = engine.queryCandles({ pair: PAIR, interval: "minute", fromTimestamp: 60, toTimestamp: 60, first: 1 }).nodes[0];
+  stream.subscribe(() => {
+    throw new Error("disconnected subscriber");
+  });
+  const delivered: number[] = [];
+  stream.subscribe((event) => delivered.push(event.candle?.revision ?? 0));
+  let persisted = 0;
+
+  await stream.publishBatch([
+    { type: "candle", pair: PAIR, interval: "minute", candle, reason: null },
+    { type: "candle", pair: PAIR, interval: "minute", candle: { ...candle, revision: candle.revision + 1 }, reason: null }
+  ], async (events) => {
+    persisted = events.length;
+  });
+
+  assert.equal(persisted, 2);
+  assert.equal(stream.cursor, "2");
+  assert.deepEqual(delivered, [candle.revision, candle.revision + 1]);
+  assert.equal(stream.subscriberCount, 1, "the failed subscriber is removed without aborting delivery");
+});
+
 test("fails USD values partial when pricing is missing, stale, or outside confidence policy", () => {
   const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
   engine.ingestBlock(

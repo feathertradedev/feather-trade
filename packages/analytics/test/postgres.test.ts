@@ -9,6 +9,7 @@ import {
   PostgresAnalyticsStore,
   USD_SCALE,
   type BlockEnvelope,
+  type BlockSubmission,
   type PricePolicy
 } from "../src/index.js";
 
@@ -147,3 +148,145 @@ test("persists canonical blocks, candles, and replay events in PostgreSQL", { sk
     await cleanup.end();
   }
 });
+
+test("atomically rolls back canonical state when outbox persistence fails across restart", { skip: DATABASE_URL === undefined }, async () => {
+  const schema = `feather_atomic_${process.pid}_${Date.now()}`;
+  const cleanup = new Pool({ connectionString: DATABASE_URL });
+  const fixedPolicies: PricePolicy[] = policies.map((policy) => ({ ...policy, source: "fixed-test" }));
+  let store: PostgresAnalyticsStore | null = new PostgresAnalyticsStore({
+    connectionString: DATABASE_URL!,
+    schema,
+    replaySize: 32
+  });
+  try {
+    const service = await AnalyticsApiService.create({
+      engine: new AnalyticsEngine(fixedPolicies, { assumeCompleteHistory: true }),
+      store,
+      allowFixedTestPrices: true
+    });
+    const first = serviceSubmission(1n, hash(1), hash(0), 60, USD_SCALE);
+    const second = serviceSubmission(2n, hash(2), hash(1), 120, 2n * USD_SCALE);
+    assert.equal(await service.ingestBlock(first), "appended");
+    const baselineCursor = service.candleStream.cursor;
+    assert.notEqual(baselineCursor, "0");
+    const baseline = await persistedCounts(cleanup, schema);
+
+    await cleanup.query(`
+      CREATE FUNCTION ${schema}.fail_candle_outbox() RETURNS trigger AS $body$
+      BEGIN
+        RAISE EXCEPTION 'injected candle outbox failure';
+      END;
+      $body$ LANGUAGE plpgsql
+    `);
+    await cleanup.query(`
+      CREATE TRIGGER fail_candle_outbox
+      BEFORE INSERT OR UPDATE ON ${schema}.candle_stream_events
+      FOR EACH ROW EXECUTE FUNCTION ${schema}.fail_candle_outbox()
+    `);
+
+    await assert.rejects(() => service.ingestBlock(second), /injected candle outbox failure/);
+    assert.equal(service.candleStream.cursor, baselineCursor, "failed atomic writes never become live");
+    assert.deepEqual(await persistedCounts(cleanup, schema), baseline, "canonical and outbox writes roll back together");
+
+    await store.close();
+    store = null;
+    store = new PostgresAnalyticsStore({ connectionString: DATABASE_URL!, schema, replaySize: 32 });
+    const restarted = await AnalyticsApiService.create({
+      engine: new AnalyticsEngine(fixedPolicies, { assumeCompleteHistory: true }),
+      store,
+      allowFixedTestPrices: true
+    });
+    assert.equal(restarted.getHealth(120).headBlock, 1n, "restart restores the last fully published canonical head");
+    assert.equal(restarted.candleStream.cursor, baselineCursor);
+    assert.deepEqual(restarted.candleStream.replay(baselineCursor, PAIR, "minute"), []);
+
+    await cleanup.query(`DROP TRIGGER fail_candle_outbox ON ${schema}.candle_stream_events`);
+    assert.equal(await restarted.ingestBlock(second), "appended");
+    const committedCursor = restarted.candleStream.cursor;
+    assert(Number(committedCursor) > Number(baselineCursor));
+    assert((restarted.candleStream.replay(baselineCursor, PAIR, "minute") ?? []).length > 0);
+
+    await store.close();
+    store = null;
+    store = new PostgresAnalyticsStore({ connectionString: DATABASE_URL!, schema, replaySize: 32 });
+    const committedRestart = await AnalyticsApiService.create({
+      engine: new AnalyticsEngine(fixedPolicies, { assumeCompleteHistory: true }),
+      store,
+      allowFixedTestPrices: true
+    });
+    assert.equal(committedRestart.getHealth(120).headBlock, 2n);
+    assert.equal(committedRestart.candleStream.cursor, committedCursor);
+    assert((committedRestart.candleStream.replay(baselineCursor, PAIR, "minute") ?? []).length > 0,
+      "an old Last-Event-ID can replay the replacement after restart");
+  } finally {
+    await store?.close();
+    await cleanup.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    await cleanup.end();
+  }
+});
+
+function serviceSubmission(
+  number: bigint,
+  blockHash: `0x${string}`,
+  parentHash: `0x${string}`,
+  timestamp: number,
+  marketPriceQuoteE18: bigint
+): BlockSubmission {
+  return {
+    number,
+    hash: blockHash,
+    parentHash,
+    timestamp,
+    prices: [
+      {
+        token: TOKEN_X,
+        source: "fixed-test",
+        feedId: "x-usd",
+        priceUsdE18: marketPriceQuoteE18,
+        confidenceUsdE18: 0n,
+        observedAt: timestamp,
+        sequence: number,
+        signedReport: null
+      },
+      {
+        token: TOKEN_Y,
+        source: "fixed-test",
+        feedId: "y-usd",
+        priceUsdE18: USD_SCALE,
+        confidenceUsdE18: 0n,
+        observedAt: timestamp,
+        sequence: number,
+        signedReport: null
+      }
+    ],
+    events: [{
+      pair: PAIR,
+      tokenX: TOKEN_X,
+      tokenY: TOKEN_Y,
+      decimalsX: 18,
+      decimalsY: 18,
+      kind: "swap",
+      amountInX: 10n ** 18n,
+      amountInY: 0n,
+      feeX: 10n ** 15n,
+      feeY: 0n,
+      reserveX: 10n * 10n ** 18n,
+      reserveY: 20_000n * 10n ** 18n,
+      marketPriceQuoteE18,
+      activeId: 8_388_608 + Number(number),
+      binStep: 10
+    }]
+  };
+}
+
+async function persistedCounts(pool: Pool, schema: string): Promise<{ blocks: string; candles: string; events: string }> {
+  const result = await pool.query<{ blocks: string; candles: string; events: string }>(`SELECT
+    (SELECT COUNT(*)::text FROM ${schema}.canonical_blocks) AS blocks,
+    (SELECT COUNT(*)::text FROM ${schema}.candles) AS candles,
+    (SELECT COUNT(*)::text FROM ${schema}.candle_stream_events) AS events`);
+  return result.rows[0]!;
+}
+
+function hash(value: number): `0x${string}` {
+  return `0x${value.toString(16).padStart(64, "0")}`;
+}

@@ -189,6 +189,50 @@ test("a fail-once replay-event write emits no live cursor until duplicate retry 
   assert.equal(service.candleStream.cursor, String(store.streamEvents));
 });
 
+test("a pending atomic append is repaired before any later persistence can bypass its outbox", async () => {
+  const store = new FailOnceAtomicStore();
+  const service = await AnalyticsApiService.create({
+    engine: new AnalyticsEngine(policies.map((policy) => ({ ...policy, source: "fixed-test" }))),
+    store,
+    allowFixedTestPrices: true
+  });
+  const first = submission(1, hash(1), hash(0));
+
+  await assert.rejects(() => service.ingestBlock(first), /injected atomic persistence failure/);
+  assert.equal(store.atomicAttempts, 1);
+  assert.equal(store.atomicCommits, 0);
+  assert.equal(store.fullSaveCalls, 0);
+  assert.equal(service.candleStream.cursor, "0");
+
+  await service.persist();
+  assert.equal(store.atomicAttempts, 2, "persist flushes the pending state+outbox transaction first");
+  assert.equal(store.atomicCommits, 1);
+  assert.equal(store.fullSaveCalls, 1, "the requested checkpoint follows only after atomic repair");
+  assert(store.streamEvents > 0);
+  assert.notEqual(service.candleStream.cursor, "0");
+});
+
+test("backfill finalization uses the atomic full-state and outbox capability", async () => {
+  const store = new RecordingAtomicFullStore();
+  const service = await AnalyticsApiService.create({
+    engine: new AnalyticsEngine(policies.map((policy) => ({ ...policy, source: "fixed-test" }))),
+    store,
+    allowFixedTestPrices: true
+  });
+  let fetched = false;
+
+  await service.backfill(async () => {
+    if (fetched) return { blocks: [], nextCursor: null, hasMore: false };
+    fetched = true;
+    return { blocks: [submission(1, hash(1), hash(0))], nextCursor: null, hasMore: false };
+  });
+
+  assert.equal(store.atomicFullSaves, 1);
+  assert.equal(store.fullSaveCalls, 0, "backfill must not save canonical state separately from its outbox");
+  assert(store.streamEvents > 0);
+  assert.equal(service.candleStream.cursor, String(store.streamEvents));
+});
+
 function block(index: number, blockHash: `0x${string}`, parentHash: `0x${string}`): BlockEnvelope {
   const timestamp = index * 60;
   const priceUsdE18 = BigInt(1_900 + index % 200) * USD_SCALE;
@@ -321,6 +365,37 @@ class FailOnceEventStore extends RecordingIncrementalStore {
       this.#failed = true;
       throw new Error("injected replay persistence failure");
     }
+    await super.appendCandleEvents(events);
+  }
+}
+
+class FailOnceAtomicStore extends RecordingIncrementalStore {
+  atomicAttempts = 0;
+  atomicCommits = 0;
+
+  async appendCanonicalStateAndCandleEvents(
+    metadata: AnalyticsCheckpointMetadata,
+    blockValue: BlockEnvelope,
+    candles: readonly Candle[],
+    events: readonly CandleStreamEvent[]
+  ): Promise<void> {
+    this.atomicAttempts += 1;
+    if (this.atomicAttempts === 1) throw new Error("injected atomic persistence failure");
+    await super.appendCanonicalState(metadata, blockValue, candles);
+    await super.appendCandleEvents(events);
+    this.atomicCommits += 1;
+  }
+}
+
+class RecordingAtomicFullStore extends RecordingIncrementalStore {
+  atomicFullSaves = 0;
+
+  async saveCanonicalStateAndCandleEvents(
+    _checkpoint: AnalyticsCheckpoint,
+    _candles: readonly Candle[],
+    events: readonly CandleStreamEvent[]
+  ): Promise<void> {
+    this.atomicFullSaves += 1;
     await super.appendCandleEvents(events);
   }
 }

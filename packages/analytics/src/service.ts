@@ -79,6 +79,17 @@ export interface AnalyticsStateStore {
     block: BlockEnvelope,
     candles: readonly Candle[]
   ): Promise<void>;
+  appendCanonicalStateAndCandleEvents?(
+    metadata: AnalyticsCheckpointMetadata,
+    block: BlockEnvelope,
+    candles: readonly Candle[],
+    events: readonly CandleStreamEvent[]
+  ): Promise<void>;
+  saveCanonicalStateAndCandleEvents?(
+    checkpoint: AnalyticsCheckpoint,
+    candles: readonly Candle[],
+    events: readonly CandleStreamEvent[]
+  ): Promise<void>;
   loadCandleEvents?(): Promise<CandleStreamEvent[]>;
   appendCandleEvents?(events: readonly CandleStreamEvent[]): Promise<void>;
   close?(): Promise<void>;
@@ -211,7 +222,13 @@ export class CandleStreamHub {
     this.#sequence = cursor;
     this.#events.push(event);
     if (this.#events.length > this.#replaySize) this.#events.splice(0, this.#events.length - this.#replaySize);
-    for (const subscriber of this.#subscribers) subscriber(event);
+    for (const subscriber of this.#subscribers) {
+      try {
+        subscriber(event);
+      } catch {
+        this.#subscribers.delete(subscriber);
+      }
+    }
   }
 }
 
@@ -282,6 +299,7 @@ export class AnalyticsApiService {
     options: { startCursor?: string | null; maxPages?: number } = {}
   ): Promise<BackfillResult> {
     return this.#mutations.run(async () => {
+      await this.#flushPendingCanonicalCommit();
       try {
         return await runBackfill({
           engine: this.#engine,
@@ -296,8 +314,7 @@ export class AnalyticsApiService {
           }
         });
       } finally {
-        await this.#persistUnlocked();
-        await this.#publishCandleChanges(false);
+        await this.#persistFullStateAndPublish(false);
       }
     });
   }
@@ -307,7 +324,10 @@ export class AnalyticsApiService {
   }
 
   async persist(): Promise<void> {
-    await this.#mutations.run(() => this.#persistUnlocked());
+    await this.#mutations.run(async () => {
+      await this.#flushPendingCanonicalCommit();
+      await this.#persistUnlocked();
+    });
   }
 
   async execute(source: string, variableValues?: Record<string, unknown>): Promise<ExecutionResult> {
@@ -360,6 +380,7 @@ export class AnalyticsApiService {
       }
       try {
         return await this.#mutations.run(async () => {
+          await this.#flushPendingCanonicalCommit();
           this.#engine.augmentHeadPositionSnapshots(head, snapshots);
           await this.#persistHeadUnlocked();
           return this.#engine.queryWalletPositions(args);
@@ -374,6 +395,24 @@ export class AnalyticsApiService {
 
   async #persistUnlocked(): Promise<void> {
     await this.#store?.save(this.#engine.exportCheckpoint(), this.#engine.listCandles());
+  }
+
+  async #persistFullStateAndPublish(reorg: boolean): Promise<void> {
+    const candles = this.#engine.listCandles();
+    const inputs = this.#candleChangeInputs(reorg, candles);
+    if (this.#store?.saveCanonicalStateAndCandleEvents !== undefined) {
+      await this.#stream.publishBatch(inputs, (events) =>
+        this.#store!.saveCanonicalStateAndCandleEvents!(
+          this.#engine.exportCheckpoint(),
+          candles,
+          events
+        )
+      );
+      this.#applyCandleSnapshot(reorg, candles);
+      return;
+    }
+    await this.#persistUnlocked();
+    await this.#publishCandleChanges(reorg, candles);
   }
 
   async #persistHeadUnlocked(): Promise<void> {
@@ -399,6 +438,37 @@ export class AnalyticsApiService {
   async #flushPendingCanonicalCommit(): Promise<void> {
     const pending = this.#pendingCanonicalCommit;
     if (pending === null) return;
+    const candles = pending.result === "reorg"
+      ? pending.fullCandles ?? this.#engine.listCandles()
+      : pending.changedCandles;
+    const inputs = this.#candleChangeInputs(pending.result === "reorg", candles);
+    if (!pending.canonicalPersisted && pending.result === "appended" &&
+      this.#store?.appendCanonicalStateAndCandleEvents !== undefined) {
+      await this.#stream.publishBatch(inputs, (events) =>
+        this.#store!.appendCanonicalStateAndCandleEvents!(
+          this.#engine.exportCheckpointMetadata(),
+          pending.block,
+          pending.changedCandles,
+          events
+        )
+      );
+      this.#applyCandleSnapshot(false, pending.changedCandles);
+      this.#pendingCanonicalCommit = null;
+      return;
+    }
+    if (!pending.canonicalPersisted && pending.result === "reorg" &&
+      this.#store?.saveCanonicalStateAndCandleEvents !== undefined) {
+      await this.#stream.publishBatch(inputs, (events) =>
+        this.#store!.saveCanonicalStateAndCandleEvents!(
+          this.#engine.exportCheckpoint(),
+          candles,
+          events
+        )
+      );
+      this.#applyCandleSnapshot(true, candles);
+      this.#pendingCanonicalCommit = null;
+      return;
+    }
     if (!pending.canonicalPersisted) {
       if (pending.result === "appended" && this.#store?.appendCanonicalState !== undefined) {
         await this.#store.appendCanonicalState(
@@ -411,27 +481,34 @@ export class AnalyticsApiService {
       }
       pending.canonicalPersisted = true;
     }
-    await this.#publishCandleChanges(
-      pending.result === "reorg",
-      pending.result === "reorg" ? pending.fullCandles ?? this.#engine.listCandles() : pending.changedCandles
-    );
+    await this.#publishCandleChanges(pending.result === "reorg", candles);
     this.#pendingCanonicalCommit = null;
   }
 
   async #publishCandleChanges(reorg: boolean, candles = this.#engine.listCandles()): Promise<void> {
-    const inputs: CandleStreamEventInput[] = [];
-    if (reorg) inputs.push({ type: "reset", pair: null, interval: null, candle: null, reason: "canonical-reorg" });
+    const inputs = this.#candleChangeInputs(reorg, candles);
+    if (inputs.length > 0) {
+      await this.#stream.publishBatch(inputs, async (events) => {
+        await this.#store?.appendCandleEvents?.(events);
+      });
+    }
+    this.#applyCandleSnapshot(reorg, candles);
+  }
+
+  #candleChangeInputs(reorg: boolean, candles: readonly Candle[]): CandleStreamEventInput[] {
+    const inputs: CandleStreamEventInput[] = reorg
+      ? [{ type: "reset", pair: null, interval: null, candle: null, reason: "canonical-reorg" }]
+      : [];
     for (const candle of candles) {
       const key = candleKey(candle);
       const fingerprint = candleFingerprint(candle);
       if (!reorg && this.#candleSnapshot.get(key) === fingerprint) continue;
       if (!reorg) inputs.push({ type: "candle", pair: candle.pair, interval: candle.interval, candle, reason: null });
     }
-    if (inputs.length > 0) {
-      await this.#stream.publishBatch(inputs, async (events) => {
-        await this.#store?.appendCandleEvents?.(events);
-      });
-    }
+    return inputs;
+  }
+
+  #applyCandleSnapshot(reorg: boolean, candles: readonly Candle[]): void {
     if (reorg) {
       this.#candleSnapshot = new Map(candles.map((candle) => [candleKey(candle), candleFingerprint(candle)]));
     } else {
