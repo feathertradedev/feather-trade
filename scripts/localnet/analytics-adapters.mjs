@@ -28,21 +28,21 @@ const HEAD_QUERY = `
 `;
 
 const BLOCK_QUERY = `
-  query LocalAnalyticsBlock($block: Int!, $blockNumber: BigInt!) {
-    _meta(block: { number: $block }) { block { number hash } hasIndexingErrors }
-    pairs(first: 1000, block: { number: $block }) {
+  query LocalAnalyticsBlock($blockHash: Bytes!, $blockNumber: BigInt!) {
+    _meta(block: { hash: $blockHash }) { block { number hash } hasIndexingErrors }
+    pairs(first: 1000, block: { hash: $blockHash }) {
       id address reserveX reserveY activeId binStep
       tokenX { id address }
       tokenY { id address }
     }
-    swaps(first: 1000, block: { number: $block }, where: { blockNumber: $blockNumber }) {
+    swaps(first: 1000, block: { hash: $blockHash }, where: { blockNumber: $blockNumber }) {
       id pair { id } activeId amountInX amountInY amountOutX amountOutY totalFeeX totalFeeY protocolFeeX protocolFeeY
       transactionHash
     }
-    liquidityEvents(first: 1000, block: { number: $block }, where: { blockNumber: $blockNumber }) {
+    liquidityEvents(first: 1000, block: { hash: $blockHash }, where: { blockNumber: $blockNumber }) {
       id pair { id } type ids amounts transactionHash
     }
-    transferBatchEvents(first: 1000, block: { number: $block }, where: { blockNumber: $blockNumber }) {
+    transferBatchEvents(first: 1000, block: { hash: $blockHash }, where: { blockNumber: $blockNumber }) {
       id pair { id } from to ids amounts transactionHash
     }
   }
@@ -246,8 +246,8 @@ async function loadBlock(config, decimals, poolProgress, number) {
   const rpcBlock = await rpc(config, "eth_getBlockByNumber", [quantity(number), false]);
   assertRpcBlock(rpcBlock, number);
   const blockHash = hash(rpcBlock.hash, `RPC block ${number} hash`);
-  const data = await graph(config, BLOCK_QUERY, { block: number, blockNumber: String(number) });
-  assertGraphMeta(data._meta, { number, hash: blockHash });
+  const data = await graph(config, BLOCK_QUERY, { blockHash, blockNumber: String(number) });
+  assertHashPinnedGraphMeta(data._meta, { number, hash: blockHash });
 
   const pairRows = boundedRows(data.pairs, "pairs");
   const identities = new Map();
@@ -625,15 +625,15 @@ async function waitForExactHead(config) {
   const rpcTimestamp = hexQuantity(rpcBlock.timestamp, "RPC head timestamp");
   while (true) {
     const data = await graph(config, HEAD_QUERY, {});
-    const meta = parseGraphMeta(data._meta);
+    const meta = parseGraphMeta(data._meta, false);
     if (meta.hasIndexingErrors) throw new Error("Indexer reports indexing errors");
-    if (meta.number === rpcNumber) {
+    if (meta.number === rpcNumber && meta.hash !== null) {
       if (meta.hash !== rpcHash) throw new Error(`RPC/indexer head hash mismatch at block ${rpcNumber}`);
       return { number: rpcNumber, hash: rpcHash, timestamp: rpcTimestamp };
     }
     // The local chain can advance while the indexer catches the captured
     // target. Per-block loads below still verify the canonical target hash.
-    if (meta.number > rpcNumber) return { number: rpcNumber, hash: rpcHash, timestamp: rpcTimestamp };
+    if (meta.number > rpcNumber && meta.hash !== null) return { number: rpcNumber, hash: rpcHash, timestamp: rpcTimestamp };
     if (Date.now() >= deadline) throw new Error(`Indexer did not reach RPC head ${rpcNumber} before timeout`);
     await delay(Math.min(config.pollIntervalMs, 250), config.signal);
   }
@@ -765,6 +765,18 @@ function assertGraphMeta(value, expected) {
   if (meta.hasIndexingErrors) throw new Error("Indexer reports indexing errors");
   if (meta.number !== expected.number) throw new Error(`Indexer returned block ${meta.number}, expected ${expected.number}`);
   if (meta.hash !== expected.hash) {
+    throw new Error(`RPC/indexer hash mismatch at block ${expected.number}`);
+  }
+}
+
+function assertHashPinnedGraphMeta(value, expected) {
+  // Graph Node may omit the genesis hash from historical `_meta`, even when
+  // the query itself is canonically pinned by the RPC-attested block hash.
+  // A non-null response hash must still agree with that query pin.
+  const meta = parseGraphMeta(value, false);
+  if (meta.hasIndexingErrors) throw new Error("Indexer reports indexing errors");
+  if (meta.number !== expected.number) throw new Error(`Indexer returned block ${meta.number}, expected ${expected.number}`);
+  if (meta.hash !== null && meta.hash !== expected.hash) {
     throw new Error(`RPC/indexer hash mismatch at block ${expected.number}`);
   }
 }

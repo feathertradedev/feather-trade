@@ -278,6 +278,7 @@ function fixtureState() {
     reorg: false,
     duplicateMode: null,
     headHashOverride: null,
+    headHashNullResponses: 1,
     calls: []
   };
 }
@@ -318,6 +319,10 @@ function rpc(payload, state) {
 
 function graph(payload, state) {
   if (payload.query.includes("LocalAnalyticsHead")) {
+    if (state.headHashNullResponses > 0) {
+      state.headHashNullResponses -= 1;
+      return { data: { _meta: meta(state.head, null) } };
+    }
     return { data: { _meta: meta(state.head, state.headHashOverride ?? rpcBlock(state.head, state).hash) } };
   }
   if (payload.query.includes("LocalAnalyticsPositions")) {
@@ -335,8 +340,16 @@ function graph(payload, state) {
     };
   }
   if (payload.query.includes("LocalAnalyticsBlock")) {
-    const number = payload.variables.block;
+    const number = Number(payload.variables.blockNumber);
+    const expectedHash = rpcBlock(number, state).hash;
+    assert.equal(payload.variables.blockHash, expectedHash);
+    assert.equal(
+      payload.query.match(/block: \{ hash: \$blockHash \}/g)?.length,
+      5,
+      "historical metadata and every collection must use the RPC-attested hash pin"
+    );
     const result = graphBlock(number, state);
+    if (number === 0) result._meta = meta(0, null);
     if (number === 1 && state.duplicateMode !== null) {
       const duplicate = { ...result.swaps[0] };
       if (state.duplicateMode === "conflict") duplicate.amountInX = "11";
