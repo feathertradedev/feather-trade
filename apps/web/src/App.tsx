@@ -95,6 +95,7 @@ import {
   analyticsEndpointForRegistry,
   brandLinks,
   defaultEnvironmentKey,
+  docsHref,
   isLocalnetRegistry,
   registries,
   routes,
@@ -655,14 +656,6 @@ function DexShell() {
   });
   const walletPanelKey = account.status === "connected" ? walletSessionKey : `${environmentKey}:disconnected`;
   const previousWalletSessionKey = useRef(walletSessionKey);
-  const transactionJournal = useTransactionJournal();
-  const visibleJournalRecords = account.status === "connected" && account.address
-    ? transactionJournal.records.filter((record) =>
-        record.reviewed.account.toLowerCase() === account.address!.toLowerCase() &&
-        record.reviewed.chainId === walletChainId &&
-        record.reviewed.environment === environmentKey &&
-        record.reviewed.deploymentEpoch === deploymentEpoch(registry))
-    : [];
   const snapshotQuery = useQuery({
     queryKey: [
       "dashboard",
@@ -738,42 +731,9 @@ function DexShell() {
               </a>
             );
           })}
+          <DocsLink className="nav-item" />
         </nav>
         <div className="app-header-actions">
-          <a className="operations-quick-link" href="#/liquidity" aria-label="Liquidity" onClick={() => setRouteKey("liquidity")}>Manage</a>
-          <details
-            className="operations-menu"
-            onBlur={(event) => {
-              if (!event.currentTarget.contains(event.relatedTarget)) event.currentTarget.removeAttribute("open");
-            }}
-            onKeyDown={(event) => {
-              if (event.key === "Escape") {
-                event.preventDefault();
-                event.currentTarget.removeAttribute("open");
-                event.currentTarget.querySelector("summary")?.focus();
-              }
-            }}
-          >
-            <summary>Operations</summary>
-            <div className="operations-popover">
-              <a href="#/activity" onClick={(event) => {
-                event.currentTarget.closest("details")?.removeAttribute("open");
-                setRouteKey("activity");
-              }}>Activity</a>
-              {visibleJournalRecords.length > 0 ? (
-                <details className="transaction-journal" data-testid="submitted-transaction-journal">
-                  <summary>Your transactions ({visibleJournalRecords.length})</summary>
-                  <div>
-                    {visibleJournalRecords.map((transaction) => (
-                      <span data-transaction-hash={transaction.activeHash ?? undefined} key={transaction.id}>
-                        {transaction.reviewed.intent} · {transaction.activeHash ? formatCompactAddress(transaction.activeHash) : "hash pending"} · {transaction.status}
-                      </span>
-                    ))}
-                  </div>
-                </details>
-              ) : null}
-            </div>
-          </details>
           <WalletPanel activeChain={registry.chain} key={walletPanelKey} />
         </div>
       </header>
@@ -829,16 +789,23 @@ function BrandLockup({ compact = false }: { compact?: boolean }) {
   );
 }
 
+function DocsLink({ className }: { className?: string }) {
+  const external = /^https?:\/\//.test(docsHref);
+  return (
+    <a className={className} href={docsHref} rel={external ? "noreferrer" : undefined} target={external ? "_blank" : undefined}>
+      <span>Docs</span>
+    </a>
+  );
+}
+
 function LandingView(_: { networkName: string; snapshot: AppSnapshot | undefined }) {
   return (
     <main className="landing-shell">
       <header className="landing-header">
         <BrandLockup />
         <nav aria-label="Marketing">
-          <a href="#/pools">Pools</a>
-          {brandLinks.filter((link) => link.label === "Docs").map((link) => (
-            <a href={link.href} key={link.label} rel="noreferrer" target="_blank">{link.label}</a>
-          ))}
+          <a className="landing-pools-link" href="#/pools">Pools</a>
+          <DocsLink />
         </nav>
         <a className="primary-button landing-launch" href="#/pools">Launch app</a>
       </header>

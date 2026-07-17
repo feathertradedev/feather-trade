@@ -27,6 +27,7 @@ declare const __PUBLIC_RELEASE_ENV__: "robinhoodTestnet" | "robinhood" | undefin
 
 export const publicReleaseEnvironment = __PUBLIC_RELEASE_ENV__;
 export const defaultEnvironmentKey: EnvironmentKey = publicReleaseEnvironment ?? "localnet";
+export const docsHref = import.meta.env.VITE_FEATHER_DOCS_URL || "/docs";
 const analyticsEndpoints: Record<EnvironmentKey, string | null> = {
   localnet: normalizeAnalyticsEndpoint(import.meta.env.VITE_ANALYTICS_LOCALNET_URL ?? import.meta.env.VITE_ANALYTICS_URL),
   robinhoodTestnet: normalizeAnalyticsEndpoint(import.meta.env.VITE_ANALYTICS_ROBINHOOD_TESTNET_URL),
@@ -59,7 +60,7 @@ export const routes: Array<{
 ];
 
 export const brandLinks: BrandLink[] = [
-  ...optionalBrandLink("Docs", import.meta.env.VITE_FEATHER_DOCS_URL),
+  { href: docsHref, label: "Docs" },
   ...optionalBrandLink("Security", import.meta.env.VITE_FEATHER_SECURITY_URL),
   ...optionalBrandLink("X", import.meta.env.VITE_FEATHER_X_URL),
   ...optionalBrandLink("Discord", import.meta.env.VITE_FEATHER_DISCORD_URL)

@@ -288,11 +288,11 @@ test("a pair code change during durable pre-wallet review aborts without broadca
   await page.getByTestId("swap-submit-button").click();
   await expect(page.getByTestId("gas-review")).toBeVisible();
 
+  const codeReadsBeforeReview = rpc.snapshot().methods.filter((method) => method === "eth_getCode").length;
   const secondClick = page.getByTestId("swap-submit-button").click();
-  await expect(page.getByTestId("submitted-transaction-journal")).toContainText("awaiting-wallet");
+  await expect.poll(() => rpc.snapshot().methods.filter((method) => method === "eth_getCode").length).toBeGreaterThan(codeReadsBeforeReview);
   rpc.update({ pairCode: "0x" });
   await secondClick;
-  await expect(page.getByTestId("submitted-transaction-journal")).toContainText("aborted");
   await expect(page.getByTestId("swap-failure-state")).not.toContainText(/possible broadcast/i);
   await expect(page.getByTestId("swap-failure-state")).toContainText(/code|context changed|attestation/i);
   expect((await readMockWallet(page)).sentTransactions).toEqual([]);
@@ -583,14 +583,13 @@ test("account change resets executable state and receipt banners but preserves t
   await page.locator("#swap-amount").fill("2.25");
   await clickReviewedAction(page, "swap-submit-button");
   await expect(page.getByText("Swap confirmed")).toBeVisible();
-  await expect(page.getByTestId("submitted-transaction-journal")).toHaveCount(1);
+  expect(await persistedTransactionJournalCount(page)).toBe(1);
 
   await page.evaluate(() => window.__mockWalletControl.setAccounts(["0x1111111111111111111111111111111111111111"]));
   await expect(page.getByTestId("wallet-account-button")).toContainText("0x1111...1111");
   await expect(page.locator("#swap-amount")).toHaveValue("1.0");
   await expect(page.getByTestId("swap-failure-state")).toContainText("Ready for wallet confirmation");
   await expect(page.getByText("Swap confirmed")).toHaveCount(0);
-  await expect(page.getByTestId("submitted-transaction-journal")).toHaveCount(0);
   expect(await persistedTransactionJournalCount(page)).toBe(1);
 });
 
@@ -639,7 +638,6 @@ test("LP owner change reissues owner queries and clears LP drafts and terminal b
   await expect(page.getByTestId("liquidity-amount-x")).toHaveValue("0.01");
   await expect(page.getByText("Token approval confirmed")).toHaveCount(0);
   await expect.poll(() => rpc.snapshot().graphRequests.some((request) => request.variables?.owner?.toLowerCase() === nextOwner)).toBe(true);
-  await expect(page.getByTestId("submitted-transaction-journal")).toHaveCount(0);
   expect(await persistedTransactionJournalCount(page)).toBe(1);
 });
 
@@ -1056,7 +1054,7 @@ test("wallet prompts longer than the reconciliation interval retain their durabl
 
   await clickReviewedAction(page, "swap-submit-button");
   await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
-  await expect(page.getByTestId("submitted-transaction-journal").locator("[data-transaction-hash]"), { timeout: 8_000 }).toHaveCount(1);
+  await expect.poll(() => persistedTransactionJournalHashes(page), { timeout: 8_000 }).toHaveLength(1);
   expect(await persistedTransactionJournalCount(page)).toBe(1);
 });
 
@@ -1069,7 +1067,7 @@ test("ambiguous wallet transport blocks blind retry while preserving a hashless 
   await clickReviewedAction(page, "swap-submit-button");
   await expect(page.getByTestId("swap-failure-state")).toContainText(/possible broadcast/i);
   expect((await readMockWallet(page)).sentTransactions).toHaveLength(1);
-  await expect(page.getByTestId("submitted-transaction-journal")).toContainText(/unknown-submission|reconciling/);
+  await expect.poll(() => persistedTransactionJournalStatuses(page)).toEqual(expect.arrayContaining([expect.stringMatching(/unknown-submission|reconciling/)]));
 
   await page.locator("#swap-amount").fill("1.1");
   await page.locator("#swap-amount").fill("1.0");
@@ -1126,7 +1124,7 @@ test("two same-origin tabs serialize identical intents before either wallet can 
 
   await expect(secondPage.getByTestId("swap-failure-state")).toContainText(/still unresolved/i);
   expect((await readMockWallet(secondPage)).sentTransactions).toHaveLength(0);
-  await expect(page.getByTestId("submitted-transaction-journal").locator("[data-transaction-hash]"), { timeout: 8_000 }).toHaveCount(1);
+  await expect.poll(() => persistedTransactionJournalHashes(page), { timeout: 8_000 }).toHaveLength(1);
 });
 
 test("exact routing submits only through the selected pair and bin step", async ({ page }) => {
@@ -3194,18 +3192,21 @@ test("mobile viewport renders core wallet and swap controls without overlap-crit
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
-test("mobile viewport reaches every core route", async ({ page }) => {
+test("mobile viewport keeps direct activity routes available without top-bar operations", async ({ page }) => {
   await installMockRpc(page);
   await page.goto("/#/swap");
 
-  for (const route of ["Swap", "Pools", "Liquidity", "Portfolio"]) {
-    await page.getByRole("link", { name: route }).click();
-    await expect(page.locator(".panel-heading").filter({ hasText: route === "Portfolio" ? "Positions" : route }).first()).toBeVisible();
+  for (const [path, heading] of [
+    ["/#/pools", "Pools"],
+    ["/#/positions", "Positions"]
+  ] as const) {
+    await page.goto(path);
+    await expect(page.locator(".panel-heading").filter({ hasText: heading }).first()).toBeVisible();
   }
 
-  await page.locator(".operations-menu summary").click();
-  await page.getByRole("link", { name: "Activity" }).click();
+  await page.goto("/#/activity");
   await expect(page.locator(".panel-heading").filter({ hasText: "Activity" }).first()).toBeVisible();
+  await expect(page.getByText("Operations", { exact: true })).toHaveCount(0);
 });
 
 test("portfolio stays owner-scoped and its deep link survives reload", async ({ page }) => {
@@ -3791,6 +3792,28 @@ async function persistedTransactionJournalCount(page: import("@playwright/test")
     if (raw === null) return 0;
     const parsed = JSON.parse(raw) as { records?: unknown[] };
     return Array.isArray(parsed.records) ? parsed.records.length : 0;
+  });
+}
+
+async function persistedTransactionJournalStatuses(page: import("@playwright/test").Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const raw = window.localStorage.getItem("feather.transaction-journal.v1");
+    if (raw === null) return [];
+    const parsed = JSON.parse(raw) as { records?: Array<{ status?: unknown }> };
+    return Array.isArray(parsed.records)
+      ? parsed.records.flatMap((record) => typeof record.status === "string" ? [record.status] : [])
+      : [];
+  });
+}
+
+async function persistedTransactionJournalHashes(page: import("@playwright/test").Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const raw = window.localStorage.getItem("feather.transaction-journal.v1");
+    if (raw === null) return [];
+    const parsed = JSON.parse(raw) as { records?: Array<{ activeHash?: unknown }> };
+    return Array.isArray(parsed.records)
+      ? parsed.records.flatMap((record) => typeof record.activeHash === "string" ? [record.activeHash] : [])
+      : [];
   });
 }
 

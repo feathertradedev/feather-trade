@@ -139,74 +139,6 @@ textarea {
   justify-content: flex-end;
 }
 
-.operations-menu {
-  position: relative;
-}
-
-.operations-menu > summary {
-  padding: 8px 12px;
-  color: var(--ink-60);
-  font-size: 0.76rem;
-  border: 1px solid var(--hairline);
-  border-radius: 999px;
-  cursor: pointer;
-  list-style: none;
-}
-
-.operations-quick-link {
-  padding: 8px 12px;
-  color: var(--ink-60);
-  font-size: 0.76rem;
-  border: 1px solid var(--hairline);
-  border-radius: 999px;
-}
-
-.operations-quick-link:hover {
-  color: var(--bone);
-  border-color: rgb(233 236 231 / 28%);
-}
-
-.operations-menu > summary::-webkit-details-marker {
-  display: none;
-}
-
-.operations-popover {
-  position: absolute;
-  top: calc(100% + 10px);
-  right: 0;
-  display: grid;
-  gap: 8px;
-  min-width: 220px;
-  padding: 12px;
-  background: #161816;
-  border: 1px solid var(--hairline);
-  border-radius: 12px;
-  box-shadow: 0 24px 60px rgb(0 0 0 / 45%);
-}
-
-.operations-popover > a {
-  padding: 9px 10px;
-  color: var(--ink-60);
-  border-radius: 8px;
-}
-
-.operations-popover > a:hover {
-  color: var(--bone);
-  background: rgb(233 236 231 / 5%);
-}
-
-.operations-popover > span {
-  padding: 4px 10px;
-  color: var(--ink-45);
-  font-size: 0.7rem;
-  line-height: 1.45;
-}
-
-.operations-divider {
-  height: 1px;
-  background: var(--hairline);
-}
-
 .workspace {
   width: min(1240px, 100%);
   margin: 0 auto;
@@ -984,8 +916,16 @@ textarea {
     padding: 0 16px;
   }
 
-  .brand-trade,
+  .brand-trade {
+    display: none;
+  }
+
   .landing-header nav {
+    gap: 0;
+    justify-self: end;
+  }
+
+  .landing-header .landing-pools-link {
     display: none;
   }
 
@@ -1088,26 +1028,6 @@ textarea {
     font-size: 0.76rem;
   }
 
-  .operations-quick-link,
-  .operations-menu > summary {
-    padding: 7px 9px;
-    font-size: 0.7rem;
-  }
-
-  .operations-quick-link {
-    grid-row: 3;
-    grid-column: 1;
-    justify-self: start;
-    margin-bottom: 10px;
-  }
-
-  .operations-menu {
-    grid-row: 3;
-    grid-column: 2;
-    justify-self: end;
-    margin-bottom: 10px;
-  }
-
   .workspace {
     padding: 14px;
   }
@@ -1172,15 +1092,23 @@ textarea {
   }
 }
 
-@media (max-width: 360px) {
-  .app-header {
+@media (max-width: 420px) {
+  .app-header,
+  .landing-header {
     gap: 8px;
     padding-right: 10px;
     padding-left: 10px;
   }
 
-  .app-header .brand-wordmark {
+  .app-header .brand-wordmark,
+  .landing-header .brand-wordmark {
     display: none;
+  }
+
+  .landing-launch {
+    min-width: auto;
+    padding-right: 14px;
+    padding-left: 14px;
   }
 }
 
@@ -1931,31 +1859,6 @@ a {
   max-width: 420px;
   font-size: 12px;
   text-align: right;
-}
-
-.transaction-journal {
-  padding: 10px;
-  color: var(--bone);
-  background: var(--panel);
-  border-top: 1px solid var(--hairline);
-}
-
-.transaction-journal summary {
-  color: var(--bone-bright);
-  cursor: pointer;
-  font-size: 12px;
-  font-weight: 800;
-}
-
-.transaction-journal div {
-  display: grid;
-  gap: 6px;
-  padding-top: 8px;
-  max-width: 320px;
-  color: var(--ink-60);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  overflow-wrap: anywhere;
 }
 
 .icon-button,
@@ -4602,7 +4505,7 @@ a {
 
 /* Final target-size floor: placed after route-specific compact controls so the
    computed hit area remains 44 CSS pixels without widening inline text links. */
-.app-shell :where(button, summary, input:not([type="checkbox"]), select, .primary-button, .secondary-button, .nav-item, .operations-quick-link, .back-link),
+.app-shell :where(button, summary, input:not([type="checkbox"]), select, .primary-button, .secondary-button, .nav-item, .back-link),
 .app-shell :where(.position-option, .check-row) {
   min-block-size: 44px;
 }
