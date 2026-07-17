@@ -12,7 +12,7 @@ const script = path.join(root, "scripts/indexer/assert-graph-node-mappings.cjs")
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "graph-node-assertions-"));
 const factory = "0x2222222222222222222222222222222222222222";
 const pair = "0x1111111111111111111111111111111111111111";
-const manifestPath = write("manifest.json", { contracts: { lbFactory: factory }, seededPools: { wnativeUsdc: { pair } } });
+const manifestPath = write("manifest.json", { contracts: { lbFactory: factory }, seededPools: { wethUsdc: { pair } } });
 
 const response = {
   data: {

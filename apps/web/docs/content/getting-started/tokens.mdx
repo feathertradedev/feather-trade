@@ -1,0 +1,27 @@
+---
+title: "Tokens, addresses, balances, and verification"
+description: "Identify supported assets by contract address and understand balance, decimal, and token-risk handling."
+slug: "getting-started/tokens"
+section: "Getting started"
+order: 4
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+A token symbol is not unique. Confirm the network and full contract address whenever you select, approve, or receive an asset.
+
+## Supported assets
+
+Feather only enables actions for assets that meet its configured support policy. Unsupported addresses may be identifiable, but they cannot be silently imported into an executable transaction.
+
+Assets with known transfer taxes, rebasing behavior, unsupported approval behavior, or other incompatible controls can be restricted or blocked.
+
+## Balance precision
+
+Token decimals determine how the displayed amount maps to the integer value transferred onchain. Inputs with too many decimals, scientific notation, negative values, or amounts above the available balance are rejected.
+
+Selecting **Max** for ETH preserves a gas reserve. Selecting **Max** for an ERC-20 token does not change the separate ETH requirement.
+
+<Risk title="Verification is not endorsement">
+A verified address confirms identity, not quality, safety, market value, or future behavior.
+</Risk>

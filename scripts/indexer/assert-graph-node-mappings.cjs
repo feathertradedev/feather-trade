@@ -12,10 +12,10 @@ const attempts = Number(process.env.GRAPH_NODE_E2E_ASSERT_ATTEMPTS || "120");
 const sleepMs = Number(process.env.GRAPH_NODE_E2E_ASSERT_SLEEP_MS || "1000");
 const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
 const factoryId = lower(manifest.contracts && manifest.contracts.lbFactory);
-const pairId = lower(manifest.seededPools && manifest.seededPools.wnativeUsdc && manifest.seededPools.wnativeUsdc.pair);
+const pairId = lower(manifest.seededPools && manifest.seededPools.wethUsdc && manifest.seededPools.wethUsdc.pair);
 
 if (!address(factoryId) || !address(pairId)) {
-  throw new Error(`Manifest ${manifestPath} is missing the local factory or WNATIVE/USDC pair.`);
+  throw new Error(`Manifest ${manifestPath} is missing the local factory or WETH/USDC pair.`);
 }
 
 const query = `query GraphNodeMappingEvidence($factory: ID!, $pair: ID!) {

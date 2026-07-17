@@ -1,0 +1,25 @@
+---
+title: "LBFactory"
+description: "Plan direct pair discovery and creation against the verified Feather mainnet factory."
+slug: "contracts/factory"
+section: "Contracts for builders"
+order: 3
+audience: "builder"
+lastReviewed: "2026-07-14"
+---
+
+LBFactory is the authority for registered pairs, supported implementations, quote assets, and open bin-step presets.
+
+## Integration responsibilities
+
+Before using a pair, resolve it from the verified factory and validate token order, bin step, implementation, and hook configuration. Before creating a pair, confirm both token contracts, quote-asset eligibility, open preset state, semantic price orientation, and duplicate-pair result.
+
+<MethodSummary name="getLBPairInformation">
+Read the registered pair identity for a token pair and bin step, then attest the returned contract before use.
+</MethodSummary>
+
+<MethodSummary name="createLBPair">
+Create only after validating semantic token order, supported preset, initial active ID, and absence of an existing pair.
+</MethodSummary>
+
+Exact signatures and examples publish with the verified mainnet release.

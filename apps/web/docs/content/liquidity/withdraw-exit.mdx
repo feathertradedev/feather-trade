@@ -1,0 +1,30 @@
+---
+title: "Partial withdrawal and full exit"
+description: "Burn selected live bin balances with protected outputs, or exit every positive balance in one pool."
+slug: "liquidity/withdraw-exit"
+section: "Liquidity"
+order: 8
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+## Partial withdrawal
+
+Choose selected bins and an exact percentage. The review calculates a burn amount per live balance and protects minimum token X and token Y outputs. A successful partial withdrawal leaves remaining balances in the position.
+
+## Full exit
+
+Full Exit means 100% of every live positive bin balance owned by the connected wallet in the selected pool. A subset or percentage below 100% is never labeled a full exit.
+
+<Steps>
+1. Refresh the complete owned-bin set.
+2. Reconcile live balances and pool reserves at one current state.
+3. Review operator approval scope when required.
+4. Inspect expected and minimum outputs, gas, and output asset policy.
+5. Simulate and submit the exact burn transaction.
+6. Confirm received assets and remaining bin balances.
+</Steps>
+
+<Risk title="Withdrawal realizes the current composition">
+A position may return mostly or entirely one asset after market movement. A protected zero on one side can be valid when the other side remains protected.
+</Risk>

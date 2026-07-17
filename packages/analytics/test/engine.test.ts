@@ -8,7 +8,10 @@ import {
   AnalyticsApiService,
   AnalyticsCheckpointStore,
   AnalyticsEngine,
+  CANDLE_INTERVALS,
+  CandleStreamHub,
   FULL_HISTORY_START_TIMESTAMP,
+  candleBoundary,
   runBackfill,
   startAnalyticsHttpServer,
   USD_SCALE,
@@ -17,7 +20,8 @@ import {
   type BlockSubmission,
   type PriceSampleVerifier,
   type PricePolicy,
-  type PositionSnapshotEvent
+  type PositionSnapshotEvent,
+  type SwapAnalyticsEvent
 } from "../src/index.js";
 
 test("serves GraphQL CORS only to exact configured browser origins", async () => {
@@ -38,7 +42,7 @@ test("serves GraphQL CORS only to exact configured browser origins", async () =>
     });
     assert.equal(allowed.status, 204);
     assert.equal(allowed.headers.get("access-control-allow-origin"), "https://app.testnet.example.com");
-    assert.equal(allowed.headers.get("access-control-allow-methods"), "POST, OPTIONS");
+    assert.equal(allowed.headers.get("access-control-allow-methods"), "GET, POST, OPTIONS");
 
     const disallowed = await fetch(endpoint, {
       method: "OPTIONS",
@@ -54,6 +58,79 @@ test("serves GraphQL CORS only to exact configured browser origins", async () =>
     });
     assert.equal(query.status, 200);
     assert.equal(query.headers.get("access-control-allow-origin"), "https://app.testnet.example.com");
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("GraphQL/SSE emits multiple open 1m revisions then finalizes and opens across the minute boundary", async () => {
+  const streamPair = "0x00000000000000000000000000000000000000a1";
+  const service = await AnalyticsApiService.create({
+    engine: new AnalyticsEngine(policies, { assumeCompleteHistory: true }),
+    priceVerifier: testPriceVerifier()
+  });
+  const server = await startAnalyticsHttpServer({ service, host: "127.0.0.1", port: 0 });
+  try {
+    const address = server.address();
+    assert(address && typeof address === "object");
+    const base = `http://127.0.0.1:${address.port}`;
+    const historyResponse = await fetch(`${base}/graphql`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        query: "query($pair: ID!) { pairCandles(pair: $pair, interval: ONE_MINUTE, fromTimestamp: 600, toTimestamp: 660, first: 100) { streamCursor nodes { startTimestamp revision } } }",
+        variables: { pair: streamPair }
+      })
+    });
+    const history = await historyResponse.json() as { data: { pairCandles: { streamCursor: string; nodes: unknown[] } } };
+    assert.equal(history.data.pairCandles.streamCursor, "0");
+    assert.deepEqual(history.data.pairCandles.nodes, []);
+
+    await service.ingestBlock(submitBlock(block(1n, "0xb1", "0x00", 610, [{ ...marketSwap(USD_SCALE, UNIT), pair: streamPair }], [
+      price(TOKEN_X, "x-usd", USD_SCALE, 610, 1n),
+      price(TOKEN_Y, "y-usd", USD_SCALE, 610, 1n)
+    ])));
+    const first = await nextCandleEvent(base, streamPair, "0");
+    assert.equal(first.candle.startTimestamp, 600);
+    assert.equal(first.candle.finalized, false);
+    assert.equal(first.candle.swapCount, 1);
+
+    await service.ingestBlock(submitBlock(block(2n, "0xb2", "0xb1", 640, [{ ...marketSwap(2n * USD_SCALE, UNIT), pair: streamPair }], [
+      price(TOKEN_X, "x-usd", 2n * USD_SCALE, 640, 2n),
+      price(TOKEN_Y, "y-usd", USD_SCALE, 640, 2n)
+    ])));
+    const replacement = await nextCandleEvent(base, streamPair, first.cursor);
+    assert.equal(replacement.candle.startTimestamp, first.candle.startTimestamp);
+    assert(replacement.candle.revision > first.candle.revision);
+    assert.equal(replacement.candle.closeUsdE18, "2000000000000000000");
+    assert.equal(replacement.candle.swapCount, 2);
+
+    await service.ingestBlock(submitBlock(block(3n, "0xb3", "0xb2", 665, [{ ...marketSwap(3n * USD_SCALE, UNIT), pair: streamPair }], [
+      price(TOKEN_X, "x-usd", 3n * USD_SCALE, 665, 3n),
+      price(TOKEN_Y, "y-usd", USD_SCALE, 665, 3n)
+    ])));
+    const boundaryEvents = await nextCandleEvents(base, streamPair, replacement.cursor, 2);
+    assert.deepEqual(boundaryEvents.map((event) => [event.candle.startTimestamp, event.candle.finalized]), [[600, true], [660, false]]);
+    assert.deepEqual(boundaryEvents.map((event) => event.candle.swapCount), [2, 1]);
+
+    const replay = await nextCandleEvent(base, streamPair, boundaryEvents[0].cursor, { lastEventId: replacement.cursor });
+    assert.equal(replay.cursor, boundaryEvents[0].cursor);
+
+    const canonicalHistory = await service.execute(`query($pair: ID!) {
+      pairCandles(pair: $pair, interval: ONE_MINUTE, fromTimestamp: 600, toTimestamp: 660, first: 100) {
+        nodes { startTimestamp finalized revision swapCount }
+        streamCursor
+      }
+    }`, { pair: streamPair });
+    assert.equal(canonicalHistory.errors, undefined);
+    const canonicalData = canonicalHistory.data as {
+      pairCandles: { nodes: Array<{ finalized: boolean; revision: number; startTimestamp: number; swapCount: number }>; streamCursor: string };
+    };
+    assert.deepEqual(
+      canonicalData.pairCandles.nodes.map((candle) => [candle.startTimestamp, candle.finalized, candle.swapCount]),
+      [[600, true, 2], [660, false, 1]]
+    );
+    assert.equal(canonicalData.pairCandles.streamCursor, service.candleStream.cursor);
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
@@ -91,6 +168,11 @@ test("builds exact 24h USD metrics and bounded OHLC candles", () => {
   assert.equal(metrics.volume24hUsdE18, 20n * USD_SCALE);
   assert.equal(metrics.fees24hUsdE18, 2n * USD_SCALE);
   assert.equal(metrics.feeToTvlE18, (2n * USD_SCALE * USD_SCALE) / (390n * USD_SCALE));
+  assert.equal(metrics.totalSwapFees24hUsdE18, 2n * USD_SCALE);
+  assert.equal(metrics.protocolSwapFees24hUsdE18, 0n);
+  assert.equal(metrics.lpNetSwapFees24hUsdE18, 2n * USD_SCALE);
+  assert.equal(metrics.lpNetSwapFeeToTvlE18, (2n * USD_SCALE * USD_SCALE) / (390n * USD_SCALE));
+  assert.equal(metrics.feeBreakdownComplete, true);
   assert.equal(metrics.priceUsdE18, 3n * USD_SCALE);
 
   const historical = engine.queryPoolMetrics({ first: 10, asOfTimestamp: 3_600 }).nodes[0];
@@ -105,7 +187,201 @@ test("builds exact 24h USD metrics and bounded OHLC candles", () => {
   assert.equal(candle.lowUsdE18, 2n * USD_SCALE);
   assert.equal(candle.closeUsdE18, 3n * USD_SCALE);
   assert.equal(candle.volumeUsdE18, 20n * USD_SCALE);
+  assert.equal(candle.feesUsdE18, 2n * USD_SCALE);
+  assert.equal(candle.totalSwapFeesUsdE18, 2n * USD_SCALE);
+  assert.equal(candle.protocolSwapFeesUsdE18, 0n);
+  assert.equal(candle.lpNetSwapFeesUsdE18, 2n * USD_SCALE);
+  assert.equal(candle.feeBreakdownComplete, true);
   assert.equal(candle.swapCount, 1);
+});
+
+test("attributes indexed total, protocol, and LP-net swap fees without guessing legacy protocol shares", () => {
+  const complete = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  complete.ingestBlock(block(1n, "0xf1", "0x00", 3_600, [{
+    ...swap(10n * UNIT, 0n, UNIT, 0n),
+    protocolFeeX: UNIT / 4n,
+    protocolFeeY: 0n
+  }], [
+    price(TOKEN_X, "x-usd", 2n * USD_SCALE, 3_600, 1n),
+    price(TOKEN_Y, "y-usd", USD_SCALE, 3_600, 1n)
+  ]));
+
+  const metrics = complete.queryPoolMetrics({ first: 10 }).nodes[0];
+  assert.equal(metrics.totalSwapFees24hUsdE18, 2n * USD_SCALE);
+  assert.equal(metrics.protocolSwapFees24hUsdE18, USD_SCALE / 2n);
+  assert.equal(metrics.lpNetSwapFees24hUsdE18, 3n * USD_SCALE / 2n);
+  assert.equal(metrics.feeBreakdownComplete, true);
+  const candle = complete.queryCandles({ pair: PAIR, interval: "hour", fromTimestamp: 3_600, toTimestamp: 3_600, first: 10 }).nodes[0];
+  assert.equal(candle.feesUsdE18, candle.totalSwapFeesUsdE18);
+  assert.equal(candle.protocolSwapFeesUsdE18, USD_SCALE / 2n);
+  assert.equal(candle.lpNetSwapFeesUsdE18, 3n * USD_SCALE / 2n);
+  assert.equal(candle.feeBreakdownComplete, true);
+
+  const legacy = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  const { protocolFeeX: _protocolFeeX, protocolFeeY: _protocolFeeY, ...legacySwap } =
+    swap(10n * UNIT, 0n, UNIT, 0n) as Extract<AnalyticsEvent, { kind: "swap" }>;
+  legacy.ingestBlock(block(1n, "0xf2", "0x00", 3_600, [legacySwap], [
+    price(TOKEN_X, "x-usd", 2n * USD_SCALE, 3_600, 1n),
+    price(TOKEN_Y, "y-usd", USD_SCALE, 3_600, 1n)
+  ]));
+  const legacyMetrics = legacy.queryPoolMetrics({ first: 10 }).nodes[0];
+  assert.equal(legacyMetrics.fees24hUsdE18, 2n * USD_SCALE);
+  assert.equal(legacyMetrics.totalSwapFees24hUsdE18, 2n * USD_SCALE);
+  assert.equal(legacyMetrics.protocolSwapFees24hUsdE18, null);
+  assert.equal(legacyMetrics.lpNetSwapFees24hUsdE18, null);
+  assert.equal(legacyMetrics.lpNetSwapFeeToTvlE18, null);
+  assert.equal(legacyMetrics.feeBreakdownComplete, false);
+  assert.equal(legacyMetrics.status, "partial");
+  const legacyCandle = legacy.queryCandles({ pair: PAIR, interval: "hour", fromTimestamp: 3_600, toTimestamp: 3_600, first: 10 }).nodes[0];
+  assert.equal(legacyCandle.totalSwapFeesUsdE18, 2n * USD_SCALE);
+  assert.equal(legacyCandle.protocolSwapFeesUsdE18, null);
+  assert.equal(legacyCandle.lpNetSwapFeesUsdE18, null);
+  assert.equal(legacyCandle.feeBreakdownComplete, false);
+  assert.equal(legacyCandle.status, "partial");
+
+  const noSwap = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  noSwap.ingestBlock(block(1n, "0xf3", "0x00", 3_600, [pairSnapshot(UNIT, UNIT)], [
+    price(TOKEN_X, "x-usd", USD_SCALE, 3_600, 1n),
+    price(TOKEN_Y, "y-usd", USD_SCALE, 3_600, 1n)
+  ]));
+  const zeroMetrics = noSwap.queryPoolMetrics({ first: 10 }).nodes[0];
+  assert.equal(zeroMetrics.totalSwapFees24hUsdE18, 0n);
+  assert.equal(zeroMetrics.protocolSwapFees24hUsdE18, 0n);
+  assert.equal(zeroMetrics.lpNetSwapFees24hUsdE18, 0n);
+  assert.equal(zeroMetrics.feeBreakdownComplete, true);
+  const zeroCandle = noSwap.queryCandles({ pair: PAIR, interval: "hour", fromTimestamp: 3_600, toTimestamp: 3_600, first: 10 }).nodes[0];
+  assert.equal(zeroCandle.totalSwapFeesUsdE18, 0n);
+  assert.equal(zeroCandle.protocolSwapFeesUsdE18, 0n);
+  assert.equal(zeroCandle.lpNetSwapFeesUsdE18, 0n);
+  assert.equal(zeroCandle.feeBreakdownComplete, true);
+});
+
+test("rejects invalid fee attribution at the canonical engine boundary", () => {
+  const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  assert.throws(
+    () => engine.ingestBlock(block(1n, "0xfa", "0x00", 3_600, [{ ...swap(UNIT, 0n, -1n, 0n) }], [])),
+    /non-negative/
+  );
+  assert.throws(
+    () => engine.ingestBlock(block(1n, "0xfb", "0x00", 3_600, [{ ...swap(UNIT, 0n, 1n, 0n), protocolFeeX: 2n }], [])),
+    /cannot exceed/
+  );
+});
+
+test("materializes minute candles, hierarchical rollups, revisions, finalization, and Monday weeks", () => {
+  const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  const monday = 4 * 86_400;
+  engine.ingestBlock(block(1n, "0x91", "0x00", monday + 10, [marketSwap(2n * USD_SCALE, UNIT)], [
+    price(TOKEN_X, "x-usd", 2n * USD_SCALE, monday + 10, 1n),
+    price(TOKEN_Y, "y-usd", USD_SCALE, monday + 10, 1n)
+  ]));
+  engine.ingestBlock(block(2n, "0x92", "0x91", monday + 40, [marketSwap(3n * USD_SCALE, 2n * UNIT)], [
+    price(TOKEN_X, "x-usd", 3n * USD_SCALE, monday + 40, 2n),
+    price(TOKEN_Y, "y-usd", USD_SCALE, monday + 40, 2n)
+  ]));
+  engine.ingestBlock(block(3n, "0x93", "0x92", monday + 70, [marketSwap(USD_SCALE, UNIT)], [
+    price(TOKEN_X, "x-usd", USD_SCALE, monday + 70, 3n),
+    price(TOKEN_Y, "y-usd", USD_SCALE, monday + 70, 3n)
+  ]));
+  engine.ingestBlock(block(4n, "0x94", "0x93", monday + 121, [], []));
+
+  const minutes = engine.queryCandles({ pair: PAIR, interval: "minute", fromTimestamp: monday, toTimestamp: monday + 120, first: 10 }).nodes;
+  assert.equal(minutes.length, 2);
+  assert.deepEqual(
+    [minutes[0].openUsdE18, minutes[0].highUsdE18, minutes[0].lowUsdE18, minutes[0].closeUsdE18],
+    [2n * USD_SCALE, 3n * USD_SCALE, 2n * USD_SCALE, 3n * USD_SCALE]
+  );
+  assert.equal(minutes[0].swapCount, 2);
+  assert.equal(minutes[0].revision, 4);
+  assert.equal(minutes[0].finalized, true);
+  assert.equal(minutes[0].firstBlockHash, "0x91");
+  assert.equal(minutes[0].lastBlockHash, "0x92");
+  assert.equal(minutes[1].finalized, true);
+  assert.equal(minutes[1].priceSource, "active-bin-quote-usd");
+  assert.equal(minutes[1].quoteToken, TOKEN_Y);
+
+  for (const interval of CANDLE_INTERVALS.filter((value) => value !== "minute")) {
+    const rows = engine.queryCandles({ pair: PAIR, interval, fromTimestamp: candleBoundary(monday, interval), toTimestamp: monday + 120, first: 10 }).nodes;
+    assert.equal(rows.length, 1, `${interval} rollup is present`);
+    assert.equal(rows[0].openUsdE18, 2n * USD_SCALE);
+    assert.equal(rows[0].highUsdE18, 3n * USD_SCALE);
+    assert.equal(rows[0].lowUsdE18, USD_SCALE);
+    assert.equal(rows[0].closeUsdE18, USD_SCALE);
+    assert.equal(rows[0].swapCount, 3);
+  }
+  assert.equal(candleBoundary(monday + 6 * 86_400, "week"), monday);
+  assert.equal(candleBoundary(monday + 7 * 86_400, "week"), monday + 7 * 86_400);
+  assert.throws(
+    () => engine.queryCandles({ pair: PAIR, interval: "minute", fromTimestamp: 0, toTimestamp: 500 * 60, first: 100 }),
+    /cannot span more than 500/
+  );
+
+  assert.equal(engine.ingestBlock(block(3n, "0x95", "0x92", monday + 70, [marketSwap(4n * USD_SCALE, UNIT)], [
+    price(TOKEN_X, "x-usd", 4n * USD_SCALE, monday + 70, 3n),
+    price(TOKEN_Y, "y-usd", USD_SCALE, monday + 70, 3n)
+  ])), "reorg");
+  const rebuiltHour = engine.queryCandles({ pair: PAIR, interval: "hour", fromTimestamp: monday, toTimestamp: monday, first: 10 }).nodes[0];
+  assert.equal(rebuiltHour.highUsdE18, 4n * USD_SCALE);
+  assert.equal(rebuiltHour.closeUsdE18, 4n * USD_SCALE);
+  assert.equal(rebuiltHour.lastBlockHash, "0x95");
+});
+
+test("replays bounded candle replacements and resets expired stream cursors", () => {
+  const stream = new CandleStreamHub(2);
+  const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  engine.ingestBlock(block(1n, "0xa1", "0x00", 60, [marketSwap(USD_SCALE, UNIT)], [
+    price(TOKEN_X, "x-usd", USD_SCALE, 60, 1n),
+    price(TOKEN_Y, "y-usd", USD_SCALE, 60, 1n)
+  ]));
+  const candle = engine.queryCandles({ pair: PAIR, interval: "minute", fromTimestamp: 60, toTimestamp: 60, first: 1 }).nodes[0];
+  const first = stream.publishCandle(candle);
+  const second = stream.publishCandle({ ...candle, revision: candle.revision + 1 });
+  assert.deepEqual(stream.replay(first.cursor, PAIR, "minute")?.map((event) => event.cursor), [second.cursor]);
+  stream.publishReset("canonical-reorg");
+  assert.equal(stream.replay("0", PAIR, "minute"), null);
+  assert.deepEqual(stream.replay(second.cursor, PAIR, "minute")?.map((event) => event.type), ["reset"]);
+});
+
+test("bounds candle stream subscribers and releases capacity on disconnect", () => {
+  const stream = new CandleStreamHub();
+  const unsubscribes = Array.from({ length: 500 }, () => stream.subscribe(() => undefined));
+  assert.equal(stream.subscriberCount, 500);
+  assert.throws(() => stream.subscribe(() => undefined), /subscriber limit/);
+  unsubscribes[0]!();
+  assert.equal(stream.subscriberCount, 499);
+  const unsubscribe = stream.subscribe(() => undefined);
+  assert.equal(stream.subscriberCount, 500);
+  unsubscribe();
+  for (const release of unsubscribes.slice(1)) release();
+  assert.equal(stream.subscriberCount, 0);
+});
+
+test("isolates failed candle subscribers after a durable batch commit", async () => {
+  const stream = new CandleStreamHub();
+  const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  engine.ingestBlock(block(1n, "0xa2", "0x00", 60, [marketSwap(USD_SCALE, UNIT)], [
+    price(TOKEN_X, "x-usd", USD_SCALE, 60, 1n),
+    price(TOKEN_Y, "y-usd", USD_SCALE, 60, 1n)
+  ]));
+  const candle = engine.queryCandles({ pair: PAIR, interval: "minute", fromTimestamp: 60, toTimestamp: 60, first: 1 }).nodes[0];
+  stream.subscribe(() => {
+    throw new Error("disconnected subscriber");
+  });
+  const delivered: number[] = [];
+  stream.subscribe((event) => delivered.push(event.candle?.revision ?? 0));
+  let persisted = 0;
+
+  await stream.publishBatch([
+    { type: "candle", pair: PAIR, interval: "minute", candle, reason: null },
+    { type: "candle", pair: PAIR, interval: "minute", candle: { ...candle, revision: candle.revision + 1 }, reason: null }
+  ], async (events) => {
+    persisted = events.length;
+  });
+
+  assert.equal(persisted, 2);
+  assert.equal(stream.cursor, "2");
+  assert.deepEqual(delivered, [candle.revision, candle.revision + 1]);
+  assert.equal(stream.subscriberCount, 1, "the failed subscriber is removed without aborting delivery");
 });
 
 test("fails USD values partial when pricing is missing, stale, or outside confidence policy", () => {
@@ -198,6 +474,245 @@ test("rolls back orphaned aggregates and position state on a reorg", () => {
   assert.equal(engine.queryWalletPositions({ owner: OWNER, first: 10 }).nodes.length, 0);
   assert.equal(engine.getHealth().reorgCount, 1);
   assert.equal(engine.getHealth().headHash, "0x23");
+});
+
+test("materializes canonical pool state with bounded bins and sparse absolute replacements", () => {
+  const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  const activeId = 8_388_608;
+  engine.ingestBlock({
+    ...block(1n, "0xc1", "0x00", 1_000, [poolObservation({
+      sourceId: "snapshot:1",
+      sourceEventIds: ["log:2", "log:1"],
+      activeId,
+      marketPriceQuoteE18: 101n * USD_SCALE,
+      reserveX: 10n * UNIT,
+      reserveY: 20n * UNIT,
+      bins: [
+        poolBin(activeId - 2, 1n, 0n, 1n),
+        poolBin(activeId - 1, 2n, 0n, 2n),
+        poolBin(activeId, 3n, 4n, 7n),
+        poolBin(activeId + 1, 0n, 5n, 5n),
+        poolBin(activeId + 2, 0n, 6n, 6n)
+      ]
+    })], [
+      price(TOKEN_X, "x-usd", 2n * USD_SCALE, 1_000, 1n),
+      price(TOKEN_Y, "y-usd", USD_SCALE, 1_000, 1n)
+    ]),
+    chainId: 31_337
+  });
+
+  const first = engine.queryPoolState({ pair: PAIR.toUpperCase(), radius: 1 });
+  assert(first);
+  assert.equal(first.state.chainId, 31_337);
+  assert.equal(first.state.activeId, activeId);
+  assert.equal(first.state.binStep, 10);
+  assert.equal(first.state.marketPriceQuoteE18, 101n * USD_SCALE);
+  assert.equal(first.state.priceUsdE18, 101n * USD_SCALE, "display price follows the active bin");
+  assert.equal(first.state.tvlUsdE18, 40n * USD_SCALE, "TVL remains valued from trusted token prices");
+  assert.equal(first.state.asOfBlockHash, "0xc1");
+  assert.equal(first.state.revision, 1);
+  assert.deepEqual(first.bins.map((bin) => bin.binId), [String(activeId - 1), String(activeId), String(activeId + 1)]);
+  assert.deepEqual(engine.listLastChangedPoolUpdates()[0].sourceEventIds, ["log:1", "log:2"]);
+  assert.equal(
+    engine.listLastChangedPoolUpdates()[0].eventId,
+    `31337:0xc1:${PAIR}:log:1,log:2`
+  );
+
+  engine.ingestBlock({
+    ...block(2n, "0xc2", "0xc1", 1_010, [poolObservation({
+      sourceId: "snapshot:2",
+      sourceEventIds: ["log:3"],
+      activeId: activeId + 1,
+      marketPriceQuoteE18: 102n * USD_SCALE,
+      reserveX: 9n * UNIT,
+      reserveY: 25n * UNIT,
+      bins: [
+        poolBin(activeId, 3n, 4n, 7n),
+        poolBin(activeId + 1, 0n, 8n, 8n),
+        poolBin(activeId + 2, 0n, 9n, 9n)
+      ]
+    })], [
+      price(TOKEN_X, "x-usd", 2n * USD_SCALE, 1_010, 2n),
+      price(TOKEN_Y, "y-usd", USD_SCALE, 1_010, 2n)
+    ]),
+    chainId: 31_337
+  });
+
+  const update = engine.listLastChangedPoolUpdates()[0];
+  assert.equal(update.state.revision, 2);
+  assert.equal(update.state.asOfBlockHash, "0xc2");
+  assert.deepEqual(update.binReplacements.map((bin) => [bin.binId, bin.revision]), [
+    [String(activeId + 1), 2],
+    [String(activeId + 2), 2]
+  ]);
+  assert.equal(update.binReplacements.some((bin) => bin.binId === String(activeId)), false, "unchanged bins are omitted");
+  assert.equal(engine.listPoolStates()[0].bins.length, 5, "the engine retains the complete observed canonical bin set");
+
+  engine.ingestBlock({
+    ...block(3n, "0xc3", "0xc2", 1_020, [poolObservation({
+      sourceId: "snapshot:3",
+      sourceEventIds: ["log:4"],
+      activeId: activeId + 1,
+      marketPriceQuoteE18: 102n * USD_SCALE,
+      reserveX: 9n * UNIT,
+      reserveY: 25n * UNIT,
+      bins: [
+        poolBin(activeId, 3n, 4n, 7n),
+        poolBin(activeId + 1, 0n, 8n, 8n),
+        poolBin(activeId + 2, 0n, 9n, 9n)
+      ],
+      replaceBinWindow: true
+    })]),
+    chainId: 31_337
+  });
+  const windowReplacement = engine.listLastChangedPoolUpdates()[0];
+  assert.equal(windowReplacement.replaceBinWindow, true);
+  assert.deepEqual(windowReplacement.binReplacements.map((bin) => [bin.binId, bin.revision]), [
+    [String(activeId), 1],
+    [String(activeId + 1), 2],
+    [String(activeId + 2), 2]
+  ], "window resets include every observed row without inventing bin revisions");
+  assert.equal(engine.listPoolStates()[0].bins.length, 3, "a complete window replacement discards bins outside the new window");
+
+  assert.throws(() => engine.queryPoolState({ pair: PAIR, radius: -1 }), /between 0 and 100/);
+  assert.throws(() => engine.queryPoolState({ pair: PAIR, radius: 101 }), /between 0 and 100/);
+});
+
+test("deduplicates canonical event sources and rejects source or block payload conflicts", () => {
+  const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  const sourcedSwap = {
+    ...swap(UNIT, 0n, 0n, 0n),
+    source: logSource("swap:1", "0xaa", 0)
+  };
+  const firstBlock = {
+    ...block(1n, "0xd1", "0x00", 2_000, [sourcedSwap, structuredClone(sourcedSwap)], [
+      price(TOKEN_X, "x-usd", USD_SCALE, 2_000, 1n),
+      price(TOKEN_Y, "y-usd", USD_SCALE, 2_000, 1n)
+    ]),
+    chainId: 31_337
+  };
+  assert.equal(engine.ingestBlock(firstBlock), "appended");
+  assert.equal(
+    engine.queryCandles({ pair: PAIR, interval: "minute", fromTimestamp: 1_980, toTimestamp: 1_980, first: 10 }).nodes[0].swapCount,
+    1
+  );
+  assert.equal(engine.ingestBlock(firstBlock), "duplicate");
+  assert.throws(
+    () => engine.ingestBlock({ ...firstBlock, timestamp: 2_001 }),
+    /changed payload/
+  );
+  engine.augmentHeadPositionSnapshots(engine.getCanonicalHead()!, [{
+    ...identity(),
+    kind: "position-snapshot",
+    owner: OWNER,
+    bins: []
+  }]);
+  assert.equal(
+    engine.ingestBlock(firstBlock),
+    "duplicate",
+    "mutable position enrichment does not make the original canonical payload look conflicting"
+  );
+
+  assert.throws(
+    () => new AnalyticsEngine(policies).ingestBlock({
+      ...block(1n, "0xd2", "0x00", 2_000, [sourcedSwap, { ...sourcedSwap, amountInX: 2n * UNIT }]),
+      chainId: 31_337
+    }),
+    /Canonical event source swap:1 changed payload/
+  );
+
+  const second = {
+    ...block(2n, "0xd3", "0xd1", 2_010, [structuredClone(sourcedSwap)]),
+    chainId: 31_337
+  };
+  assert.equal(engine.ingestBlock(second), "appended");
+  assert.equal(engine.listLastChangedCandles().length, 0, "an exact cross-block redelivery has no aggregate effect");
+});
+
+test("retains active-bin observations across legacy events that omit market fields", () => {
+  const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  engine.ingestBlock(block(1n, "0xd4", "0x00", 4_000, [marketSwap(5n * USD_SCALE, UNIT)], [
+    price(TOKEN_X, "x-usd", 2n * USD_SCALE, 4_000, 1n),
+    price(TOKEN_Y, "y-usd", USD_SCALE, 4_000, 1n)
+  ]));
+  engine.ingestBlock(block(2n, "0xd5", "0xd4", 4_010, [pairSnapshot(90n * UNIT, 110n * UNIT)], [
+    price(TOKEN_X, "x-usd", 2n * USD_SCALE, 4_010, 2n),
+    price(TOKEN_Y, "y-usd", USD_SCALE, 4_010, 2n)
+  ]));
+
+  const candle = engine.queryCandles({ pair: PAIR, interval: "minute", fromTimestamp: 3_960, toTimestamp: 3_960, first: 10 }).nodes[0];
+  assert.equal(candle.closeUsdE18, 5n * USD_SCALE);
+  assert.equal(candle.priceSource, "active-bin-quote-usd");
+});
+
+test("requires chain-scoped source identity for pool observations and rebuilds them on reorg", () => {
+  const activeId = 8_388_608;
+  const genesis = {
+    ...block(1n, "0xe1", "0x00", 3_000, [poolObservation({
+      sourceId: "snapshot:e1",
+      sourceEventIds: ["log:e1"],
+      activeId,
+      marketPriceQuoteE18: USD_SCALE,
+      bins: [poolBin(activeId, 1n, 1n, 2n)]
+    })], [
+      price(TOKEN_X, "x-usd", USD_SCALE, 3_000, 1n),
+      price(TOKEN_Y, "y-usd", USD_SCALE, 3_000, 1n)
+    ]),
+    chainId: 31_337
+  };
+  const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  engine.ingestBlock(genesis);
+  engine.ingestBlock({
+    ...block(2n, "0xe2", "0xe1", 3_010, [poolObservation({
+      sourceId: "snapshot:e2",
+      sourceEventIds: ["log:e2"],
+      activeId: activeId + 1,
+      marketPriceQuoteE18: 2n * USD_SCALE,
+      bins: [poolBin(activeId + 1, 0n, 5n, 5n)]
+    })]),
+    chainId: 31_337
+  });
+  assert.deepEqual(engine.listPoolStates()[0].bins.map((bin) => bin.binId), [String(activeId), String(activeId + 1)]);
+
+  assert.equal(engine.ingestBlock({
+    ...block(2n, "0xe3", "0xe1", 3_011, [poolObservation({
+      sourceId: "snapshot:e3",
+      sourceEventIds: ["log:e3"],
+      activeId: activeId - 1,
+      marketPriceQuoteE18: USD_SCALE / 2n,
+      bins: [poolBin(activeId - 1, 7n, 0n, 7n)]
+    })]),
+    chainId: 31_337
+  }), "reorg");
+  const rebuilt = engine.listPoolStates()[0];
+  assert.equal(rebuilt.state.asOfBlockHash, "0xe3");
+  assert.equal(rebuilt.state.revision, 2);
+  assert.deepEqual(rebuilt.bins.map((bin) => bin.binId), [String(activeId - 1), String(activeId)]);
+  assert.deepEqual(engine.listLastChangedPoolUpdates()[0].binReplacements.map((bin) => bin.binId), [String(activeId - 1)]);
+
+  const { chainId: _chainId, ...missingChain } = genesis;
+  assert.throws(() => new AnalyticsEngine(policies).ingestBlock(missingChain), /chain ID/);
+  assert.throws(
+    () => engine.ingestBlock({ ...block(3n, "0xe4", "0xe3", 3_012, []), chainId: 1 }),
+    /does not match canonical chain/
+  );
+
+  const invalidFee = poolObservation({
+    sourceId: "snapshot:invalid-fee",
+    sourceEventIds: ["log:invalid-fee"],
+    activeId,
+    marketPriceQuoteE18: USD_SCALE,
+    bins: [poolBin(activeId, 1n, 1n, 1n)]
+  });
+  if (invalidFee.kind !== "pair-snapshot" || invalidFee.poolState === undefined) throw new Error("invalid test fixture");
+  invalidFee.poolState.feeState.static.protocolShare = 2_501n;
+  assert.throws(
+    () => new AnalyticsEngine(policies).ingestBlock({
+      ...block(1n, "0xe5", "0x00", 3_000, [invalidFee]),
+      chainId: 31_337
+    }),
+    /protocol fee share.*canonical unsigned range/
+  );
 });
 
 test("groups per-bin balances and computes proportional realized and unrealized P&L", () => {
@@ -467,6 +982,31 @@ test("reports partial and capped backfills with resumable cursors", async () => 
   });
   assert.equal(resumed.status, "complete");
   assert.equal(resumedEngine.exportCheckpoint().backfill.coverageThroughTimestamp, 100);
+
+  const rollbackEngine = new AnalyticsEngine(policies);
+  rollbackEngine.ingestBlock(block(1n, "0x81", "0x00", 60, []));
+  rollbackEngine.ingestBlock(block(2n, "0x82", "0x81", 120, []));
+  rollbackEngine.ingestBlock(block(3n, "0x83", "0x82", 180, []));
+  rollbackEngine.updateBackfillState({
+    status: "complete",
+    cursor: "4",
+    error: null,
+    coverageStartTimestamp: FULL_HISTORY_START_TIMESTAMP,
+    coverageThroughTimestamp: 180
+  });
+  const rolledBack = await runBackfill({
+    engine: rollbackEngine,
+    startCursor: "4",
+    fetchPage: async () => ({
+      blocks: [],
+      canonicalHead: { number: 2n, hash: "0x82", timestamp: 120 },
+      nextCursor: "3",
+      hasMore: false
+    })
+  });
+  assert.equal(rolledBack.status, "complete");
+  assert.equal(rollbackEngine.getHealth(120).headBlock, 2n);
+  assert.equal(rollbackEngine.exportCheckpoint().backfill.coverageThroughTimestamp, 120);
 });
 
 test("serves and restores the bounded GraphQL query surface", async () => {
@@ -518,7 +1058,11 @@ test("serves and restores the bounded GraphQL query surface", async () => {
 
     const query = `query Metrics($first: Int!) {
       poolMetrics(first: $first) {
-        nodes { pair tvlUsdE18 volume24hUsdE18 fees24hUsdE18 status }
+        nodes {
+          pair tvlUsdE18 volume24hUsdE18 fees24hUsdE18
+          totalSwapFees24hUsdE18 protocolSwapFees24hUsdE18 lpNetSwapFees24hUsdE18
+          lpNetSwapFeeToTvlE18 feeBreakdownComplete status
+        }
         pageInfo { hasNextPage partial }
       }
     }`;
@@ -532,6 +1076,11 @@ test("serves and restores the bounded GraphQL query surface", async () => {
           tvlUsdE18: "300000000000000000000",
           volume24hUsdE18: "2000000000000000000",
           fees24hUsdE18: "20000000000000000",
+          totalSwapFees24hUsdE18: "20000000000000000",
+          protocolSwapFees24hUsdE18: "0",
+          lpNetSwapFees24hUsdE18: "20000000000000000",
+          lpNetSwapFeeToTvlE18: "66666666666666",
+          feeBreakdownComplete: true,
           status: "READY"
         }
       ],
@@ -636,8 +1185,84 @@ function pairSnapshot(reserveX: bigint, reserveY: bigint): AnalyticsEvent {
   return { ...identity(), kind: "pair-snapshot", reserveX, reserveY };
 }
 
-function swap(amountInX: bigint, amountInY: bigint, feeX: bigint, feeY: bigint): AnalyticsEvent {
-  return { ...identity(), kind: "swap", amountInX, amountInY, feeX, feeY, reserveX: 100n * UNIT, reserveY: 100n * UNIT };
+function swap(amountInX: bigint, amountInY: bigint, feeX: bigint, feeY: bigint): SwapAnalyticsEvent {
+  return { ...identity(), kind: "swap", amountInX, amountInY, feeX, feeY, protocolFeeX: 0n, protocolFeeY: 0n, reserveX: 100n * UNIT, reserveY: 100n * UNIT };
+}
+
+function marketSwap(marketPriceQuoteE18: bigint, amountInX: bigint): SwapAnalyticsEvent {
+  return {
+    ...identity(),
+    kind: "swap",
+    amountInX,
+    amountInY: 0n,
+    feeX: amountInX / 100n,
+    feeY: 0n,
+    protocolFeeX: 0n,
+    protocolFeeY: 0n,
+    reserveX: 100n * UNIT,
+    reserveY: 100n * UNIT,
+    marketPriceQuoteE18,
+    activeId: 8_388_608,
+    binStep: 10
+  };
+}
+
+function poolObservation(input: {
+  sourceId: string;
+  sourceEventIds: string[];
+  activeId: number;
+  marketPriceQuoteE18: bigint;
+  bins: Array<{ binId: string; reserveX: bigint; reserveY: bigint; totalSupply: bigint }>;
+  reserveX?: bigint;
+  reserveY?: bigint;
+  replaceBinWindow?: boolean;
+}): AnalyticsEvent {
+  return {
+    ...identity(),
+    kind: "pair-snapshot",
+    reserveX: input.reserveX ?? 100n * UNIT,
+    reserveY: input.reserveY ?? 100n * UNIT,
+    activeId: input.activeId,
+    binStep: 10,
+    marketPriceQuoteE18: input.marketPriceQuoteE18,
+    source: {
+      eventId: input.sourceId,
+      transactionHash: null,
+      logIndex: null,
+      sequence: 0,
+      kind: "block-snapshot"
+    },
+    poolState: {
+      feeState: {
+        static: {
+          baseFactor: 1n,
+          filterPeriod: 2n,
+          decayPeriod: 3n,
+          reductionFactor: 4n,
+          variableFeeControl: 5n,
+          protocolShare: 6n,
+          maxVolatilityAccumulator: 10n
+        },
+        variable: {
+          volatilityAccumulator: 8n,
+          volatilityReference: 9n,
+          idReference: BigInt(input.activeId),
+          timeOfLastUpdate: 10n
+        }
+      },
+      binUpdates: input.bins,
+      sourceEventIds: input.sourceEventIds,
+      replaceBinWindow: input.replaceBinWindow ?? false
+    }
+  };
+}
+
+function poolBin(binId: number, reserveX: bigint, reserveY: bigint, totalSupply: bigint) {
+  return { binId: String(binId), reserveX, reserveY, totalSupply };
+}
+
+function logSource(eventId: string, transactionHash: `0x${string}`, logIndex: number) {
+  return { eventId, transactionHash, logIndex, sequence: logIndex, kind: "log" as const };
 }
 
 function liquidity(kind: "deposit" | "withdraw", bins: Array<{ binId: string; liquidityDelta: bigint; amountX: bigint; amountY: bigint }>): AnalyticsEvent {
@@ -683,4 +1308,53 @@ function testPriceVerifier(): PriceSampleVerifier {
       return { ...sample, verifiedBy: "test-signature-verifier" };
     }
   };
+}
+
+async function nextCandleEvent(
+  base: string,
+  pair: string,
+  after: string,
+  options: { lastEventId?: string } = {}
+): Promise<{ cursor: string; candle: { startTimestamp: number; finalized: boolean; revision: number; closeUsdE18: string | null; swapCount: number } }> {
+  return (await nextCandleEvents(base, pair, after, 1, options))[0]!;
+}
+
+async function nextCandleEvents(
+  base: string,
+  pair: string,
+  after: string,
+  count: number,
+  options: { lastEventId?: string } = {}
+): Promise<Array<{ cursor: string; candle: { startTimestamp: number; finalized: boolean; revision: number; closeUsdE18: string | null; swapCount: number } }>> {
+  const controller = new AbortController();
+  const response = await fetch(`${base}/events/candles?pair=${pair}&interval=ONE_MINUTE&after=${after}`, {
+    headers: options.lastEventId ? { "last-event-id": options.lastEventId } : undefined,
+    signal: controller.signal
+  });
+  assert.equal(response.status, 200);
+  assert(response.body);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const events: Array<{ cursor: string; candle: { startTimestamp: number; finalized: boolean; revision: number; closeUsdE18: string | null; swapCount: number } }> = [];
+  try {
+    while (events.length < count) {
+      const chunk = await reader.read();
+      if (chunk.done) throw new Error("Candle stream closed before the expected event arrived");
+      buffer += decoder.decode(chunk.value, { stream: true });
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const frame = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        if (frame.includes("event: candle")) {
+          const data = frame.split("\n").find((line) => line.startsWith("data: "))?.slice(6);
+          if (data) events.push(JSON.parse(data));
+        }
+        boundary = buffer.indexOf("\n\n");
+      }
+    }
+    return events;
+  } finally {
+    controller.abort();
+  }
 }

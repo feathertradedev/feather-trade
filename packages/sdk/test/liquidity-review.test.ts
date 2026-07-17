@@ -8,6 +8,7 @@ import {
   normalizeAddLiquiditySimulationResult,
   quoteAddLiquidityMath,
   quoteAddLiquidityMathFromSimulation,
+  quoteCurrentFeeRates,
   type AddLiquidityReviewInput
 } from "../src/liquidity-review.js";
 
@@ -115,6 +116,69 @@ test("changes the fee estimate at filter and decay timestamp boundaries", () => 
   assert.ok(filtered.bins[0]!.totalFeeRate > reduced.bins[0]!.totalFeeRate);
   assert.ok(reduced.bins[0]!.totalFeeRate > decayed.bins[0]!.totalFeeRate);
   assert.ok(filtered.compositionFeeX > reduced.compositionFeeX);
+});
+
+test("quotes current active-bin fee rates with explicit protocol and LP-net attribution", () => {
+  const rates = quoteCurrentFeeRates({
+    activeId,
+    binStep: 100n,
+    blockTimestamp: 1_005n,
+    staticFees: { ...zeroFees, baseFactor: 1_000n, variableFeeControl: 100n, protocolShare: 2_500n },
+    variableFees: { volatilityAccumulator: 1_000n, volatilityReference: 500n, idReference: activeId - 1n, timeOfLastUpdate: 1_000n }
+  });
+  assert.equal(rates.baseFeeRate, 1_000_000_000_000_000n);
+  assert.ok(rates.variableFeeRate > 0n);
+  assert.equal(rates.totalFeeRate, rates.baseFeeRate + rates.variableFeeRate);
+  assert.equal(rates.protocolFeeRate, rates.totalFeeRate / 4n);
+  assert.equal(rates.lpNetFeeRate, rates.totalFeeRate - rates.protocolFeeRate);
+  assert.equal(rates.protocolShare, 2_500n);
+  const existingReview = quoteAddLiquidityMath(fixture({
+    amountXReceived: 16n,
+    amountYReceived: 0n,
+    binStep: 100n,
+    blockTimestamp: 1_005n,
+    distributionY: [0n],
+    staticFees: { ...zeroFees, baseFactor: 1_000n, variableFeeControl: 100n, protocolShare: 2_500n },
+    variableFees: { volatilityAccumulator: 1_000n, volatilityReference: 500n, idReference: activeId - 1n, timeOfLastUpdate: 1_000n }
+  }));
+  assert.equal(rates.totalFeeRate, existingReview.bins[0]!.totalFeeRate, "read-only fee breakdown stays in parity with the unchanged review path");
+
+  const staticOnly = quoteCurrentFeeRates({
+    activeId,
+    binStep: 10n,
+    blockTimestamp: 1_000n,
+    staticFees: zeroFees,
+    variableFees: zeroVariable
+  });
+  assert.equal(staticOnly.variableFeeRate, 0n);
+  assert.equal(staticOnly.totalFeeRate, staticOnly.baseFeeRate);
+  assert.equal(staticOnly.protocolFeeRate, 0n);
+  assert.equal(staticOnly.lpNetFeeRate, staticOnly.totalFeeRate);
+  assert.throws(() => quoteCurrentFeeRates({
+    activeId,
+    binStep: 0n,
+    blockTimestamp: 1_000n,
+    staticFees: zeroFees,
+    variableFees: zeroVariable
+  }), /greater than zero/);
+});
+
+test("keeps the read-only fee breakdown in parity with review math at filter and decay boundaries", () => {
+  const staticFees = { ...zeroFees, baseFactor: 1_000n, variableFeeControl: 100n, protocolShare: 500n };
+  const variableFees = { volatilityAccumulator: 1_000n, volatilityReference: 500n, idReference: activeId - 1n, timeOfLastUpdate: 1_000n };
+  for (const blockTimestamp of [1_005n, 1_010n, 1_020n]) {
+    const rates = quoteCurrentFeeRates({ activeId, binStep: 100n, blockTimestamp, staticFees, variableFees });
+    const review = quoteAddLiquidityMath(fixture({
+      amountXReceived: 16n,
+      amountYReceived: 0n,
+      binStep: 100n,
+      blockTimestamp,
+      distributionY: [0n],
+      staticFees,
+      variableFees
+    }));
+    assert.equal(rates.totalFeeRate, review.bins[0]!.totalFeeRate, `timestamp ${blockTimestamp}`);
+  }
 });
 
 test("derives transfer-tax-safe received amounts from the pinned simulation", () => {

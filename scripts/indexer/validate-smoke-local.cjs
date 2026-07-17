@@ -42,6 +42,9 @@ function positive(value) {
 
 function amountEq(actual, expected) {
   try {
+    if (typeof expected === "number" && Number.isInteger(expected) && !Number.isSafeInteger(expected)) {
+      return Number(String(actual || "0")) === expected;
+    }
     return BigInt(String(actual || "0")) === BigInt(String(expected || "0"));
   } catch (_) {
     return false;
@@ -139,19 +142,24 @@ for (const seededPool of seededPools) {
     fail(`Seeded pair ${seededPool.name} reserves are not both positive.`);
   }
 
-  if (!positive(pair.totalVolumeX) && !positive(pair.totalVolumeY)) {
-    fail(`Seeded pair ${seededPool.name} decoded volume is not positive.`);
-  }
-
-  if (!positive(pair.swapCount) || !positive(pair.depositCount)) {
-    fail(`Seeded pair ${seededPool.name} swap/deposit counts are missing.`);
-  }
-
   const expectsXForY = smokeTokenIn === seededPool.tokenX && smokeTokenOut === seededPool.tokenY;
   const expectsYForX = smokeTokenIn === seededPool.tokenY && smokeTokenOut === seededPool.tokenX;
+  const isSmokePool = expectsXForY || expectsYForX;
   const hasExactSmokeSwap = smoke.swapAmountIn != null && smoke.swapAmountOut != null && (expectsXForY || expectsYForX);
 
-  const swap = swaps.find((item) => {
+  if (!positive(pair.depositCount)) {
+    fail(`Seeded pair ${seededPool.name} deposit count is missing.`);
+  }
+
+  if (isSmokePool && !positive(pair.totalVolumeX) && !positive(pair.totalVolumeY)) {
+    fail(`Smoke pair ${seededPool.name} decoded volume is not positive.`);
+  }
+
+  if (isSmokePool && !positive(pair.swapCount)) {
+    fail(`Smoke pair ${seededPool.name} swap count is missing.`);
+  }
+
+  const swap = isSmokePool ? swaps.find((item) => {
     if (lower(item.pair && item.pair.id) !== seededPool.pair || !nonzeroBytes(item.amountsIn) || !nonzeroBytes(item.amountsOut)) {
       return false;
     }
@@ -175,9 +183,9 @@ for (const seededPool of seededPools) {
     }
 
     return (positive(item.amountInX) || positive(item.amountInY)) && (positive(item.amountOutX) || positive(item.amountOutY));
-  });
-  if (!swap) {
-    fail(`Seeded pair ${seededPool.name} has no decoded indexed swap matching the manifest side ordering.`);
+  }) : null;
+  if (isSmokePool && !swap) {
+    fail(`Smoke pair ${seededPool.name} has no decoded indexed swap matching the manifest side ordering.`);
   }
 
   const liquidityEvent = liquidityEvents.find(
@@ -186,8 +194,8 @@ for (const seededPool of seededPools) {
       item.type === "DEPOSIT" &&
       Array.isArray(item.ids) &&
       item.ids.length > 0 &&
-      (smoke.liquidityAmountX != null ? amountEq(item.amountX, smoke.liquidityAmountX) : positive(item.amountX)) &&
-      (smoke.liquidityAmountY != null ? amountEq(item.amountY, smoke.liquidityAmountY) : positive(item.amountY))
+      (isSmokePool && smoke.liquidityAmountX != null ? amountEq(item.amountX, smoke.liquidityAmountX) : positive(item.amountX)) &&
+      (isSmokePool && smoke.liquidityAmountY != null ? amountEq(item.amountY, smoke.liquidityAmountY) : positive(item.amountY))
   );
   if (!liquidityEvent) {
     fail(`Seeded pair ${seededPool.name} has no nonzero decoded indexed deposit.`);
@@ -201,7 +209,7 @@ for (const seededPool of seededPools) {
   const checkedPair = {
     name: seededPool.name,
     pair: seededPool.pair,
-    swap: swap.id,
+    swap: swap?.id ?? null,
     liquidityEvent: liquidityEvent.id,
     position: position.id
   };

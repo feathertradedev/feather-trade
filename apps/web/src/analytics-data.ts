@@ -1,8 +1,17 @@
 import { isAddress, type Address } from "viem";
 
 export type AnalyticsStatus = "READY" | "PARTIAL" | "UNAVAILABLE";
-export type CandleInterval = "HOUR" | "DAY";
+export type CandleInterval =
+  | "ONE_MINUTE"
+  | "FIVE_MINUTES"
+  | "FIFTEEN_MINUTES"
+  | "HOUR"
+  | "FOUR_HOURS"
+  | "DAY"
+  | "WEEK";
 export type BackfillStatus = "unavailable" | "running" | "complete" | "partial" | "capped";
+export const CANDLE_STREAM_STALE_AFTER_MS = 45_000;
+export const POOL_STREAM_STALE_AFTER_MS = 45_000;
 
 export interface AnalyticsPageInfo {
   endCursor: string | null;
@@ -16,6 +25,7 @@ export interface AnalyticsPage<T> {
   status: AnalyticsStatus;
   pageInfo: AnalyticsPageInfo;
   error: string | null;
+  streamCursor: string | null;
 }
 
 export interface PoolAnalyticsMetric {
@@ -24,14 +34,91 @@ export interface PoolAnalyticsMetric {
   tokenY: Address;
   tvlUsdE18: string | null;
   volume24hUsdE18: string | null;
-  /** Existing analytics-schema fee value; LP-net only. No protocol-fee amount is inferred. */
+  totalSwapFees24hUsdE18: string | null;
+  protocolSwapFees24hUsdE18: string | null;
   lpFees24hUsdE18: string | null;
   feeToTvlE18: string | null;
+  feeBreakdownComplete: boolean;
   priceUsdE18: string | null;
   asOfBlock: string;
   asOfTimestamp: number;
   status: AnalyticsStatus;
   missingPriceTokens: Address[];
+}
+
+export interface PoolStaticFeeParameters {
+  baseFactor: string;
+  filterPeriod: string;
+  decayPeriod: string;
+  reductionFactor: string;
+  variableFeeControl: string;
+  protocolShare: string;
+  maxVolatilityAccumulator: string;
+}
+
+export interface PoolVariableFeeParameters {
+  volatilityAccumulator: string;
+  volatilityReference: string;
+  idReference: string;
+  timeOfLastUpdate: string;
+}
+
+export interface PoolFeeState {
+  static: PoolStaticFeeParameters;
+  variable: PoolVariableFeeParameters;
+}
+
+export interface LivePoolBin {
+  chainId: number;
+  pair: Address;
+  binId: string;
+  reserveX: string;
+  reserveY: string;
+  totalSupply: string;
+  updatedAtBlock: string;
+  updatedAtBlockHash: string;
+  updatedAtTimestamp: number;
+  revision: number;
+}
+
+export interface LivePoolState {
+  chainId: number;
+  pair: Address;
+  tokenX: Address;
+  tokenY: Address;
+  decimalsX: number;
+  decimalsY: number;
+  reserveX: string;
+  reserveY: string;
+  activeId: number;
+  binStep: number;
+  marketPriceQuoteE18: string;
+  priceUsdE18: string | null;
+  tvlUsdE18: string | null;
+  status: AnalyticsStatus;
+  missingPriceTokens: Address[];
+  feeState: PoolFeeState;
+  asOfBlock: string;
+  asOfBlockHash: string;
+  asOfTimestamp: number;
+  revision: number;
+}
+
+export interface LivePoolSnapshot {
+  state: LivePoolState;
+  bins: LivePoolBin[];
+  streamCursor: string;
+  radius: number;
+  lastEventId: string | null;
+}
+
+export interface LivePoolUpdate {
+  cursor: string;
+  eventId: string;
+  state: LivePoolState;
+  binReplacements: LivePoolBin[];
+  replaceBinWindow: boolean;
+  sourceEventIds: string[];
 }
 
 export interface PairCandle {
@@ -44,14 +131,22 @@ export interface PairCandle {
   lowUsdE18: string | null;
   closeUsdE18: string | null;
   volumeUsdE18: string | null;
-  /** Existing analytics-schema fee value; LP-net only. No protocol-fee amount is inferred. */
+  totalSwapFeesUsdE18: string | null;
+  protocolSwapFeesUsdE18: string | null;
   lpFeesUsdE18: string | null;
+  feeBreakdownComplete: boolean;
   tvlUsdE18: string | null;
   swapCount: number;
   status: AnalyticsStatus;
   missingPriceTokens: Address[];
   firstBlock: string;
   lastBlock: string;
+  firstBlockHash: string;
+  lastBlockHash: string;
+  finalized: boolean;
+  revision: number;
+  priceSource: string;
+  quoteToken: Address;
 }
 
 export interface PriceHealth {
@@ -99,11 +194,72 @@ const DEFAULT_PAGE_SIZE = 100;
 const DEFAULT_MAX_PAGES = 5;
 const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_TIMEOUT_MS = 60_000;
+const MONDAY_EPOCH_OFFSET_SECONDS = 4 * 86_400;
+
+export const CANDLE_INTERVAL_SECONDS: Readonly<Record<CandleInterval, number>> = {
+  ONE_MINUTE: 60,
+  FIVE_MINUTES: 5 * 60,
+  FIFTEEN_MINUTES: 15 * 60,
+  HOUR: 3_600,
+  FOUR_HOURS: 4 * 3_600,
+  DAY: 86_400,
+  WEEK: 7 * 86_400
+};
+
+export const CANDLE_INTERVAL_LABELS: Readonly<Record<CandleInterval, string>> = {
+  ONE_MINUTE: "1m",
+  FIVE_MINUTES: "5m",
+  FIFTEEN_MINUTES: "15m",
+  HOUR: "1h",
+  FOUR_HOURS: "4h",
+  DAY: "1d",
+  WEEK: "1w"
+};
+
+export const CANDLE_LOOKBACK_SECONDS: Readonly<Record<CandleInterval, number>> = {
+  ONE_MINUTE: 6 * 3_600,
+  FIVE_MINUTES: 24 * 3_600,
+  FIFTEEN_MINUTES: 3 * 86_400,
+  HOUR: 14 * 86_400,
+  FOUR_HOURS: 60 * 86_400,
+  DAY: 365 * 86_400,
+  WEEK: 3 * 365 * 86_400
+};
+
+export const CANDLE_LOOKBACK_LABELS: Readonly<Record<CandleInterval, string>> = {
+  ONE_MINUTE: "6H history",
+  FIVE_MINUTES: "24H history",
+  FIFTEEN_MINUTES: "3D history",
+  HOUR: "14D history",
+  FOUR_HOURS: "60D history",
+  DAY: "1Y history",
+  WEEK: "3Y history"
+};
+
+export function candleBoundary(timestamp: number, interval: CandleInterval): number {
+  const seconds = CANDLE_INTERVAL_SECONDS[interval];
+  if (interval !== "WEEK") return Math.floor(timestamp / seconds) * seconds;
+  return Math.floor((timestamp - MONDAY_EPOCH_OFFSET_SECONDS) / seconds) * seconds + MONDAY_EPOCH_OFFSET_SECONDS;
+}
+
+export function isCandleStreamStale(lastActivityAt: number, now: number): boolean {
+  if (!Number.isFinite(lastActivityAt) || !Number.isFinite(now)) throw new Error("Candle stream timestamps must be finite");
+  return now - lastActivityAt >= CANDLE_STREAM_STALE_AFTER_MS;
+}
+
+export function isPoolStreamStale(lastActivityAt: number, now: number): boolean {
+  if (!Number.isFinite(lastActivityAt) || !Number.isFinite(now)) throw new Error("Pool stream timestamps must be finite");
+  return now - lastActivityAt >= POOL_STREAM_STALE_AFTER_MS;
+}
 
 const POOL_METRICS_QUERY = `
   query WebPoolMetrics($first: Int!, $after: String, $asOfTimestamp: Int) {
     poolMetrics(first: $first, after: $after, asOfTimestamp: $asOfTimestamp) {
-      nodes { pair tokenX tokenY tvlUsdE18 volume24hUsdE18 fees24hUsdE18 feeToTvlE18 priceUsdE18 asOfBlock asOfTimestamp status missingPriceTokens }
+      nodes {
+        pair tokenX tokenY tvlUsdE18 volume24hUsdE18
+        totalSwapFees24hUsdE18 protocolSwapFees24hUsdE18 lpNetSwapFees24hUsdE18 lpNetSwapFeeToTvlE18 feeBreakdownComplete
+        priceUsdE18 asOfBlock asOfTimestamp status missingPriceTokens
+      }
       pageInfo { endCursor hasNextPage partial }
     }
   }
@@ -112,8 +268,32 @@ const POOL_METRICS_QUERY = `
 const PAIR_CANDLES_QUERY = `
   query WebPairCandles($pair: ID!, $interval: CandleInterval!, $fromTimestamp: Int!, $toTimestamp: Int!, $first: Int!, $after: String) {
     pairCandles(pair: $pair, interval: $interval, fromTimestamp: $fromTimestamp, toTimestamp: $toTimestamp, first: $first, after: $after) {
-      nodes { pair interval startTimestamp endTimestamp openUsdE18 highUsdE18 lowUsdE18 closeUsdE18 volumeUsdE18 feesUsdE18 tvlUsdE18 swapCount status missingPriceTokens firstBlock lastBlock }
+      nodes {
+        pair interval startTimestamp endTimestamp openUsdE18 highUsdE18 lowUsdE18 closeUsdE18 volumeUsdE18
+        totalSwapFeesUsdE18 protocolSwapFeesUsdE18 lpNetSwapFeesUsdE18 feeBreakdownComplete
+        tvlUsdE18 swapCount status missingPriceTokens firstBlock lastBlock firstBlockHash lastBlockHash finalized revision priceSource quoteToken
+      }
       pageInfo { endCursor hasNextPage partial }
+      streamCursor
+    }
+  }
+`;
+
+const POOL_STATE_QUERY = `
+  query WebPoolState($pair: ID!, $radius: Int!) {
+    poolState(pair: $pair, radius: $radius) {
+      state {
+        chainId pair tokenX tokenY decimalsX decimalsY reserveX reserveY activeId binStep marketPriceQuoteE18
+        priceUsdE18 tvlUsdE18 status missingPriceTokens asOfBlock asOfBlockHash asOfTimestamp revision
+        feeState {
+          static { baseFactor filterPeriod decayPeriod reductionFactor variableFeeControl protocolShare maxVolatilityAccumulator }
+          variable { volatilityAccumulator volatilityReference idReference timeOfLastUpdate }
+        }
+      }
+      bins {
+        chainId pair binId reserveX reserveY totalSupply updatedAtBlock updatedAtBlockHash updatedAtTimestamp revision
+      }
+      streamCursor
     }
   }
 `;
@@ -131,6 +311,7 @@ const ANALYTICS_HEALTH_QUERY = `
 interface GraphConnection {
   nodes: unknown;
   pageInfo: unknown;
+  streamCursor?: unknown;
 }
 
 export async function loadPoolMetrics(
@@ -169,7 +350,7 @@ export async function loadPairCandles(
   options: AnalyticsLoadOptions = {}
 ): Promise<AnalyticsPage<PairCandle>> {
   const canonicalPair = parseAddress(pair);
-  if (interval !== "HOUR" && interval !== "DAY") throw new Error("Unsupported candle interval");
+  if (!CANDLE_INTERVAL_SECONDS[interval]) throw new Error("Unsupported candle interval");
   parseSafeInteger(fromTimestamp, "fromTimestamp");
   parseSafeInteger(toTimestamp, "toTimestamp");
   if (fromTimestamp > toTimestamp) throw new Error("Candle range is reversed");
@@ -184,6 +365,153 @@ export async function loadPairCandles(
     (row) => `${row.startTimestamp.toString().padStart(16, "0")}:${row.pair}`,
     options
   );
+}
+
+export async function loadPoolState(
+  endpoint: string | null,
+  pair: Address,
+  radius = 40,
+  options: Pick<AnalyticsLoadOptions, "timeoutMs"> = {}
+): Promise<AnalyticsValue<LivePoolSnapshot>> {
+  const canonicalPair = parseAddress(pair);
+  if (!Number.isSafeInteger(radius) || radius < 0 || radius > 100) {
+    throw new Error("Pool-state radius must be between 0 and 100");
+  }
+  if (endpoint === null) return { value: null, status: "UNAVAILABLE", error: "Analytics endpoint is not configured" };
+  const timeoutMs = normalizeBoundedPositive(options.timeoutMs, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, "timeoutMs");
+  try {
+    const data = asRecord(await fetchGraph(endpoint, POOL_STATE_QUERY, { pair: canonicalPair, radius }, timeoutMs));
+    if (data.poolState === null) return { value: null, status: "UNAVAILABLE", error: "Canonical pool state is not available yet" };
+    const snapshot = parsePoolSnapshot(data.poolState, canonicalPair, radius);
+    return { value: snapshot, status: snapshot.state.status, error: null };
+  } catch (error) {
+    return { value: null, status: "UNAVAILABLE", error: errorMessage(error) };
+  }
+}
+
+export function candleStreamUrl(
+  endpoint: string,
+  pair: Address,
+  interval: CandleInterval,
+  after: string
+): string {
+  const url = new URL(endpoint);
+  url.pathname = url.pathname.endsWith("/graphql")
+    ? `${url.pathname.slice(0, -"/graphql".length)}/events/candles`
+    : `${url.pathname.replace(/\/+$/, "")}/events/candles`;
+  url.search = "";
+  url.searchParams.set("pair", parseAddress(pair));
+  url.searchParams.set("interval", interval);
+  url.searchParams.set("after", after);
+  return url.toString();
+}
+
+export function poolStreamUrl(endpoint: string, pair: Address, after: string): string {
+  const url = new URL(endpoint);
+  url.pathname = url.pathname.endsWith("/graphql")
+    ? `${url.pathname.slice(0, -"/graphql".length)}/events/pools`
+    : `${url.pathname.replace(/\/+$/, "")}/events/pools`;
+  url.search = "";
+  url.searchParams.set("pair", parseAddress(pair));
+  url.searchParams.set("after", parseCursor(after));
+  return url.toString();
+}
+
+export function parseCandleStreamPayload(
+  value: unknown,
+  pair: Address,
+  interval: CandleInterval
+): { cursor: string; candle: PairCandle } {
+  const payload = asRecord(value);
+  return {
+    cursor: parseString(payload.cursor, "stream cursor"),
+    candle: parseCandle(payload.candle, parseAddress(pair), interval, 0, Number.MAX_SAFE_INTEGER)
+  };
+}
+
+export function parsePoolStreamPayload(value: unknown, pair: Address): LivePoolUpdate {
+  const payload = asRecord(value);
+  const update = asRecord(payload.update);
+  const expectedPair = parseAddress(pair);
+  const state = parseLivePoolState(update.state, expectedPair);
+  const binReplacements = asArray(update.binReplacements, "binReplacements")
+    .map((bin) => parseLivePoolBin(bin, state.chainId, expectedPair, state.asOfBlock, state.asOfBlockHash));
+  assertUnique(binReplacements.map((bin) => bin.binId), "pool-state replacement bin");
+  const sourceEventIds = asArray(update.sourceEventIds, "sourceEventIds")
+    .map((entry) => parseNonEmptyString(entry, "source event ID"));
+  assertUnique(sourceEventIds, "source event ID");
+  return {
+    cursor: parseCursor(payload.cursor),
+    eventId: parseNonEmptyString(update.eventId, "pool update event ID"),
+    state,
+    binReplacements,
+    replaceBinWindow: parseBoolean(update.replaceBinWindow, "replaceBinWindow"),
+    sourceEventIds
+  };
+}
+
+/**
+ * Applies an idempotent absolute replacement. A thrown error means the caller
+ * must discard the cache and refetch the canonical bootstrap.
+ */
+export function applyPoolStateUpdate(current: LivePoolSnapshot, update: LivePoolUpdate): LivePoolSnapshot {
+  if (update.state.pair !== current.state.pair || update.state.chainId !== current.state.chainId) {
+    throw new Error("Pool stream update identity differs from the bootstrap");
+  }
+  if (
+    update.state.tokenX !== current.state.tokenX ||
+    update.state.tokenY !== current.state.tokenY ||
+    update.state.decimalsX !== current.state.decimalsX ||
+    update.state.decimalsY !== current.state.decimalsY ||
+    update.state.binStep !== current.state.binStep
+  ) {
+    throw new Error("Pool stream changed immutable market identity");
+  }
+  const currentCursor = BigInt(parseCursor(current.streamCursor));
+  const nextCursor = BigInt(parseCursor(update.cursor));
+  if (nextCursor < currentCursor) throw new Error("Pool stream cursor moved backwards");
+  if (nextCursor === currentCursor) {
+    if (current.lastEventId === update.eventId) return current;
+    throw new Error("Pool stream cursor was reused with different content");
+  }
+  const currentBlock = BigInt(current.state.asOfBlock);
+  const nextBlock = BigInt(update.state.asOfBlock);
+  if (nextBlock < currentBlock) throw new Error("Pool stream block moved backwards");
+  if (nextBlock === currentBlock && update.state.asOfBlockHash !== current.state.asOfBlockHash) {
+    throw new Error("Pool stream changed the canonical hash without a reset");
+  }
+  if (update.state.revision < current.state.revision) throw new Error("Pool stream revision moved backwards");
+  if (update.state.revision === current.state.revision && update.eventId !== current.lastEventId) {
+    throw new Error("Pool stream reused a revision with different content");
+  }
+
+  const bins = update.replaceBinWindow
+    ? new Map<string, LivePoolBin>()
+    : new Map(current.bins.map((bin) => [bin.binId, bin]));
+  for (const bin of update.binReplacements) {
+    const previous = bins.get(bin.binId);
+    if (previous !== undefined && bin.revision < previous.revision) {
+      throw new Error(`Pool bin ${bin.binId} revision moved backwards`);
+    }
+    bins.set(bin.binId, bin);
+  }
+
+  const active = BigInt(update.state.activeId);
+  const radius = BigInt(current.radius);
+  const minimum = active > radius ? active - radius : 0n;
+  const maximum = active + radius > 16_777_215n ? 16_777_215n : active + radius;
+  const bounded = [...bins.values()]
+    .filter((bin) => BigInt(bin.binId) >= minimum && BigInt(bin.binId) <= maximum)
+    .sort((left, right) => compareDecimal(left.binId, right.binId));
+  if (bounded.length > current.radius * 2 + 1) throw new Error("Pool stream exceeded the bounded bin window");
+
+  return {
+    ...current,
+    state: update.state,
+    bins: bounded,
+    streamCursor: update.cursor,
+    lastEventId: update.eventId
+  };
 }
 
 export async function loadAnalyticsHealth(
@@ -235,11 +563,11 @@ async function loadConnection<T>(
       }
       partial ||= connection.pageInfo.partial || rows.some((row) => rowStatus(row) !== "READY");
       if (!connection.pageInfo.hasNextPage) {
-        return resultPage(rows, partial ? "PARTIAL" : "READY", connection.pageInfo, pageNumber + 1, null);
+        return resultPage(rows, partial ? "PARTIAL" : "READY", connection.pageInfo, pageNumber + 1, null, connection.streamCursor);
       }
       const next = connection.pageInfo.endCursor;
       if (next === null || next === after) {
-        return resultPage(rows, "PARTIAL", connection.pageInfo, pageNumber + 1, `${field} pagination cursor did not advance`);
+        return resultPage(rows, "PARTIAL", connection.pageInfo, pageNumber + 1, `${field} pagination cursor did not advance`, connection.streamCursor);
       }
       after = next;
     } catch (error) {
@@ -258,13 +586,16 @@ function parsePoolMetric(value: unknown): PoolAnalyticsMetric {
     pair: parseAddress(row.pair), tokenX: parseAddress(row.tokenX), tokenY: parseAddress(row.tokenY),
     tvlUsdE18: parseNullableDecimal(row.tvlUsdE18, "tvlUsdE18"),
     volume24hUsdE18: parseNullableDecimal(row.volume24hUsdE18, "volume24hUsdE18"),
-    lpFees24hUsdE18: parseNullableDecimal(row.fees24hUsdE18, "fees24hUsdE18"),
-    feeToTvlE18: parseNullableDecimal(row.feeToTvlE18, "feeToTvlE18"),
+    totalSwapFees24hUsdE18: parseNullableDecimal(row.totalSwapFees24hUsdE18, "totalSwapFees24hUsdE18"),
+    protocolSwapFees24hUsdE18: parseNullableDecimal(row.protocolSwapFees24hUsdE18, "protocolSwapFees24hUsdE18"),
+    lpFees24hUsdE18: parseNullableDecimal(row.lpNetSwapFees24hUsdE18, "lpNetSwapFees24hUsdE18"),
+    feeToTvlE18: parseNullableDecimal(row.lpNetSwapFeeToTvlE18, "lpNetSwapFeeToTvlE18"),
+    feeBreakdownComplete: parseBoolean(row.feeBreakdownComplete, "feeBreakdownComplete"),
     priceUsdE18: parseNullableDecimal(row.priceUsdE18, "priceUsdE18"),
     asOfBlock: parseDecimal(row.asOfBlock, "asOfBlock"), asOfTimestamp: parseSafeInteger(row.asOfTimestamp, "asOfTimestamp"),
     status, missingPriceTokens
   };
-  if (status === "READY" && (missingPriceTokens.length > 0 || Object.values(result).some((item) => item === null))) {
+  if (status === "READY" && (!result.feeBreakdownComplete || missingPriceTokens.length > 0 || Object.values(result).some((item) => item === null))) {
     throw new Error(`READY pool metrics are incomplete for ${result.pair}`);
   }
   return result;
@@ -277,8 +608,8 @@ function parseCandle(value: unknown, pair: Address, interval: CandleInterval, fr
   if (row.interval !== interval) throw new Error("pairCandles returned the wrong interval");
   const startTimestamp = parseSafeInteger(row.startTimestamp, "startTimestamp");
   const endTimestamp = parseSafeInteger(row.endTimestamp, "endTimestamp");
-  const seconds = interval === "HOUR" ? 3_600 : 86_400;
-  if (startTimestamp < from || startTimestamp > to || startTimestamp % seconds !== 0 || endTimestamp !== startTimestamp + seconds) {
+  const seconds = CANDLE_INTERVAL_SECONDS[interval];
+  if (startTimestamp < from || startTimestamp > to || !isCandleBoundary(startTimestamp, interval) || endTimestamp !== startTimestamp + seconds) {
     throw new Error(`Invalid ${interval} candle boundary at ${startTimestamp}`);
   }
   const ohlc = ["openUsdE18", "highUsdE18", "lowUsdE18", "closeUsdE18"].map((key) => parseNullableDecimal(row[key], key));
@@ -292,12 +623,150 @@ function parseCandle(value: unknown, pair: Address, interval: CandleInterval, fr
   if (BigInt(firstBlock) > BigInt(lastBlock)) throw new Error("Candle block range is reversed");
   const status = parseStatus(row.status);
   const missingPriceTokens = parseAddresses(row.missingPriceTokens, "missingPriceTokens");
-  if (status === "READY" && (missingPriceTokens.length > 0 || ohlc[0] === null)) throw new Error("READY candle is incomplete");
-  return {
+  const result: PairCandle = {
     pair, interval, startTimestamp, endTimestamp, openUsdE18: ohlc[0], highUsdE18: ohlc[1], lowUsdE18: ohlc[2], closeUsdE18: ohlc[3],
-    volumeUsdE18: parseNullableDecimal(row.volumeUsdE18, "volumeUsdE18"), lpFeesUsdE18: parseNullableDecimal(row.feesUsdE18, "feesUsdE18"),
+    volumeUsdE18: parseNullableDecimal(row.volumeUsdE18, "volumeUsdE18"),
+    totalSwapFeesUsdE18: parseNullableDecimal(row.totalSwapFeesUsdE18, "totalSwapFeesUsdE18"),
+    protocolSwapFeesUsdE18: parseNullableDecimal(row.protocolSwapFeesUsdE18, "protocolSwapFeesUsdE18"),
+    lpFeesUsdE18: parseNullableDecimal(row.lpNetSwapFeesUsdE18, "lpNetSwapFeesUsdE18"),
+    feeBreakdownComplete: parseBoolean(row.feeBreakdownComplete, "feeBreakdownComplete"),
     tvlUsdE18: parseNullableDecimal(row.tvlUsdE18, "tvlUsdE18"), swapCount: parseSafeInteger(row.swapCount, "swapCount"), status,
-    missingPriceTokens, firstBlock, lastBlock
+    missingPriceTokens,
+    firstBlock,
+    lastBlock,
+    firstBlockHash: parseHash(row.firstBlockHash, "firstBlockHash"),
+    lastBlockHash: parseHash(row.lastBlockHash, "lastBlockHash"),
+    finalized: parseBoolean(row.finalized, "finalized"),
+    revision: parseSafeInteger(row.revision, "revision"),
+    priceSource: parseString(row.priceSource, "priceSource"),
+    quoteToken: parseAddress(row.quoteToken)
+  };
+  if (status === "READY" && (
+    missingPriceTokens.length > 0 || ohlc[0] === null || !result.feeBreakdownComplete ||
+    result.volumeUsdE18 === null || result.totalSwapFeesUsdE18 === null ||
+    result.protocolSwapFeesUsdE18 === null || result.lpFeesUsdE18 === null || result.tvlUsdE18 === null
+  )) throw new Error("READY candle is incomplete");
+  return result;
+}
+
+function parsePoolSnapshot(value: unknown, pair: Address, radius: number): LivePoolSnapshot {
+  const row = asRecord(value);
+  const state = parseLivePoolState(row.state, pair);
+  const bins = asArray(row.bins, "pool bins")
+    .map((bin) => parseLivePoolBin(bin, state.chainId, pair, state.asOfBlock, state.asOfBlockHash))
+    .sort((left, right) => compareDecimal(left.binId, right.binId));
+  assertUnique(bins.map((bin) => bin.binId), "pool-state bin");
+  if (bins.length > radius * 2 + 1) throw new Error("Pool-state bootstrap exceeded its bounded bin window");
+  const active = BigInt(state.activeId);
+  for (const bin of bins) {
+    const distance = BigInt(bin.binId) > active ? BigInt(bin.binId) - active : active - BigInt(bin.binId);
+    if (distance > BigInt(radius)) throw new Error(`Pool-state bin ${bin.binId} is outside the requested radius`);
+  }
+  return {
+    state,
+    bins,
+    streamCursor: parseCursor(row.streamCursor),
+    radius,
+    lastEventId: null
+  };
+}
+
+function parseLivePoolState(value: unknown, pair: Address): LivePoolState {
+  const row = asRecord(value);
+  const rowPair = parseAddress(row.pair);
+  if (rowPair !== pair) throw new Error(`poolState returned foreign pair ${rowPair}`);
+  const chainId = parseSafeInteger(row.chainId, "chainId");
+  if (chainId === 0) throw new Error("Pool-state chainId must be positive");
+  const activeId = parseSafeInteger(row.activeId, "activeId");
+  if (activeId > 16_777_215) throw new Error("Pool-state activeId is outside uint24");
+  const binStep = parseSafeInteger(row.binStep, "binStep");
+  if (binStep === 0 || binStep > 65_535) throw new Error("Pool-state binStep is outside uint16");
+  const decimalsX = parseSafeInteger(row.decimalsX, "decimalsX");
+  const decimalsY = parseSafeInteger(row.decimalsY, "decimalsY");
+  if (decimalsX > 255 || decimalsY > 255) throw new Error("Pool-state token decimals are outside uint8");
+  const status = parseStatus(row.status);
+  const missingPriceTokens = parseAddresses(row.missingPriceTokens, "pool-state missingPriceTokens");
+  const state: LivePoolState = {
+    chainId,
+    pair,
+    tokenX: parseAddress(row.tokenX),
+    tokenY: parseAddress(row.tokenY),
+    decimalsX,
+    decimalsY,
+    reserveX: parseDecimal(row.reserveX, "reserveX"),
+    reserveY: parseDecimal(row.reserveY, "reserveY"),
+    activeId,
+    binStep,
+    marketPriceQuoteE18: parseDecimal(row.marketPriceQuoteE18, "marketPriceQuoteE18"),
+    priceUsdE18: parseNullableDecimal(row.priceUsdE18, "priceUsdE18"),
+    tvlUsdE18: parseNullableDecimal(row.tvlUsdE18, "tvlUsdE18"),
+    status,
+    missingPriceTokens,
+    feeState: parsePoolFeeState(row.feeState),
+    asOfBlock: parseDecimal(row.asOfBlock, "asOfBlock"),
+    asOfBlockHash: parseBlockHash(row.asOfBlockHash, "asOfBlockHash"),
+    asOfTimestamp: parseSafeInteger(row.asOfTimestamp, "asOfTimestamp"),
+    revision: parseSafeInteger(row.revision, "revision")
+  };
+  if (status === "READY" && (state.priceUsdE18 === null || state.tvlUsdE18 === null || missingPriceTokens.length > 0)) {
+    throw new Error("READY pool state is incomplete");
+  }
+  return state;
+}
+
+function parseLivePoolBin(
+  value: unknown,
+  chainId: number,
+  pair: Address,
+  maximumBlock: string,
+  maximumBlockHash: string
+): LivePoolBin {
+  const row = asRecord(value);
+  const rowChainId = parseSafeInteger(row.chainId, "bin chainId");
+  const rowPair = parseAddress(row.pair);
+  if (rowChainId !== chainId || rowPair !== pair) throw new Error("Pool bin identity differs from pool state");
+  const binId = parseDecimal(row.binId, "binId");
+  if (BigInt(binId) > 16_777_215n) throw new Error("Pool bin ID is outside uint24");
+  const updatedAtBlock = parseDecimal(row.updatedAtBlock, "bin updatedAtBlock");
+  if (BigInt(updatedAtBlock) > BigInt(maximumBlock)) throw new Error("Pool bin is newer than the pool snapshot");
+  const updatedAtBlockHash = parseBlockHash(row.updatedAtBlockHash, "bin updatedAtBlockHash");
+  if (updatedAtBlock === maximumBlock && updatedAtBlockHash !== maximumBlockHash) {
+    throw new Error("Pool bin canonical hash differs from its pool snapshot");
+  }
+  return {
+    chainId,
+    pair,
+    binId,
+    reserveX: parseDecimal(row.reserveX, "bin reserveX"),
+    reserveY: parseDecimal(row.reserveY, "bin reserveY"),
+    totalSupply: parseDecimal(row.totalSupply, "bin totalSupply"),
+    updatedAtBlock,
+    updatedAtBlockHash,
+    updatedAtTimestamp: parseSafeInteger(row.updatedAtTimestamp, "bin updatedAtTimestamp"),
+    revision: parseSafeInteger(row.revision, "bin revision")
+  };
+}
+
+function parsePoolFeeState(value: unknown): PoolFeeState {
+  const row = asRecord(value);
+  const staticFees = asRecord(row.static);
+  const variableFees = asRecord(row.variable);
+  return {
+    static: {
+      baseFactor: parseDecimal(staticFees.baseFactor, "baseFactor"),
+      filterPeriod: parseDecimal(staticFees.filterPeriod, "filterPeriod"),
+      decayPeriod: parseDecimal(staticFees.decayPeriod, "decayPeriod"),
+      reductionFactor: parseDecimal(staticFees.reductionFactor, "reductionFactor"),
+      variableFeeControl: parseDecimal(staticFees.variableFeeControl, "variableFeeControl"),
+      protocolShare: parseDecimal(staticFees.protocolShare, "protocolShare"),
+      maxVolatilityAccumulator: parseDecimal(staticFees.maxVolatilityAccumulator, "maxVolatilityAccumulator")
+    },
+    variable: {
+      volatilityAccumulator: parseDecimal(variableFees.volatilityAccumulator, "volatilityAccumulator"),
+      volatilityReference: parseDecimal(variableFees.volatilityReference, "volatilityReference"),
+      idReference: parseDecimal(variableFees.idReference, "idReference"),
+      timeOfLastUpdate: parseDecimal(variableFees.timeOfLastUpdate, "timeOfLastUpdate")
+    }
   };
 }
 
@@ -316,8 +785,8 @@ function parseHealth(value: unknown): AnalyticsHealth {
     missingPriceTokens: parseAddresses(row.missingPriceTokens, "missingPriceTokens"), fresh: parseBoolean(row.fresh, "fresh"),
     headLagSeconds: parseNullableInteger(row.headLagSeconds, "headLagSeconds"), maxHeadLagSeconds: parseSafeInteger(row.maxHeadLagSeconds, "maxHeadLagSeconds"),
     backfillStatus: backfillStatus as BackfillStatus, backfillCursor: parseNullableString(row.backfillCursor, "backfillCursor"),
-    backfillError: parseNullableString(row.backfillError, "backfillError"), coverageStartTimestamp: parseNullableDecimal(row.coverageStartTimestamp, "coverageStartTimestamp"),
-    coverageThroughTimestamp: parseNullableDecimal(row.coverageThroughTimestamp, "coverageThroughTimestamp"), prices
+    backfillError: parseNullableString(row.backfillError, "backfillError"), coverageStartTimestamp: parseNullableSignedDecimal(row.coverageStartTimestamp, "coverageStartTimestamp"),
+    coverageThroughTimestamp: parseNullableSignedDecimal(row.coverageThroughTimestamp, "coverageThroughTimestamp"), prices
   };
 }
 
@@ -327,10 +796,10 @@ function truthfulHealthStatus(health: AnalyticsHealth): AnalyticsStatus {
   return health.status === "READY" && ready ? "READY" : "PARTIAL";
 }
 
-function parseConnection(value: unknown): { nodes: unknown[]; pageInfo: { endCursor: string | null; hasNextPage: boolean; partial: boolean } } {
+function parseConnection(value: unknown): { nodes: unknown[]; pageInfo: { endCursor: string | null; hasNextPage: boolean; partial: boolean }; streamCursor: string | null } {
   const connection = asRecord(value) as unknown as GraphConnection;
   const pageInfo = asRecord(connection.pageInfo);
-  return { nodes: asArray(connection.nodes, "nodes"), pageInfo: { endCursor: parseNullableString(pageInfo.endCursor, "endCursor"), hasNextPage: parseBoolean(pageInfo.hasNextPage, "hasNextPage"), partial: parseBoolean(pageInfo.partial, "partial") } };
+  return { nodes: asArray(connection.nodes, "nodes"), pageInfo: { endCursor: parseNullableString(pageInfo.endCursor, "endCursor"), hasNextPage: parseBoolean(pageInfo.hasNextPage, "hasNextPage"), partial: parseBoolean(pageInfo.partial, "partial") }, streamCursor: connection.streamCursor === undefined ? null : parseNullableString(connection.streamCursor, "streamCursor") };
 }
 
 async function fetchGraph(endpoint: string, query: string, variables: Record<string, unknown>, timeoutMs: number): Promise<unknown> {
@@ -349,8 +818,8 @@ async function fetchGraph(endpoint: string, query: string, variables: Record<str
   } finally { clearTimeout(timeout); }
 }
 
-function resultPage<T>(rows: T[], status: AnalyticsStatus, pageInfo: { endCursor: string | null; hasNextPage: boolean; partial: boolean }, pagesLoaded: number, error: string | null): AnalyticsPage<T> {
-  return { rows, status, pageInfo: { ...pageInfo, partial: pageInfo.partial || status !== "READY", pagesLoaded }, error };
+function resultPage<T>(rows: T[], status: AnalyticsStatus, pageInfo: { endCursor: string | null; hasNextPage: boolean; partial: boolean }, pagesLoaded: number, error: string | null, streamCursor: string | null = null): AnalyticsPage<T> {
+  return { rows, status, pageInfo: { ...pageInfo, partial: pageInfo.partial || status !== "READY", pagesLoaded }, error, streamCursor };
 }
 function unavailablePage<T>(error: string): AnalyticsPage<T> { return resultPage([], "UNAVAILABLE", { endCursor: null, hasNextPage: false, partial: true }, 0, error); }
 function rowStatus(value: unknown): AnalyticsStatus { const status = asRecord(value).status; return parseStatus(status); }
@@ -360,11 +829,17 @@ function parseAddresses(value: unknown, label: string): Address[] { const rows =
 function assertUnique(values: readonly string[], label: string): void { if (new Set(values).size !== values.length) throw new Error(`Duplicate ${label} address`); }
 function parseDecimal(value: unknown, label: string): string { if (typeof value !== "string" || !/^(0|[1-9]\d*)$/.test(value)) throw new Error(`Invalid ${label}`); return value; }
 function parseNullableDecimal(value: unknown, label: string): string | null { return value === null ? null : parseDecimal(value, label); }
+function parseSignedDecimal(value: unknown, label: string): string { if (typeof value !== "string" || !/^(0|-?[1-9]\d*)$/.test(value)) throw new Error(`Invalid ${label}`); return value; }
+function parseNullableSignedDecimal(value: unknown, label: string): string | null { return value === null ? null : parseSignedDecimal(value, label); }
 function parseSafeInteger(value: unknown, label: string): number { if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new Error(`Invalid ${label}`); return value; }
 function parseNullableInteger(value: unknown, label: string): number | null { return value === null ? null : parseSafeInteger(value, label); }
 function parseString(value: unknown, label: string): string { if (typeof value !== "string") throw new Error(`Invalid ${label}`); return value; }
 function parseNullableString(value: unknown, label: string): string | null { return value === null ? null : parseString(value, label); }
+function parseHash(value: unknown, label: string): string { if (typeof value !== "string" || !/^0x[0-9a-fA-F]+$/.test(value)) throw new Error(`Invalid ${label}`); return value.toLowerCase(); }
+function parseBlockHash(value: unknown, label: string): string { if (typeof value !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(value)) throw new Error(`Invalid ${label}`); return value.toLowerCase(); }
 function parseBoolean(value: unknown, label: string): boolean { if (typeof value !== "boolean") throw new Error(`Invalid ${label}`); return value; }
+function parseCursor(value: unknown): string { return parseDecimal(value, "stream cursor"); }
+function parseNonEmptyString(value: unknown, label: string): string { const parsed = parseString(value, label); if (parsed.trim() === "") throw new Error(`Invalid ${label}`); return parsed; }
 function asRecord(value: unknown): Record<string, unknown> { if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("Expected analytics object"); return value as Record<string, unknown>; }
 function asArray(value: unknown, label: string): unknown[] { if (!Array.isArray(value)) throw new Error(`Invalid ${label}`); return value; }
 function normalizeBoundedPositive(value: number | undefined, fallback: number, maximum: number, label: string): number {
@@ -375,3 +850,10 @@ function normalizeBoundedPositive(value: number | undefined, fallback: number, m
 }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : "Analytics request failed"; }
 function joinErrors(left: string | null, right: string): string { return left === null ? right : `${left}; ${right}`; }
+function compareDecimal(left: string, right: string): number { const a = BigInt(left); const b = BigInt(right); return a < b ? -1 : a > b ? 1 : 0; }
+
+function isCandleBoundary(timestamp: number, interval: CandleInterval): boolean {
+  const seconds = CANDLE_INTERVAL_SECONDS[interval];
+  if (interval !== "WEEK") return timestamp % seconds === 0;
+  return (timestamp - MONDAY_EPOCH_OFFSET_SECONDS) % seconds === 0;
+}

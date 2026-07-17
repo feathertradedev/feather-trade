@@ -1,0 +1,27 @@
+---
+title: "LBPair and LBToken"
+description: "Understand pair reserves, bin state, swaps, and fungible per-bin liquidity balances."
+slug: "contracts/pair-token"
+section: "Contracts for builders"
+order: 4
+audience: "builder"
+lastReviewed: "2026-07-14"
+---
+
+LBPair holds market reserves and maps liquidity to bin IDs. LBToken behavior exposes each owner's fungible balance in those bins.
+
+## Required identity checks
+
+Validate the factory, token X, token Y, bin step, hook configuration, deployed code, and active ID before preparing a write. Treat a deep link or visually matching symbol as untrusted until these checks agree.
+
+## Position semantics
+
+An owner can hold balances across many bin IDs. Overlapping deposits merge. Removing liquidity burns selected balances and returns proportional current reserves. There is no unique position NFT and no independent LP fee claim.
+
+<MethodSummary name="balanceOf">
+Read the owner's live balance for an exact bin ID and pair contract.
+</MethodSummary>
+
+<MethodSummary name="getBin">
+Read current token reserves for one bin and combine them with total supply for proportional claims.
+</MethodSummary>

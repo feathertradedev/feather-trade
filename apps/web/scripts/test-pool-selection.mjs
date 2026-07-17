@@ -20,24 +20,25 @@ try {
     seededPools: localnetDefaultManifest.seededPools,
     tokens: {
       WNATIVE: token("wnative", "WNATIVE", localnetDefaultManifest.tokens.wnative, localnetDefaultManifest.chainId, 18),
+      WETH: token("weth", "WETH", localnetDefaultManifest.tokens.weth, localnetDefaultManifest.chainId, 18),
       USDC: token("usdc", "USDC", localnetDefaultManifest.tokens.usdc, localnetDefaultManifest.chainId, 6)
     }
   };
   const localnet = buildSelectedPoolDescriptor({
-    poolKey: "wnativeUsdc",
+    poolKey: "wethUsdc",
     registry: localnetRegistry,
     source: "localnet-seeded"
   });
   assert.equal(localnet.ready, true);
   assert.equal(localnet.blocked, false);
   assert.equal(localnet.source, "localnet-seeded");
-  assert.equal(localnet.pair, getAddress(localnetDefaultManifest.seededPools.wnativeUsdc.pair));
-  assert.equal(localnet.tokenXAddress, getAddress(localnetDefaultManifest.tokens.wnative));
+  assert.equal(localnet.pair, getAddress(localnetDefaultManifest.seededPools.wethUsdc.pair));
+  assert.equal(localnet.tokenXAddress, getAddress(localnetDefaultManifest.tokens.weth));
   assert.equal(localnet.tokenYAddress, getAddress(localnetDefaultManifest.tokens.usdc));
-  assert.equal(localnet.tokenX?.symbol, "WNATIVE");
+  assert.equal(localnet.tokenX?.symbol, "WETH");
   assert.equal(localnet.tokenY?.symbol, "USDC");
   assert.equal(localnet.binStep, 10);
-  assert.equal(localnet.activeId, 8_388_608);
+  assert.equal(localnet.activeId, 8_396_213);
   assert.deepEqual(localnet.blockers, []);
   assert.deepEqual(localnet.warnings, []);
 

@@ -3,27 +3,30 @@ import { decodeFunctionData, encodeAbiParameters, encodeEventTopics, encodeFunct
 
 import { erc20Abi, lbFactoryAbi, lbPairAbi, lbQuoterAbi, lbRouterAbi } from "../../../../packages/sdk/src/abi";
 import { LB_Q128, quoteAddLiquidityMath, type AddLiquidityMathQuote } from "../../../../packages/sdk/src/liquidity-review";
+import { localnetDefaultManifest } from "../../src/default-manifests";
 
 export const LOCALNET_RPC_URL = "http://127.0.0.1:8545";
 export const LOCALNET_INDEXER_URL = "http://127.0.0.1:8000/subgraphs/name/robinhood-lb/localnet";
 export const LOCALNET_ANALYTICS_URL = "http://127.0.0.1:8787/graphql";
-export const WNATIVE = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
-export const USDC = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512";
-export const USDT = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0";
-export const WETH = "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9";
+export const WNATIVE = localnetDefaultManifest.tokens.wnative;
+export const USDC = localnetDefaultManifest.tokens.usdc;
+export const USDT = localnetDefaultManifest.tokens.usdt;
+export const WETH = localnetDefaultManifest.tokens.weth;
 export const WNATIVE_USDC_PAIR = "0x4A47586912f0e03d9f3DCAa762fB8B659E52604b";
 export const SECOND_WNATIVE_USDC_PAIR = "0x2222222222222222222222222222222222222201";
 export const ALT_WNATIVE_USDC_PAIR = "0x1111111111111111111111111111111111111101";
 export const WNATIVE_USDT_PAIR = "0x1111111111111111111111111111111111111102";
 export const USDT_USDC_PAIR = "0x1111111111111111111111111111111111111103";
 export const WNATIVE_WETH_PAIR = "0x1111111111111111111111111111111111111104";
-export const WETH_USDC_PAIR = "0x1111111111111111111111111111111111111105";
+export const WETH_USDC_PAIR = localnetDefaultManifest.seededPools.wethUsdc.pair;
+export const WETH_USDC_BIN_STEP = localnetDefaultManifest.seededPools.wethUsdc.binStep;
+export const ALT_WETH_USDC_PAIR = "0x1111111111111111111111111111111111111105";
 export const CREATED_WETH_USDT_PAIR = "0x3333333333333333333333333333333333333301";
 export const LB_ROUTER = "0x0165878A594ca255338adfa4d48449f69242Eb8F";
 export const LB_FACTORY = "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9";
 export const DEFAULT_ACCOUNT = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
 
-const LOCALNET_CHAIN_ID = 31_337;
+const LOCALNET_CHAIN_ID = localnetDefaultManifest.chainId;
 const ACTIVE_ID = 8_388_608;
 const DEFAULT_BALANCE = 10_000_000_000_000_000_000n;
 const DEFAULT_ALLOWANCE = 10_000_000_000_000_000_000n;
@@ -47,6 +50,8 @@ export interface MockRpcOptions {
   analyticsBinCount?: number;
   analyticsCandleGap?: boolean;
   analyticsAsOfBlock?: bigint;
+  analyticsHeadHash?: Hex;
+  analyticsBinOffset?: number;
   analyticsMode?: "ready" | "error";
   analyticsOutOfRange?: boolean;
   analyticsPartialHistory?: boolean;
@@ -111,20 +116,28 @@ export interface MockRpcOptions {
   pairAddress?: string;
   pairBinStep?: string;
   pairRuntimeBinStep?: number;
+  pairRuntimeActiveId?: number;
   pairRuntimeTokenX?: Address;
+  pairRuntimeTokenXDecimals?: number;
   pairRuntimeTokenY?: Address;
   pairTokenX?: string;
   pairTokenXAfterReceipt?: string;
   pairTokenY?: string;
   pairByIdDelayMs?: number;
   pairByIdMode?: "ready" | "error";
+  poolActivityMode?: "ready" | "empty";
+  positionHistoryCount?: number;
+  positionHistoryFailAtSkip?: number;
   positionOwner?: Address;
   positionPair?: Address;
+  ownerPositionResponseOwner?: Address;
+  ownerPositionResponsePair?: Address;
   positionLiquidity?: bigint;
   priceQ128ByBin?: Readonly<Record<string, bigint>>;
   poolCount?: number;
   poolBinCount?: number;
   poolBinsMode?: "ready" | "error";
+  poolIndexerSnapshotMode?: "ready" | "error";
   quoteMode?: "ready" | "error" | "no-route";
   quoteDelayMs?: number;
   quoteDelayMsAfterReceipt?: number;
@@ -198,14 +211,18 @@ interface GraphRequest {
   variables?: {
     after?: string | null;
     asOfTimestamp?: number;
+    block?: number;
     first?: number;
     fromTimestamp?: number;
     id?: string;
-    interval?: "HOUR" | "DAY";
+    interval?: "ONE_MINUTE" | "FIVE_MINUTES" | "FIFTEEN_MINUTES" | "HOUR" | "FOUR_HOURS" | "DAY" | "WEEK";
     owner?: string;
     pair?: string;
+    radius?: number;
+    pairId?: string;
     skip?: number;
     toTimestamp?: number;
+    transactionHashes?: string[];
   };
 }
 
@@ -323,8 +340,11 @@ function mockAnalyticsResponse(body: GraphRequest, options: MockRpcOptions): Rec
       tokenY: metadata.tokenY.toLowerCase(),
       tvlUsdE18: partial ? null : String((500_000n - BigInt(index) * 10_000n) * 10n ** 18n),
       volume24hUsdE18: String((120_000n - BigInt(index) * 1_000n) * 10n ** 18n),
-      fees24hUsdE18: String((240n - BigInt(index)) * 10n ** 18n),
-      feeToTvlE18: partial ? null : "480000000000000",
+      totalSwapFees24hUsdE18: String((300n - BigInt(index)) * 10n ** 18n),
+      protocolSwapFees24hUsdE18: String((60n - BigInt(index)) * 10n ** 18n),
+      lpNetSwapFees24hUsdE18: String((240n - BigInt(index)) * 10n ** 18n),
+      lpNetSwapFeeToTvlE18: partial ? null : "480000000000000",
+      feeBreakdownComplete: true,
       priceUsdE18: "2500000000000000000",
       asOfBlock: String(options.analyticsAsOfBlock ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER),
       asOfTimestamp: 1_720_000_000,
@@ -333,12 +353,78 @@ function mockAnalyticsResponse(body: GraphRequest, options: MockRpcOptions): Rec
     })).sort((left, right) => left.pair.localeCompare(right.pair));
     return { data: { poolMetrics: { nodes, pageInfo: { endCursor: null, hasNextPage: false, partial } } } };
   }
+  if (query.includes("WebPoolState")) {
+    const pair = (body.variables?.pair ?? WNATIVE_USDC_PAIR).toLowerCase();
+    const metadata = allPairMetadata(options).find((candidate) => candidate.pair.toLowerCase() === pair);
+    if (metadata === undefined) return { data: { poolState: null } };
+    const radius = Math.max(0, Math.min(100, body.variables?.radius ?? 40));
+    const activeId = activeIdFor(options);
+    const block = String(options.analyticsAsOfBlock ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER);
+    const blockHash = options.analyticsHeadHash ?? options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222";
+    const reserveX = String(options.pairReserveX ?? 1_000n * 10n ** 18n);
+    const reserveY = String(options.pairReserveY ?? 160_000n * 10n ** 18n);
+    const bins = Array.from({ length: radius * 2 + 1 }, (_, index) => {
+      const binId = Math.max(0, activeId - radius) + index;
+      return {
+        chainId: options.chainId ?? LOCALNET_CHAIN_ID,
+        pair,
+        binId: String(binId),
+        reserveX: String(options.binReserveX ?? BigInt(100 + index) * 10n ** 18n),
+        reserveY: String(options.binReserveY ?? BigInt(200 + index) * 10n ** 18n),
+        totalSupply: String(options.binTotalSupply ?? BigInt(300 + index) * 10n ** 18n),
+        updatedAtBlock: block,
+        updatedAtBlockHash: blockHash,
+        updatedAtTimestamp: 1_720_000_000,
+        revision: 1
+      };
+    }).filter((bin) => Number(bin.binId) <= 16_777_215);
+    return { data: { poolState: {
+      state: {
+        chainId: options.chainId ?? LOCALNET_CHAIN_ID,
+        pair,
+        tokenX: metadata.tokenX.toLowerCase(),
+        tokenY: metadata.tokenY.toLowerCase(),
+        decimalsX: 18,
+        decimalsY: 18,
+        reserveX,
+        reserveY,
+        activeId,
+        binStep: Number(metadata.binStep),
+        marketPriceQuoteE18: "160000000000000000000",
+        priceUsdE18: partial ? null : "160000000000000000000",
+        tvlUsdE18: partial ? null : "320000000000000000000000",
+        status: analyticsStatus,
+        missingPriceTokens: partial ? [metadata.tokenX.toLowerCase()] : [],
+        feeState: {
+          static: {
+            baseFactor: "20", filterPeriod: "30", decayPeriod: "120", reductionFactor: "5000",
+            variableFeeControl: "100", protocolShare: "1000", maxVolatilityAccumulator: "100000"
+          },
+          variable: { volatilityAccumulator: "1000", volatilityReference: "500", idReference: String(activeId), timeOfLastUpdate: "1720000000" }
+        },
+        asOfBlock: block,
+        asOfBlockHash: blockHash,
+        asOfTimestamp: 1_720_000_000,
+        revision: 1
+      },
+      bins,
+      streamCursor: "0"
+    } } };
+  }
   if (query.includes("WebPairCandles")) {
     const pair = body.variables?.pair ?? WNATIVE_USDC_PAIR.toLowerCase();
     const from = body.variables?.fromTimestamp ?? 1_719_913_600;
     const to = body.variables?.toTimestamp ?? from + 23 * 3_600;
     const interval = body.variables?.interval ?? "HOUR";
-    const seconds = interval === "DAY" ? 86_400 : 3_600;
+    const seconds = {
+      ONE_MINUTE: 60,
+      FIVE_MINUTES: 300,
+      FIFTEEN_MINUTES: 900,
+      HOUR: 3_600,
+      FOUR_HOURS: 14_400,
+      DAY: 86_400,
+      WEEK: 604_800
+    }[interval];
     const nodes = Array.from({ length: Math.floor((to - from) / seconds) + 1 }, (_, index) => {
       const open = 2_400_000_000_000_000_000n + BigInt(index) * 2_000_000_000_000_000n;
       const close = open + 1_000_000_000_000_000n;
@@ -352,22 +438,31 @@ function mockAnalyticsResponse(body: GraphRequest, options: MockRpcOptions): Rec
         lowUsdE18: partial && index === 0 ? null : (open - 2_000_000_000_000_000n).toString(),
         closeUsdE18: partial && index === 0 ? null : close.toString(),
         volumeUsdE18: String((10_000n + BigInt(index) * 100n) * 10n ** 18n),
-        feesUsdE18: String((20n + BigInt(index)) * 10n ** 18n),
+        totalSwapFeesUsdE18: String((25n + BigInt(index)) * 10n ** 18n),
+        protocolSwapFeesUsdE18: String(5n * 10n ** 18n),
+        lpNetSwapFeesUsdE18: String((20n + BigInt(index)) * 10n ** 18n),
+        feeBreakdownComplete: true,
         tvlUsdE18: String(500_000n * 10n ** 18n),
         swapCount: 20 + index,
         status: partial && index === 0 ? "PARTIAL" : "READY",
         missingPriceTokens: partial && index === 0 ? [WNATIVE.toLowerCase()] : [],
         firstBlock: String(100 + index),
-        lastBlock: String(100 + index)
+        lastBlock: String(100 + index),
+        firstBlockHash: `0x${(100 + index).toString(16).padStart(64, "0")}`,
+        lastBlockHash: `0x${(100 + index).toString(16).padStart(64, "0")}`,
+        finalized: index < Math.floor((to - from) / seconds),
+        revision: index + 1,
+        priceSource: "active-bin-quote-usd",
+        quoteToken: USDC.toLowerCase()
       };
-    }).filter((_, index) => options.analyticsCandleGap !== true || index !== 1);
-    return { data: { pairCandles: { nodes, pageInfo: { endCursor: null, hasNextPage: false, partial } } } };
+    }).filter((_, index, candles) => options.analyticsCandleGap !== true || index !== Math.max(1, candles.length - 23));
+    return { data: { pairCandles: { nodes, pageInfo: { endCursor: null, hasNextPage: false, partial }, streamCursor: "0" } } };
   }
   if (query.includes("WebAnalyticsHealth")) {
     return { data: { analyticsHealth: mockAnalyticsHealth(options, partial) } };
   }
   const owner = body.variables?.owner ?? DEFAULT_ACCOUNT;
-  const binId = options.analyticsOutOfRange === true ? activeIdFor(options) + 10 : activeIdFor(options);
+  const binId = activeIdFor(options) + (options.analyticsBinOffset ?? (options.analyticsOutOfRange === true ? 10 : 0));
   const transferred = options.analyticsTransferred === true;
   const analyticsBins = transferred
     ? []
@@ -407,6 +502,7 @@ function mockAnalyticsResponse(body: GraphRequest, options: MockRpcOptions): Rec
       analyticsHealth: {
         fresh: true,
         headBlock: String(options.analyticsAsOfBlock ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER),
+        headHash: options.analyticsHeadHash ?? options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222",
         status: partial ? "PARTIAL" : "READY"
       },
       walletPositions: { nodes, pageInfo: { endCursor: null, hasNextPage: false, partial } }
@@ -418,7 +514,7 @@ function mockAnalyticsHealth(options: MockRpcOptions, partial: boolean): Record<
   return {
     status: partial ? "PARTIAL" : "READY",
     headBlock: String(options.analyticsAsOfBlock ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER),
-    headHash: options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222",
+    headHash: options.analyticsHeadHash ?? options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222",
     headTimestamp: 1_720_000_000,
     canonicalBlockCount: 42,
     reorgCount: 0,
@@ -430,7 +526,7 @@ function mockAnalyticsHealth(options: MockRpcOptions, partial: boolean): Record<
     backfillStatus: partial ? "partial" : "complete",
     backfillCursor: null,
     backfillError: null,
-    coverageStartTimestamp: "1719913600",
+    coverageStartTimestamp: "-9007199254740991",
     coverageThroughTimestamp: "1720000000",
     prices: [{ token: WNATIVE.toLowerCase(), source: "mock", feedId: "wnative-usd", status: partial ? "missing" : "available", observedAt: 1_720_000_000, ageSeconds: 0 }]
   };
@@ -460,6 +556,25 @@ function mockGraphResponse(body: GraphRequest, options: MockRpcOptions): Record<
     };
   }
 
+  if (query.includes("PoolIndexerSnapshot")) {
+    if (options.poolIndexerSnapshotMode === "error") {
+      return { errors: [{ message: "Mock pool indexer snapshot failed" }] };
+    }
+    const requestedPair = typeof body.variables?.pairId === "string" ? body.variables.pairId : WNATIVE_USDC_PAIR;
+    return {
+      data: {
+        _meta: {
+          block: {
+            hash: options.indexerBlockHash ?? options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222",
+            number: Number(options.indexerBlockNumber ?? DEFAULT_BLOCK_NUMBER)
+          },
+          hasIndexingErrors: options.indexerHasErrors ?? false
+        },
+        pair: mockPairByAddress(options, requestedPair)
+      }
+    };
+  }
+
   if (query.includes("PairById")) {
     if (options.pairByIdMode === "error") return { errors: [{ message: "Mock pair lookup failed" }] };
     const pair = typeof body.variables?.id === "string" ? mockPairByAddress(options, body.variables.id) : null;
@@ -480,7 +595,20 @@ function mockGraphResponse(body: GraphRequest, options: MockRpcOptions): Record<
     const bins = Array.from({ length: count }, (_, index) => mockBin(options, index, count)).filter(
       (bin) => options.omitActivePoolBin !== true || bin.binId !== activeIdFor(options).toString()
     );
-    return { data: { bins } };
+    const requestedPair = typeof body.variables?.pairId === "string" ? body.variables.pairId : WNATIVE_USDC_PAIR;
+    return {
+      data: {
+        _meta: {
+          block: {
+            hash: options.indexerBlockHash ?? options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222",
+            number: Number(options.indexerBlockNumber ?? body.variables?.block ?? DEFAULT_BLOCK_NUMBER)
+          },
+          hasIndexingErrors: options.indexerHasErrors ?? false
+        },
+        pair: mockPairByAddress(options, requestedPair),
+        bins
+      }
+    };
   }
   if (query.includes("PairBins")) {
     const skip = body.variables?.skip ?? 0;
@@ -491,41 +619,143 @@ function mockGraphResponse(body: GraphRequest, options: MockRpcOptions): Record<
     );
     return { data: { bins } };
   }
+  if (query.includes("PoolActivity") || query.includes("PairActivity")) {
+    const pair = typeof body.variables?.pair === "string" ? body.variables.pair.toLowerCase() : WNATIVE_USDC_PAIR.toLowerCase();
+    const owner = typeof body.variables?.owner === "string" ? body.variables.owner.toLowerCase() : null;
+    const otherAccount = "0x0000000000000000000000000000000000000002";
+    const swaps = options.poolActivityMode === "empty"
+      ? []
+      : [
+          {
+            id: "pool-swap-wallet",
+            transactionHash: `0x${"d1".padStart(64, "0")}`,
+            blockNumber: "42",
+            timestamp: "1720000300",
+            amountInX: "1000000000000000000",
+            amountInY: "0",
+            amountOutX: "0",
+            amountOutY: "2500000",
+            pair: { id: pair },
+            transactionFrom: DEFAULT_ACCOUNT,
+            sender: LB_ROUTER,
+            to: LB_ROUTER
+          },
+          {
+            id: "pool-swap-other",
+            transactionHash: `0x${"d2".padStart(64, "0")}`,
+            blockNumber: "41",
+            timestamp: "1720000240",
+            amountInX: "2000000000000000000",
+            amountInY: "0",
+            amountOutX: "0",
+            amountOutY: "5000000",
+            pair: { id: pair },
+            transactionFrom: otherAccount,
+            sender: otherAccount,
+            to: otherAccount
+          }
+        ].filter((event) => owner === null || event.transactionFrom.toLowerCase() === owner || event.sender.toLowerCase() === owner || event.to.toLowerCase() === owner);
+    const liquidityEvents = options.poolActivityMode === "empty"
+      ? []
+      : [
+          {
+            id: "liquidity-history-0",
+            type: "DEPOSIT",
+            transactionHash: `0x${"a0".padStart(64, "0")}`,
+            blockNumber: "1000",
+            timestamp: "1720000000",
+            amountX: "10000000000000000000",
+            amountY: "20000000000000000000",
+            pair: { id: pair },
+            sender: DEFAULT_ACCOUNT,
+            to: DEFAULT_ACCOUNT
+          },
+          {
+            id: "liquidity-history-1",
+            type: "WITHDRAW",
+            transactionHash: `0x${"a1".padStart(64, "0")}`,
+            blockNumber: "999",
+            timestamp: "1719999940",
+            amountX: "11000000000000000000",
+            amountY: "21000000000000000000",
+            pair: { id: pair },
+            sender: LB_ROUTER,
+            to: LB_ROUTER
+          },
+          {
+            id: "pool-liquidity-other",
+            type: "WITHDRAW",
+            transactionHash: `0x${"e2".padStart(64, "0")}`,
+            blockNumber: "39",
+            timestamp: "1720000120",
+            amountX: "1000000000000000000",
+            amountY: "2500000",
+            pair: { id: pair },
+            sender: otherAccount,
+            to: otherAccount
+          }
+        ].filter((event) => owner === null || event.sender.toLowerCase() === owner || event.to.toLowerCase() === owner);
+    return { data: { swaps, liquidityEvents } };
+  }
   if (query.includes("SwapsPage")) return { data: { swaps: [] } };
   if (query.includes("LiquidityEventsPage")) return { data: { liquidityEvents: [] } };
+  if (query.includes("PositionLiquidityDetails")) {
+    const pair = body.variables?.pair ?? WNATIVE_USDC_PAIR.toLowerCase();
+    const skip = body.variables?.skip ?? 0;
+    const first = body.variables?.first ?? 100;
+    const requestedHashes = new Set(body.variables?.transactionHashes ?? []);
+    const historyCount = options.includePositions === true ? options.positionHistoryCount ?? 2 : 0;
+    const matching = Array.from({ length: historyCount }, (_, index) => ({
+      id: `liquidity-history-${index}`,
+      type: index % 2 === 0 ? "DEPOSIT" : "WITHDRAW",
+      transactionHash: `0x${(0xa0 + index).toString(16).padStart(64, "0")}`,
+      blockNumber: String(1_000 - index),
+      timestamp: String(1_720_000_000 - index * 60),
+      amountX: String((10n + BigInt(index)) * 10n ** 18n),
+      amountY: String((20n + BigInt(index)) * 10n ** 18n),
+      ids: [String(activeIdFor(options) + index)],
+      pair: { id: pair },
+      sender: index % 2 === 0 ? DEFAULT_ACCOUNT : LB_ROUTER,
+      to: index % 2 === 0 ? DEFAULT_ACCOUNT : LB_ROUTER
+    })).filter((event) => requestedHashes.has(event.transactionHash.toLowerCase()));
+    return { data: { liquidityEvents: matching.slice(skip, skip + first) } };
+  }
   if (query.includes("PositionLiquidityHistory")) {
     const owner = body.variables?.owner ?? DEFAULT_ACCOUNT;
+    const pair = body.variables?.pair ?? WNATIVE_USDC_PAIR.toLowerCase();
+    const skip = body.variables?.skip ?? 0;
+    const first = body.variables?.first ?? 100;
+    if (options.positionHistoryFailAtSkip !== undefined && skip >= options.positionHistoryFailAtSkip) {
+      return { errors: [{ message: "Mock position history page failed" }] };
+    }
+    const historyCount = options.includePositions === true ? options.positionHistoryCount ?? 2 : 0;
+    const correlatedTransfers = Array.from(
+      { length: Math.max(0, Math.min(first, historyCount - skip)) },
+      (_, pageIndex) => {
+        const index = skip + pageIndex;
+        const deposit = index % 2 === 0;
+        const transactionHash = `0x${(0xa0 + index).toString(16).padStart(64, "0")}`;
+        const blockNumber = String(1_000 - index);
+        const timestamp = String(1_720_000_000 - index * 60);
+        const ids = [String(activeIdFor(options) + index)];
+        return {
+          id: `liquidity-history-transfer-${index}`,
+          transactionHash,
+          blockNumber,
+          timestamp,
+          sender: LB_ROUTER,
+          from: deposit ? "0x0000000000000000000000000000000000000000" : owner,
+          to: deposit ? owner : "0x0000000000000000000000000000000000000000",
+          ids,
+          pair: { id: pair }
+        };
+      }
+    );
     return {
       data: {
-        liquidityEvents: options.includePositions === true
-          ? [
-              {
-                id: "deposit-1",
-                type: "DEPOSIT",
-                transactionHash: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                blockNumber: "40",
-                timestamp: "1720000000",
-                amountX: "10000000000000000000",
-                amountY: "20000000000000000000",
-                ids: [String(activeIdFor(options))],
-                sender: owner,
-                to: owner
-              },
-              {
-                id: "withdraw-1",
-                type: "WITHDRAW",
-                transactionHash: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                blockNumber: "41",
-                timestamp: "1720000100",
-                amountX: "1000000000000000000",
-                amountY: "2000000000000000000",
-                ids: [String(activeIdFor(options))],
-                sender: owner,
-                to: owner
-              }
-            ]
-          : [],
-        transferBatchEvents: options.analyticsTransferred === true
+        transferBatchEvents: [
+          ...correlatedTransfers,
+          ...(options.analyticsTransferred === true && skip === 0
           ? [{
               id: "transfer-out-1",
               transactionHash: "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
@@ -534,9 +764,11 @@ function mockGraphResponse(body: GraphRequest, options: MockRpcOptions): Record<
               sender: owner,
               from: owner,
               to: "0x0000000000000000000000000000000000000002",
-              ids: [String(activeIdFor(options))]
+              ids: [String(activeIdFor(options))],
+              pair: { id: pair }
             }]
-          : []
+          : [])
+        ]
       }
     };
   }
@@ -548,8 +780,13 @@ function mockGraphResponse(body: GraphRequest, options: MockRpcOptions): Record<
 
     const count = shouldIncludeOwnerPairPosition(body, options) ? options.ownerPositionCount ?? 1 : 0;
     const first = body.variables?.first ?? count;
+    const responseOptions = {
+      ...options,
+      positionOwner: options.ownerPositionResponseOwner ?? options.positionOwner,
+      positionPair: options.ownerPositionResponsePair ?? options.positionPair
+    };
     const positions = Array.from({ length: Math.max(0, Math.min(first, count - skip)) }, (_, index) =>
-      mockPosition(options, skip + index)
+      mockPosition(responseOptions, skip + index)
     );
 
     return { data: { positions } };
@@ -727,7 +964,11 @@ async function handleEthCall(
   }
 
   if (functionName === "decimals") {
-    return encodeFunctionResult({ abi: erc20Abi, functionName, result: 18 });
+    const tokenX = options.pairRuntimeTokenX ?? options.pairTokenX ?? WNATIVE;
+    const result = addressEquals(call.to ?? "", tokenX)
+      ? options.pairRuntimeTokenXDecimals ?? 18
+      : 18;
+    return encodeFunctionResult({ abi: erc20Abi, functionName, result });
   }
 
   if (functionName === "symbol") {
@@ -847,7 +1088,9 @@ async function handleEthCall(
 
   if (functionName === "getActiveId") {
     const createdPair = options.createdPairAddress ?? CREATED_WETH_USDT_PAIR;
-    const result = state.creationConfirmed && addressEquals(call.to ?? "", createdPair) ? state.createdActiveId! : activeIdFor(options);
+    const result = state.creationConfirmed && addressEquals(call.to ?? "", createdPair)
+      ? state.createdActiveId!
+      : options.pairRuntimeActiveId ?? activeIdFor(options);
     return encodeFunctionResult({ abi: lbPairAbi, functionName, result });
   }
 
@@ -1164,7 +1407,7 @@ function quotePairForLeg(tokenIn: Address, tokenOut: Address, alternateDirect: b
     [tokenPairKey(WNATIVE, USDT)]: WNATIVE_USDT_PAIR,
     [tokenPairKey(USDT, USDC)]: USDT_USDC_PAIR,
     [tokenPairKey(WNATIVE, WETH)]: WNATIVE_WETH_PAIR,
-    [tokenPairKey(WETH, USDC)]: WETH_USDC_PAIR
+    [tokenPairKey(WETH, USDC)]: alternateDirect ? ALT_WETH_USDC_PAIR : WETH_USDC_PAIR
   };
   const pair = pairs[key];
   if (pair === undefined) throw new Error(`No mock pair for ${tokenIn}/${tokenOut}`);
@@ -1179,7 +1422,7 @@ function quoteBinStepForLeg(tokenIn: Address, tokenOut: Address, alternateDirect
     [tokenPairKey(WNATIVE, USDT)]: 11n,
     [tokenPairKey(USDT, USDC)]: 12n,
     [tokenPairKey(WNATIVE, WETH)]: 13n,
-    [tokenPairKey(WETH, USDC)]: 14n
+    [tokenPairKey(WETH, USDC)]: alternateDirect ? 14n : BigInt(WETH_USDC_BIN_STEP)
   };
   const binStep = binSteps[key];
   if (binStep === undefined) throw new Error(`No mock bin step for ${tokenIn}/${tokenOut}`);
@@ -1245,13 +1488,28 @@ function pairMetadata(address: Address | undefined, options: MockRpcOptions) {
 }
 
 function allPairMetadata(options: MockRpcOptions) {
+  const primary = {
+    pair: (options.pairAddress ?? WNATIVE_USDC_PAIR) as Address,
+    tokenX: (options.pairTokenX ?? WNATIVE) as Address,
+    tokenY: (options.pairTokenY ?? USDC) as Address,
+    binStep: Number(options.pairBinStep ?? 10)
+  };
   return [
-    { pair: (options.pairAddress ?? WNATIVE_USDC_PAIR) as Address, tokenX: (options.pairTokenX ?? WNATIVE) as Address, tokenY: (options.pairTokenY ?? USDC) as Address, binStep: Number(options.pairBinStep ?? 10) },
+    primary,
+    ...(addressEquals(primary.pair, WNATIVE_USDC_PAIR)
+      ? []
+      : [{ pair: WNATIVE_USDC_PAIR as Address, tokenX: WNATIVE as Address, tokenY: USDC as Address, binStep: 10 }]),
     { pair: ALT_WNATIVE_USDC_PAIR as Address, tokenX: WNATIVE as Address, tokenY: USDC as Address, binStep: 20 },
     { pair: WNATIVE_USDT_PAIR as Address, tokenX: WNATIVE as Address, tokenY: USDT as Address, binStep: 11 },
     { pair: USDT_USDC_PAIR as Address, tokenX: USDT as Address, tokenY: USDC as Address, binStep: 12 },
     { pair: WNATIVE_WETH_PAIR as Address, tokenX: WNATIVE as Address, tokenY: WETH as Address, binStep: 13 },
-    { pair: WETH_USDC_PAIR as Address, tokenX: WETH as Address, tokenY: USDC as Address, binStep: 14 },
+    {
+      pair: WETH_USDC_PAIR as Address,
+      tokenX: WETH as Address,
+      tokenY: USDC as Address,
+      binStep: WETH_USDC_BIN_STEP
+    },
+    { pair: ALT_WETH_USDC_PAIR as Address, tokenX: WETH as Address, tokenY: USDC as Address, binStep: 14 },
     { pair: SECOND_WNATIVE_USDC_PAIR as Address, tokenX: WNATIVE as Address, tokenY: USDC as Address, binStep: 11 }
   ];
 }

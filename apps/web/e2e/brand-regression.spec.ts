@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 
+import { installMockAnalyticsStream } from "./fixtures/mock-analytics-stream";
 import { installMockRpc } from "./fixtures/mock-rpc";
 import { installMockWallet, LOCALNET_CHAIN_ID, ROBINHOOD_TESTNET_CHAIN_ID } from "./fixtures/mock-wallet";
 
@@ -9,6 +10,10 @@ const screenshotOptions = {
   maxDiffPixelRatio: 0.001
 };
 
+test.beforeEach(async ({ page }) => {
+  await page.clock.setFixedTime("2026-07-12T14:00:00Z");
+});
+
 async function connectWallet(page: Parameters<typeof installMockRpc>[0]) {
   await page.getByTestId("wallet-connect-button").click();
   await expect(page.getByTestId("wallet-account-button")).toBeVisible();
@@ -17,17 +22,24 @@ async function connectWallet(page: Parameters<typeof installMockRpc>[0]) {
 test("canonical Feather landing desktop", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium");
   await installMockRpc(page, { includePairs: true });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
+  await page.emulateMedia({ reducedMotion: "reduce" });
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Weightless liquidity." })).toBeVisible();
-  await expect(page.locator(".landing-stats div").filter({ hasText: "Network" })).toContainText("Local Anvil");
-  await expect(page.locator(".landing-stats div").filter({ hasText: "Indexed pools" })).toContainText("1");
-  await expect(page.getByRole("link", { name: "Docs" })).toHaveCount(0);
+  await expect(page.getByLabel("Illustrative SPCX and USDC Liquidity Book market simulation")).toBeVisible();
+  await expect(page.getByText("10 bps per bin")).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "Marketing" }).getByRole("link", { name: "Docs" })).toHaveAttribute("href", "/docs");
+  await expect(page.getByRole("navigation", { name: "Marketing" }).getByRole("link", { name: "Swap" })).toHaveCount(0);
+  await expect(page.locator(".landing-launch")).toHaveAttribute("href", "#/pools");
+  await expect(page.locator(".hero-launch")).toHaveAttribute("href", "#/pools");
   await expect(page).toHaveScreenshot("feather-landing-desktop.png", screenshotOptions);
 });
 
 test("canonical Feather landing mobile", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile-chromium");
   await installMockRpc(page, { includePairs: true });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
+  await page.emulateMedia({ reducedMotion: "reduce" });
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Weightless liquidity." })).toBeVisible();
   await expect(page).toHaveScreenshot("feather-landing-mobile.png", screenshotOptions);
@@ -36,6 +48,7 @@ test("canonical Feather landing mobile", async ({ page }, testInfo) => {
 test("canonical Feather swap desktop", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium");
   await installMockRpc(page, { includePairs: true });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/swap");
   await expect(page.getByTestId("swap-submit-button")).toBeVisible();
   await expect(page).toHaveScreenshot("feather-swap-desktop.png", screenshotOptions);
@@ -44,6 +57,7 @@ test("canonical Feather swap desktop", async ({ page }, testInfo) => {
 test("canonical Feather swap mobile", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile-chromium");
   await installMockRpc(page, { includePairs: true });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/swap");
   await expect(page.getByTestId("swap-submit-button")).toBeVisible();
   await expect(page).toHaveScreenshot("feather-swap-mobile.png", screenshotOptions);
@@ -52,6 +66,7 @@ test("canonical Feather swap mobile", async ({ page }, testInfo) => {
 test("canonical Feather pools desktop", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium");
   await installMockRpc(page, { includePairs: true });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/pools");
   await expect(page.locator(".panel-heading").filter({ hasText: "Pools" })).toBeVisible();
   await expect(page).toHaveScreenshot("feather-pools-desktop.png", screenshotOptions);
@@ -60,28 +75,49 @@ test("canonical Feather pools desktop", async ({ page }, testInfo) => {
 test("canonical Feather pools mobile", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile-chromium");
   await installMockRpc(page, { includePairs: true });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/pools");
   await expect(page.locator(".panel-heading").filter({ hasText: "Pools" })).toBeVisible();
   await expect(page).toHaveScreenshot("feather-pools-mobile.png", screenshotOptions);
 });
 
-test("canonical Feather pool detail desktop", async ({ page }, testInfo) => {
+test("canonical Feather pool workspace desktop", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium");
-  await page.clock.setFixedTime("2026-07-12T14:00:00Z");
+  await installMockAnalyticsStream(page);
   await installMockRpc(page, { includePairs: true });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/pools");
   await page.locator(".discovery-table .pair-name").first().click();
-  await expect(page.getByText("Live liquidity bins")).toBeVisible();
+  await expect(page).toHaveURL(/#\/pools\/.+\/create\?returnTo=/);
+  await expect(page.getByRole("tablist", { name: "Pool workspace views" })).toBeHidden();
+  await expect(page.getByTestId("swap-market-chart")).toBeVisible();
+  await expect(page.getByTestId("pool-workspace-rail")).toBeVisible();
+  await expect(page.getByTestId("liquidity-range-editor")).toBeVisible();
+  await expect(page.getByTestId("pool-workspace-owner-panel")).toBeVisible();
+  await expect(page.getByRole("link", { name: "Market overview" })).toHaveCount(0);
   await expect(page).toHaveScreenshot("feather-pool-detail-desktop.png", screenshotOptions);
 });
 
-test("canonical Feather pool detail mobile", async ({ page }, testInfo) => {
+test("canonical Feather pool workspace mobile", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile-chromium");
-  await page.clock.setFixedTime("2026-07-12T14:00:00Z");
+  await installMockAnalyticsStream(page);
   await installMockRpc(page, { includePairs: true });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/pools");
   await page.locator(".discovery-table .pair-name").first().click();
-  await expect(page.getByText("Live liquidity bins")).toBeVisible();
+  await expect(page).toHaveURL(/#\/pools\/.+\/create\?returnTo=/);
+  const views = page.getByRole("tablist", { name: "Pool workspace views" });
+  await expect(views.getByRole("tab", { name: "Trade" })).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByTestId("swap-market-chart")).toBeHidden();
+  await expect(page.getByTestId("liquidity-range-editor")).toBeVisible();
+  await views.getByRole("tab", { name: "Market" }).click();
+  await expect(page.getByTestId("swap-market-chart")).toBeVisible();
+  await expect(page.getByTestId("pool-workspace-rail")).toBeVisible();
+  await expect(page.getByTestId("liquidity-range-editor")).toBeHidden();
+  await views.getByRole("tab", { name: "Positions" }).click();
+  await expect(page.getByTestId("pool-workspace-owner-panel")).toBeVisible();
+  await expect(page.getByRole("link", { name: "Market overview" })).toHaveCount(0);
+  await views.getByRole("tab", { name: "Trade" }).click();
   await expect(page).toHaveScreenshot("feather-pool-detail-mobile.png", screenshotOptions);
 });
 
@@ -144,35 +180,31 @@ test("canonical Feather portfolio and position mobile", async ({ page }, testInf
   await expect(page).toHaveScreenshot("feather-position-mobile.png", screenshotOptions);
 });
 
-test("Feather navigation exposes focus and keyboard operations states", async ({ page }, testInfo) => {
+test("Feather navigation exposes focused core links without legacy operations controls", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium");
   await installMockRpc(page, { includePairs: true });
   await page.goto("/#/swap");
-  const swapLink = page.getByRole("link", { name: "Swap" });
-  await expect(swapLink).toHaveAttribute("aria-current", "page");
-  await swapLink.focus();
-  await expect(swapLink).toBeFocused();
-  expect(await swapLink.evaluate((element) => getComputedStyle(element).outlineStyle)).not.toBe("none");
+  await expect(page.getByTestId("swap-submit-button")).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "Primary" }).getByRole("link", { name: "Swap" })).toHaveCount(0);
+  const poolsLink = page.getByRole("link", { name: "Pools" });
+  await poolsLink.focus();
+  await expect(poolsLink).toBeFocused();
+  expect(await poolsLink.evaluate((element) => getComputedStyle(element).outlineStyle)).not.toBe("none");
   await page.keyboard.press("Tab");
-  await expect(page.getByRole("link", { name: "Pools" })).toBeFocused();
-
-  const operations = page.locator(".operations-menu");
-  const summary = operations.locator("summary");
-  await summary.focus();
-  await page.keyboard.press("Enter");
-  await expect(operations).toHaveAttribute("open", "");
-  const activityLink = operations.getByRole("link", { name: "Activity" });
-  await activityLink.focus();
-  await expect(activityLink).toBeFocused();
-  await page.keyboard.press("Escape");
-  await expect(operations).not.toHaveAttribute("open", "");
-  await expect(summary).toBeFocused();
+  await expect(page.getByRole("link", { name: "Portfolio" })).toBeFocused();
+  await page.keyboard.press("Tab");
+  const docsLink = page.getByRole("navigation", { name: "Primary" }).getByRole("link", { name: "Docs" });
+  await expect(docsLink).toBeFocused();
+  await expect(docsLink).toHaveAttribute("href", "/docs");
+  await expect(page.getByRole("link", { name: "Liquidity" })).toHaveCount(0);
+  await expect(page.getByText("Operations", { exact: true })).toHaveCount(0);
 });
 
 test("Feather tertiary text token keeps AA contrast on carbon surfaces", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium");
   await installMockRpc(page, { includePairs: true });
   await page.goto("/#/swap");
+  await expect(page.locator(".app-shell")).toBeVisible();
 
   const contrastRatios = await page.evaluate(() => {
     const parseColor = (value: string) => {
@@ -211,7 +243,7 @@ test("Feather tertiary text token keeps AA contrast on carbon surfaces", async (
   for (const ratio of contrastRatios) expect(ratio).toBeGreaterThanOrEqual(4.5);
 });
 
-test("320px wrong-chain header keeps wallet and operations reachable", async ({ page }, testInfo) => {
+test("320px wrong-chain header keeps wallet and docs reachable", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium");
   await page.setViewportSize({ width: 320, height: 800 });
   await installMockRpc(page, { includePairs: true });
@@ -219,8 +251,9 @@ test("320px wrong-chain header keeps wallet and operations reachable", async ({ 
   await page.goto("/#/swap");
   await connectWallet(page);
   await expect(page.getByTestId("wallet-switch-button")).toBeVisible();
-  await expect(page.getByRole("link", { name: "Liquidity" })).toBeVisible();
-  await expect(page.locator(".operations-menu summary")).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "Primary" }).getByRole("link", { name: "Docs" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Liquidity" })).toHaveCount(0);
+  await expect(page.getByText("Operations", { exact: true })).toHaveCount(0);
   const overflow = await page.locator("body").evaluate((body) =>
     [...body.querySelectorAll("*")]
       .filter((element) => element.getBoundingClientRect().right > document.documentElement.clientWidth + 1)

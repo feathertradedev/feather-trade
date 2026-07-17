@@ -18,6 +18,7 @@ const chainId = process.env.LOCALNET_CHAIN_ID ?? "31337";
 const commands = [
   { name: "swap", command: ["pnpm", "--silent", "sdk:example:localnet:swap"], expectation: "success" },
   { name: "liquidity", command: ["pnpm", "--silent", "sdk:example:localnet:liquidity"], expectation: "success" },
+  { name: "market-activity-movement", command: ["pnpm", "--silent", "market-activity:verify"], expectation: "success" },
   { name: "expected-revert", command: ["pnpm", "--silent", "sdk:e2e:localnet:expected-revert"], expectation: "expected-revert" }
 ];
 let anvilProcess = null;
@@ -183,6 +184,10 @@ function run(name, command, options = {}) {
     env: {
       ...process.env,
       LOCALNET_RPC_URL: rpcUrl,
+      MARKET_ACTIVITY_MANIFEST_PATH: path.join(root, "deployments", "localnet", "latest.json"),
+      MARKET_ACTIVITY_PRIVATE_KEY: process.env.MARKET_ACTIVITY_PRIVATE_KEY ?? "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+      MARKET_ACTIVITY_RANDOM_SEED: process.env.MARKET_ACTIVITY_RANDOM_SEED ?? "1723928558",
+      MARKET_ACTIVITY_RPC_URL: rpcUrl,
       SDK_EXAMPLE_DEADLINE_MINUTES: process.env.SDK_EXAMPLE_DEADLINE_MINUTES ?? "20",
       SDK_EXAMPLE_ID_SLIPPAGE: process.env.SDK_EXAMPLE_ID_SLIPPAGE ?? "2",
       SDK_EXAMPLE_SLIPPAGE_BPS: process.env.SDK_EXAMPLE_SLIPPAGE_BPS ?? "50",

@@ -1,0 +1,23 @@
+---
+title: "One-sided liquidity"
+description: "Provide one pool asset directly when the selected range and active-bin relationship permit it."
+slug: "liquidity/one-sided"
+section: "Liquidity"
+order: 4
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+One-sided liquidity deposits only token X or only token Y. Feather does not silently swap one asset into the other.
+
+## Eligible ranges
+
+A range wholly above the active bin can receive token X. A range wholly below the active bin can receive token Y. The interface blocks an incompatible asset and explains which side the range accepts.
+
+## Review carefully
+
+Inspect the active bin, selected range, nonzero asset amount, zero asset amount, projected weights, approval requirement, and refund behavior. If the market moves across the selected range before execution, the earlier review becomes stale.
+
+<Callout title="No hidden acquisition step">
+If you need the other pool asset, acquire it through a separately reviewed trade. A direct one-sided add is not a swap or Zap.
+</Callout>

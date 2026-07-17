@@ -1,0 +1,25 @@
+---
+title: "Mainnet deployments"
+description: "Find verified Robinhood Chain mainnet contract addresses after Feather completes deployment validation."
+slug: "contracts/mainnet-deployments"
+section: "Contracts for builders"
+order: 2
+audience: "builder"
+lastReviewed: "2026-07-14"
+---
+
+Mainnet addresses will appear only after the release process verifies chain ID, deployed code, constructor configuration, ownership state, and explorer source verification.
+
+<ContractAddress label="LBFactory" />
+<ContractAddress label="LBPair implementation" />
+<ContractAddress label="LBRouter" />
+<ContractAddress label="LBQuoter" />
+<ContractAddress label="Wrapped native token" />
+
+## Verification policy
+
+This page never publishes testnet, local development, dry-run, zero, or placeholder addresses as mainnet contracts. Integrators should compare addresses against the official explorer and the currently selected release before signing or encoding transactions.
+
+<Risk title="Do not preconfigure placeholder addresses">
+Wait for verified mainnet values. A syntactically valid address can still target the wrong chain or contract.
+</Risk>

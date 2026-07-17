@@ -182,9 +182,16 @@ jobs:
 
       - name: Smoke hosted release against sealed artifact
         if: ${{ needs.build.result == 'success' }}
+        shell: bash
         env:
           DEPLOYED_URL: ${{ needs.trusted-preflight.outputs.deployed_origin }}
-        run: node scripts/web/check-hosted-release.cjs --url "$DEPLOYED_URL" --dist .local/web-promotion/verified/dist
+          TARGET_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          args=(--url "$DEPLOYED_URL" --dist .local/web-promotion/verified/dist)
+          if [[ "$TARGET_ENVIRONMENT" == mainnet ]]; then
+            args+=(--docs-url https://feather.markets/docs)
+          fi
+          node scripts/web/check-hosted-release.cjs "${args[@]}"
 
       - name: Write sanitized promotion and rollback-readiness evidence
         if: always()

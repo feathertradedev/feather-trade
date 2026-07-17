@@ -1,7 +1,7 @@
 import { lbPairAbi } from "@robinhood-lb/sdk/abi";
 import type { DexRegistry } from "@robinhood-lb/sdk/registry";
 import type { TokenMetadata } from "@robinhood-lb/sdk/tokens";
-import { createPublicClient, formatUnits, http, isAddressEqual, type Address } from "viem";
+import { createPublicClient, formatUnits, http, isAddressEqual, type Address, type Hex } from "viem";
 
 import { isLocalnetRegistry } from "./config";
 
@@ -9,9 +9,11 @@ export type LoadState = "loading" | "ready" | "partial" | "stale" | "empty" | "u
 export const GRAPHQL_PAGE_SIZE = 100;
 export const GRAPHQL_MAX_PAGES = 5;
 export const GRAPHQL_ACTIVITY_RENDER_LIMIT = 100;
+export const POOL_ACTIVITY_LIMIT = 100;
 export const INDEXER_STALE_BLOCK_THRESHOLD = 20n;
 export const ROBINHOOD_TESTNET_INDEXER_STALE_BLOCK_THRESHOLD = 300n;
 export const GRAPHQL_REQUEST_TIMEOUT_MS = 10_000;
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 
 export interface AppDataLoadOptions {
   graphqlTimeoutMs?: number;
@@ -24,6 +26,7 @@ export interface PaginationInfo {
   loadedCount: number;
   maxPages: number;
   pageSize: number;
+  windowed: boolean;
 }
 
 export interface RuntimeState {
@@ -122,6 +125,7 @@ export interface WalletPortfolioPage {
   health: {
     fresh: boolean;
     headBlock: string | null;
+    headHash: string | null;
     status: "READY" | "PARTIAL" | "UNAVAILABLE";
   };
 }
@@ -148,7 +152,7 @@ export interface PositionHistoryRow {
 }
 
 interface PositionHistoryGraph {
-  liquidityEvents: Array<Omit<PositionHistoryRow, "binIds"> & { ids: string[] }>;
+  liquidityEvents: Array<Omit<PositionHistoryRow, "binIds"> & { ids: string[]; pair: { id: string } }>;
   transferBatchEvents: Array<{
     id: string;
     transactionHash: string;
@@ -158,7 +162,13 @@ interface PositionHistoryGraph {
     from: string;
     to: string;
     ids: string[];
+    pair: { id: string };
   }>;
+}
+
+interface PoolActivityGraph {
+  swaps: DashboardGraph["swaps"];
+  liquidityEvents: DashboardGraph["liquidityEvents"];
 }
 
 export interface IndexerState {
@@ -230,7 +240,9 @@ interface DashboardGraph {
     amountOutX: string;
     amountOutY: string;
     pair: { id: string };
+    transactionFrom: string;
     sender: string;
+    to?: string;
   }>;
   liquidityEvents: Array<{
     id: string;
@@ -242,6 +254,7 @@ interface DashboardGraph {
     amountY: string;
     pair: { id: string };
     sender: string;
+    to?: string;
   }>;
   positions: Array<{
     id: string;
@@ -270,6 +283,45 @@ interface PairBinsGraph {
     totalSupply: string;
     updatedAtBlock: string;
   }>;
+}
+
+interface PairBinWindowGraph extends PairBinsGraph {
+  _meta?: {
+    block: {
+      number: number;
+      hash: string | null;
+    };
+    hasIndexingErrors: boolean;
+  };
+  pair: {
+    id: string;
+    address: string;
+    activeId: string | null;
+    binStep: string;
+    factory: { id: string };
+    reserveX?: string;
+    reserveY?: string;
+    tokenX: { address: string };
+    tokenY: { address: string };
+    updatedAtBlock?: string;
+  } | null;
+}
+
+export interface PoolBinWindowSnapshot {
+  activeId: bigint;
+  binStep: bigint;
+  blockHash: Hex;
+  blockNumber: bigint;
+  factory: Address;
+  tokenX: Address;
+  tokenY: Address;
+}
+
+export interface PoolIndexerSnapshot extends PoolBinWindowSnapshot {
+  reserveX: string;
+  reserveY: string;
+  source: "indexer-head";
+  updatedAtBlock: string;
 }
 
 export interface PaginatedRows<T> {
@@ -360,7 +412,9 @@ const SWAPS_PAGE_QUERY = `
       pair {
         id
       }
+      transactionFrom
       sender
+      to
     }
   }
 `;
@@ -379,6 +433,7 @@ const LIQUIDITY_EVENTS_PAGE_QUERY = `
         id
       }
       sender
+      to
     }
   }
 `;
@@ -496,6 +551,7 @@ const WALLET_PORTFOLIO_QUERY = `
     analyticsHealth {
       status
       headBlock
+      headHash
       fresh
     }
   }
@@ -516,24 +572,6 @@ const PAIR_BINS_QUERY = `
 
 const POSITION_HISTORY_QUERY = `
   query PositionLiquidityHistory($owner: Bytes!, $pair: String!, $first: Int!, $skip: Int!) {
-    liquidityEvents(
-      first: $first
-      skip: $skip
-      orderBy: blockNumber
-      orderDirection: desc
-      where: { pair: $pair, or: [{ sender: $owner }, { to: $owner }] }
-    ) {
-      id
-      type
-      transactionHash
-      blockNumber
-      timestamp
-      amountX
-      amountY
-      ids
-      sender
-      to
-    }
     transferBatchEvents(
       first: $first
       skip: $skip
@@ -549,18 +587,155 @@ const POSITION_HISTORY_QUERY = `
       from
       to
       ids
+      pair { id }
+    }
+  }
+`;
+
+const POSITION_HISTORY_LIQUIDITY_QUERY = `
+  query PositionLiquidityDetails($pair: String!, $transactionHashes: [Bytes!]!, $first: Int!, $skip: Int!) {
+    liquidityEvents(
+      first: $first
+      skip: $skip
+      orderBy: blockNumber
+      orderDirection: desc
+      where: { pair: $pair, transactionHash_in: $transactionHashes }
+    ) {
+      id
+      type
+      transactionHash
+      blockNumber
+      timestamp
+      amountX
+      amountY
+      ids
+      pair { id }
+      sender
+      to
+    }
+  }
+`;
+
+const POOL_ACTIVITY_QUERY = `
+  query PoolActivity($pair: String!, $first: Int!) {
+    swaps(first: $first, orderBy: blockNumber, orderDirection: desc, where: { pair: $pair }) {
+      id
+      transactionHash
+      blockNumber
+      timestamp
+      amountInX
+      amountInY
+      amountOutX
+      amountOutY
+      pair { id }
+      transactionFrom
+      sender
+      to
+    }
+    liquidityEvents(first: $first, orderBy: blockNumber, orderDirection: desc, where: { pair: $pair }) {
+      id
+      type
+      transactionHash
+      blockNumber
+      timestamp
+      amountX
+      amountY
+      pair { id }
+      sender
+      to
+    }
+  }
+`;
+
+const OWNER_POOL_ACTIVITY_QUERY = `
+  query PoolActivity($pair: String!, $owner: Bytes!, $first: Int!) {
+    swaps(
+      first: $first
+      orderBy: blockNumber
+      orderDirection: desc
+      where: { pair: $pair, or: [{ transactionFrom: $owner }, { sender: $owner }, { to: $owner }] }
+    ) {
+      id
+      transactionHash
+      blockNumber
+      timestamp
+      amountInX
+      amountInY
+      amountOutX
+      amountOutY
+      pair { id }
+      transactionFrom
+      sender
+      to
+    }
+    liquidityEvents(
+      first: $first
+      orderBy: blockNumber
+      orderDirection: desc
+      where: { pair: $pair, or: [{ sender: $owner }, { to: $owner }] }
+    ) {
+      id
+      type
+      transactionHash
+      blockNumber
+      timestamp
+      amountX
+      amountY
+      pair { id }
+      sender
+      to
     }
   }
 `;
 
 const PAIR_BIN_WINDOW_QUERY = `
-  query PairBinWindow($pair: String!, $minBin: BigInt!, $maxBin: BigInt!, $first: Int!) {
-    bins(first: $first, orderBy: binId, orderDirection: asc, where: { pair: $pair, binId_gte: $minBin, binId_lte: $maxBin }) {
+  query PairBinWindow($pair: String!, $pairId: ID!, $blockHash: Bytes!, $minBin: BigInt!, $maxBin: BigInt!, $first: Int!) {
+    _meta(block: { hash: $blockHash }) {
+      block {
+        number
+        hash
+      }
+      hasIndexingErrors
+    }
+    pair(id: $pairId, block: { hash: $blockHash }) {
+      id
+      address
+      activeId
+      binStep
+      factory { id }
+      tokenX { address }
+      tokenY { address }
+    }
+    bins(first: $first, orderBy: binId, orderDirection: asc, block: { hash: $blockHash }, where: { pair: $pair, binId_gte: $minBin, binId_lte: $maxBin }) {
       id
       binId
       reserveX
       reserveY
       totalSupply
+      updatedAtBlock
+    }
+  }
+`;
+
+const POOL_INDEXER_SNAPSHOT_QUERY = `
+  query PoolIndexerSnapshot($pairId: ID!) {
+    _meta {
+      block {
+        number
+        hash
+      }
+      hasIndexingErrors
+    }
+    pair(id: $pairId) {
+      id
+      address
+      activeId
+      binStep
+      factory { id }
+      reserveX
+      reserveY
+      tokenX { address }
+      tokenY { address }
       updatedAtBlock
     }
   }
@@ -634,7 +809,7 @@ export async function loadPaginatedPositionsForOwnerPair(
     return { rows: [], pageInfo: emptyPaginationInfo() };
   }
 
-  return loadPaginatedGraphRows<OwnerPairPositionsGraph, DashboardGraph["positions"][number], PositionRow>({
+  const page = await loadPaginatedGraphRows<OwnerPairPositionsGraph, DashboardGraph["positions"][number], PositionRow>({
     endpoint: registry.endpoints.indexerUrl,
     query: OWNER_PAIR_POSITIONS_QUERY,
     variables: {
@@ -645,6 +820,8 @@ export async function loadPaginatedPositionsForOwnerPair(
     map: toPositionRow,
     timeoutMs: normalizeGraphqlTimeout(options.graphqlTimeoutMs)
   });
+  assertOwnerPairPositionRows(page.rows, owner, pair);
+  return page;
 }
 
 export async function loadPaginatedPositionsForOwnerPairAtBlock(
@@ -661,7 +838,7 @@ export async function loadPaginatedPositionsForOwnerPairAtBlock(
     throw new Error("Pinned owner-position block must be a non-negative safe integer");
   }
 
-  return loadPaginatedGraphRows<OwnerPairPositionsGraph, DashboardGraph["positions"][number], PositionRow>({
+  const page = await loadPaginatedGraphRows<OwnerPairPositionsGraph, DashboardGraph["positions"][number], PositionRow>({
     endpoint: registry.endpoints.indexerUrl,
     query: OWNER_PAIR_POSITIONS_AT_BLOCK_QUERY,
     variables: {
@@ -673,12 +850,15 @@ export async function loadPaginatedPositionsForOwnerPairAtBlock(
     map: toPositionRow,
     timeoutMs: normalizeGraphqlTimeout(options.graphqlTimeoutMs)
   });
+  assertOwnerPairPositionRows(page.rows, owner, pair);
+  return page;
 }
 
 export async function loadWalletPortfolio(endpoint: string, owner: Address): Promise<WalletPortfolioPage> {
   const positions: PortfolioPositionRow[] = [];
   let after: string | null = null;
   let health: WalletPortfolioPage["health"] | null = null;
+  let partial = false;
 
   for (let page = 0; page < GRAPHQL_MAX_PAGES; page += 1) {
     const data: WalletPortfolioGraph = await fetchGraph<WalletPortfolioGraph>(
@@ -688,9 +868,14 @@ export async function loadWalletPortfolio(endpoint: string, owner: Address): Pro
       GRAPHQL_REQUEST_TIMEOUT_MS
     );
     health ??= data.analyticsHealth;
+    partial ||= data.walletPositions.pageInfo.partial;
     positions.push(...data.walletPositions.nodes);
     if (!data.walletPositions.pageInfo.hasNextPage) {
-      return { positions, pageInfo: data.walletPositions.pageInfo, health };
+      return {
+        positions,
+        pageInfo: { ...data.walletPositions.pageInfo, partial },
+        health
+      };
     }
     if (!data.walletPositions.pageInfo.endCursor || data.walletPositions.pageInfo.endCursor === after) {
       throw new Error("Analytics pagination cursor did not advance");
@@ -701,8 +886,30 @@ export async function loadWalletPortfolio(endpoint: string, owner: Address): Pro
   return {
     positions,
     pageInfo: { endCursor: after, hasNextPage: true, partial: true },
-    health: health ?? { fresh: false, headBlock: null, status: "UNAVAILABLE" }
+    health: health ?? { fresh: false, headBlock: null, headHash: null, status: "UNAVAILABLE" }
   };
+}
+
+export function selectWalletPortfolioPosition(
+  page: WalletPortfolioPage,
+  owner: Address,
+  pair: Address
+): PortfolioPositionRow | null {
+  const expectedOwner = owner.toLowerCase();
+  const expectedPair = pair.toLowerCase();
+  const selected: PortfolioPositionRow[] = [];
+
+  for (const position of page.positions) {
+    if (position.owner.toLowerCase() !== expectedOwner) {
+      throw new Error(`Wallet portfolio returned a position for another owner: ${position.owner}`);
+    }
+    if (position.pair.toLowerCase() === expectedPair) selected.push(position);
+  }
+
+  if (selected.length > 1) {
+    throw new Error(`Wallet portfolio returned duplicate positions for pair ${expectedPair}`);
+  }
+  return selected[0] ?? null;
 }
 
 export async function loadPositionHistory(
@@ -713,74 +920,298 @@ export async function loadPositionHistory(
   if (registry.endpoints.indexerUrl === null) {
     return { rows: [], pageInfo: emptyPaginationInfo() };
   }
-  const rows: PositionHistoryRow[] = [];
+  const transferBatchEvents: PositionHistoryGraph["transferBatchEvents"] = [];
+  let transferCapped = false;
+  let transferFailed = false;
+  let transferError: string | null = null;
   for (let page = 0; page < GRAPHQL_MAX_PAGES; page += 1) {
-    let data: PositionHistoryGraph;
+    let data: Pick<PositionHistoryGraph, "transferBatchEvents">;
     try {
-      data = await fetchGraph<PositionHistoryGraph>(
+      data = await fetchGraph<Pick<PositionHistoryGraph, "transferBatchEvents">>(
         registry.endpoints.indexerUrl,
         POSITION_HISTORY_QUERY,
         { owner: owner.toLowerCase(), pair: pair.toLowerCase(), first: GRAPHQL_PAGE_SIZE, skip: page * GRAPHQL_PAGE_SIZE },
         GRAPHQL_REQUEST_TIMEOUT_MS
       );
     } catch (error) {
-      if (rows.length === 0) throw error;
-      return {
-        rows: sortPositionHistory(rows),
-        pageInfo: {
-          capped: false,
-          error: error instanceof Error ? error.message : "Position history request failed",
-          failed: true,
-          loadedCount: rows.length,
-          maxPages: GRAPHQL_MAX_PAGES,
-          pageSize: GRAPHQL_PAGE_SIZE
-        }
-      };
+      if (transferBatchEvents.length === 0) throw error;
+      transferFailed = true;
+      transferError = error instanceof Error ? error.message : "Position history request failed";
+      break;
     }
-    rows.push(
-      ...data.liquidityEvents.map((event) => ({ ...event, binIds: event.ids })),
-      ...data.transferBatchEvents.map((event) => ({
-        id: event.id,
-        type: event.from.toLowerCase() === owner.toLowerCase()
-          ? event.to.toLowerCase() === owner.toLowerCase() ? "TRANSFER" : "TRANSFER_OUT"
-          : "TRANSFER_IN",
-        transactionHash: event.transactionHash,
-        blockNumber: event.blockNumber,
-        timestamp: event.timestamp,
-        amountX: null,
-        amountY: null,
-        binIds: event.ids,
-        sender: event.sender,
-        to: event.to
-      }))
-    );
-    if (data.liquidityEvents.length < GRAPHQL_PAGE_SIZE && data.transferBatchEvents.length < GRAPHQL_PAGE_SIZE) {
-      return {
-        rows: sortPositionHistory(rows),
-        pageInfo: {
-          capped: false,
-          failed: false,
-          loadedCount: rows.length,
-          maxPages: GRAPHQL_MAX_PAGES,
-          pageSize: GRAPHQL_PAGE_SIZE
-        }
-      };
+    transferBatchEvents.push(...data.transferBatchEvents);
+    if (data.transferBatchEvents.length < GRAPHQL_PAGE_SIZE) break;
+    if (page === GRAPHQL_MAX_PAGES - 1) {
+      transferCapped = true;
     }
   }
+
+  const details = await loadPositionLiquidityDetails(
+    registry.endpoints.indexerUrl,
+    pair,
+    transferBatchEvents,
+    GRAPHQL_REQUEST_TIMEOUT_MS
+  );
+  const correlated = correlatePositionHistory(owner, pair, details.rows, transferBatchEvents);
+  const missingDetails = correlated.unmatchedOperations > 0
+    ? `${correlated.unmatchedOperations} owner mint/burn event${correlated.unmatchedOperations === 1 ? " has" : "s have"} missing or ambiguous liquidity details`
+    : null;
+  const errors = [transferError, details.error, missingDetails].filter((value): value is string => value !== null);
+  const rows = sortPositionHistory(correlated.rows);
   return {
-    rows: sortPositionHistory(rows),
+    rows,
     pageInfo: {
-      capped: true,
-      failed: false,
+      capped: transferCapped || details.capped,
+      ...(errors.length > 0 ? { error: errors.join("; ") } : {}),
+      failed: transferFailed || details.failed || correlated.unmatchedOperations > 0,
       loadedCount: rows.length,
       maxPages: GRAPHQL_MAX_PAGES,
-      pageSize: GRAPHQL_PAGE_SIZE
+      pageSize: GRAPHQL_PAGE_SIZE,
+      windowed: false
     }
   };
 }
 
+async function loadPositionLiquidityDetails(
+  endpoint: string,
+  pair: Address,
+  transfers: readonly PositionHistoryGraph["transferBatchEvents"][number][],
+  timeoutMs: number
+): Promise<{ capped: boolean; error: string | null; failed: boolean; rows: PositionHistoryGraph["liquidityEvents"] }> {
+  const transactionHashes = [...new Set(transfers.map((transfer) => transfer.transactionHash.toLowerCase()))];
+  const rows: PositionHistoryGraph["liquidityEvents"] = [];
+  const errors: string[] = [];
+  let capped = false;
+
+  for (let offset = 0; offset < transactionHashes.length; offset += GRAPHQL_PAGE_SIZE) {
+    const chunk = transactionHashes.slice(offset, offset + GRAPHQL_PAGE_SIZE);
+    for (let page = 0; page < GRAPHQL_MAX_PAGES; page += 1) {
+      try {
+        const data = await fetchGraph<Pick<PositionHistoryGraph, "liquidityEvents">>(
+          endpoint,
+          POSITION_HISTORY_LIQUIDITY_QUERY,
+          { pair: pair.toLowerCase(), transactionHashes: chunk, first: GRAPHQL_PAGE_SIZE, skip: page * GRAPHQL_PAGE_SIZE },
+          timeoutMs
+        );
+        rows.push(...data.liquidityEvents);
+        if (data.liquidityEvents.length < GRAPHQL_PAGE_SIZE) break;
+        if (page === GRAPHQL_MAX_PAGES - 1) capped = true;
+      } catch (error) {
+        errors.push(error instanceof Error ? error.message : "Position liquidity details request failed");
+        break;
+      }
+    }
+  }
+
+  return { capped, error: errors.length > 0 ? errors.join("; ") : null, failed: errors.length > 0, rows };
+}
+
+export async function loadPoolActivity(
+  registry: DexRegistry,
+  pair: Address,
+  owner: Address | null = null,
+  options: AppDataLoadOptions = {}
+): Promise<PaginatedRows<ActivityRow>> {
+  if (registry.endpoints.indexerUrl === null) {
+    return { rows: [], pageInfo: poolActivityPaginationInfo(0, false) };
+  }
+
+  const expectedPair = pair.toLowerCase();
+  const expectedOwner = owner?.toLowerCase() ?? null;
+  const timeoutMs = normalizeGraphqlTimeout(options.graphqlTimeoutMs);
+  const [data, ownerHistory] = await Promise.all([
+    fetchGraph<PoolActivityGraph>(
+      registry.endpoints.indexerUrl,
+      owner === null ? POOL_ACTIVITY_QUERY : OWNER_POOL_ACTIVITY_QUERY,
+      {
+        pair: expectedPair,
+        ...(expectedOwner === null ? {} : { owner: expectedOwner }),
+        first: POOL_ACTIVITY_LIMIT + 1
+      },
+      timeoutMs
+    ),
+    owner === null ? Promise.resolve(null) : loadPositionHistory(registry, owner, pair)
+  ]);
+  const directRows: ActivityRow[] = [
+    ...data.swaps.map((swap) => {
+      assertPoolActivityScope(swap, expectedPair, expectedOwner);
+      return {
+        id: swap.id,
+        type: "Swap",
+        transactionHash: swap.transactionHash,
+        blockNumber: swap.blockNumber,
+        timestamp: swap.timestamp,
+        amountX: BigInt(swap.amountInX) > 0n ? swap.amountInX : swap.amountOutX,
+        amountY: BigInt(swap.amountInY) > 0n ? swap.amountInY : swap.amountOutY,
+        account: swap.transactionFrom,
+        pair: swap.pair.id
+      };
+    }),
+    ...data.liquidityEvents.map((event) => {
+      assertPoolActivityScope(event, expectedPair, expectedOwner);
+      return {
+        id: event.id,
+        type: event.type,
+        transactionHash: event.transactionHash,
+        blockNumber: event.blockNumber,
+        timestamp: event.timestamp,
+        amountX: event.amountX,
+        amountY: event.amountY,
+        account: event.sender,
+        pair: event.pair.id
+      };
+    })
+  ];
+  const ownerLiquidityRows: ActivityRow[] = ownerHistory?.rows
+    .filter((event) => event.type === "DEPOSIT" || event.type === "WITHDRAW")
+    .map((event) => ({
+      id: event.id,
+      type: event.type,
+      transactionHash: event.transactionHash,
+      blockNumber: event.blockNumber,
+      timestamp: event.timestamp,
+      amountX: event.amountX,
+      amountY: event.amountY,
+      account: owner,
+      pair
+    })) ?? [];
+  const rows = mergePoolActivityRows([...directRows, ...ownerLiquidityRows]);
+  rows.sort((left, right) => {
+    const blockOrder = BigInt(left.blockNumber) < BigInt(right.blockNumber)
+      ? 1
+      : BigInt(left.blockNumber) > BigInt(right.blockNumber)
+        ? -1
+        : 0;
+    return blockOrder !== 0 ? blockOrder : left.id.localeCompare(right.id);
+  });
+  const windowed = data.swaps.length > POOL_ACTIVITY_LIMIT ||
+    data.liquidityEvents.length > POOL_ACTIVITY_LIMIT ||
+    ownerHistory?.pageInfo.windowed === true ||
+    rows.length > POOL_ACTIVITY_LIMIT;
+  const bounded = rows.slice(0, POOL_ACTIVITY_LIMIT);
+  const pageInfo = poolActivityPaginationInfo(bounded.length, windowed);
+  if (ownerHistory !== null) {
+    pageInfo.capped = ownerHistory.pageInfo.capped;
+    pageInfo.failed = ownerHistory.pageInfo.failed;
+    if (ownerHistory.pageInfo.error) pageInfo.error = ownerHistory.pageInfo.error;
+    pageInfo.maxPages = ownerHistory.pageInfo.maxPages;
+  }
+  return { rows: bounded, pageInfo };
+}
+
+function correlatePositionHistory(
+  owner: Address,
+  pair: Address,
+  liquidityEvents: readonly PositionHistoryGraph["liquidityEvents"][number][],
+  transferBatchEvents: readonly PositionHistoryGraph["transferBatchEvents"][number][]
+): { rows: PositionHistoryRow[]; unmatchedOperations: number } {
+  const expectedOwner = owner.toLowerCase();
+  const expectedPair = pair.toLowerCase();
+  const liquidity = liquidityEvents.map((event) => {
+    if (event.pair.id.toLowerCase() !== expectedPair) {
+      throw new Error(`Position history returned liquidity for another pair: ${event.pair.id}`);
+    }
+    return {
+      event,
+      operation: event.type.toUpperCase(),
+      transactionHash: event.transactionHash.toLowerCase(),
+      binKey: positionHistoryBinKey(event.ids)
+    };
+  });
+  const usedLiquidity = new Set<number>();
+  const rows: PositionHistoryRow[] = [];
+  let unmatchedOperations = 0;
+
+  for (const transfer of transferBatchEvents) {
+    if (transfer.pair.id.toLowerCase() !== expectedPair) {
+      throw new Error(`Position history returned a transfer for another pair: ${transfer.pair.id}`);
+    }
+    const from = transfer.from.toLowerCase();
+    const to = transfer.to.toLowerCase();
+    if (from !== expectedOwner && to !== expectedOwner) {
+      throw new Error(`Position history returned a transfer unrelated to owner ${expectedOwner}`);
+    }
+
+    const operation = from === ZERO_ADDRESS && to === expectedOwner
+      ? "DEPOSIT"
+      : from === expectedOwner && to === ZERO_ADDRESS
+        ? "WITHDRAW"
+        : null;
+    const binKey = positionHistoryBinKey(transfer.ids);
+    const transactionHash = transfer.transactionHash.toLowerCase();
+    const matchCandidates = operation === null
+      ? []
+      : liquidity
+          .map((candidate, index) => ({ candidate, index }))
+          .filter(({ candidate, index }) =>
+            !usedLiquidity.has(index) &&
+            candidate.operation === operation &&
+            candidate.transactionHash === transactionHash &&
+            candidate.binKey === binKey
+          );
+    const matchIndex = selectPositionHistoryLiquidityMatch(transfer, matchCandidates);
+
+    if (matchIndex >= 0) {
+      usedLiquidity.add(matchIndex);
+      const event = liquidity[matchIndex]!.event;
+      rows.push({
+        id: event.id,
+        type: operation!,
+        transactionHash: event.transactionHash,
+        blockNumber: event.blockNumber,
+        timestamp: event.timestamp,
+        amountX: event.amountX,
+        amountY: event.amountY,
+        binIds: [...event.ids],
+        sender: event.sender,
+        to: event.to
+      });
+      continue;
+    }
+
+    rows.push({
+      id: transfer.id,
+      type: operation ?? (from === expectedOwner
+            ? to === expectedOwner ? "TRANSFER" : "TRANSFER_OUT"
+            : "TRANSFER_IN"),
+      transactionHash: transfer.transactionHash,
+      blockNumber: transfer.blockNumber,
+      timestamp: transfer.timestamp,
+      amountX: null,
+      amountY: null,
+      binIds: [...transfer.ids],
+      sender: transfer.sender,
+      to: transfer.to
+    });
+    if (operation !== null) unmatchedOperations += 1;
+  }
+
+  return { rows: assertUniqueHistoryRows(rows), unmatchedOperations };
+}
+
 function sortPositionHistory(rows: PositionHistoryRow[]): PositionHistoryRow[] {
   return rows.sort((left, right) => Number(BigInt(right.blockNumber) - BigInt(left.blockNumber)));
+}
+
+export function coalescePositionHistory(rows: readonly PositionHistoryRow[]): PositionHistoryRow[] {
+  const liquidityKeys = new Set(
+    rows
+      .filter((row) => row.type === "DEPOSIT" || row.type === "WITHDRAW")
+      .map(positionHistoryActionKey)
+  );
+  return rows.filter((row) => {
+    if (row.type !== "TRANSFER" && row.type !== "TRANSFER_IN" && row.type !== "TRANSFER_OUT") return true;
+    return !liquidityKeys.has(positionHistoryActionKey(row));
+  });
+}
+
+function positionHistoryActionKey(row: Pick<PositionHistoryRow, "binIds" | "transactionHash">): string {
+  const binIds = [...row.binIds].sort((left, right) => {
+    const leftValue = BigInt(left);
+    const rightValue = BigInt(right);
+    return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
+  }).join(",");
+  return `${row.transactionHash.toLowerCase()}:${binIds}`;
 }
 
 export async function loadPaginatedBinsForPair(
@@ -805,21 +1236,27 @@ export async function loadPaginatedBinsForPair(
 export async function loadPoolBinWindow(
   registry: DexRegistry,
   pair: Address,
-  activeId: number,
+  snapshot: PoolBinWindowSnapshot,
   radius = 40,
   options: AppDataLoadOptions = {}
 ): Promise<BinRow[]> {
   if (registry.endpoints.indexerUrl === null) return [];
+  const activeId = Number(snapshot.activeId);
   if (!Number.isSafeInteger(activeId) || activeId < 0) throw new Error("Active bin must be a non-negative safe integer");
   if (!Number.isSafeInteger(radius) || radius < 0 || radius > 100) throw new Error("Bin window radius must be between 0 and 100");
+  if (!/^0x[0-9a-f]{64}$/i.test(snapshot.blockHash)) {
+    throw new Error("Pinned bin window block hash is invalid");
+  }
 
   const minBin = Math.max(0, activeId - radius);
   const maxBin = activeId + radius;
-  const data = await fetchGraph<PairBinsGraph>(
+  const data = await fetchGraph<PairBinWindowGraph>(
     registry.endpoints.indexerUrl,
     PAIR_BIN_WINDOW_QUERY,
     {
+      blockHash: snapshot.blockHash,
       pair: pair.toLowerCase(),
+      pairId: pair.toLowerCase(),
       minBin: minBin.toString(),
       maxBin: maxBin.toString(),
       first: maxBin - minBin + 1
@@ -827,7 +1264,100 @@ export async function loadPoolBinWindow(
     normalizeGraphqlTimeout(options.graphqlTimeoutMs)
   );
 
+  assertPinnedPoolBinWindow(data, pair, snapshot);
+
   return data.bins.map((bin) => ({ ...bin }));
+}
+
+export async function loadPoolIndexerSnapshot(
+  registry: DexRegistry,
+  pool: PoolRow,
+  options: AppDataLoadOptions = {}
+): Promise<PoolIndexerSnapshot> {
+  if (registry.endpoints.indexerUrl === null) throw new Error("Pool indexer endpoint is unavailable");
+  const data = await fetchGraph<Omit<PairBinWindowGraph, "bins">>(
+    registry.endpoints.indexerUrl,
+    POOL_INDEXER_SNAPSHOT_QUERY,
+    { pairId: pool.address.toLowerCase() },
+    normalizeGraphqlTimeout(options.graphqlTimeoutMs)
+  );
+  if (!data._meta) throw new Error("Pool indexer snapshot did not include block metadata");
+  if (data._meta.hasIndexingErrors) throw new Error("Pool indexer snapshot reports indexing errors");
+  if (data._meta.block.hash === null || !/^0x[0-9a-f]{64}$/i.test(data._meta.block.hash)) {
+    throw new Error("Pool indexer snapshot did not include a canonical block hash");
+  }
+  if (!Number.isSafeInteger(data._meta.block.number) || data._meta.block.number < 0) {
+    throw new Error("Pool indexer snapshot block number is invalid");
+  }
+  if (data.pair === null) throw new Error("Selected pool is unavailable at the indexer snapshot");
+  if (!isAddressEqual(data.pair.address as Address, pool.address) || data.pair.id.toLowerCase() !== pool.address.toLowerCase()) {
+    throw new Error("Pool indexer snapshot pair identity differs from the selected market");
+  }
+  if (data.pair.activeId === null || !/^\d+$/.test(data.pair.activeId)) {
+    throw new Error("Pool indexer snapshot active ID is unavailable");
+  }
+  if (!/^\d+$/.test(data.pair.binStep) || data.pair.binStep !== pool.binStep) {
+    throw new Error("Pool indexer snapshot bin step differs from the selected market");
+  }
+  assertPinnedBinAddress(data.pair.factory.id, pool.factoryAddress, "factory");
+  assertPinnedBinAddress(data.pair.factory.id, registry.contracts.lbFactory, "registry factory");
+  assertPinnedBinAddress(data.pair.tokenX.address, pool.tokenXAddress, "token X");
+  assertPinnedBinAddress(data.pair.tokenY.address, pool.tokenYAddress, "token Y");
+  if (data.pair.reserveX === undefined || !/^\d+$/.test(data.pair.reserveX) ||
+    data.pair.reserveY === undefined || !/^\d+$/.test(data.pair.reserveY)) {
+    throw new Error("Pool indexer snapshot reserves are invalid");
+  }
+  if (data.pair.updatedAtBlock === undefined || !/^\d+$/.test(data.pair.updatedAtBlock)) {
+    throw new Error("Pool indexer snapshot update block is invalid");
+  }
+
+  return {
+    activeId: BigInt(data.pair.activeId),
+    binStep: BigInt(data.pair.binStep),
+    blockHash: data._meta.block.hash as Hex,
+    blockNumber: BigInt(data._meta.block.number),
+    factory: data.pair.factory.id as Address,
+    reserveX: data.pair.reserveX,
+    reserveY: data.pair.reserveY,
+    source: "indexer-head",
+    tokenX: data.pair.tokenX.address as Address,
+    tokenY: data.pair.tokenY.address as Address,
+    updatedAtBlock: data.pair.updatedAtBlock
+  };
+}
+
+function assertPinnedPoolBinWindow(
+  data: PairBinWindowGraph,
+  pairAddress: Address,
+  snapshot: PoolBinWindowSnapshot
+): void {
+  if (!data._meta) throw new Error("Pinned bin window response did not include indexer block metadata");
+  if (data._meta.hasIndexingErrors) throw new Error("Pinned bin window indexer reports indexing errors");
+  if (BigInt(data._meta.block.number) !== snapshot.blockNumber) {
+    throw new Error(`Pinned bin window indexer block ${data._meta.block.number} differs from RPC block ${snapshot.blockNumber}`);
+  }
+  if (data._meta.block.hash === null || data._meta.block.hash.toLowerCase() !== snapshot.blockHash.toLowerCase()) {
+    throw new Error("Pinned bin window indexer block hash differs from the RPC snapshot");
+  }
+  if (data.pair === null) throw new Error("Pinned bin window pair is unavailable at the RPC snapshot block");
+  if (!isAddressEqual(data.pair.address as Address, pairAddress) || data.pair.id.toLowerCase() !== pairAddress.toLowerCase()) {
+    throw new Error("Pinned bin window pair identity differs from the selected market");
+  }
+  if (data.pair.activeId === null || BigInt(data.pair.activeId) !== snapshot.activeId) {
+    throw new Error("Pinned bin window active ID differs from the RPC snapshot");
+  }
+  if (BigInt(data.pair.binStep) !== snapshot.binStep) {
+    throw new Error("Pinned bin window bin step differs from the RPC snapshot");
+  }
+  assertPinnedBinAddress(data.pair.factory.id, snapshot.factory, "factory");
+  assertPinnedBinAddress(data.pair.tokenX.address, snapshot.tokenX, "token X");
+  assertPinnedBinAddress(data.pair.tokenY.address, snapshot.tokenY, "token Y");
+}
+
+function assertPinnedBinAddress(actual: string, expected: Address, label: string): void {
+  if (!isAddressEqual(actual as Address, expected)) {
+    throw new Error(`Pinned bin window ${label} differs from the RPC snapshot`);
+  }
 }
 
 export function formatCompactAddress(value: string | null | undefined): string {
@@ -876,7 +1406,7 @@ async function loadRuntimeState(registry: DexRegistry): Promise<RuntimeState> {
 
     if (isLocalnetRegistry(registry)) {
       seededActiveId = await client.readContract({
-        address: registry.seededPools.wnativeUsdc.pair,
+        address: registry.seededPools.wethUsdc.pair,
         abi: lbPairAbi,
         functionName: "getActiveId"
       });
@@ -931,8 +1461,9 @@ async function loadIndexerState(registry: DexRegistry, timeoutMs: number): Promi
         map: (pair) => toPoolRow(registry, pair),
         timeoutMs
       }),
-      loadPaginatedGraphRows<Pick<DashboardGraph, "swaps">, DashboardGraph["swaps"][number], ActivityRow>({
+      loadRecentGraphRows<Pick<DashboardGraph, "swaps">, DashboardGraph["swaps"][number], ActivityRow>({
         endpoint: registry.endpoints.indexerUrl,
+        limit: GRAPHQL_ACTIVITY_RENDER_LIMIT,
         query: SWAPS_PAGE_QUERY,
         select: (data) => data.swaps,
         map: (swap) => ({
@@ -943,13 +1474,14 @@ async function loadIndexerState(registry: DexRegistry, timeoutMs: number): Promi
           timestamp: swap.timestamp,
           amountX: BigInt(swap.amountInX) > 0n ? swap.amountInX : swap.amountOutX,
           amountY: BigInt(swap.amountInY) > 0n ? swap.amountInY : swap.amountOutY,
-          account: swap.sender,
+          account: swap.transactionFrom,
           pair: swap.pair.id
         }),
         timeoutMs
       }),
-      loadPaginatedGraphRows<Pick<DashboardGraph, "liquidityEvents">, DashboardGraph["liquidityEvents"][number], ActivityRow>({
+      loadRecentGraphRows<Pick<DashboardGraph, "liquidityEvents">, DashboardGraph["liquidityEvents"][number], ActivityRow>({
         endpoint: registry.endpoints.indexerUrl,
+        limit: GRAPHQL_ACTIVITY_RENDER_LIMIT,
         query: LIQUIDITY_EVENTS_PAGE_QUERY,
         select: (data) => data.liquidityEvents,
         map: (event) => ({
@@ -1109,7 +1641,8 @@ async function loadPaginatedGraphRows<TData, TGraphRow, TRow>({
           failed: true,
           loadedCount: rows.length,
           maxPages: GRAPHQL_MAX_PAGES,
-          pageSize: GRAPHQL_PAGE_SIZE
+          pageSize: GRAPHQL_PAGE_SIZE,
+          windowed: false
         }
       };
     }
@@ -1125,7 +1658,8 @@ async function loadPaginatedGraphRows<TData, TGraphRow, TRow>({
           failed: false,
           loadedCount: rows.length,
           maxPages: GRAPHQL_MAX_PAGES,
-          pageSize: GRAPHQL_PAGE_SIZE
+          pageSize: GRAPHQL_PAGE_SIZE,
+          windowed: false
         }
       };
     }
@@ -1138,8 +1672,165 @@ async function loadPaginatedGraphRows<TData, TGraphRow, TRow>({
       failed: false,
       loadedCount: rows.length,
       maxPages: GRAPHQL_MAX_PAGES,
-      pageSize: GRAPHQL_PAGE_SIZE
+      pageSize: GRAPHQL_PAGE_SIZE,
+      windowed: false
     }
+  };
+}
+
+async function loadRecentGraphRows<TData, TGraphRow, TRow>({
+  endpoint,
+  limit,
+  map,
+  query,
+  select,
+  timeoutMs,
+  variables = {}
+}: {
+  endpoint: string;
+  limit: number;
+  map: (row: TGraphRow) => TRow;
+  query: string;
+  select: (data: TData) => TGraphRow[];
+  timeoutMs: number;
+  variables?: Record<string, unknown>;
+}): Promise<PaginatedRows<TRow>> {
+  if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error("Recent activity limit must be a positive integer");
+  const data = await fetchGraph<TData>(
+    endpoint,
+    query,
+    { ...variables, first: limit + 1, skip: 0 },
+    timeoutMs
+  );
+  const graphRows = select(data);
+  const rows = graphRows.slice(0, limit).map(map);
+  return {
+    rows,
+    pageInfo: {
+      capped: false,
+      failed: false,
+      loadedCount: rows.length,
+      maxPages: 1,
+      pageSize: limit,
+      windowed: graphRows.length > limit
+    }
+  };
+}
+
+function assertOwnerPairPositionRows(rows: readonly PositionRow[], owner: Address, pair: Address): void {
+  const expectedOwner = owner.toLowerCase();
+  const expectedPair = pair.toLowerCase();
+  const ids = new Set<string>();
+  const bins = new Set<string>();
+
+  for (const row of rows) {
+    if (row.owner.toLowerCase() !== expectedOwner) {
+      throw new Error(`Owner/pair positions returned a position for another owner: ${row.owner}`);
+    }
+    if (row.pair.toLowerCase() !== expectedPair) {
+      throw new Error(`Owner/pair positions returned a position for another pair: ${row.pair}`);
+    }
+    const id = row.id.toLowerCase();
+    if (id.length === 0 || ids.has(id)) throw new Error(`Owner/pair positions returned duplicate position id: ${row.id}`);
+    ids.add(id);
+    const bin = canonicalUnsignedInteger(row.binId, "position bin id");
+    if (bins.has(bin)) throw new Error(`Owner/pair positions returned duplicate position bin: ${bin}`);
+    bins.add(bin);
+  }
+}
+
+function positionHistoryBinKey(ids: readonly string[]): string {
+  return ids
+    .map((id) => canonicalUnsignedInteger(id, "position history bin id"))
+    .sort((left, right) => BigInt(left) < BigInt(right) ? -1 : BigInt(left) > BigInt(right) ? 1 : 0)
+    .join(",");
+}
+
+function selectPositionHistoryLiquidityMatch(
+  transfer: PositionHistoryGraph["transferBatchEvents"][number],
+  candidates: readonly { candidate: { event: PositionHistoryGraph["liquidityEvents"][number] }; index: number }[]
+): number {
+  if (candidates.length === 1) return candidates[0]!.index;
+  if (candidates.length === 0) return -1;
+
+  const transferLogIndex = indexedEventLogIndex(transfer.id, transfer.transactionHash);
+  if (transferLogIndex === null) return -1;
+  const adjacent = candidates.filter(({ candidate }) => {
+    const liquidityLogIndex = indexedEventLogIndex(candidate.event.id, candidate.event.transactionHash);
+    return liquidityLogIndex !== null && liquidityLogIndex === transferLogIndex + 1n;
+  });
+  return adjacent.length === 1 ? adjacent[0]!.index : -1;
+}
+
+function indexedEventLogIndex(id: string, transactionHash: string): bigint | null {
+  const prefix = `${transactionHash.toLowerCase()}-`;
+  const normalizedId = id.toLowerCase();
+  if (!normalizedId.startsWith(prefix)) return null;
+  const suffix = normalizedId.slice(prefix.length);
+  return /^(0|[1-9]\d*)$/.test(suffix) ? BigInt(suffix) : null;
+}
+
+function assertUniqueHistoryRows(rows: readonly PositionHistoryRow[]): PositionHistoryRow[] {
+  const ids = new Set<string>();
+  return rows.map((row) => {
+    const id = row.id.toLowerCase();
+    if (id.length === 0 || ids.has(id)) throw new Error(`Position history returned duplicate event id: ${row.id}`);
+    ids.add(id);
+    return row;
+  });
+}
+
+function assertPoolActivityScope(
+  row: { pair: { id: string }; sender: string; to?: string; transactionFrom?: string },
+  expectedPair: string,
+  expectedOwner: string | null
+): void {
+  if (row.pair.id.toLowerCase() !== expectedPair) {
+    throw new Error(`Pool activity returned an event for another pair: ${row.pair.id}`);
+  }
+  if (
+    expectedOwner !== null &&
+    row.transactionFrom?.toLowerCase() !== expectedOwner &&
+    row.sender.toLowerCase() !== expectedOwner &&
+    row.to?.toLowerCase() !== expectedOwner
+  ) {
+    throw new Error(`Pool activity returned an event unrelated to owner ${expectedOwner}`);
+  }
+}
+
+function mergePoolActivityRows(rows: readonly ActivityRow[]): ActivityRow[] {
+  const byId = new Map<string, ActivityRow>();
+  for (const row of rows) {
+    const id = row.id.toLowerCase();
+    if (id.length === 0) throw new Error("Pool activity returned an empty event id");
+    const previous = byId.get(id);
+    if (previous !== undefined && (
+      previous.type.toUpperCase() !== row.type.toUpperCase() ||
+      previous.transactionHash.toLowerCase() !== row.transactionHash.toLowerCase() ||
+      previous.blockNumber !== row.blockNumber ||
+      previous.amountX !== row.amountX ||
+      previous.amountY !== row.amountY
+    )) {
+      throw new Error(`Pool activity returned conflicting event id: ${row.id}`);
+    }
+    byId.set(id, row);
+  }
+  return [...byId.values()];
+}
+
+function canonicalUnsignedInteger(value: string, label: string): string {
+  if (!/^(0|[1-9]\d*)$/.test(value)) throw new Error(`Invalid ${label}: ${value}`);
+  return BigInt(value).toString();
+}
+
+function poolActivityPaginationInfo(loadedCount: number, windowed: boolean): PaginationInfo {
+  return {
+    capped: false,
+    failed: false,
+    loadedCount,
+    maxPages: 1,
+    pageSize: POOL_ACTIVITY_LIMIT,
+    windowed
   };
 }
 
@@ -1149,7 +1840,8 @@ function emptyPaginationInfo(): PaginationInfo {
     failed: false,
     loadedCount: 0,
     maxPages: GRAPHQL_MAX_PAGES,
-    pageSize: GRAPHQL_PAGE_SIZE
+    pageSize: GRAPHQL_PAGE_SIZE,
+    windowed: false
   };
 }
 

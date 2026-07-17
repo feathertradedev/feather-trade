@@ -43,6 +43,14 @@ export interface DeploymentOwnership {
   lbFactoryOwner: Address;
 }
 
+export interface LocalnetSeededPoolManifest {
+  pair: Address;
+  tokenX: Address;
+  tokenY: Address;
+  activeId: number;
+  binStep: number;
+}
+
 export interface LocalnetDeploymentManifest {
   schemaVersion: "lb.localnet.v1";
   environment: "localnet";
@@ -63,13 +71,7 @@ export interface LocalnetDeploymentManifest {
   supportedHooks?: SupportedHook[];
   supportedPairImplementations?: Address[];
   seededPools: {
-    wnativeUsdc: {
-      pair: Address;
-      tokenX: Address;
-      tokenY: Address;
-      activeId: number;
-      binStep: number;
-    };
+    wethUsdc: LocalnetSeededPoolManifest;
   };
   constructorArgs: Record<string, unknown>;
   smoke: Record<string, unknown>;
@@ -139,7 +141,7 @@ function normalizeLocalnetManifest(value: Record<string, unknown>, path: string)
   const tokens = expectObject(value.tokens, "tokens");
   const preset = expectObject(value.factoryPreset, "factoryPreset");
   const seededPools = expectObject(value.seededPools, "seededPools");
-  const wnativeUsdc = expectObject(seededPools.wnativeUsdc, "seededPools.wnativeUsdc");
+  const wethUsdc = expectObject(seededPools.wethUsdc, "seededPools.wethUsdc");
   const environment = expectString(value.environment, "environment");
   const chainId = expectInteger(value.chainId, "chainId", { min: 1 });
   const deployer = expectAddress(value.deployer, "deployer", { allowZero: false });
@@ -173,16 +175,23 @@ function normalizeLocalnetManifest(value: Record<string, unknown>, path: string)
     supportedHooks: normalizeSupportedHooks(value.supportedHooks),
     supportedPairImplementations: normalizeSupportedPairImplementations(value.supportedPairImplementations, normalizedContracts.lbPairImplementation),
     seededPools: {
-      wnativeUsdc: {
-        pair: expectAddress(wnativeUsdc.pair, "seededPools.wnativeUsdc.pair", { allowZero: false }),
-        tokenX: expectAddress(wnativeUsdc.tokenX, "seededPools.wnativeUsdc.tokenX", { allowZero: false }),
-        tokenY: expectAddress(wnativeUsdc.tokenY, "seededPools.wnativeUsdc.tokenY", { allowZero: false }),
-        activeId: expectInteger(wnativeUsdc.activeId, "seededPools.wnativeUsdc.activeId"),
-        binStep: expectInteger(wnativeUsdc.binStep, "seededPools.wnativeUsdc.binStep", { min: 1 })
-      }
+      wethUsdc: normalizeLocalnetSeededPool(wethUsdc, "seededPools.wethUsdc")
     },
     constructorArgs,
     smoke: expectObject(value.smoke, "smoke")
+  };
+}
+
+function normalizeLocalnetSeededPool(
+  pool: Record<string, unknown>,
+  path: string
+): LocalnetSeededPoolManifest {
+  return {
+    pair: expectAddress(pool.pair, `${path}.pair`, { allowZero: false }),
+    tokenX: expectAddress(pool.tokenX, `${path}.tokenX`, { allowZero: false }),
+    tokenY: expectAddress(pool.tokenY, `${path}.tokenY`, { allowZero: false }),
+    activeId: expectInteger(pool.activeId, `${path}.activeId`),
+    binStep: expectInteger(pool.binStep, `${path}.binStep`, { min: 1 })
   };
 }
 

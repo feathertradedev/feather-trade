@@ -7,8 +7,10 @@ than reconstructing history in a browser.
 The package provides:
 
 - trusted, policy-gated USD price samples;
-- exact 24-hour pool volume, fee, TVL, and fee/TVL metrics;
-- hourly and daily OHLC/volume/fee/TVL candles;
+- exact 24-hour pool volume, total swap fee, protocol swap fee, LP-net swap fee,
+  TVL, and LP-net fee/TVL metrics;
+- 1m, 5m, 15m, 1h, 4h, 1d, and Monday-aligned 1w OHLC/volume/fee/TVL candles;
+- bounded historical GraphQL pages plus resumable SSE candle replacements;
 - grouped owner/pair/bin balances with cost basis and realized/unrealized P&L;
 - parent-hash reorg rollback and deterministic replay;
 - resumable, capped backfill helpers and cursor-limited query methods; and
@@ -18,12 +20,26 @@ All USD integers use 18-decimal fixed point. Query fields become `null` and the
 row becomes `partial` when required pricing or history is unavailable; the
 engine never silently substitutes zero, a pool spot price, or a stablecoin peg.
 
+`SwapAnalyticsEvent.feeX/feeY` remain the legacy total trader-paid swap-fee
+fields for checkpoint compatibility. New adapters also supply indexed
+`protocolFeeX/protocolFeeY`; LP-net fees are exactly total minus protocol. If a
+legacy checkpoint lacks either protocol field, total fees remain queryable but
+protocol and LP-net values are `null`, `feeBreakdownComplete` is false, and the
+row is partial. Composition fees and flash-loan fees are separate event classes
+and are never included in these swap-fee metrics.
+
 Run:
 
 ```sh
 pnpm analytics:typecheck
 pnpm analytics:test
+pnpm analytics:load
 ```
+
+The accepted boundaries, rollup DAG, mutable/finalized lifecycle, PostgreSQL
+retention/partition plan, SSE resume/backpressure behavior, reorg recovery,
+compatibility contract, and capacity targets are documented in
+[`docs/wave-5/candle-architecture.md`](../../docs/wave-5/candle-architecture.md).
 
 `AnalyticsApiService` implements `schema.graphql`, persists canonical blocks and
 coverage state through atomic checkpoints, restores on restart, and exposes a
@@ -54,13 +70,18 @@ preflight responses and CORS headers; wildcards are not supported and the
 authenticated ingestion endpoint is never exposed through CORS. A same-origin
 reverse proxy may leave the allowlist empty.
 
-On a fresh state path the CLI refuses to serve until
-`ANALYTICS_BLOCK_SOURCE_MODULE` completes canonical backfill. The module exports
-`createBlockSource()`, returning `fetchPage(cursor)` and optionally
-`followLive(ingest)`. Backfill status/cursor/error and coverage bounds are
-checkpointed; partial/capped startup exits instead of serving zero activity as
-complete. A restored complete checkpoint may use authenticated
-`/internal/blocks` without a source module.
+The CLI refuses to serve until `ANALYTICS_BLOCK_SOURCE_MODULE` completes a
+canonical startup reconciliation. The module exports `createBlockSource()`,
+returning `fetchPage(cursor)` and optionally `startupCursor(checkpoint)` and
+`followLive(ingest, reconcileHead)`. Sources must explicitly attest a persisted
+cursor through `startupCursor`; otherwise startup replays from the source's
+beginning. The local adapter always returns `null` so its process-local pool
+progression and canonical hash window are rebuilt deterministically from the
+manifest `startBlock`. Backfill status/cursor/error and coverage bounds are
+checkpointed, and partial/capped startup exits rather than serving incomplete
+state as ready. A canonical block source and position snapshot module are
+required at startup; authenticated `/internal/blocks` is only an additional
+ingestion path.
 
 `ANALYTICS_PRICE_VERIFIER_MODULE` exports `createPriceVerifier()`, returning a
 `PriceSampleVerifier`. The verifier receives the signed Chainlink report and

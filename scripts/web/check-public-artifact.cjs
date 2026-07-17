@@ -83,6 +83,14 @@ function main() {
   requireFile(distPath, "index.html", errors);
   requireFile(distPath, "_redirects", errors);
   requireFile(distPath, "_headers", errors);
+  requireFile(distPath, "_worker.js", errors);
+  requireFile(distPath, "robots.txt", errors);
+  requireFile(distPath, "sitemap.xml", errors);
+  requireFile(distPath, "docs/index.html", errors);
+  requireFile(distPath, "docs/docs-manifest.json", errors);
+  requireFile(distPath, "docs/search-index.json", errors);
+  requireFile(distPath, "docs/pools/swap/index.html", errors);
+  requireFile(distPath, "docs/contracts/mainnet-deployments/index.html", errors);
   if (!files.some((file) => /^index-.+\.js$/.test(path.basename(file)))) {
     errors.push("dist artifact must contain at least one hashed index JavaScript asset");
   }
@@ -152,10 +160,40 @@ function main() {
   }
 
   validateTokenAssets(distPath, tokenList, errors);
+  validateDocsArtifact(distPath, files, errors);
   validateRedirects(distPath, errors);
   validateHeaders(distPath, manifest, errors);
 
   finish(errors, `Validated public ${options.environment} web artifact in ${display(distPath)}.`);
+}
+
+function validateDocsArtifact(distPath, files, errors) {
+  const manifest = readJson(path.join(distPath, "docs/docs-manifest.json"), errors);
+  const search = readJson(path.join(distPath, "docs/search-index.json"), errors);
+  if (!Array.isArray(manifest) || manifest.length !== 49) errors.push("docs manifest must contain 49 public pages");
+  if (!Array.isArray(search) || search.length !== 49) errors.push("docs search index must contain 49 public pages");
+
+  const docsIndex = readText(path.join(distPath, "docs/index.html"), errors);
+  if (docsIndex !== null) {
+    for (const token of [
+      "Welcome to Feather",
+      'rel="canonical" href="https://feather.markets/docs"',
+      'type="application/ld+json"'
+    ]) {
+      if (!docsIndex.includes(token)) errors.push(`docs/index.html is missing ${token}`);
+    }
+  }
+
+  const worker = readText(path.join(distPath, "_worker.js"), errors);
+  if (worker !== null) {
+    for (const token of ["app.feather.markets", "feather.markets", "env.ASSETS.fetch", "Response.redirect", "308"]) {
+      if (!worker.includes(token)) errors.push(`_worker.js is missing docs host-routing token: ${token}`);
+    }
+  }
+
+  if (files.some((file) => /apps[\\/]web[\\/]docs[\\/]README\.md$/.test(file))) {
+    errors.push("public artifact must not contain the private docs sync tracker");
+  }
 }
 
 function validateTokenAssets(distPath, tokenList, errors) {

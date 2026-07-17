@@ -15,7 +15,6 @@ import {
   readPoolCreationFactoryDiscovery,
   reconcileCreatedPool,
   type CreatablePoolPreflight,
-  type PoolCreationFactoryDiscovery,
   type PoolCreationSelection
 } from "../../../packages/sdk/src/pool-creation";
 import { erc20Abi, lbFactoryAbi, lbPairAbi, lbRouterAbi } from "@robinhood-lb/sdk/abi";
@@ -37,7 +36,6 @@ import {
 import type { DexRegistry, LocalnetDexRegistry } from "@robinhood-lb/sdk/registry";
 import {
   assertQuoteMatchesExactInRequest,
-  buildExactInSwapPath,
   buildExactInSwapTransaction,
   buildExactNativeForTokensSwapTransaction,
   buildExactTokensForNativeSwapTransaction,
@@ -53,6 +51,17 @@ import {
 } from "@robinhood-lb/sdk/swap";
 import { tokenAllowsAction, tokenApprovalCapabilityLabel, type TokenAction, type TokenMetadata } from "@robinhood-lb/sdk/tokens";
 import {
+  CandlestickSeries,
+  ColorType,
+  HistogramSeries,
+  createChart,
+  type CandlestickData,
+  type HistogramData,
+  type IChartApi,
+  type ISeriesApi,
+  type UTCTimestamp
+} from "lightweight-charts";
+import {
   Activity,
   AlertTriangle,
   ArrowLeftRight,
@@ -64,9 +73,10 @@ import {
   Network,
   RefreshCw,
   Server,
-  Wallet
+  Wallet,
+  X
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from "react";
 import { decodeEventLog, encodeFunctionData, isAddress, isAddressEqual, keccak256, zeroAddress, type Address, type Chain, type Hex, type PublicClient, formatUnits } from "viem";
 import {
   useAccount,
@@ -85,7 +95,7 @@ import {
   analyticsEndpointForRegistry,
   brandLinks,
   defaultEnvironmentKey,
-  environmentOptions,
+  docsHref,
   isLocalnetRegistry,
   registries,
   routes,
@@ -101,10 +111,8 @@ import {
   loadPoolById,
   loadPositionHistory,
   loadWalletPortfolio,
-  loadPoolBinWindow,
   tokenSymbol,
   type AppSnapshot,
-  type BinRow,
   type LoadState,
   type PaginatedRows,
   type PaginationInfo,
@@ -165,7 +173,7 @@ import {
   type NativeSwapSubmissionBinding,
   type SwapExecutionContext
 } from "./transaction-safety";
-import { wagmiConfig } from "./wagmi";
+import { openWalletModal, wagmiConfig, walletModalConfigured } from "./wagmi";
 import { SUPPORTED_WALLET_RDNS, walletFailure, walletSessionIdentity, type WalletFailure } from "./wallet-lifecycle";
 import { TransactionJournalProvider, useTransactionJournal, type TransactionJournalApi } from "./transaction-journal-react";
 import {
@@ -188,6 +196,7 @@ import {
   type NativeRemoveLiquidityReceiptReconciliation,
   type PinnedAddLiquidityReview
 } from "./liquidity-review";
+import { suggestPairedLiquidityAmounts, type PairedFillSide } from "./liquidity-amount-suggestion";
 import {
   assertExecutableTokenAction,
   deterministicTokenFallback,
@@ -221,34 +230,51 @@ import {
   discoveryHref,
   filterPoolPage,
   parsePoolDiscoveryState,
-  poolDetailHref,
   returnHrefFromAction,
-  samePairPools,
   type PoolDiscoveryState
 } from "./pool-discovery";
 import {
+  CANDLE_INTERVAL_LABELS,
+  CANDLE_LOOKBACK_LABELS,
+  CANDLE_LOOKBACK_SECONDS,
+  candleBoundary,
   loadAnalyticsHealth,
   loadPairCandles,
   loadPoolMetrics,
   type AnalyticsPage,
   type AnalyticsStatus,
+  type CandleInterval,
+  type PairCandle,
   type PoolAnalyticsMetric
 } from "./analytics-data";
 import {
-  buildBinDistribution,
-  buildCandleChartModel,
+  buildCenteredBinDistribution,
   joinPoolWorkspaceRows,
+  shouldShowWorkspaceAnalyticsState,
   sortPoolWorkspaceRows,
   workspaceAnalyticsState,
   workspaceMetricTiles,
-  type CandleChartModel,
-  type PoolEconomicSort,
-  type PoolWorkspaceRow
+  type BinDistributionPoint,
+  type PoolEconomicSort
 } from "./pool-workspace";
+import {
+  parsePoolWorkspaceRoute,
+  poolWorkspaceHref,
+  type PoolWorkspaceTask
+} from "./pool-workspace-route";
+import {
+  useOptionalPoolWorkspace,
+  usePoolDraftState,
+  type CandleStreamState
+} from "./pool-workspace-context";
+import { PoolWorkspaceShell, PoolWorkspaceTaskTabs } from "./pool-workspace-shell";
+import { PoolWorkspaceOwnerPanel } from "./pool-workspace-owner-panel";
+import { useMediaQuery } from "./use-media-query";
 
 const queryClient = new QueryClient();
 const SNAPSHOT_REFRESH_INTERVAL_MS = 10_000;
 const SWAP_QUOTE_REFRESH_INTERVAL_MS = 10_000;
+const CHART_INTERVALS: readonly CandleInterval[] = ["ONE_MINUTE", "FIVE_MINUTES", "FIFTEEN_MINUTES", "HOUR", "FOUR_HOURS", "DAY", "WEEK"];
 const MAX_LIQUIDITY_BIN_ID = 16_777_215;
 const LB_PAIR_RESERVES_ABI = [{
   type: "function",
@@ -616,8 +642,8 @@ function SafeWalletReconnect() {
 }
 
 function DexShell() {
-  const [environmentKey, setEnvironmentKey] = useState<EnvironmentKey>(defaultEnvironmentKey);
-  const [routeKey, setRouteKey, poolDetailId, liquiditySection, actionPoolId, positionDetailId, portfolioAction] = useHashRoute();
+  const environmentKey = defaultEnvironmentKey;
+  const [routeKey, setRouteKey, poolDetailId, liquiditySection, actionPoolId, positionDetailId, portfolioAction, workspaceTask] = useHashRoute();
   const registry = registries[environmentKey];
   const account = useAccount();
   const walletChainId = useChainId();
@@ -630,14 +656,6 @@ function DexShell() {
   });
   const walletPanelKey = account.status === "connected" ? walletSessionKey : `${environmentKey}:disconnected`;
   const previousWalletSessionKey = useRef(walletSessionKey);
-  const transactionJournal = useTransactionJournal();
-  const visibleJournalRecords = account.status === "connected" && account.address
-    ? transactionJournal.records.filter((record) =>
-        record.reviewed.account.toLowerCase() === account.address!.toLowerCase() &&
-        record.reviewed.chainId === walletChainId &&
-        record.reviewed.environment === environmentKey &&
-        record.reviewed.deploymentEpoch === deploymentEpoch(registry))
-    : [];
   const snapshotQuery = useQuery({
     queryKey: [
       "dashboard",
@@ -652,6 +670,14 @@ function DexShell() {
     refetchOnWindowFocus: "always"
   });
   const snapshot = snapshotQuery.data;
+
+  useEffect(() => {
+    if (routeKey !== "pools" || poolDetailId === null || workspaceTask !== "market") return;
+    const returnContext = returnHrefFromAction(window.location.hash) ?? window.location.hash;
+    const returnHref = discoveryHref(parsePoolDiscoveryState(returnContext));
+    const createHref = actionHref("add", poolDetailId, returnHref);
+    if (window.location.hash !== createHref) window.location.replace(createHref);
+  }, [poolDetailId, routeKey, workspaceTask]);
 
   useEffect(() => {
     if (previousWalletSessionKey.current === walletSessionKey) return;
@@ -672,18 +698,24 @@ function DexShell() {
 
   useEffect(() => {
     window.scrollTo({ behavior: "auto", left: 0, top: 0 });
-  }, [actionPoolId, liquiditySection, poolDetailId, portfolioAction, positionDetailId, routeKey]);
+    document.title = poolDetailId !== null
+      ? `Pool ${workspaceTask ?? "market"} | Feather`
+      : `${routes.find((route) => route.key === routeKey)?.label ?? "Feather"} | Feather`;
+    window.requestAnimationFrame(() => {
+      document.getElementById("app-route-content")?.focus({ preventScroll: true });
+    });
+  }, [actionPoolId, liquiditySection, poolDetailId, portfolioAction, positionDetailId, routeKey, workspaceTask]);
 
   if (routeKey === "home") {
     return <LandingView networkName={registry.chain.name} snapshot={snapshot} />;
   }
 
   return (
-    <main className="shell app-shell">
+    <main className="shell app-shell route-focus-target" id="app-route-content" tabIndex={-1}>
       <header className="app-header">
         <BrandLockup />
         <nav className="nav-list" aria-label="Primary">
-          {routes.filter((route) => ["swap", "pools", "positions"].includes(route.key)).map((route) => {
+          {routes.filter((route) => ["pools", "positions"].includes(route.key)).map((route) => {
             const Icon = routeIcons[route.key];
             return (
               <a
@@ -699,73 +731,26 @@ function DexShell() {
               </a>
             );
           })}
+          <DocsLink className="nav-item" />
         </nav>
         <div className="app-header-actions">
-          <a className="operations-quick-link" href="#/liquidity" aria-label="Liquidity" onClick={() => setRouteKey("liquidity")}>Manage</a>
-          <details
-            className="operations-menu"
-            onBlur={(event) => {
-              if (!event.currentTarget.contains(event.relatedTarget)) event.currentTarget.removeAttribute("open");
-            }}
-            onKeyDown={(event) => {
-              if (event.key === "Escape") {
-                event.preventDefault();
-                event.currentTarget.removeAttribute("open");
-                event.currentTarget.querySelector("summary")?.focus();
-              }
-            }}
-          >
-            <summary>Operations</summary>
-            <div className="operations-popover">
-              <a href="#/activity" onClick={(event) => {
-                event.currentTarget.closest("details")?.removeAttribute("open");
-                setRouteKey("activity");
-              }}>Activity</a>
-              <span>Runtime health is shown beside the environment selector.</span>
-            </div>
-          </details>
           <WalletPanel activeChain={registry.chain} key={walletPanelKey} />
         </div>
       </header>
 
       <section className="workspace">
-        <header className="top-bar">
-          <EnvironmentSwitch active={environmentKey} onChange={setEnvironmentKey} />
-          <div className="top-actions">
-            <div className="runtime-statuses" aria-label="Runtime health">
-              <StatusPill icon={Network} label={runtimeChainLabel(registry.chainId, snapshot?.runtime.chainId ?? null)} state={snapshot?.runtime.status ?? "loading"} />
-              <StatusPill icon={Server} label="Indexer" state={snapshot?.indexer.status ?? "loading"} />
-            </div>
-            <button
-              className="icon-button"
-              data-testid="snapshot-refresh-button"
-              type="button"
-              onClick={() => void snapshotQuery.refetch()}
-              title="Refresh state"
-            >
-              <RefreshCw size={18} />
-            </button>
-          </div>
+        <header className="workspace-refresh">
+          <button
+            className="icon-button"
+            data-testid="snapshot-refresh-button"
+            type="button"
+            onClick={() => void snapshotQuery.refetch()}
+            title="Refresh state"
+          >
+            <RefreshCw size={18} />
+          </button>
         </header>
 
-        <section className="status-strip" aria-live="polite">
-          <MetricTile label="Block" value={formatBlock(snapshot)} tone={snapshot?.runtime.status === "ready" ? "good" : "warn"} />
-          <MetricTile label="Pools" value={formatPoolsMetric(snapshot)} tone={isPartialPagination(snapshot?.indexer.pagination.pools) ? "warn" : "neutral"} />
-          <MetricTile label="Active Bin" value={formatActiveBin(snapshot)} tone="neutral" />
-          <MetricTile label="Indexer Head" value={snapshot?.indexer.blockNumber ?? "offline"} tone={snapshot?.indexer.status === "ready" ? "good" : "warn"} />
-        </section>
-        {visibleJournalRecords.length > 0 ? (
-          <details className="transaction-journal" data-testid="submitted-transaction-journal">
-            <summary>Transaction history ({visibleJournalRecords.length})</summary>
-            <div>
-              {visibleJournalRecords.map((transaction) => (
-                <span data-transaction-hash={transaction.activeHash ?? undefined} key={transaction.id}>
-                  {transaction.reviewed.intent} · {transaction.activeHash ? formatCompactAddress(transaction.activeHash) : "hash pending"} · {transaction.status} · {formatCompactAddress(transaction.reviewed.account)} · {transaction.reviewed.environment} · chain {transaction.reviewed.chainId}
-                </span>
-              ))}
-            </div>
-          </details>
-        ) : null}
         {snapshot?.indexer.message ? (
           <p
             className={`snapshot-message ${snapshot.indexer.status}`}
@@ -787,6 +772,7 @@ function DexShell() {
             routeKey={routeKey}
             snapshot={snapshot}
             snapshotState={snapshotQuery.isLoading ? "loading" : snapshotQuery.isError ? "error" : snapshot?.indexer.status ?? "loading"}
+            workspaceTask={workspaceTask}
             onRefresh={() => snapshotQuery.refetch()}
           />
       </section>
@@ -803,64 +789,63 @@ function BrandLockup({ compact = false }: { compact?: boolean }) {
   );
 }
 
-function LandingView({ networkName, snapshot }: { networkName: string; snapshot: AppSnapshot | undefined }) {
-  const poolCount = snapshot?.indexer.pairCount;
+function DocsLink({ className }: { className?: string }) {
+  const external = /^https?:\/\//.test(docsHref);
+  return (
+    <a className={className} href={docsHref} rel={external ? "noreferrer" : undefined} target={external ? "_blank" : undefined}>
+      <span>Docs</span>
+    </a>
+  );
+}
 
+function LandingView(_: { networkName: string; snapshot: AppSnapshot | undefined }) {
   return (
     <main className="landing-shell">
       <header className="landing-header">
         <BrandLockup />
         <nav aria-label="Marketing">
-          <a href="#/swap">Swap</a>
-          <a href="#/pools">Pools</a>
-          {brandLinks.filter((link) => link.label === "Docs").map((link) => (
-            <a href={link.href} key={link.label} rel="noreferrer" target="_blank">{link.label}</a>
-          ))}
+          <a className="landing-pools-link" href="#/pools">Pools</a>
+          <DocsLink />
         </nav>
-        <a className="primary-button landing-launch" href="#/swap">Launch app</a>
+        <a className="primary-button landing-launch" href="#/pools">Launch app</a>
       </header>
 
       <section className="landing-hero" aria-labelledby="landing-title">
-        <p className="eyebrow">The featherweight DEX · Built for Robinhood Chain</p>
-        <h1 id="landing-title">Weightless<br />liquidity.</h1>
-        <p>Concentrated DLMM liquidity with dynamic fees that rise when markets move. Engineered without the weight.</p>
-        <div className="hero-actions">
-          <a className="primary-button" href="#/swap">Launch app</a>
-          {brandLinks.filter((link) => link.label === "Docs").map((link) => (
-            <a className="secondary-button" href={link.href} key={link.label} rel="noreferrer" target="_blank">Read the docs</a>
-          ))}
+        <div className="hero-copy">
+          <p className="eyebrow">Built for Robinhood Chain</p>
+          <h1 id="landing-title">Weightless liquidity.</h1>
+          <p>Trade and deploy concentrated liquidity through a DLMM with dynamic fees built for fast-moving markets.</p>
+          <div className="hero-actions">
+            <a className="primary-button hero-launch" href="#/pools">Launch app <span aria-hidden="true">↗</span></a>
+          </div>
         </div>
-        <dl className="landing-stats" aria-label="Protocol overview">
-          <div><dt>Network</dt><dd>{networkName}</dd></div>
-          <div><dt>Indexed pools</dt><dd>{poolCount ?? "—"}</dd></div>
-          <div><dt>Liquidity model</dt><dd>DLMM</dd></div>
-          <div><dt>LP fees</dt><dd className="positive">Dynamic</dd></div>
-        </dl>
+
+        <LiquidityBookSimulation />
       </section>
 
-      <section className="landing-pillars" aria-label="Product pillars">
-        <article>
-          <BinGlyph mode="spot" />
-          <h2>Liquidity in bins</h2>
-          <p>Place capital exactly where trading happens. Zero slippage inside the active bin; nothing wasted outside your range.</p>
-        </article>
-        <article>
-          <p className="fee-surge">0.20% → <span>2.41%</span></p>
-          <h2>Fees that surge with volatility</h2>
-          <p>Dynamic fees climb when price moves fast, paying LPs for the risk they take and settling back when it is quiet.</p>
-        </article>
-        <article>
-          <div className="chain-glyph"><span /></div>
-          <h2>Built for Robinhood Chain</h2>
-          <p>Built for fast finality, small network fees, and a first-class onchain trading experience.</p>
-        </article>
+      <section className="landing-pillars" aria-labelledby="liquidity-title">
+        <div className="pillar-intro">
+          <h2 id="liquidity-title">Capital that works where the market moves.</h2>
+          <p>Liquidity Book places capital into discrete price bins, giving LPs precise control without adding complexity for traders.</p>
+        </div>
+        <div className="pillar-list">
+          <article>
+            <div><h3>Concentrated by design</h3><p>Choose the range. Keep capital close to active trading.</p></div>
+          </article>
+          <article>
+            <div><h3>Fees respond to volatility</h3><p>Dynamic fees increase when markets move and normalize as activity settles.</p></div>
+          </article>
+          <article>
+            <div><h3>Execution stays lightweight</h3><p>Fast finality and low network costs keep every position practical to manage.</p></div>
+          </article>
+        </div>
       </section>
 
       <section className="strategy-band">
         <div>
           <p className="eyebrow">For liquidity providers</p>
           <h2>Three strategies. One slider.</h2>
-          <p>Spot, Curve, or Bid-Ask — shape liquidity to your view, set a range, done.</p>
+          <p>Choose Spot, Curve, or Bid-Ask. Shape the range to match your market view.</p>
         </div>
         <div className="strategy-tiles" aria-label="Liquidity strategies">
           <div className="active"><BinGlyph mode="spot" /><span>Spot</span></div>
@@ -874,10 +859,162 @@ function LandingView({ networkName, snapshot }: { networkName: string; snapshot:
         <nav aria-label="Project links">
           {brandLinks.map((link) => <a href={link.href} key={link.label} rel="noreferrer" target="_blank">{link.label}</a>)}
         </nav>
-        <span>engineered on robinhood chain · 2026</span>
+        <span>Engineered on Robinhood Chain, 2026</span>
       </footer>
     </main>
   );
+}
+
+interface SimulatedLiquidityBin {
+  capacity: number;
+  reserveX: number;
+  reserveY: number;
+}
+
+interface SimulatedLiquidityState {
+  activeIndex: number;
+  bins: SimulatedLiquidityBin[];
+  crossingsRemaining: number;
+  direction: -1 | 1;
+}
+
+const simulationBinHeights = [
+  34, 48, 29, 57, 43, 66, 38, 54, 72, 47, 63, 41, 76, 58, 69, 45,
+  82, 61, 74, 53, 88, 64, 79, 49, 70, 56, 85, 62, 73, 59, 78, 66,
+  87, 55, 75, 63, 80, 51, 68, 72, 46, 77, 60, 83, 52, 69, 44, 71,
+  57, 65, 50, 74, 42, 61, 48, 67, 39, 58, 45, 53, 36
+];
+const simulationCenterIndex = 30;
+const simulationCenterBinId = 8_388_608;
+const simulationBinStep = 10;
+const simulationBinPitch = 27;
+const simulationCenterPrice = 160;
+
+function LiquidityBookSimulation() {
+  const [simulation, setSimulation] = useState<SimulatedLiquidityState>(createLiquiditySimulation);
+
+  useEffect(() => {
+    if (simulation.bins.length !== simulationBinHeights.length) setSimulation(createLiquiditySimulation());
+  }, [simulation.bins.length]);
+
+  useEffect(() => {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return undefined;
+    const interval = window.setInterval(() => setSimulation((current) => advanceLiquiditySimulation(current)), 620);
+    return () => window.clearInterval(interval);
+  }, []);
+
+  const activeBinId = simulationCenterBinId + simulation.activeIndex - simulationCenterIndex;
+  const currentPrice = simulationCenterPrice * Math.pow(1 + simulationBinStep / 10_000, activeBinId - simulationCenterBinId);
+  const activeBin = simulation.bins[simulation.activeIndex];
+  const activeTotal = Math.max(activeBin.reserveX + activeBin.reserveY, 0.001);
+  const activeXShare = Math.round((activeBin.reserveX / activeTotal) * 100);
+  const activeYShare = 100 - activeXShare;
+
+  return (
+    <aside className="hero-market" aria-label="Illustrative SPCX and USDC Liquidity Book market simulation">
+      <div className="hero-market-head">
+        <span>Bin liquidity simulation</span>
+        <span className="market-state">Illustrative</span>
+      </div>
+      <div className="hero-pair">
+        <span>SPCX / USDC</span>
+        <strong>{simulationBinStep} bps per bin</strong>
+      </div>
+      <div className="market-price">
+        <span>Current bin price</span>
+        <strong>{currentPrice.toFixed(2)}</strong>
+        <small>USDC per SPCX</small>
+      </div>
+      <div className="hero-bin-field" aria-label="The centered price bin converts one token reserve into the other as the market moves">
+        <div
+          className="hero-bin-track"
+          style={{ transform: `translate3d(-${simulation.activeIndex * simulationBinPitch + 11}px, 0, 0)` }}
+        >
+          {simulation.bins.map((bin, index) => {
+            const total = Math.max(bin.reserveX + bin.reserveY, 0.001);
+            return (
+              <i key={index} style={{ height: `${simulationBinHeights[index]}%` }}>
+                <span className="bin-reserve-x" style={{ height: `${(bin.reserveX / total) * 100}%` }} />
+                <span className="bin-reserve-y" style={{ height: `${(bin.reserveY / total) * 100}%` }} />
+              </i>
+            );
+          })}
+        </div>
+      </div>
+      <div className="bin-legend" aria-hidden="true"><span>SPCX</span><span>USDC</span></div>
+      <dl className="hero-market-data">
+        <div><dt>Bin composition</dt><dd>{activeXShare}% / {activeYShare}%</dd></div>
+        <div><dt>Price step</dt><dd>{simulationBinStep} bps</dd></div>
+        <div><dt>Bin ID</dt><dd>{activeBinId}</dd></div>
+        <div><dt>Trade pressure</dt><dd>{simulation.direction > 0 ? "Buying SPCX" : "Selling SPCX"}</dd></div>
+      </dl>
+    </aside>
+  );
+}
+
+function createLiquiditySimulation(): SimulatedLiquidityState {
+  return {
+    activeIndex: simulationCenterIndex,
+    crossingsRemaining: 6,
+    direction: 1,
+    bins: simulationBinHeights.map((capacity, index) => ({
+      capacity,
+      reserveX: index > simulationCenterIndex ? capacity : index === simulationCenterIndex ? capacity / 2 : 0,
+      reserveY: index < simulationCenterIndex ? capacity : index === simulationCenterIndex ? capacity / 2 : 0
+    }))
+  };
+}
+
+function advanceLiquiditySimulation(current: SimulatedLiquidityState): SimulatedLiquidityState {
+  let direction = current.direction;
+  let activeIndex = current.activeIndex;
+  let crossingsRemaining = current.crossingsRemaining;
+  const bins = current.bins.map((bin) => ({ ...bin }));
+  let activeBin = bins[activeIndex];
+
+  const convertedShare = direction === 1
+    ? activeBin.reserveY / activeBin.capacity
+    : activeBin.reserveX / activeBin.capacity;
+
+  if (crossingsRemaining === 0 && convertedShare >= 0.42) {
+    direction = direction === 1 ? -1 : 1;
+    crossingsRemaining = 3 + Math.floor(Math.random() * 6);
+  }
+
+  const outputReserve = direction === 1 ? activeBin.reserveX : activeBin.reserveY;
+
+  if (outputReserve <= 0.5) {
+    const nextIndex = activeIndex + direction;
+    const nextOffset = nextIndex - simulationCenterIndex;
+    const resistanceDistance = Math.max(0, Math.abs(nextOffset) - 10);
+    const crossingProbability = resistanceDistance === 0
+      ? 1
+      : Math.exp(-0.35 * resistanceDistance * resistanceDistance);
+    const canCross = Math.abs(nextOffset) <= 15 && Math.random() < crossingProbability;
+
+    if (canCross) {
+      activeIndex = nextIndex;
+      crossingsRemaining = Math.max(0, crossingsRemaining - 1);
+    } else {
+      direction = direction === 1 ? -1 : 1;
+      crossingsRemaining = 3 + Math.floor(Math.random() * 6);
+    }
+    activeBin = bins[activeIndex];
+  }
+
+  const availableOutput = direction === 1 ? activeBin.reserveX : activeBin.reserveY;
+  const amount = Math.min(availableOutput, activeBin.capacity * (0.12 + Math.random() * 0.07));
+  const binPrice = Math.pow(1 + simulationBinStep / 10_000, activeIndex - simulationCenterIndex);
+
+  if (direction === 1) {
+    activeBin.reserveX = Math.max(0, activeBin.reserveX - amount);
+    activeBin.reserveY += amount * binPrice;
+  } else {
+    activeBin.reserveY = Math.max(0, activeBin.reserveY - amount);
+    activeBin.reserveX += amount / binPrice;
+  }
+
+  return { activeIndex, bins, crossingsRemaining, direction };
 }
 
 function BinGlyph({ mode }: { mode: "spot" | "curve" | "bidask" }) {
@@ -885,54 +1022,25 @@ function BinGlyph({ mode }: { mode: "spot" | "curve" | "bidask" }) {
   return <span className={`bin-glyph ${mode}`} aria-hidden="true">{heights.map((height, index) => <i key={index} style={{ height }} />)}</span>;
 }
 
-function EnvironmentSwitch({
-  active,
-  onChange
-}: {
-  active: EnvironmentKey;
-  onChange: (environment: EnvironmentKey) => void;
-}) {
-  return (
-    <div className="segmented" role="tablist" aria-label="Environment">
-      {environmentOptions.map((option) => (
-        <button
-          className={active === option.key ? "segment active" : "segment"}
-          key={option.key}
-          onClick={() => onChange(option.key)}
-          type="button"
-        >
-          <span>{option.label}</span>
-          <span className={option.tone === "ready" ? "dot ready" : "dot dry"} />
-        </button>
-      ))}
-    </div>
-  );
-}
-
 function WalletPanel({ activeChain }: { activeChain: Chain }) {
   const [localFailure, setLocalFailure] = useState<WalletFailure | null>(null);
   const [discoverySettled, setDiscoverySettled] = useState(false);
+  const walletDialogRef = useRef<HTMLDialogElement>(null);
   const account = useAccount();
   const activeWalletChainId = useChainId();
   const { connect, connectors, error: connectError, isPending, reset: resetConnect } = useConnect();
   const { disconnect } = useDisconnect();
   const { error: switchError, switchChain, isPending: isSwitching, reset: resetSwitch } = useSwitchChain();
   const discoveredConnectors = connectors.filter((connector) => connector.id !== "injected");
-  const supportedDiscoveredConnectors = discoveredConnectors.filter(
-    (connector, index, all) => SUPPORTED_WALLET_RDNS.has(connector.id) && all.findIndex((candidate) => candidate.id === connector.id) === index
-  );
-  const availableConnectors = discoveredConnectors.length > 0 ? supportedDiscoveredConnectors : connectors;
-  const injectedConnector = availableConnectors[0];
+  const availableConnectors = discoveredConnectors.length > 0
+    ? discoveredConnectors.filter((connector, index, all) => all.findIndex((candidate) => candidate.id === connector.id) === index)
+    : connectors;
   const connected = account.status === "connected";
   const onWrongChain = connected && activeWalletChainId !== activeChain.id;
-  const unsupportedProviderFailure: WalletFailure | null =
-    discoveredConnectors.length > 0 && supportedDiscoveredConnectors.length === 0
-      ? { action: "No supported wallet was found. Enable MetaMask or Brave Wallet, then reload this page.", kind: "missing" }
-      : null;
-  const noProviderFailure: WalletFailure | null = discoverySettled && connectors.length === 0
-    ? { action: "No wallet provider was found. Enable MetaMask or Brave Wallet, then reload this page.", kind: "missing" }
+  const noProviderFailure: WalletFailure | null = discoverySettled && !walletModalConfigured && connectors.length === 0
+    ? { action: "No browser wallet was found. Install a compatible wallet or use a build with mobile wallet connections enabled.", kind: "missing" }
     : null;
-  const connectionFailure = localFailure ?? (connectError ? walletFailure(connectError, "connect") : unsupportedProviderFailure ?? noProviderFailure);
+  const connectionFailure = localFailure ?? (connectError ? walletFailure(connectError, "connect") : noProviderFailure);
   const switchingFailure = switchError ? walletFailure(switchError, "switch") : null;
 
   useEffect(() => {
@@ -957,37 +1065,78 @@ function WalletPanel({ activeChain }: { activeChain: Chain }) {
     connect({ connector });
   };
 
+  const openConnectionFlow = () => {
+    resetConnect();
+    setLocalFailure(null);
+    if (walletModalConfigured) {
+      void openWalletModal().catch(() => {
+        setLocalFailure({ action: "The wallet chooser could not open. Reload the page and try again.", kind: "provider-error" });
+      });
+      return;
+    }
+    if (availableConnectors.length === 1) {
+      void connectWith(availableConnectors[0]);
+      return;
+    }
+    walletDialogRef.current?.showModal();
+  };
+
   if (!connected) {
     return (
       <div className="wallet-cluster" data-testid="wallet-disconnected-state">
-        {availableConnectors.length > 1 ? (
-          <div className="wallet-provider-choices" data-testid="wallet-provider-choices" role="group" aria-label="Choose wallet provider">
-            {availableConnectors.map((connector) => (
-              <button
-                className="secondary-button"
-                data-provider-id={connector.id}
-                disabled={isPending}
-                key={connector.uid}
-                onClick={() => void connectWith(connector)}
-                type="button"
-              >
-                <Wallet size={18} />
-                <span>{isPending ? "Connecting" : connector.name}</span>
-              </button>
-            ))}
-          </div>
-        ) : (
-          <button
-            className="primary-button"
-            data-testid="wallet-connect-button"
-            disabled={!injectedConnector || isPending}
-            onClick={() => injectedConnector && void connectWith(injectedConnector)}
-            type="button"
+        <button
+          className="primary-button"
+          data-testid="wallet-connect-button"
+          disabled={(!walletModalConfigured && availableConnectors.length === 0) || isPending}
+          onClick={openConnectionFlow}
+          type="button"
+        >
+          {isPending ? <LoaderCircle className="spin" size={18} /> : <Wallet size={18} />}
+          <span>{isPending ? "Connecting" : "Connect wallet"}</span>
+        </button>
+        {!walletModalConfigured && availableConnectors.length > 1 ? (
+          <dialog
+            aria-labelledby="wallet-provider-title"
+            className="wallet-provider-dialog"
+            onClick={(event) => {
+              if (event.target === event.currentTarget) event.currentTarget.close();
+            }}
+            ref={walletDialogRef}
           >
-            {isPending ? <LoaderCircle className="spin" size={18} /> : <Wallet size={18} />}
-            <span>{injectedConnector ? "Connect" : "No wallet"}</span>
-          </button>
-        )}
+            <div className="wallet-provider-sheet">
+              <header>
+                <h2 id="wallet-provider-title">Choose a wallet</h2>
+                <button aria-label="Close wallet chooser" className="wallet-dialog-close" onClick={() => walletDialogRef.current?.close()} type="button">
+                  <X size={18} />
+                </button>
+              </header>
+              <div className="wallet-provider-choices" data-testid="wallet-provider-choices" role="group" aria-label="Choose wallet provider">
+                {availableConnectors.map((connector) => (
+                  <button
+                    className="wallet-provider-option"
+                    data-provider-id={connector.id}
+                    disabled={isPending}
+                    key={connector.uid}
+                    onClick={() => {
+                      walletDialogRef.current?.close();
+                      void connectWith(connector);
+                    }}
+                    type="button"
+                  >
+                    <span className="wallet-provider-icon">
+                      {connector.icon ? <img alt="" src={connector.icon} /> : <Wallet size={20} />}
+                    </span>
+                    <span>
+                      <strong>{connector.name}</strong>
+                      <small>Browser wallet</small>
+                    </span>
+                  </button>
+                ))}
+              </div>
+              <p>Only wallets announced by your browser are shown in this local build.</p>
+            </div>
+          </dialog>
+        ) : null}
         {connectionFailure ? (
           <span className="inline-error" data-testid="wallet-status" data-wallet-state={connectionFailure.kind} role="alert">
             {connectionFailure.action}
@@ -1037,6 +1186,7 @@ function ContentView({
   routeKey,
   snapshot,
   snapshotState,
+  workspaceTask,
   onRefresh
 }: {
   actionPoolId: string | null;
@@ -1048,6 +1198,7 @@ function ContentView({
   routeKey: RouteKey;
   snapshot: AppSnapshot | undefined;
   snapshotState: LoadState;
+  workspaceTask: PoolWorkspaceTask | null;
   onRefresh: SnapshotRefetch;
 }) {
   const indexedPools = snapshot?.indexer.pools ?? [];
@@ -1060,7 +1211,11 @@ function ContentView({
     : indexedPools;
   const [selectedPoolId, setSelectedPoolId] = useState("");
   const poolIdsKey = pools.map((pool) => pool.id).join("|");
-  const defaultPool = selectDefaultIndexedPool(pools);
+  const activeRegistry = registries[environmentKey];
+  const preferredPoolAddress = isLocalnetRegistry(activeRegistry)
+    ? activeRegistry.seededPools.wethUsdc.pair
+    : null;
+  const defaultPool = selectDefaultIndexedPool(pools, preferredPoolAddress);
   const dashboardActionPool =
     actionPoolId === null
       ? null
@@ -1124,12 +1279,17 @@ function ContentView({
       if (actionPool !== null) return actionPool.id;
       if (pools.some((pool) => pool.id === currentId)) return currentId;
 
-      return selectDefaultIndexedPool(pools)?.id ?? "";
+      return selectDefaultIndexedPool(pools, preferredPoolAddress)?.id ?? "";
     });
-  }, [actionPool, environmentKey, poolIdsKey]);
+  }, [actionPool, environmentKey, poolIdsKey, preferredPoolAddress]);
 
   const handleSelectedPoolChange = (poolId: string) => {
     setSelectedPoolId(poolId);
+
+    if (routeKey === "pools" && workspaceTask !== null) {
+      window.location.hash = poolWorkspaceHref(poolId, workspaceTask === "market" ? "create" : workspaceTask);
+      return;
+    }
 
     if (actionPoolId === null) return;
 
@@ -1185,16 +1345,47 @@ function ContentView({
             ? "error"
             : directPoolQuery.data === null
               ? "empty"
-              : snapshotState;
+            : snapshotState;
+
+      if (detailPool !== null) {
+        const resolvedWorkspaceTask = workspaceTask === "swap" || workspaceTask === "manage" ? workspaceTask : "create";
+        const workspacePoolOptions = pools.some((pool) => pool.id === detailPool.id) ? pools : [detailPool, ...pools];
+        const workspaceContent = resolvedWorkspaceTask === "swap"
+          ? (
+              <SwapView
+                environmentKey={environmentKey}
+                onRefresh={onRefresh}
+                onSelectedPoolChange={handleSelectedPoolChange}
+                poolOptions={workspacePoolOptions}
+                primaryPool={detailPool}
+                selectedPoolId={detailPool.id}
+                snapshot={snapshot}
+              />
+            )
+          : (
+              <LiquidityView
+                environmentKey={environmentKey}
+                initialSection={resolvedWorkspaceTask === "create" ? "add" : "withdraw"}
+                onRefresh={onRefresh}
+                onSelectedPoolChange={handleSelectedPoolChange}
+                poolOptions={workspacePoolOptions}
+                portfolioAction={null}
+                primaryPool={detailPool}
+                selectedPoolId={detailPool.id}
+                snapshot={snapshot}
+                snapshotQueryErrored={snapshotState === "error"}
+              />
+            );
+
+        return (
+          <PoolWorkspaceShell environmentKey={environmentKey} key={detailPool.id} pool={detailPool} pools={workspacePoolOptions}>
+            {workspaceContent}
+          </PoolWorkspaceShell>
+        );
+      }
+
       return (
-        <PoolDetailView
-          environmentKey={environmentKey}
-          onSelectPool={setSelectedPoolId}
-          pool={detailPool ?? null}
-          poolDetailId={poolDetailId}
-          pools={pools}
-          snapshotState={detailState}
-        />
+        <RequestedPoolState error={directPoolQuery.error} poolId={poolDetailId} state={detailState} />
       );
     }
 
@@ -1260,8 +1451,11 @@ function RequestedPoolState({ error, poolId, state }: { error: Error | null; poo
   );
 }
 
-function selectDefaultIndexedPool(pools: PoolRow[]): PoolRow | null {
+function selectDefaultIndexedPool(pools: PoolRow[], preferredPoolAddress: Address | null = null): PoolRow | null {
   return (
+    (preferredPoolAddress === null
+      ? null
+      : pools.find((pool) => isAddressEqual(pool.address, preferredPoolAddress) && poolSupportsCoreActions(pool))) ??
     pools.find((pool) => poolHasSwapLiquidity(pool) && poolSupportsCoreActions(pool)) ??
     pools.find((pool) => poolSupportsCoreActions(pool)) ??
     pools.find((pool) => poolHasSwapLiquidity(pool)) ??
@@ -1323,12 +1517,13 @@ function SwapView({
   snapshot: AppSnapshot | undefined;
   onRefresh: SnapshotRefetch;
 }) {
-  const [amount, setAmount] = useState("1.0");
-  const [routeMode, setRouteMode] = useState<"exact-selected" | "best">("exact-selected");
-  const [swapForY, setSwapForY] = useState(true);
-  const [useNativeWrapper, setUseNativeWrapper] = useState(false);
-  const [slippageInput, setSlippageInput] = useState("0.5");
-  const [deadlineInput, setDeadlineInput] = useState("20");
+  const [amount, setAmount] = usePoolDraftState("swap.amount", "1.0");
+  const [routeMode, setRouteMode] = usePoolDraftState<"exact-selected" | "best">("swap.routeMode", "exact-selected");
+  const [swapForY, setSwapForY] = usePoolDraftState("swap.swapForY", true);
+  const [useNativeWrapper, setUseNativeWrapper] = usePoolDraftState("swap.useNativeWrapper", false);
+  const [standaloneCandleInterval, setStandaloneCandleInterval] = useState<CandleInterval>("HOUR");
+  const [slippageInput, setSlippageInput] = usePoolDraftState("swap.slippage", "0.5");
+  const [deadlineInput, setDeadlineInput] = usePoolDraftState("swap.deadline", "20");
   const [safetyNow, setSafetyNow] = useState(() => Date.now());
   const [approvalSimulationError, setApprovalSimulationError] = useState<string | null>(null);
   const [approvalSimulationPending, setApprovalSimulationPending] = useState(false);
@@ -1355,6 +1550,29 @@ function SwapView({
   const [submittedNativeSwapReceiptContext, setSubmittedNativeSwapReceiptContext] = useState<SubmittedNativeSwapReceiptContext | null>(null);
   const transactionJournal = useTransactionJournal();
   const registry = registries[environmentKey];
+  const poolWorkspace = useOptionalPoolWorkspace();
+  const analyticsEndpoint = analyticsEndpointForRegistry(registry);
+  const workspaceMatchesPool = poolWorkspace !== null && primaryPool !== null && isAddressEqual(poolWorkspace.pool.address, primaryPool.address);
+  const mobileWorkspaceNavigation = useMediaQuery("(max-width: 720px)") && workspaceMatchesPool;
+  const candleInterval = workspaceMatchesPool ? poolWorkspace.analytics.candleInterval : standaloneCandleInterval;
+  const standaloneCandleWindow = useMemo(() => {
+    const end = candleBoundary(Math.floor(Date.now() / 1_000), candleInterval);
+    return { end, start: end - CANDLE_LOOKBACK_SECONDS[candleInterval] };
+  }, [candleInterval, environmentKey, primaryPool?.address]);
+  const candleEnd = standaloneCandleWindow.end;
+  const candleStart = standaloneCandleWindow.start;
+  const swapCandlesQuery = useQuery({
+    queryKey: ["swapCandles", environmentKey, primaryPool?.address, candleInterval, candleStart, candleEnd],
+    queryFn: () => {
+      if (primaryPool === null) throw new Error("Swap candle target is unavailable");
+      return loadPairCandles(analyticsEndpoint, primaryPool.address, candleInterval, candleStart, candleEnd);
+    },
+    enabled: primaryPool !== null && !workspaceMatchesPool,
+    placeholderData: (previous) => previous,
+    refetchInterval: primaryPool !== null && !workspaceMatchesPool ? SNAPSHOT_REFRESH_INTERVAL_MS : false,
+    refetchOnWindowFocus: "always",
+    retry: false
+  });
   const localnetRegistry = isLocalnetRegistry(registry) ? registry : null;
   const account = useAccount();
   const activeWalletChainId = useChainId();
@@ -2299,207 +2517,310 @@ function SwapView({
     void handleSwap();
   };
 
+  const swapCandlePage: AnalyticsPage<PairCandle> = workspaceMatchesPool
+    ? poolWorkspace.analytics.candles
+    : swapCandlesQuery.data ?? {
+        rows: [],
+        status: swapCandlesQuery.isError ? "UNAVAILABLE" : "PARTIAL",
+        error: swapCandlesQuery.error instanceof Error ? swapCandlesQuery.error.message : null,
+        pageInfo: { endCursor: null, hasNextPage: false, partial: true, pagesLoaded: 0 },
+        streamCursor: null
+      };
+  const swapCandlesLoading = workspaceMatchesPool
+    ? poolWorkspace.analytics.candlesLoading
+    : swapCandlesQuery.isLoading || swapCandlesQuery.isPlaceholderData;
+
   return (
-    <div className="view-grid two-col">
-      <section className="tool-panel">
-        <div className="panel-heading">
-          <span>Swap</span>
-          <StatusBadge state={swapMarketReady ? "ready" : "unavailable"} label={swapMarketReady ? routeMode === "exact-selected" ? "exact pool" : "best route" : swapMarketError ?? "unavailable"} />
+    <div className="view-grid swap-workspace">
+      <div
+        aria-labelledby={mobileWorkspaceNavigation ? "pool-mobile-market-tab" : undefined}
+        className="swap-market-column"
+        id="pool-mobile-market-panel"
+        role={mobileWorkspaceNavigation ? "tabpanel" : undefined}
+        tabIndex={mobileWorkspaceNavigation ? -1 : undefined}
+      >
+        <SwapMarketChart
+          candles={swapCandlePage.rows}
+          error={swapCandlePage.error}
+          interval={candleInterval}
+          loading={swapCandlesLoading}
+          onIntervalChange={workspaceMatchesPool ? poolWorkspace.analytics.setCandleInterval : setStandaloneCandleInterval}
+          pairAddress={primaryPool?.address ?? null}
+          pairLabel={`${tokenSymbol(tokenX)} / ${tokenSymbol(tokenY)}`}
+          status={swapCandlePage.status}
+          streamState={workspaceMatchesPool ? poolWorkspace.analytics.candleStreamState : "unavailable"}
+        />
+      </div>
+      {workspaceMatchesPool ? (
+        <div
+          aria-labelledby={mobileWorkspaceNavigation ? "pool-mobile-positions-tab" : undefined}
+          className="pool-positions-column"
+          id="pool-mobile-positions-panel"
+          role={mobileWorkspaceNavigation ? "tabpanel" : undefined}
+          tabIndex={mobileWorkspaceNavigation ? -1 : undefined}
+        >
+          <PoolWorkspaceOwnerPanel />
         </div>
-
-        <fieldset className="routing-mode-control">
-          <legend>Routing choice</legend>
-          <div className="segmented" role="group" aria-label="Swap routing choice">
-            <button aria-pressed={routeMode === "exact-selected"} className={routeMode === "exact-selected" ? "segment active" : "segment"} onClick={() => setRouteMode("exact-selected")} type="button">
-              Exact selected pool
-            </button>
-            <button aria-pressed={routeMode === "best"} className={routeMode === "best" ? "segment active" : "segment"} onClick={() => setRouteMode("best")} type="button">
-              Best route
-            </button>
+      ) : null}
+      <section
+        aria-labelledby={mobileWorkspaceNavigation ? "pool-mobile-trade-tab" : undefined}
+        className={`tool-panel swap-task-panel${workspaceMatchesPool ? " pool-task-panel-scoped" : ""}`}
+        data-testid="swap-task-panel"
+        id={workspaceMatchesPool ? "swap-task-panel" : undefined}
+        role={mobileWorkspaceNavigation ? "tabpanel" : undefined}
+        tabIndex={mobileWorkspaceNavigation ? -1 : undefined}
+      >
+        {workspaceMatchesPool ? <PoolWorkspaceTaskTabs task="swap" /> : null}
+        <header className="swap-task-header">
+          <div>
+            <span>Swap</span>
+            <strong>{inputSymbol} / {outputSymbol}</strong>
           </div>
-          <p>{routeMode === "exact-selected" ? "Quote and submit only through the selected pair and bin step." : "Search the supported direct and one-intermediary V2.2 routes for the best output."}</p>
-        </fieldset>
+          <StatusBadge state={swapMarketReady ? "ready" : "unavailable"} label={swapMarketReady ? routeMode === "exact-selected" ? "exact pool" : "best route" : swapMarketError ?? "unavailable"} />
+        </header>
 
-        <PoolSelect
-          id="swap-pool"
-          label="Selected market"
-          onChange={onSelectedPoolChange}
-          pools={poolOptions}
-          selectedPoolId={selectedPoolId}
-        />
+        <div className="swap-task-body">
+          {workspaceMatchesPool ? (
+            <details className="swap-market-lock swap-route-disclosure" data-testid="swap-route-disclosure">
+              <summary data-testid="swap-market-lock">
+                <span className="swap-route-pool">
+                  <span>Selected pool</span>
+                  <strong>{tokenSymbol(tokenX)} / {tokenSymbol(tokenY)}</strong>
+                </span>
+                <span className="swap-route-context">
+                  <small>{selectedPool.binStep ?? "unknown"} bps/bin</small>
+                  <strong data-testid="swap-route-mode-summary">{routeMode === "exact-selected" ? "Exact selected pool" : "Best route"}</strong>
+                </span>
+              </summary>
+              <div className="swap-route-disclosure-body">
+                <SwapRouteModeControl onChange={setRouteMode} routeMode={routeMode} />
+              </div>
+            </details>
+          ) : (
+            <>
+              <PoolSelect
+                id="swap-pool"
+                label="Selected market"
+                onChange={onSelectedPoolChange}
+                pools={poolOptions}
+                selectedPoolId={selectedPoolId}
+              />
+              <SwapRouteModeControl onChange={setRouteMode} routeMode={routeMode} />
+            </>
+          )}
 
-        {connected && selectedPoolHasWrapper && wrappedNativeToken ? (
-          <fieldset className="routing-mode-control" data-testid="swap-native-mode">
-            <legend>Wrapped-native asset mode</legend>
-            <div className="segmented" role="group" aria-label="Wrapped-native asset mode">
-              <button aria-pressed={useNativeWrapper} className={useNativeWrapper ? "segment active" : "segment"} onClick={() => { nativeSwapMaxBindingRef.current = null; setUseNativeWrapper(true); setApprovalConfirmation(null); setNativeReceiptReview(null); setNativeReceiptError(null); }} type="button">ETH · native</button>
-              <button aria-pressed={!useNativeWrapper} className={!useNativeWrapper ? "segment active" : "segment"} onClick={() => { nativeSwapMaxBindingRef.current = null; setUseNativeWrapper(false); setApprovalConfirmation(null); setNativeReceiptReview(null); setNativeReceiptError(null); }} type="button">{wrappedNativeToken.symbol} · ERC-20</button>
-            </div>
-            <p data-testid="swap-wrapper-disclosure">ETH uses router native calldata and transaction value. {wrappedNativeToken.symbol} remains ERC-20 {wrappedNativeToken.address} and requires allowance when sold. Native Max requires a current positive probe amount so Feather can review buffered gas before computing spendable ETH.</p>
-          </fieldset>
-        ) : null}
-
-        <SwapMarketRecovery
-          error={swapMarketError}
-          onRefresh={onRefresh}
-          pool={primaryPool}
-          readiness={selectedPool}
-        />
-
-        {routeAttestationQuery.error === null && routeAttestationQuery.data?.length ? routeAttestationQuery.data.map((attestation, index) => (
-          <PairAttestationReview attestation={attestation} error={null} key={`${attestation.pair}-${index}`} loading={false} />
-        )) : (
-          <PairAttestationReview
-            attestation={pairAttestationQuery.data ?? null}
-            error={routeAttestationQuery.error ?? pairAttestationQuery.error}
-            loading={routeAttestationQuery.isLoading || routeAttestationQuery.isFetching || pairAttestationQuery.isLoading}
-          />
-        )}
-
-        <label className="field-label" htmlFor="swap-amount">
-          Sell
-        </label>
-        <div className="amount-box">
-          <input id="swap-amount" inputMode="decimal" onChange={(event) => { nativeSwapMaxBindingRef.current = null; setAmount(event.target.value); }} value={amount} />
-          <span>{inputSymbol}</span>
-          <button
-            className="token-max-button"
-            data-testid="swap-max-button"
-            disabled={walletBalance === null || tokenIn === null || (nativeInput && ((!canSwap && !canReuseNativeSwapMaxObservation) || nativeSwapMaxPending))}
-            onClick={() => {
-              if (nativeInput) handleNativeSwapMax();
-              else if (walletBalance !== null && tokenIn !== null) setAmount(maxAmountInput({ asset: "token", balance: walletBalance, decimals: tokenIn.decimals }));
-            }}
-            type="button"
-          >Max</button>
-        </div>
-        {nativeInput && (parsedAmount === null || parsedAmount <= 0n) ? <div className="state-row warning" data-testid="swap-native-max-guidance"><AlertTriangle size={16} /><span>Enter a valid positive ETH probe amount before using Native Max; no wallet request is opened for the gas probe.</span></div> : null}
-        {nativeInput ? <div className="state-row" data-testid="swap-token-in-identity">ETH native asset · router wrapper {wrappedNativeToken?.symbol} {wrappedNativeToken?.address}</div> : <TokenIdentity token={tokenIn} networkName={registry.chain.name} testId="swap-token-in-identity" />}
-        <div className="balance-line">
-          <span>Balance</span>
-          <strong data-testid="swap-balance-value">{walletQuery.data ? nativeInput ? `${formatUnits(BigInt(walletQuery.data.balance), 18)} ETH` : formatTokenAmount(walletQuery.data.balance, tokenIn) : connected ? "loading" : "connect wallet"}</strong>
-        </div>
-
-        <button className="flip-button" type="button" title="Flip tokens" onClick={() => { nativeSwapMaxBindingRef.current = null; setSwapForY((value) => !value); }}>
-          <ArrowLeftRight size={18} />
-        </button>
-
-        <label className="field-label" htmlFor="swap-output">
-          Buy
-        </label>
-        <div className="amount-box output">
-          <input id="swap-output" readOnly value={formatSwapOutput(quoteQuery.isFetching, amountOut, tokenOut)} />
-          <span>{outputSymbol}</span>
-        </div>
-        {nativeOutput ? <div className="state-row" data-testid="swap-token-out-identity">ETH native asset · router wrapper {wrappedNativeToken?.symbol} {wrappedNativeToken?.address}</div> : <TokenIdentity token={tokenOut} networkName={registry.chain.name} testId="swap-token-out-identity" />}
-
-        <div className="swap-settings">
-          <label htmlFor="swap-slippage">
-            <span>Slippage</span>
-            <input id="swap-slippage" inputMode="decimal" value={slippageInput} onChange={(event) => setSlippageInput(event.target.value)} />
-          </label>
-          <label htmlFor="swap-deadline">
-            <span>Deadline</span>
-            <input id="swap-deadline" inputMode="numeric" value={deadlineInput} onChange={(event) => setDeadlineInput(event.target.value)} />
-          </label>
-        </div>
-
-        <div className="quote-grid">
-          <MiniMetric label="Minimum received" value={amountOutMin !== null ? nativeOutput ? `${formatUnits(amountOutMin, 18)} ETH` : formatTokenAmount(amountOutMin.toString(), tokenOut) : "n/a"} />
-          <MiniMetric label="Quote freshness" value={quoteFreshnessLabel} />
-          <MiniMetric data-testid="swap-allowance-value" label="Allowance" value={nativeInput ? "not required for ETH" : walletQuery.data ? formatTokenAmount(walletQuery.data.allowance, tokenIn) : "n/a"} />
-          <MiniMetric data-testid="swap-native-balance" label="ETH for gas" value={nativeBalance !== null ? `${formatUnits(nativeBalance, 18)} ETH` : connected ? "loading" : "connect wallet"} />
-        </div>
-
-        <GasReview review={gasReview} />
-
-        {!nativeInput ? <ApprovalDetails
-          asset={tokenSymbol(tokenIn)}
-          amount={parsedAmount}
-          currentState={walletQuery.data ? `${formatTokenAmount(walletQuery.data.allowance, tokenIn)} allowance${needsApproval ? " (approval needed)" : " (sufficient)"}` : "unavailable"}
-          id="swap-approval-details"
-          requested={parsedAmount !== null ? formatTokenAmount(parsedAmount.toString(), tokenIn) : "invalid amount"}
-          scope="Exact token amount for this swap"
-          spender={registry.contracts.lbRouter}
-          token={tokenIn}
-        /> : <div className="state-row success" data-testid="swap-native-no-approval">ETH uses exact transaction value and never requests ERC-20 approval.</div>}
-
-        <div className="action-stack">
-          {!nativeInput ? <button
-            className="secondary-button wide"
-            data-testid="swap-approve-button"
-            type="button"
-            aria-describedby="swap-approval-details"
-            disabled={!canApprove || approvalWrite.isPending || approvalReceipt.isLoading || approvalSimulationPending}
-            title={swapApprovalDisclosure}
-            onClick={handleApprove}
-          >
-            {approvalSimulationPending || approvalWrite.isPending || approvalReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <CheckCircle2 size={18} />}
-            <span>{needsApproval ? `Approve ${tokenSymbol(tokenIn)}` : "Approved"}</span>
-          </button> : null}
-          <button className="primary-button wide" data-testid="swap-submit-button" type="button" disabled={!canSwap} onClick={handleSwap}>
-            {swapSimulationPending || swapWrite.isPending || swapReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <ArrowLeftRight size={18} />}
-            <span>
-              {buttonLabel({
-                poolReady: swapMarketReady,
-                connected,
-                onWrongChain,
-                needsApproval,
-                insufficientBalance,
-                insufficientGas: actionError?.startsWith("Insufficient ETH for gas") === true,
-                invalidInput: inputError !== null,
-                quoteLoading: quoteQuery.isFetching,
-                quoteReady: quote !== undefined,
-                safetyReason: swapSafetyReason,
-                walletError: walletError !== null,
-                walletLoading: walletReadsPending
-              })}
-            </span>
-          </button>
-          {approvalRefreshRetryRequired ? (
-            <button className="secondary-button wide" data-testid="swap-approval-refresh-button" onClick={retryApprovalRefresh} type="button">
-              <RefreshCw size={18} />
-              <span>Refresh after approval</span>
-            </button>
+          {connected && selectedPoolHasWrapper && wrappedNativeToken ? (
+            <fieldset className="routing-mode-control swap-native-mode" data-testid="swap-native-mode">
+              <legend>Asset mode</legend>
+              <div className="segmented" role="group" aria-label="Wrapped-native asset mode">
+                <button aria-pressed={useNativeWrapper} className={useNativeWrapper ? "segment active" : "segment"} onClick={() => { nativeSwapMaxBindingRef.current = null; setUseNativeWrapper(true); setApprovalConfirmation(null); setNativeReceiptReview(null); setNativeReceiptError(null); }} type="button">ETH · native</button>
+                <button aria-pressed={!useNativeWrapper} className={!useNativeWrapper ? "segment active" : "segment"} onClick={() => { nativeSwapMaxBindingRef.current = null; setUseNativeWrapper(false); setApprovalConfirmation(null); setNativeReceiptReview(null); setNativeReceiptError(null); }} type="button">{wrappedNativeToken.symbol} · ERC-20</button>
+              </div>
+              <p data-testid="swap-wrapper-disclosure">ETH uses router native calldata and transaction value. {wrappedNativeToken.symbol} remains ERC-20 {wrappedNativeToken.address} and requires allowance when sold. Native Max requires a current positive probe amount so Feather can review buffered gas before computing spendable ETH.</p>
+            </fieldset>
           ) : null}
+
+          <SwapMarketRecovery
+            error={swapMarketError}
+            onRefresh={onRefresh}
+            pool={primaryPool}
+            readiness={selectedPool}
+          />
+
+          <div className="swap-amount-stack">
+            <section className="swap-asset-card">
+              <div className="swap-asset-heading">
+                <label htmlFor="swap-amount">Sell</label>
+                <div className="balance-line">
+                  <span>Balance</span>
+                  <strong data-testid="swap-balance-value">{walletQuery.data ? nativeInput ? `${formatUnits(BigInt(walletQuery.data.balance), 18)} ETH` : formatTokenAmount(walletQuery.data.balance, tokenIn) : connected ? "loading" : "connect wallet"}</strong>
+                </div>
+              </div>
+              <div className="amount-box">
+                <input id="swap-amount" inputMode="decimal" onChange={(event) => { nativeSwapMaxBindingRef.current = null; setAmount(event.target.value); }} value={amount} />
+                <span>{inputSymbol}</span>
+                <button
+                  className="token-max-button"
+                  data-testid="swap-max-button"
+                  disabled={walletBalance === null || tokenIn === null || (nativeInput && ((!canSwap && !canReuseNativeSwapMaxObservation) || nativeSwapMaxPending))}
+                  onClick={() => {
+                    if (nativeInput) handleNativeSwapMax();
+                    else if (walletBalance !== null && tokenIn !== null) setAmount(maxAmountInput({ asset: "token", balance: walletBalance, decimals: tokenIn.decimals }));
+                  }}
+                  type="button"
+                >Max</button>
+              </div>
+              {!nativeInput ? <TokenIdentity token={tokenIn} networkName={registry.chain.name} testId="swap-token-in-identity" /> : null}
+            </section>
+
+            {nativeInput && (parsedAmount === null || parsedAmount <= 0n) ? <div className="state-row warning" data-testid="swap-native-max-guidance"><AlertTriangle size={16} /><span>Enter a valid positive ETH probe amount before using Native Max; no wallet request is opened for the gas probe.</span></div> : null}
+
+            <button className="flip-button" type="button" title="Flip tokens" onClick={() => { nativeSwapMaxBindingRef.current = null; setSwapForY((value) => !value); }}>
+              <ArrowLeftRight size={18} />
+            </button>
+
+            <section className="swap-asset-card output">
+              <div className="swap-asset-heading">
+                <label htmlFor="swap-output">Buy</label>
+                <span>Estimated output</span>
+              </div>
+              <div className="amount-box output">
+                <input id="swap-output" readOnly value={formatSwapOutput(quoteQuery.isFetching, amountOut, tokenOut)} />
+                <span>{outputSymbol}</span>
+              </div>
+              {!nativeOutput ? <TokenIdentity token={tokenOut} networkName={registry.chain.name} testId="swap-token-out-identity" /> : null}
+            </section>
+          </div>
+
+          <section aria-label="Trade quote" className="swap-quote-summary">
+            <div className="swap-quote-heading">
+              <span>Trade quote</span>
+              <small>{quoteFreshnessLabel}</small>
+            </div>
+            <dl className="swap-quote-list">
+              <div><dt>Expected output</dt><dd>{expectedOutLabel}</dd></div>
+              <div><dt>Minimum received</dt><dd>{amountOutMin !== null ? nativeOutput ? `${formatUnits(amountOutMin, 18)} ETH` : formatTokenAmount(amountOutMin.toString(), tokenOut) : "n/a"}</dd></div>
+              <div><dt>LP fee</dt><dd>{feeLabel}</dd></div>
+              <div><dt>Price impact</dt><dd>{priceImpactLabel}</dd></div>
+            </dl>
+          </section>
+
+          <div className="swap-settings">
+            <label htmlFor="swap-slippage">
+              <span>Slippage %</span>
+              <input id="swap-slippage" inputMode="decimal" value={slippageInput} onChange={(event) => setSlippageInput(event.target.value)} />
+            </label>
+            <label htmlFor="swap-deadline">
+              <span>Deadline min</span>
+              <input id="swap-deadline" inputMode="numeric" value={deadlineInput} onChange={(event) => setDeadlineInput(event.target.value)} />
+            </label>
+          </div>
+
+          <GasReview review={gasReview} />
+
+          {nativeInput ? <div className="state-row success" data-testid="swap-native-no-approval">ETH uses exact transaction value and never requests ERC-20 approval.</div> : null}
+
+          {nativeReceiptReview ? <div className="review-card" data-testid="native-swap-receipt-review"><strong>Canonical native swap accounting</strong><p>{nativeReceiptReview.direction === "native-in" ? "ETH spent" : "ETH received"}: {formatUnits(BigInt(nativeReceiptReview.nativeAmount), 18)} ETH · token amount {nativeReceiptReview.tokenAmount} · gas {formatUnits(BigInt(nativeReceiptReview.gasCost), 18)} ETH</p></div> : null}
+          {nativeReceiptError ? <div className="state-row failure" data-testid="native-swap-receipt-error">{nativeReceiptError}</div> : null}
+
+          <details
+            className="swap-review-details"
+            data-testid="swap-review-details"
+            open={needsApproval || routeAttestationQuery.error !== null || pairAttestationQuery.error !== null ? true : undefined}
+          >
+            <summary>
+              <span>Market and approval review</span>
+              <small>{routeSteps.length > 0 ? `${routeSteps.length} hop${routeSteps.length === 1 ? "" : "s"}` : "Route pending"}</small>
+            </summary>
+            <div className="swap-review-body">
+              <SwapRouteReview
+                primaryPool={primaryPool}
+                quote={quote}
+                routeMode={routeMode}
+                routeSteps={routeSteps}
+                selectedPool={selectedPool}
+                swapMarketError={swapMarketError}
+                swapMarketReady={swapMarketReady}
+                tokenIn={tokenIn}
+                tokenOut={tokenOut}
+              />
+
+              {routeAttestationQuery.error === null && routeAttestationQuery.data?.length ? routeAttestationQuery.data.map((attestation, index) => (
+                <PairAttestationReview attestation={attestation} error={null} key={`${attestation.pair}-${index}`} loading={false} />
+              )) : (
+                <PairAttestationReview
+                  attestation={pairAttestationQuery.data ?? null}
+                  error={routeAttestationQuery.error ?? pairAttestationQuery.error}
+                  loading={routeAttestationQuery.isLoading || routeAttestationQuery.isFetching || pairAttestationQuery.isLoading}
+                />
+              )}
+
+              {nativeInput ? <div className="state-row" data-testid="swap-token-in-identity">ETH native asset · router wrapper {wrappedNativeToken?.symbol} {wrappedNativeToken?.address}</div> : null}
+              {nativeOutput ? <div className="state-row" data-testid="swap-token-out-identity">ETH native asset · router wrapper {wrappedNativeToken?.symbol} {wrappedNativeToken?.address}</div> : null}
+              {!nativeInput ? <TokenIdentity token={tokenIn} networkName={registry.chain.name} testId="swap-token-in-review" /> : null}
+              {!nativeOutput ? <TokenIdentity token={tokenOut} networkName={registry.chain.name} testId="swap-token-out-review" /> : null}
+
+              <div className="quote-grid swap-account-review">
+                <MiniMetric data-testid="swap-allowance-value" label="Allowance" value={nativeInput ? "not required for ETH" : walletQuery.data ? formatTokenAmount(walletQuery.data.allowance, tokenIn) : "n/a"} />
+                <MiniMetric data-testid="swap-native-balance" label="ETH for gas" value={nativeBalance !== null ? `${formatUnits(nativeBalance, 18)} ETH` : connected ? "loading" : "connect wallet"} />
+              </div>
+
+              {!nativeInput ? <ApprovalDetails
+                asset={tokenSymbol(tokenIn)}
+                amount={parsedAmount}
+                currentState={walletQuery.data ? `${formatTokenAmount(walletQuery.data.allowance, tokenIn)} allowance${needsApproval ? " (approval needed)" : " (sufficient)"}` : "unavailable"}
+                id="swap-approval-details"
+                requested={parsedAmount !== null ? formatTokenAmount(parsedAmount.toString(), tokenIn) : "invalid amount"}
+                scope="Exact token amount for this swap"
+                spender={registry.contracts.lbRouter}
+                token={tokenIn}
+              /> : null}
+            </div>
+          </details>
         </div>
 
-        {nativeReceiptReview ? <div className="review-card" data-testid="native-swap-receipt-review"><strong>Canonical native swap accounting</strong><p>{nativeReceiptReview.direction === "native-in" ? "ETH spent" : "ETH received"}: {formatUnits(BigInt(nativeReceiptReview.nativeAmount), 18)} ETH · token amount {nativeReceiptReview.tokenAmount} · gas {formatUnits(BigInt(nativeReceiptReview.gasCost), 18)} ETH</p></div> : null}
-        {nativeReceiptError ? <div className="state-row failure" data-testid="native-swap-receipt-error">{nativeReceiptError}</div> : null}
+        <footer className="swap-action-dock">
+          <div className="action-stack">
+            {!nativeInput ? <button
+              className="secondary-button wide"
+              data-testid="swap-approve-button"
+              type="button"
+              aria-describedby="swap-approval-details swap-failure-state"
+              disabled={!canApprove || approvalWrite.isPending || approvalReceipt.isLoading || approvalSimulationPending}
+              hidden={!connected}
+              title={swapApprovalDisclosure}
+              onClick={handleApprove}
+            >
+              {approvalSimulationPending || approvalWrite.isPending || approvalReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <CheckCircle2 size={18} />}
+              <span>{needsApproval ? `Approve ${tokenSymbol(tokenIn)}` : "Approved"}</span>
+            </button> : null}
+            <button aria-describedby="swap-failure-state" className={`primary-button wide${!connected ? " swap-primary-only" : ""}`} data-testid="swap-submit-button" type="button" disabled={!canSwap} onClick={handleSwap}>
+              {swapSimulationPending || swapWrite.isPending || swapReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <ArrowLeftRight size={18} />}
+              <span>
+                {buttonLabel({
+                  poolReady: swapMarketReady,
+                  connected,
+                  onWrongChain,
+                  needsApproval,
+                  insufficientBalance,
+                  insufficientGas: actionError?.startsWith("Insufficient ETH for gas") === true,
+                  invalidInput: inputError !== null,
+                  quoteLoading: quoteQuery.isFetching,
+                  quoteReady: quote !== undefined,
+                  safetyReason: swapSafetyReason,
+                  walletError: walletError !== null,
+                  walletLoading: walletReadsPending
+                })}
+              </span>
+            </button>
+            {approvalRefreshRetryRequired ? (
+              <button className="secondary-button wide" data-testid="swap-approval-refresh-button" onClick={retryApprovalRefresh} type="button">
+                <RefreshCw size={18} />
+                <span>Refresh after approval</span>
+              </button>
+            ) : null}
+          </div>
 
-        <SwapStateRows
-          amountError={inputError}
-          actionError={actionError}
-          approvalRefreshPending={postApprovalReviewPending && postApprovalRefreshError === null}
-          approvalHash={approvalReceiptMatchesCurrentIntent ? approvalWrite.data : undefined}
-          approvalPending={approvalWrite.isPending || (approvalReceiptMatchesCurrentIntent && approvalReceipt.isLoading)}
-          approvalReverted={approvalReverted}
-          approvalSuccess={approvalSuccess}
-          insufficientBalance={insufficientBalance}
-          insufficientGas={actionError?.startsWith("Insufficient ETH for gas") === true}
-          quoteError={quoteQuery.error}
-          swapHash={swapReceiptMatchesCurrentIntent ? swapWrite.data : undefined}
-          swapPending={swapWrite.isPending || (swapReceiptMatchesCurrentIntent && swapReceipt.isLoading)}
-          swapReverted={swapReverted}
-          swapSuccess={swapSuccess}
-          walletError={walletError}
-        />
+          <SwapStateRows
+            amountError={inputError}
+            actionError={actionError}
+            approvalRefreshPending={postApprovalReviewPending && postApprovalRefreshError === null}
+            approvalHash={approvalReceiptMatchesCurrentIntent ? approvalWrite.data : undefined}
+            approvalPending={approvalWrite.isPending || (approvalReceiptMatchesCurrentIntent && approvalReceipt.isLoading)}
+            approvalReverted={approvalReverted}
+            approvalSuccess={approvalSuccess}
+            insufficientBalance={insufficientBalance}
+            insufficientGas={actionError?.startsWith("Insufficient ETH for gas") === true}
+            quoteError={quoteQuery.error}
+            swapHash={swapReceiptMatchesCurrentIntent ? swapWrite.data : undefined}
+            swapPending={swapWrite.isPending || (swapReceiptMatchesCurrentIntent && swapReceipt.isLoading)}
+            swapReverted={swapReverted}
+            swapSuccess={swapSuccess}
+            walletError={walletError}
+          />
+        </footer>
       </section>
 
-      <SwapDetailsCard
-        expectedOutLabel={expectedOutLabel}
-        feeLabel={feeLabel}
-        primaryPool={primaryPool}
-        quote={quote}
-        priceImpactLabel={priceImpactLabel}
-        routeMode={routeMode}
-        routeSteps={routeSteps}
-        selectedPool={selectedPool}
-        swapMarketError={swapMarketError}
-        swapMarketReady={swapMarketReady}
-        tokenIn={tokenIn}
-        tokenOut={tokenOut}
-      />
     </div>
   );
 }
@@ -2536,12 +2857,287 @@ function SwapMarketRecovery({
   );
 }
 
-function SwapDetailsCard({
-  expectedOutLabel,
-  feeLabel,
+function SwapRouteModeControl({
+  onChange,
+  routeMode
+}: {
+  onChange: (routeMode: "exact-selected" | "best") => void;
+  routeMode: "exact-selected" | "best";
+}) {
+  return (
+    <fieldset className="routing-mode-control swap-route-mode">
+      <legend>Route</legend>
+      <div className="segmented" role="group" aria-label="Swap routing choice">
+        <button aria-pressed={routeMode === "exact-selected"} className={routeMode === "exact-selected" ? "segment active" : "segment"} onClick={() => onChange("exact-selected")} type="button">
+          Exact selected pool
+        </button>
+        <button aria-pressed={routeMode === "best"} className={routeMode === "best" ? "segment active" : "segment"} onClick={() => onChange("best")} type="button">
+          Best route
+        </button>
+      </div>
+      <p>{routeMode === "exact-selected" ? "Use only this pool and bin step." : "Compare supported direct and one-intermediary V2.2 routes."}</p>
+    </fieldset>
+  );
+}
+
+function SwapMarketChart({
+  candles,
+  error,
+  interval,
+  loading,
+  onIntervalChange,
+  pairAddress,
+  pairLabel,
+  status,
+  streamState
+}: {
+  candles: PairCandle[];
+  error: string | null;
+  interval: CandleInterval;
+  loading: boolean;
+  onIntervalChange: (interval: CandleInterval) => void;
+  pairAddress: string | null;
+  pairLabel: string;
+  status: AnalyticsStatus;
+  streamState: CandleStreamState;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const chartRef = useRef<IChartApi | null>(null);
+  const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
+  const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
+  const fittedDataKeyRef = useRef<string | null>(null);
+  const seriesIdentityRef = useRef<string | null>(null);
+  const seriesRevisionsRef = useRef(new Map<number, number>());
+  const seriesTimesRef = useRef(new Set<number>());
+  const intervalCandles = useMemo(() => candles.filter((candle) => candle.interval === interval), [candles, interval]);
+  const latestCandle = [...intervalCandles].reverse().find((candle) => candle.closeUsdE18 !== null) ?? null;
+  const accessibleCandles = intervalCandles.slice(-24);
+  const historyState = loading
+    ? "Loading"
+    : status === "UNAVAILABLE"
+      ? "Analytics unavailable"
+      : status === "PARTIAL"
+        ? "Partial history"
+        : intervalCandles.length === 0
+          ? "No activity"
+          : "History ready";
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (container === null) return;
+
+    const chart = createChart(container, {
+      width: container.clientWidth,
+      height: container.clientHeight,
+      layout: {
+        attributionLogo: true,
+        background: { type: ColorType.Solid, color: "#111411" },
+        fontFamily: '"IBM Plex Mono", ui-monospace, monospace',
+        textColor: "rgba(233, 236, 231, 0.56)"
+      },
+      grid: {
+        horzLines: { color: "rgba(233, 236, 231, 0.06)" },
+        vertLines: { color: "rgba(233, 236, 231, 0.045)" }
+      },
+      crosshair: {
+        horzLine: { color: "rgba(233, 236, 231, 0.38)", labelBackgroundColor: "#252925" },
+        vertLine: { color: "rgba(233, 236, 231, 0.24)", labelBackgroundColor: "#252925" }
+      },
+      localization: { priceFormatter: formatTradingChartPrice },
+      rightPriceScale: {
+        borderColor: "rgba(233, 236, 231, 0.10)",
+        scaleMargins: { top: 0.08, bottom: 0.28 }
+      },
+      timeScale: {
+        borderColor: "rgba(233, 236, 231, 0.10)",
+        rightOffset: 4,
+        barSpacing: 11,
+        timeVisible: true,
+        secondsVisible: false
+      }
+    });
+    const candleSeries = chart.addSeries(CandlestickSeries, {
+      borderVisible: false,
+      downColor: "#e56d70",
+      priceFormat: { type: "price", precision: 8, minMove: 0.00000001 },
+      upColor: "#4ac57c",
+      wickDownColor: "#e56d70",
+      wickUpColor: "#4ac57c"
+    });
+    const volumeSeries = chart.addSeries(HistogramSeries, {
+      color: "rgba(74, 197, 124, 0.32)",
+      priceFormat: { type: "volume" },
+      priceScaleId: ""
+    });
+    volumeSeries.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+    chartRef.current = chart;
+    candleSeriesRef.current = candleSeries;
+    volumeSeriesRef.current = volumeSeries;
+
+    const observer = new ResizeObserver(([entry]) => {
+      if (!entry) return;
+      chart.applyOptions({
+        width: Math.floor(entry.contentRect.width),
+        height: Math.floor(entry.contentRect.height)
+      });
+    });
+    observer.observe(container);
+
+    return () => {
+      observer.disconnect();
+      chart.remove();
+      chartRef.current = null;
+      candleSeriesRef.current = null;
+      volumeSeriesRef.current = null;
+      seriesIdentityRef.current = null;
+      seriesRevisionsRef.current.clear();
+      seriesTimesRef.current.clear();
+    };
+  }, []);
+
+  useEffect(() => {
+    const candleSeries = candleSeriesRef.current;
+    const volumeSeries = volumeSeriesRef.current;
+    if (candleSeries === null || volumeSeries === null) return;
+
+    if (loading && candles.length > 0 && intervalCandles.length === 0) return;
+    const ordered = [...intervalCandles].sort((left, right) => left.startTimestamp - right.startTimestamp);
+    const points: Array<{ candle: PairCandle; candleData: CandlestickData<UTCTimestamp>; volumeData: HistogramData<UTCTimestamp> }> = [];
+    for (const candle of ordered) {
+      const open = tradingChartValue(candle.openUsdE18);
+      const high = tradingChartValue(candle.highUsdE18);
+      const low = tradingChartValue(candle.lowUsdE18);
+      const close = tradingChartValue(candle.closeUsdE18);
+      if (open === null || high === null || low === null || close === null) continue;
+      const time = candle.startTimestamp as UTCTimestamp;
+      points.push({
+        candle,
+        candleData: { close, high, low, open, time },
+        volumeData: {
+          color: close >= open ? "rgba(74, 197, 124, 0.32)" : "rgba(229, 109, 112, 0.28)",
+          time,
+          value: tradingChartValue(candle.volumeUsdE18) ?? 0
+        }
+      });
+    }
+    const identity = `${pairAddress ?? "none"}:${interval}`;
+    const nextTimes = new Set(points.map((point) => point.candle.startTimestamp));
+    const previousTimes = seriesTimesRef.current;
+    const previousMaximum = Math.max(...previousTimes, Number.NEGATIVE_INFINITY);
+    const requiresReset = seriesIdentityRef.current !== identity
+      || [...previousTimes].some((timestamp) => !nextTimes.has(timestamp))
+      || [...nextTimes].some((timestamp) => !previousTimes.has(timestamp) && timestamp < previousMaximum);
+    if (requiresReset) {
+      candleSeries.setData(points.map((point) => point.candleData));
+      volumeSeries.setData(points.map((point) => point.volumeData));
+    } else {
+      for (const point of points) {
+        if (seriesRevisionsRef.current.get(point.candle.startTimestamp) === point.candle.revision) continue;
+        const historicalUpdate = previousTimes.has(point.candle.startTimestamp);
+        candleSeries.update(point.candleData, historicalUpdate);
+        volumeSeries.update(point.volumeData, historicalUpdate);
+      }
+    }
+    seriesIdentityRef.current = identity;
+    seriesTimesRef.current = nextTimes;
+    seriesRevisionsRef.current = new Map(points.map((point) => [point.candle.startTimestamp, point.candle.revision]));
+
+    const fitKey = `${identity}:${points[0]?.candle.startTimestamp ?? "empty"}`;
+    if (points.length > 0 && fittedDataKeyRef.current !== fitKey) {
+      chartRef.current?.timeScale().fitContent();
+      fittedDataKeyRef.current = fitKey;
+    }
+  }, [candles, interval, intervalCandles, pairAddress]);
+
+  const emptyMessage = loading
+    ? "Loading price history"
+    : status === "UNAVAILABLE" || error
+      ? "Price history is not available yet"
+      : "No activity in this time window";
+
+  return (
+    <section
+      className="info-panel swap-chart-panel"
+      data-testid="swap-market-chart"
+    >
+      <header className="swap-chart-header">
+        <div>
+          <span>Price chart</span>
+          <strong>{pairLabel}</strong>
+        </div>
+        <div aria-label="Candle interval" className="swap-chart-intervals" role="group">
+          {CHART_INTERVALS.map((option) => (
+            <button
+              aria-pressed={option === interval}
+              className={option === interval ? "active" : undefined}
+              key={option}
+              onClick={() => onIntervalChange(option)}
+              type="button"
+            >
+              {CANDLE_INTERVAL_LABELS[option]}
+            </button>
+          ))}
+        </div>
+      </header>
+      <div className="swap-chart-summary">
+        {latestCandle ? (
+          <>
+            <span>O {formatUsdE18(latestCandle.openUsdE18)}</span>
+            <span>H {formatUsdE18(latestCandle.highUsdE18)}</span>
+            <span>L {formatUsdE18(latestCandle.lowUsdE18)}</span>
+            <strong>C {formatUsdE18(latestCandle.closeUsdE18)}</strong>
+            <span>Vol {formatUsdE18(latestCandle.volumeUsdE18)}</span>
+          </>
+        ) : <span>{emptyMessage}</span>}
+      </div>
+      <div className="swap-chart-stage">
+        <div aria-describedby="pool-candle-chart-description" aria-label={`${pairLabel} ${CANDLE_INTERVAL_LABELS[interval]} candlestick chart`} className="swap-chart-canvas" ref={containerRef} role="img" />
+        {intervalCandles.length === 0 ? <div className="swap-chart-empty"><span>{emptyMessage}</span></div> : null}
+      </div>
+      <div className="visually-hidden visually-hidden-table" id="pool-candle-chart-description">
+        <p>{pairLabel} {CANDLE_INTERVAL_LABELS[interval]} price history. {historyState}. {intervalCandles.length} candles are loaded; the table contains the latest {accessibleCandles.length}.</p>
+        <table>
+          <caption>Latest {pairLabel} candle data</caption>
+          <thead><tr><th>UTC start</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Volume</th><th>Status</th></tr></thead>
+          <tbody>
+            {accessibleCandles.map((candle) => (
+              <tr key={`${candle.startTimestamp}-${candle.revision}`}>
+                <th>{new Date(candle.startTimestamp * 1_000).toISOString()}</th>
+                <td>{formatUsdE18(candle.openUsdE18)}</td>
+                <td>{formatUsdE18(candle.highUsdE18)}</td>
+                <td>{formatUsdE18(candle.lowUsdE18)}</td>
+                <td>{formatUsdE18(candle.closeUsdE18)}</td>
+                <td>{formatUsdE18(candle.volumeUsdE18)}</td>
+                <td>{candle.status}{candle.finalized ? ", finalized" : ", updating"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <footer className="swap-chart-footer">
+        <span>{CANDLE_LOOKBACK_LABELS[interval]} · {historyState}</span>
+        <span className={`swap-chart-stream ${streamState}`}>{streamState === "live" ? "Live" : streamState === "connecting" ? "Connecting" : streamState === "stale" ? "Stream stale" : "Historical only"}</span>
+        <span>{latestCandle?.priceSource === "active-bin-quote-usd" ? "Pool price · trusted USD quote" : "Trusted USD price"}</span>
+      </footer>
+    </section>
+  );
+}
+
+function tradingChartValue(value: string | null): number | null {
+  if (value === null) return null;
+  const parsed = Number(formatUnits(BigInt(value), 18));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatTradingChartPrice(price: number): string {
+  if (Math.abs(price) >= 1_000) return price.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  if (Math.abs(price) >= 1) return price.toLocaleString(undefined, { maximumFractionDigits: 4 });
+  return price.toLocaleString(undefined, { maximumSignificantDigits: 6 });
+}
+
+function SwapRouteReview({
   primaryPool,
   quote,
-  priceImpactLabel,
   routeMode,
   routeSteps,
   selectedPool,
@@ -2550,11 +3146,8 @@ function SwapDetailsCard({
   tokenIn,
   tokenOut
 }: {
-  expectedOutLabel: string;
-  feeLabel: string;
   primaryPool: PoolRow | null;
   quote: SerializedExactInQuote | undefined;
-  priceImpactLabel: string;
   routeMode: "exact-selected" | "best";
   routeSteps: RouteStepView[];
   selectedPool: SelectedPoolDescriptor;
@@ -2564,19 +3157,13 @@ function SwapDetailsCard({
   tokenOut: TokenMetadata | null;
 }) {
   return (
-    <section className="info-panel">
+    <section className="swap-route-review">
       <div className="panel-heading">
         <span>Route</span>
         <StatusBadge
           state={!swapMarketReady ? "unavailable" : quote ? "ready" : primaryPool ? "loading" : "empty"}
           label={!swapMarketReady ? swapMarketError ?? "unavailable" : quote ? routeMode === "exact-selected" ? "Exact selected pool" : "Best V2.2 route" : primaryPool ? "waiting" : "no market"}
         />
-      </div>
-
-      <div className="quote-grid">
-        <MiniMetric label="Expected out" value={expectedOutLabel} />
-        <MiniMetric label="Fee" value={feeLabel} />
-        <MiniMetric label="Price impact" value={priceImpactLabel} />
       </div>
 
       {routeSteps.length > 0 ? (
@@ -2738,7 +3325,7 @@ function buildPoolDescriptor({
   if (localnetRegistry !== null) {
     return buildSelectedPoolDescriptor({
       action,
-      poolKey: "wnativeUsdc",
+      poolKey: "wethUsdc",
       registry: localnetRegistry,
       runtime,
       source: "localnet-seeded"
@@ -2802,11 +3389,6 @@ function swapSnapshotIdentity(snapshot: AppSnapshot | undefined, poolId: string)
     runtimeChainId: snapshot?.runtime.chainId ?? null,
     runtimeStatus: snapshot?.runtime.status ?? null
   });
-}
-
-function runtimeChainLabel(expectedChainId: number, actualChainId: number | null): string {
-  if (actualChainId === null || actualChainId === expectedChainId) return `Chain ${expectedChainId}`;
-  return `Expected ${expectedChainId}, RPC ${actualChainId}`;
 }
 
 function executionPoolFromDescriptor(pool: SelectedPoolDescriptor): SelectedExecutionPool | null {
@@ -2937,6 +3519,7 @@ function SwapStateRows({
       aria-live={state.tone === "failure" ? "assertive" : "polite"}
       className={`state-row transaction-status ${state.tone}`}
       data-testid="swap-failure-state"
+      id="swap-failure-state"
       role={state.tone === "failure" ? "alert" : "status"}
     >
       {state.icon}
@@ -3417,7 +4000,7 @@ function LiquidityReceiptReview({
 }) {
   if (hash === null) return null;
   if (error !== null && error !== undefined) {
-    return <div className="state-row failure" data-testid="liquidity-receipt-review-error"><AlertTriangle size={16} /><span>Canonical receipt accounting failed closed: {getWriteError(error)}</span></div>;
+    return <div aria-atomic="true" className="state-row failure" data-testid="liquidity-receipt-review-error" role="alert"><AlertTriangle size={16} /><span>Canonical receipt accounting failed closed: {getWriteError(error)}</span></div>;
   }
   if (reconciliationJson === null) {
     return <div className="state-row" data-testid="liquidity-receipt-review-loading"><LoaderCircle className="spin" size={16} /><span>Reconciling canonical receipt {formatCompactAddress(hash)}</span></div>;
@@ -3471,7 +4054,7 @@ function NativeRemoveReceiptReview({
 }) {
   if (hash === null) return null;
   if (error !== null && error !== undefined) {
-    return <div className="state-row failure" data-testid="remove-receipt-review-error"><AlertTriangle size={16} /><span>Canonical native withdrawal accounting failed closed: {getWriteError(error)}</span></div>;
+    return <div aria-atomic="true" className="state-row failure" data-testid="remove-receipt-review-error" role="alert"><AlertTriangle size={16} /><span>Canonical native withdrawal accounting failed closed: {getWriteError(error)}</span></div>;
   }
   if (reconciliation === undefined) {
     return <div className="state-row" data-testid="remove-receipt-review-loading"><LoaderCircle className="spin" size={16} /><span>Reconciling canonical native withdrawal {formatCompactAddress(hash)}</span></div>;
@@ -3554,35 +4137,34 @@ function PoolsView({
   const [creationOpen, setCreationOpen] = useState(false);
   const creationLaunchRef = useRef<HTMLButtonElement>(null);
   const pageSize = 10;
-  const analyticsBaseEndpoint = analyticsEndpointForRegistry(registry);
-  const ownerEndpoint = analyticsBaseEndpoint === null ? null : `${analyticsBaseEndpoint}/graphql`;
+  const analyticsEndpoint = analyticsEndpointForRegistry(registry);
   const ownerPortfolioQuery = useQuery({
-    queryKey: ["poolDiscoveryOwner", environmentKey, account.address, ownerEndpoint],
+    queryKey: ["poolDiscoveryOwner", environmentKey, account.address, analyticsEndpoint],
     queryFn: async () => {
-      if (!account.address || ownerEndpoint === null) throw new Error("Wallet analytics are unavailable");
-      const page = await loadWalletPortfolio(ownerEndpoint, account.address);
+      if (!account.address || analyticsEndpoint === null) throw new Error("Wallet analytics are unavailable");
+      const page = await loadWalletPortfolio(analyticsEndpoint, account.address);
       if (page.positions.some((position) => position.owner.toLowerCase() !== account.address!.toLowerCase())) {
         throw new Error("Wallet analytics returned a position for another owner");
       }
       return page;
     },
-    enabled: discoveryState.hasLiquidity && account.address !== undefined && ownerEndpoint !== null,
+    enabled: discoveryState.hasLiquidity && account.address !== undefined && analyticsEndpoint !== null,
     refetchInterval: discoveryState.hasLiquidity ? SNAPSHOT_REFRESH_INTERVAL_MS : false,
     refetchOnWindowFocus: "always",
     retry: false
   });
   const poolAddressKey = pools.map((pool) => pool.address.toLowerCase()).sort().join("|");
   const metricsQuery = useQuery({
-    queryKey: ["poolWorkspaceMetrics", environmentKey, ownerEndpoint, poolAddressKey],
-    queryFn: () => loadPoolMetrics(ownerEndpoint, pools.map((pool) => pool.address)),
+    queryKey: ["poolWorkspaceMetrics", environmentKey, analyticsEndpoint, poolAddressKey],
+    queryFn: () => loadPoolMetrics(analyticsEndpoint, pools.map((pool) => pool.address)),
     enabled: pools.length > 0,
     refetchInterval: SNAPSHOT_REFRESH_INTERVAL_MS,
     refetchOnWindowFocus: "always",
     retry: false
   });
   const analyticsHealthQuery = useQuery({
-    queryKey: ["poolWorkspaceHealth", environmentKey, ownerEndpoint],
-    queryFn: () => loadAnalyticsHealth(ownerEndpoint),
+    queryKey: ["poolWorkspaceHealth", environmentKey, analyticsEndpoint],
+    queryFn: () => loadAnalyticsHealth(analyticsEndpoint),
     refetchInterval: SNAPSHOT_REFRESH_INTERVAL_MS,
     refetchOnWindowFocus: "always",
     retry: false
@@ -3591,7 +4173,8 @@ function PoolsView({
     rows: [],
     status: metricsQuery.isError ? "UNAVAILABLE" : "PARTIAL",
     error: metricsQuery.error instanceof Error ? metricsQuery.error.message : null,
-    pageInfo: { endCursor: null, hasNextPage: false, partial: true, pagesLoaded: 0 }
+    pageInfo: { endCursor: null, hasNextPage: false, partial: true, pagesLoaded: 0 },
+    streamCursor: null
   };
   const workspaceRows = useMemo(() => joinPoolWorkspaceRows(pools, metricsPage), [metricsPage, pools]);
   const workspaceRowsByPair = useMemo(
@@ -3619,6 +4202,10 @@ function PoolsView({
   const analyticsState = metricsQuery.isPending || analyticsHealthQuery.isPending
     ? { status: "PARTIAL" as const, label: "Loading application analytics", detail: "Pool metrics and freshness are being resolved." }
     : workspaceAnalyticsState(metricsPage.status, analyticsHealthQuery.data?.value ?? null);
+  const analyticsStateVisible = !metricsQuery.isPending && shouldShowWorkspaceAnalyticsState(
+    metricsPage.status,
+    analyticsHealthQuery.data?.value ?? null
+  );
 
   useEffect(() => {
     const read = () => setDiscoveryState(parsePoolDiscoveryState(window.location.hash));
@@ -3631,7 +4218,7 @@ function PoolsView({
     setDiscoveryState(state);
     window.history.replaceState(null, "", discoveryHref(state));
   };
-  const ownerFilterLoading = discoveryState.hasLiquidity && account.address !== undefined && ownerEndpoint !== null &&
+  const ownerFilterLoading = discoveryState.hasLiquidity && account.address !== undefined && analyticsEndpoint !== null &&
     (ownerPortfolioQuery.isPending || ownerPortfolioQuery.isFetching);
   const closeCreation = useCallback(() => {
     setCreationOpen(false);
@@ -3669,11 +4256,13 @@ function PoolsView({
               : `Confirmed by RPC at block ${rpcOverlay.row.updatedAtBlock}; indexing is catching up. This empty pool cannot quote swaps.`}</span>
           </div>
         ) : null}
-        <div className={`workspace-analytics-state ${analyticsState.status.toLowerCase()}`} data-testid="pool-analytics-state" role="status">
-          <span>{analyticsState.label}</span>
-          {analyticsState.detail ? <small>{analyticsState.detail}</small> : null}
-          {metricsPage.error ? <small>{metricsPage.error}</small> : null}
-        </div>
+        {analyticsStateVisible ? (
+          <div className={`workspace-analytics-state ${analyticsState.status.toLowerCase()}`} data-testid="pool-analytics-state" role="status">
+            <span>{analyticsState.label}</span>
+            {analyticsState.detail ? <small>{analyticsState.detail}</small> : null}
+            {metricsPage.error ? <small>{metricsPage.error}</small> : null}
+          </div>
+        ) : null}
         <div className="pool-controls">
           <label>
             <span className="field-label">Search</span>
@@ -3736,8 +4325,9 @@ function PoolsView({
               {filteredPage.rows.map((pool) => {
                 const workspaceRow = workspaceRowsByPair.get(pool.address.toLowerCase()) ?? null;
                 const tiles = workspaceMetricTiles(workspaceRow?.metric ?? null);
+                const workspaceHref = actionHref("add", pool.id, discoveryHref(discoveryState));
                 return <div className="table-row" key={pool.id}>
-                  <a className="pair-name" href={poolDetailHref(pool.id, discoveryState)}>
+                  <a className="pair-name" href={workspaceHref}>
                     {tokenSymbol(pool.tokenX)} / {tokenSymbol(pool.tokenY)}
                     <small>DLMM · bin step {pool.binStep} · {formatCompactAddress(pool.address)}</small>
                     <small>{pool.tokenX?.name ?? "Unknown token"} · {pool.tokenXAddress} · chain {pool.tokenX?.chainId ?? "?"} · review {pool.tokenX?.risk.reviewStatus ?? "unlisted"}</small>
@@ -3747,8 +4337,8 @@ function PoolsView({
                   <WorkspaceTableMetric tile={tiles[1]} />
                   <WorkspaceTableMetric tile={tiles[2]} />
                   <WorkspaceTableMetric tile={tiles[3]} />
-                  <a className="secondary-button" href={poolDetailHref(pool.id, discoveryState)}>
-                    View
+                  <a className="secondary-button" href={workspaceHref}>
+                    Open pool
                   </a>
                   {workspaceRow?.analyticsIssue ? <small className="workspace-row-issue">{workspaceRow.analyticsIssue}</small> : null}
                 </div>;
@@ -3763,7 +4353,7 @@ function PoolsView({
                     ? "Loading wallet liquidity from application analytics."
                     : filteredPage.ownerStatus === "partial"
                   ? "Wallet liquidity results are partial; only verified loaded pools are shown."
-                  : ownerEndpoint === null
+                  : analyticsEndpoint === null
                       ? "Wallet liquidity analytics are not configured for this environment."
                       : "Wallet liquidity analytics are unavailable."
                 }
@@ -4857,435 +5447,6 @@ function poolCreationRecoveryCopy(
   }
 }
 
-function PoolDetailView({
-  environmentKey,
-  onSelectPool,
-  pool,
-  poolDetailId,
-  pools,
-  snapshotState
-}: {
-  environmentKey: EnvironmentKey;
-  onSelectPool: (poolId: string) => void;
-  pool: PoolRow | null;
-  poolDetailId: string;
-  pools: PoolRow[];
-  snapshotState: LoadState;
-}) {
-  const registry = registries[environmentKey];
-  const account = useAccount();
-  const analyticsBaseEndpoint = analyticsEndpointForRegistry(registry);
-  const analyticsEndpoint = analyticsBaseEndpoint === null ? null : `${analyticsBaseEndpoint}/graphql`;
-  const discoveryState = parsePoolDiscoveryState(window.location.hash);
-  const backHref = discoveryHref(discoveryState);
-  const detailReturnHref = pool === null ? backHref : poolDetailHref(pool.id, discoveryState);
-  const currentHourBoundary = Math.floor(Date.now() / 3_600_000) * 3_600;
-  const candleEnd = currentHourBoundary - 3_600;
-  const candleStart = currentHourBoundary - 24 * 3_600;
-  const poolMetricsQuery = useQuery({
-    queryKey: ["poolDetailMetrics", environmentKey, analyticsEndpoint, pool?.address],
-    queryFn: () => {
-      if (pool === null) throw new Error("Pool analytics target is unavailable");
-      return loadPoolMetrics(analyticsEndpoint, [pool.address]);
-    },
-    enabled: pool !== null,
-    refetchInterval: SNAPSHOT_REFRESH_INTERVAL_MS,
-    refetchOnWindowFocus: "always",
-    retry: false
-  });
-  const pairCandlesQuery = useQuery({
-    queryKey: ["poolDetailCandles", environmentKey, analyticsEndpoint, pool?.address, candleStart, candleEnd],
-    queryFn: () => {
-      if (pool === null) throw new Error("Pool candle target is unavailable");
-      return loadPairCandles(analyticsEndpoint, pool.address, "HOUR", candleStart, candleEnd);
-    },
-    enabled: pool !== null,
-    refetchInterval: SNAPSHOT_REFRESH_INTERVAL_MS,
-    refetchOnWindowFocus: "always",
-    retry: false
-  });
-  const analyticsHealthQuery = useQuery({
-    queryKey: ["poolDetailAnalyticsHealth", environmentKey, analyticsEndpoint],
-    queryFn: () => loadAnalyticsHealth(analyticsEndpoint),
-    refetchInterval: SNAPSHOT_REFRESH_INTERVAL_MS,
-    refetchOnWindowFocus: "always",
-    retry: false
-  });
-  const binsQuery = useQuery({
-    queryKey: ["poolBinWindow", environmentKey, pool?.address, pool?.activeId, registry.endpoints.indexerUrl],
-    queryFn: () => {
-      if (pool === null || pool.activeId === null) throw new Error("Pool active bin is unavailable");
-      return loadPoolBinWindow(registry, pool.address, Number(pool.activeId));
-    },
-    enabled: pool !== null && pool.activeId !== null && registry.endpoints.indexerUrl !== null,
-    refetchInterval: pool !== null && pool.activeId !== null && registry.endpoints.indexerUrl !== null ? SNAPSHOT_REFRESH_INTERVAL_MS : false,
-    refetchOnWindowFocus: "always",
-    retry: false
-  });
-  const walletPositionsQuery = useQuery({
-    queryKey: ["poolDetailPositions", environmentKey, account.address, pool?.address, registry.endpoints.indexerUrl],
-    queryFn: () => {
-      if (pool === null || !account.address) throw new Error("Wallet pool position is unavailable");
-      return loadPaginatedPositionsForOwnerPair(registry, account.address, pool.address);
-    },
-    enabled: pool !== null && account.address !== undefined && registry.endpoints.indexerUrl !== null,
-    refetchInterval:
-      pool !== null && account.address !== undefined && registry.endpoints.indexerUrl !== null
-        ? SNAPSHOT_REFRESH_INTERVAL_MS
-        : false,
-    refetchOnWindowFocus: "always",
-    retry: false
-  });
-
-  if (pool === null) {
-    const lookupResolved = !["loading", "error", "unavailable"].includes(snapshotState);
-    return (
-      <div className="view-grid">
-        <section className="table-panel">
-          <a className="back-link" href={backHref}>← All pools</a>
-          <EmptyState state={lookupResolved ? "empty" : snapshotState} />
-          {lookupResolved ? (
-            <p className="inline-error">Pool {formatCompactAddress(poolDetailId)} was not found in the current environment.</p>
-          ) : null}
-        </section>
-      </div>
-    );
-  }
-
-  const indexedBins = binsQuery.data ?? [];
-  const bins = withActiveBin(indexedBins, pool.activeId);
-  const metricPage: AnalyticsPage<PoolAnalyticsMetric> = poolMetricsQuery.data ?? {
-    rows: [],
-    status: poolMetricsQuery.isError ? "UNAVAILABLE" : "PARTIAL",
-    error: poolMetricsQuery.error instanceof Error ? poolMetricsQuery.error.message : null,
-    pageInfo: { endCursor: null, hasNextPage: false, partial: true, pagesLoaded: 0 }
-  };
-  const detailWorkspaceRow = joinPoolWorkspaceRows([pool], metricPage)[0]!;
-  const metric = detailWorkspaceRow.metric;
-  const metricTiles = workspaceMetricTiles(metric);
-  const detailAnalyticsState = poolMetricsQuery.isPending || analyticsHealthQuery.isPending
-    ? { status: "PARTIAL" as const, label: "Loading application analytics", detail: "Pool metrics and freshness are being resolved." }
-    : workspaceAnalyticsState(detailWorkspaceRow.analyticsStatus, analyticsHealthQuery.data?.value ?? null);
-  const candlePage = pairCandlesQuery.data ?? {
-    rows: [],
-    status: pairCandlesQuery.isError ? "UNAVAILABLE" as const : "PARTIAL" as const,
-    error: pairCandlesQuery.error instanceof Error ? pairCandlesQuery.error.message : null,
-    pageInfo: { endCursor: null, hasNextPage: false, partial: true, pagesLoaded: 0 }
-  };
-  const candleModel = buildCandleChartModel(candlePage);
-  const binDistribution = pool.tokenX !== null && pool.tokenY !== null
-    ? buildBinDistribution(bins, pool.activeId, pool.tokenX.decimals, pool.tokenY.decimals)
-    : null;
-  const siblingPools = samePairPools(pools, pool);
-  const walletPositions = walletPositionsQuery.data?.rows ?? [];
-  const positionsPartial = isPartialPagination(walletPositionsQuery.data?.pageInfo);
-  const binsState: LoadState = registry.endpoints.indexerUrl === null
-    ? "unavailable"
-    : pool.activeId === null
-      ? "unavailable"
-    : binsQuery.isError
-      ? "error"
-      : binsQuery.isLoading
-        ? "loading"
-        : binsQuery.data
-          ? "ready"
-          : "empty";
-  const positionsState: LoadState = !account.address
-    ? "loading"
-    : registry.endpoints.indexerUrl === null
-      ? "unavailable"
-      : walletPositionsQuery.isError
-        ? "error"
-        : positionsPartial
-          ? "partial"
-          : walletPositionsQuery.isLoading
-            ? "loading"
-            : walletPositions.length > 0
-              ? "ready"
-              : "empty";
-  const positionsLabel = !account.address
-    ? "connect wallet"
-    : positionsState === "partial"
-      ? `${walletPositions.length} loaded · partial`
-      : positionsState === "ready" || positionsState === "empty"
-        ? `${walletPositions.length} bins`
-        : positionsState;
-  const selectPool = () => onSelectPool(pool.id);
-
-  return (
-    <div className="view-grid pool-detail">
-      <section className="table-panel pool-detail-header">
-        <a className="back-link" href={backHref}>← All pools</a>
-        <div className="pool-title-row">
-          <div>
-            <h2>{tokenSymbol(pool.tokenX)} / {tokenSymbol(pool.tokenY)}</h2>
-            <p>{formatCompactAddress(pool.address)} · DLMM · bin step {pool.binStep}</p>
-          </div>
-          <div className="pool-actions">
-            <a className="secondary-button" href={actionHref("swap", pool.id, detailReturnHref)} onClick={selectPool}>Swap</a>
-            <a className="secondary-button" href={actionHref("withdraw", pool.id, detailReturnHref)} onClick={selectPool}>Withdraw</a>
-            <a className="primary-button" href={actionHref("add", pool.id, detailReturnHref)} onClick={selectPool}>Deposit</a>
-          </div>
-        </div>
-      </section>
-
-      <section className={`workspace-analytics-state detail ${detailAnalyticsState.status.toLowerCase()}`} data-testid="pool-detail-analytics-state" role="status">
-        <span>{detailAnalyticsState.label}</span>
-        {detailAnalyticsState.detail ? <small>{detailAnalyticsState.detail}</small> : null}
-        {metricPage.error ? <small>{metricPage.error}</small> : null}
-        {detailWorkspaceRow.analyticsIssue ? <small>{detailWorkspaceRow.analyticsIssue}</small> : null}
-      </section>
-
-      <section className="pool-detail-metrics workspace-metrics" aria-label="Pool analytics metrics">
-        {metricTiles.map((tile) => <WorkspaceMetricTileView key={tile.key} tile={tile} />)}
-      </section>
-
-      <section className="pool-detail-metrics indexed-lifetime-metrics" aria-label="Indexed lifetime pool counters">
-        <MetricTile label="Indexed token reserves" value={`${formatTokenAmount(pool.reserveX, pool.tokenX)} / ${formatTokenAmount(pool.reserveY, pool.tokenY)}`} tone="neutral" />
-        <MetricTile label="Indexed lifetime volume" value={`${formatTokenAmount(pool.volumeX, pool.tokenX)} / ${formatTokenAmount(pool.volumeY, pool.tokenY)}`} tone="neutral" />
-        <MetricTile label="Indexed lifetime fees" value={`${formatTokenAmount(pool.feesX, pool.tokenX)} / ${formatTokenAmount(pool.feesY, pool.tokenY)}`} tone="good" />
-        <MetricTile label="Indexed swaps / active bin" value={`${pool.swapCount} / ${pool.activeId ?? "n/a"}`} tone="neutral" />
-      </section>
-
-      <section className="info-panel pool-market-chart" data-testid="pool-market-chart">
-        <div className="panel-heading">
-          <span>24h hourly OHLCV</span>
-          <span className="analytics-status-label" data-analytics-status={candleModel.status}>{candleModel.status.toLowerCase()}</span>
-        </div>
-        <PoolCandleChart model={candleModel} />
-        {candlePage.error ? <p className="inline-error">{candlePage.error}</p> : null}
-      </section>
-
-      <section className="info-panel">
-        <div className="panel-heading">
-          <span>Live liquidity bins</span>
-          <StatusBadge state={binsState} label={binsQuery.data ? `${indexedBins.length} indexed bins` : binsState} />
-        </div>
-        <PoolBinDistributionChart
-          points={binDistribution}
-          state={binsState}
-          tokenX={pool.tokenX === null ? null : tokenSymbol(pool.tokenX)}
-          tokenY={pool.tokenY === null ? null : tokenSymbol(pool.tokenY)}
-        />
-        {binsQuery.error ? <p className="inline-error">{getWriteError(binsQuery.error) ?? "Pool bins unavailable"}</p> : null}
-      </section>
-
-      {siblingPools.length > 0 ? (
-        <section className="table-panel same-pair-pools" data-testid="same-pair-pools">
-          <div className="panel-heading"><span>Same pair · other bin steps</span><span>{siblingPools.length}</span></div>
-          <div className="same-pair-list">
-            {siblingPools.map((candidate) => (
-              <a href={poolDetailHref(candidate.id, discoveryState)} key={candidate.id}>
-                <span>Bin step {candidate.binStep}</span>
-                <small>{formatCompactAddress(candidate.address)}</small>
-              </a>
-            ))}
-          </div>
-        </section>
-      ) : null}
-
-      <section className="table-panel">
-        <div className="panel-heading">
-          <span>Your bins</span>
-          <StatusBadge
-            state={positionsState}
-            label={positionsLabel}
-          />
-        </div>
-        {walletPositions.length > 0 ? (
-          <>
-            <div className="wallet-bin-list">
-              {walletPositions.map((position) => (
-                <div key={position.id}>
-                  <span>Bin {position.binId}</span>
-                  <strong>{formatTokenAmount(position.liquidity, null)} LB</strong>
-                </div>
-              ))}
-            </div>
-            {positionsPartial ? <p className="state-row warning">The owner/pair position query is partial; destructive actions remain blocked.</p> : null}
-          </>
-        ) : account.address && ["loading", "error", "unavailable"].includes(positionsState) ? (
-          <>
-            <EmptyState state={positionsState} />
-            {walletPositionsQuery.error ? <p className="inline-error">{getWriteError(walletPositionsQuery.error) ?? "Wallet pool positions are unavailable."}</p> : null}
-          </>
-        ) : (
-          <p className="inline-empty">
-            {account.address
-              ? positionsState === "unavailable"
-                ? "Indexer access is required to load wallet pool balances."
-                : walletPositionsQuery.isError
-                ? getWriteError(walletPositionsQuery.error) ?? "Wallet pool positions are unavailable."
-                : positionsPartial
-                  ? "The owner/pair position query is partial; destructive actions remain blocked."
-                : "No indexed balances in this pool."
-              : "Connect a wallet to view your pool balances."}
-          </p>
-        )}
-      </section>
-    </div>
-  );
-}
-
-function WorkspaceMetricTileView({ tile }: { tile: ReturnType<typeof workspaceMetricTiles>[number] }) {
-  return (
-    <div className="metric-tile workspace-metric-tile" data-analytics-status={tile.status}>
-      <span>{tile.label}</span>
-      <strong>{tile.value}</strong>
-      <small>{tile.status.toLowerCase()}</small>
-    </div>
-  );
-}
-
-function PoolCandleChart({ model }: { model: CandleChartModel }) {
-  if (model.points.length === 0) return <EmptyState state={analyticsStatusToLoadState(model.status)} />;
-  const segments: string[][] = [];
-  let segment: string[] = [];
-  let previousEnd: number | null = null;
-  const firstStart = model.points[0]!.startTimestamp;
-  const lastStart = model.points.at(-1)!.startTimestamp;
-  model.points.forEach((point) => {
-    if (previousEnd !== null && previousEnd !== point.startTimestamp && segment.length > 0) {
-      segments.push(segment);
-      segment = [];
-    }
-    previousEnd = point.endTimestamp;
-    if (point.normalizedClose === null) {
-      if (segment.length > 0) segments.push(segment);
-      segment = [];
-      return;
-    }
-    const x = lastStart === firstStart ? 50 : (point.startTimestamp - firstStart) * 100 / (lastStart - firstStart);
-    const y = 94 - point.normalizedClose * 0.84;
-    segment.push(`${x.toFixed(2)},${y.toFixed(2)}`);
-  });
-  if (segment.length > 0) segments.push(segment);
-  const maximumSwaps = Math.max(1, ...model.points.map((point) => point.swapCount));
-  const intervalSeconds = model.points[0]!.endTimestamp - model.points[0]!.startTimestamp;
-  const pointsByStart = new Map(model.points.map((point) => [point.startTimestamp, point]));
-  const activitySlots = intervalSeconds > 0
-    ? Array.from({ length: Math.floor((lastStart - firstStart) / intervalSeconds) + 1 }, (_, index) => pointsByStart.get(firstStart + index * intervalSeconds) ?? null)
-    : model.points;
-
-  return (
-    <div className="candle-workspace" data-testid="pool-candle-workspace">
-      <div className="candle-chart" role="img" aria-label={`Hourly close price with swap-count activity; ${model.points.length} candles${model.hasGaps ? "; partial history with gaps" : ""}`}>
-        <svg aria-hidden="true" preserveAspectRatio="none" viewBox="0 0 100 100">
-          {segments.map((points, index) => <polyline fill="none" key={index} points={points.join(" ")} vectorEffect="non-scaling-stroke" />)}
-        </svg>
-        <div className="candle-volume" aria-hidden="true">
-          {activitySlots.map((point, index) => point === null
-            ? <i className="gap" key={`gap-${index}`} />
-            : <i key={point.startTimestamp} style={{ height: `${Math.max(4, point.swapCount * 100 / maximumSwaps)}%` }} />)}
-        </div>
-        <span className="candle-legend">Close price · swap-count activity</span>
-      </div>
-      <div className="semantic-table-scroll">
-        <table className="analytics-table" data-testid="pool-candle-table">
-          <caption>Hourly OHLCV and LP-net fee data</caption>
-          <thead><tr><th>Hour</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Volume</th><th>LP fees</th><th>TVL</th><th>Swaps</th><th>Status</th></tr></thead>
-          <tbody>
-            {model.points.map((point) => (
-              <tr key={point.startTimestamp}>
-                <th scope="row"><time dateTime={new Date(point.startTimestamp * 1_000).toISOString()}>{formatCandleHour(point.startTimestamp)}</time></th>
-                <td>{point.open}</td><td>{point.high}</td><td>{point.low}</td><td>{point.close}</td>
-                <td>{point.volume}</td><td>{point.lpFees}</td><td>{point.tvl}</td><td>{point.swapCount}</td><td>{point.status.toLowerCase()}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
-function PoolBinDistributionChart({
-  points,
-  state,
-  tokenX,
-  tokenY
-}: {
-  points: ReturnType<typeof buildBinDistribution> | null;
-  state: LoadState;
-  tokenX: string | null;
-  tokenY: string | null;
-}) {
-  if (points === null || tokenX === null || tokenY === null) {
-    return <p className="state-row warning">Token decimals are unavailable; reserve amounts and distribution heights are not inferred.</p>;
-  }
-  if (points.length === 0 || state !== "ready") return <EmptyState state={state} />;
-  return (
-    <div className="bin-distribution-workspace">
-      <div className="pool-bin-chart distribution" aria-label={`Indexed ${tokenX}, ${tokenY}, and LB supply by bin`}>
-        {points.map((point) => (
-          <span
-            aria-label={`Bin ${point.binId}; ${tokenX} ${point.tokenX}; ${tokenY} ${point.tokenY}; LB supply ${point.lbSupply}${point.active ? "; active bin" : ""}`}
-            className={point.active ? "pool-bin-stack active" : "pool-bin-stack"}
-            key={point.id}
-            role="img"
-            tabIndex={0}
-          >
-            <i className="token-x" style={{ height: `${Math.max(2, point.tokenXHeight)}%` }} />
-            <i className="token-y" style={{ height: `${Math.max(2, point.tokenYHeight)}%` }} />
-            <i className="lb-supply" style={{ height: `${Math.max(2, point.lbSupplyHeight)}%` }} />
-          </span>
-        ))}
-      </div>
-      <div className="semantic-table-scroll">
-        <table className="analytics-table compact" data-testid="pool-bin-distribution-table">
-          <caption>Indexed bin reserve and LB supply data</caption>
-          <thead><tr><th>Bin</th><th>{tokenX}</th><th>{tokenY}</th><th>LB supply</th><th>Range</th></tr></thead>
-          <tbody>{points.map((point) => <tr key={point.id}><th scope="row">{point.binId}</th><td>{point.tokenX}</td><td>{point.tokenY}</td><td>{point.lbSupply}</td><td>{point.active ? "Active" : "Indexed"}</td></tr>)}</tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
-function analyticsStatusToLoadState(status: AnalyticsStatus): LoadState {
-  return status === "UNAVAILABLE" ? "unavailable" : status === "PARTIAL" ? "partial" : "ready";
-}
-
-function formatCandleHour(timestamp: number): string {
-  return new Intl.DateTimeFormat("en", { day: "2-digit", hour: "2-digit", hour12: false, month: "short", timeZone: "UTC" }).format(new Date(timestamp * 1_000));
-}
-
-function PoolBinChart({ activeId, bins, state }: { activeId: string | null; bins: BinRow[]; state: LoadState }) {
-  const maxLiquidity = bins.reduce((maximum, bin) => {
-    const supply = BigInt(bin.totalSupply);
-    return supply > maximum ? supply : maximum;
-  }, 0n);
-
-  if (bins.length === 0 || state !== "ready") return <EmptyState state={state} />;
-
-  return (
-    <div className="pool-bin-chart" aria-label="Indexed pool liquidity by bin">
-      {bins.map((bin) => {
-        const liquidity = BigInt(bin.totalSupply);
-        const height = maxLiquidity === 0n ? 8 : 8 + Number((liquidity * 92n) / maxLiquidity);
-        return (
-          <span
-            aria-label={`Bin ${bin.binId}; LB supply ${bin.totalSupply}; token X reserve ${bin.reserveX}; token Y reserve ${bin.reserveY}${bin.binId === activeId ? "; active bin" : ""}`}
-            className={bin.binId === activeId ? "pool-bin active" : "pool-bin"}
-            key={bin.id}
-            role="img"
-            style={{ height: `${height}%` }}
-            tabIndex={0}
-            title={`Bin ${bin.binId} · X ${bin.reserveX} · Y ${bin.reserveY}`}
-          />
-        );
-      })}
-    </div>
-  );
-}
-
-function withActiveBin(bins: BinRow[], activeId: string | null): BinRow[] {
-  if (activeId === null || bins.some((bin) => bin.binId === activeId)) return bins;
-
-  return [...bins, { id: `active-${activeId}`, binId: activeId, reserveX: "0", reserveY: "0", totalSupply: "0", updatedAtBlock: "0" }]
-    .sort((left, right) => Number(left.binId) - Number(right.binId));
-}
-
 function LiquidityView({
   environmentKey,
   initialSection,
@@ -5309,25 +5470,25 @@ function LiquidityView({
   snapshotQueryErrored: boolean;
   onRefresh: SnapshotRefetch;
 }) {
-  const [amountXInput, setAmountXInput] = useState("0.01");
-  const [amountYInput, setAmountYInput] = useState("1");
-  const [lowerDeltaInput, setLowerDeltaInput] = useState("-1");
-  const [upperDeltaInput, setUpperDeltaInput] = useState("1");
-  const [lowerBinInput, setLowerBinInput] = useState("");
-  const [upperBinInput, setUpperBinInput] = useState("");
-  const [lowerBinId, setLowerBinId] = useState<number | null>(null);
-  const [upperBinId, setUpperBinId] = useState<number | null>(null);
-  const [lowerPriceInput, setLowerPriceInput] = useState("");
-  const [upperPriceInput, setUpperPriceInput] = useState("");
+  const [amountXInput, setAmountXInput] = usePoolDraftState("liquidity.amountX", "0.01");
+  const [amountYInput, setAmountYInput] = usePoolDraftState("liquidity.amountY", "1");
+  const [lowerDeltaInput, setLowerDeltaInput] = usePoolDraftState("liquidity.lowerDelta", "-1");
+  const [upperDeltaInput, setUpperDeltaInput] = usePoolDraftState("liquidity.upperDelta", "1");
+  const [lowerBinInput, setLowerBinInput] = usePoolDraftState("liquidity.lowerBin", "");
+  const [upperBinInput, setUpperBinInput] = usePoolDraftState("liquidity.upperBin", "");
+  const [lowerBinId, setLowerBinId] = usePoolDraftState<number | null>("liquidity.lowerBinId", null);
+  const [upperBinId, setUpperBinId] = usePoolDraftState<number | null>("liquidity.upperBinId", null);
+  const [lowerPriceInput, setLowerPriceInput] = usePoolDraftState("liquidity.lowerPrice", "");
+  const [upperPriceInput, setUpperPriceInput] = usePoolDraftState("liquidity.upperPrice", "");
   const [rangeEditError, setRangeEditError] = useState<string | null>(null);
-  const [narrowPresetInput, setNarrowPresetInput] = useState("3");
-  const [widePresetInput, setWidePresetInput] = useState("21");
-  const [liquidityStrategy, setLiquidityStrategy] = useState<LiquidityStrategy>("spot");
-  const [liquidityAssetMode, setLiquidityAssetMode] = useState<"erc20" | "native">("erc20");
-  const [removeAssetMode, setRemoveAssetMode] = useState<"erc20" | "native">("erc20");
-  const [slippageInput, setSlippageInput] = useState("0.5");
-  const [idSlippageInput, setIdSlippageInput] = useState("2");
-  const [deadlineInput, setDeadlineInput] = useState("20");
+  const [narrowPresetInput, setNarrowPresetInput] = usePoolDraftState("liquidity.narrowPreset", "3");
+  const [widePresetInput, setWidePresetInput] = usePoolDraftState("liquidity.widePreset", "21");
+  const [liquidityStrategy, setLiquidityStrategy] = usePoolDraftState<LiquidityStrategy>("liquidity.strategy", "spot");
+  const [liquidityAssetMode, setLiquidityAssetMode] = usePoolDraftState<"erc20" | "native">("liquidity.assetMode", "erc20");
+  const [removeAssetMode, setRemoveAssetMode] = usePoolDraftState<"erc20" | "native">("liquidity.removeAssetMode", "erc20");
+  const [slippageInput, setSlippageInput] = usePoolDraftState("liquidity.slippage", "0.5");
+  const [idSlippageInput, setIdSlippageInput] = usePoolDraftState("liquidity.idSlippage", "2");
+  const [deadlineInput, setDeadlineInput] = usePoolDraftState("liquidity.deadline", "20");
   const [liquiditySimulationError, setLiquiditySimulationError] = useState<string | null>(null);
   const [liquiditySimulationPending, setLiquiditySimulationPending] = useState(false);
   const [gasReviewError, setGasReviewError] = useState<string | null>(null);
@@ -5342,8 +5503,8 @@ function LiquidityView({
   const [fullExitBatchReview, setFullExitBatchReview] = useState<FullExitBatchReviewState | null>(null);
   const latestFullExitBatchReviewRef = useRef<FullExitBatchReviewState | null>(fullExitBatchReview);
   latestFullExitBatchReviewRef.current = fullExitBatchReview;
-  const [selectedPositionIds, setSelectedPositionIds] = useState<string[]>([]);
-  const [removePercentInput, setRemovePercentInput] = useState("100");
+  const [selectedPositionIds, setSelectedPositionIds] = usePoolDraftState<string[]>("liquidity.selectedPositionIds", []);
+  const [removePercentInput, setRemovePercentInput] = usePoolDraftState("liquidity.removePercent", "100");
   const [explicitFullExitRequested, setExplicitFullExitRequested] = useState(false);
   const [liquidityReceiptPhase, setLiquidityReceiptPhase] = useState<"idle" | "lb-approval" | "remove">("idle");
   const [submittedRemoveReceiptContext, setSubmittedRemoveReceiptContext] = useState<string | null>(null);
@@ -5365,6 +5526,17 @@ function LiquidityView({
   const nativeAddMaxBindingRef = useRef<{ balance: bigint; context: string; gasPrice: bigint; reserve: bigint; side: "x" | "y"; value: bigint } | null>(null);
   const latestAddGasObservationRef = useRef<{ balance: bigint; context: string; gasPrice: bigint; reserve: bigint } | null>(null);
   const [nativeAddMaxPending, setNativeAddMaxPending] = useState(false);
+  const [pairedFillSourceSide, setPairedFillSourceSide] = useState<PairedFillSide>("x");
+  const [pairedFillApplication, setPairedFillApplication] = useState<{
+    amountX: string;
+    amountY: string;
+    contextFingerprint: string;
+    pairedAmount: string;
+    pairedSide: PairedFillSide;
+    sourceAmount: string;
+    sourceSide: PairedFillSide;
+  } | null>(null);
+  const pairedFillContextRef = useRef<string | null>(null);
   const latestLiquidityAddReviewRef = useRef<LiquidityAddReviewState | null>(null);
   const removeSubmitInFlightRef = useRef<number | null>(null);
   const [handledApproveXHash, setHandledApproveXHash] = useState<Address | null>(null);
@@ -5373,6 +5545,9 @@ function LiquidityView({
   const [handledAddHash, setHandledAddHash] = useState<Address | null>(null);
   const [handledRemoveHash, setHandledRemoveHash] = useState<Address | null>(null);
   const registry = registries[environmentKey];
+  const poolWorkspace = useOptionalPoolWorkspace();
+  const workspaceMatchesPool = poolWorkspace !== null && primaryPool !== null && isAddressEqual(poolWorkspace.pool.address, primaryPool.address);
+  const mobileWorkspaceNavigation = useMediaQuery("(max-width: 720px)") && workspaceMatchesPool;
   const portfolioEndpoint = analyticsEndpointForRegistry(registry);
   const localnetRegistry = isLocalnetRegistry(registry) ? registry : null;
   const account = useAccount();
@@ -5397,12 +5572,12 @@ function LiquidityView({
   latestObservedApprovedLbGrantsRef.current = observedApprovedLbGrants;
 
   useEffect(() => {
-    if (initialSection === null) return;
+    if (initialSection === null || workspaceMatchesPool) return;
     const frame = window.requestAnimationFrame(() => {
       document.getElementById(initialSection === "withdraw" ? "liquidity-withdraw" : "liquidity-add")?.scrollIntoView({ block: "start" });
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [initialSection, selectedPoolId]);
+  }, [initialSection, selectedPoolId, workspaceMatchesPool]);
   const selectedPool = buildPoolDescriptor({
     action: "add-liquidity",
     localnetRegistry,
@@ -5580,20 +5755,32 @@ function LiquidityView({
     setLowerPriceInput(formatExactPriceFraction(normalizeQ128Price(rangePriceQuery.data.lowerPriceQ128, rangePriceOptions)));
     setUpperPriceInput(formatExactPriceFraction(normalizeQ128Price(rangePriceQuery.data.upperPriceQ128, rangePriceOptions)));
   }, [rangePriceOptions?.baseDecimals, rangePriceOptions?.quoteDecimals, rangePriceQuery.data]);
-  const lowerInversePrice =
-    rangePriceQuery.data !== undefined && rangePriceOptions !== null
-      ? formatExactPriceFraction(normalizeQ128Price(rangePriceQuery.data.upperPriceQ128, { ...rangePriceOptions, inverse: true }))
-      : "n/a";
-  const upperInversePrice =
-    rangePriceQuery.data !== undefined && rangePriceOptions !== null
-      ? formatExactPriceFraction(normalizeQ128Price(rangePriceQuery.data.lowerPriceQ128, { ...rangePriceOptions, inverse: true }))
-      : "n/a";
   const slippageBps = parseSlippageToBps(slippageInput);
   const idSlippage = parseIdSlippage(idSlippageInput);
   const idSlippageError = idSlippageInputError(idSlippageInput);
   const deadlineMinutes = parseDeadlineMinutes(deadlineInput);
   const removePercentBps = parsePercentToBps(removePercentInput);
   const distributionResult = buildLiquidityDistributionForView(activeBin, lowerDelta, upperDelta, liquidityStrategy);
+  const rangeBackdrop = useMemo<{ error: string | null; points: BinDistributionPoint[] | null; state: LoadState }>(() => {
+    if (!workspaceMatchesPool || poolWorkspace === null) {
+      return { error: "Open a pool workspace to compare this position with indexed reserves.", points: null, state: "unavailable" };
+    }
+    if (poolWorkspace.binsState !== "ready") {
+      return { error: poolWorkspace.binsError, points: null, state: poolWorkspace.binsState };
+    }
+    if (activeBin === null || tokenX === null || tokenY === null) {
+      return { error: "Pool bin identity or token decimals are unavailable.", points: null, state: "unavailable" };
+    }
+    try {
+      return {
+        error: null,
+        points: buildCenteredBinDistribution(poolWorkspace.bins, String(activeBin), tokenX.decimals, tokenY.decimals, 40),
+        state: "ready"
+      };
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : "Indexed liquidity is unavailable.", points: null, state: "error" };
+    }
+  }, [activeBin, poolWorkspace, tokenX, tokenY, workspaceMatchesPool]);
   const liquidityMode = distributionResult.distribution?.mode ?? null;
   const amountX = liquidityMode === "token-y" ? 0n : parsedAmountX;
   const amountY = liquidityMode === "token-x" ? 0n : parsedAmountY;
@@ -6166,6 +6353,87 @@ function LiquidityView({
   const nativeBalance = walletData ? BigInt(walletData.nativeBalance) : null;
   const nativeModeX = liquidityAssetMode === "native" && liquidityWrappedNativeSide === "x";
   const nativeModeY = liquidityAssetMode === "native" && liquidityWrappedNativeSide === "y";
+  const pairedFillNativeBlockedSide =
+    nativeModeX && liquidityMode !== "token-y"
+      ? "x"
+      : nativeModeY && liquidityMode !== "token-x"
+        ? "y"
+        : null;
+  const pairedFillSourceAmount = pairedFillSourceSide === "x" ? parsedAmountX : parsedAmountY;
+  const pairedFillSourceInput = pairedFillSourceSide === "x" ? amountXInput : amountYInput;
+  const pairedFillSuggestion = useMemo(
+    () => suggestPairedLiquidityAmounts({
+      balanceX: nativeModeX ? null : walletBalanceX,
+      balanceY: nativeModeY ? null : walletBalanceY,
+      binStep: pool?.binStep ?? -1,
+      distribution: distributionResult.distribution,
+      sourceAmount: pairedFillSourceAmount,
+      sourceSide: pairedFillSourceSide
+    }),
+    [
+      activeBin,
+      liquidityStrategy,
+      lowerDelta,
+      nativeModeX,
+      nativeModeY,
+      pairedFillSourceAmount,
+      pairedFillSourceSide,
+      pool?.binStep,
+      upperDelta,
+      walletBalanceX,
+      walletBalanceY
+    ]
+  );
+  const pairedFillContextFingerprint = [
+    environmentKey,
+    registry.chainId.toString(),
+    account.address ?? "",
+    activeWalletChainId?.toString() ?? "",
+    pool?.pair ?? "",
+    pool?.binStep.toString() ?? "",
+    tokenX?.address ?? "",
+    tokenX?.decimals.toString() ?? "",
+    tokenY?.address ?? "",
+    tokenY?.decimals.toString() ?? "",
+    liquidityWrappedNative?.address ?? "",
+    liquidityWrappedNativeSide ?? "",
+    activeBin?.toString() ?? "",
+    liquidityStrategy,
+    liquidityAssetMode,
+    liquidityMode ?? "",
+    pairedFillSourceSide,
+    pairedFillSourceInput,
+    pairedFillSourceAmount?.toString() ?? "invalid",
+    distributionResult.distribution?.deltaIds.join(",") ?? "",
+    distributionResult.distribution?.distributionX.join(",") ?? "",
+    distributionResult.distribution?.distributionY.join(",") ?? "",
+    walletData?.balanceX ?? "",
+    walletData?.balanceY ?? "",
+    walletData?.nativeBalance ?? "",
+    pairedFillSuggestion.pairedSide,
+    pairedFillSuggestion.pairedAmount.toString(),
+    pairedFillSuggestion.requiredPairedAmount?.toString() ?? "",
+    pairedFillSuggestion.clamped ? "clamped" : "exact"
+  ].join("|");
+  const pairedFillCurrentSourceAmount = pairedFillSourceSide === "x" ? amountX : amountY;
+  const pairedFillCurrentPairedAmount = pairedFillSourceSide === "x" ? amountY : amountX;
+  const pairedFillApplied =
+    pairedFillApplication?.contextFingerprint === pairedFillContextFingerprint &&
+    pairedFillApplication.sourceSide === pairedFillSourceSide &&
+    pairedFillApplication.pairedSide === pairedFillSuggestion.pairedSide &&
+    pairedFillCurrentSourceAmount?.toString() === pairedFillApplication.sourceAmount &&
+    pairedFillCurrentPairedAmount?.toString() === pairedFillApplication.pairedAmount &&
+    amountX?.toString() === pairedFillApplication.amountX &&
+    amountY?.toString() === pairedFillApplication.amountY;
+  useEffect(() => {
+    if (pairedFillContextRef.current === null) {
+      pairedFillContextRef.current = pairedFillContextFingerprint;
+      return;
+    }
+    if (pairedFillContextRef.current === pairedFillContextFingerprint) return;
+    pairedFillContextRef.current = pairedFillContextFingerprint;
+    setPairedFillApplication(null);
+  }, [pairedFillContextFingerprint]);
   const nativeX = nativeAdd && liquidityWrappedNativeSide === "x";
   const nativeY = nativeAdd && liquidityWrappedNativeSide === "y";
   const spendableBalanceX = nativeX ? nativeBalance : walletBalanceX;
@@ -6215,7 +6483,7 @@ function LiquidityView({
     queryKey: ["liquidityPortfolioIntent", registry.chainId, portfolioEndpoint, account.address, pool?.pair],
     queryFn: async () => {
       if (!account.address || !portfolioEndpoint) throw new Error("Portfolio exit intent is unavailable");
-      return loadWalletPortfolio(`${portfolioEndpoint}/graphql`, account.address);
+      return loadWalletPortfolio(portfolioEndpoint, account.address);
     },
     enabled: portfolioExitRequested && connected && !onWrongChain && pool !== null && portfolioEndpoint !== null,
     refetchInterval: portfolioExitRequested && connected && !onWrongChain && pool !== null && portfolioEndpoint !== null ? 10_000 : false,
@@ -6748,6 +7016,7 @@ function LiquidityView({
     }
     setSelectedPositionIds((currentIds) => {
       if (walletPositions.length === 0) {
+        if (walletPositionsQuery.isLoading || walletPositionsQuery.isFetching) return currentIds;
         return currentIds.length === 0 ? currentIds : [];
       }
 
@@ -6765,7 +7034,7 @@ function LiquidityView({
 
       return sameStringArray(currentIds, nextIds) ? currentIds : nextIds;
     });
-  }, [pool?.pair, portfolioAction, walletPositions]);
+  }, [pool?.pair, portfolioAction, walletPositions, walletPositionsQuery.isFetching, walletPositionsQuery.isLoading]);
 
   useEffect(() => {
     setLiquiditySimulationError(null);
@@ -8372,9 +8641,110 @@ function LiquidityView({
     intentionalEmptySelectionRef.current = true;
     setSelectedPositionIds([]);
   };
+  const walletBalanceReadPending = walletQuery.isLoading || walletQuery.isFetching;
+  const pairedFillWalletReady = walletData !== null && !walletBalanceReadPending && !walletQuery.isError;
+  const amountCardBalance = (side: PairedFillSide) => {
+    if (!connected) return "connect wallet";
+    if (walletQuery.isError) return "unavailable";
+    if (walletBalanceReadPending) return "loading";
+    if (walletData === null) return "unavailable";
+    if (side === "x") {
+      return nativeModeX
+        ? `${formatTokenAmount(walletData.nativeBalance, null)} ETH`
+        : `${formatTokenAmount(walletData.balanceX, tokenX)} ${tokenSymbol(tokenX)}`;
+    }
+    return nativeModeY
+      ? `${formatTokenAmount(walletData.nativeBalance, null)} ETH`
+      : `${formatTokenAmount(walletData.balanceY, tokenY)} ${tokenSymbol(tokenY)}`;
+  };
+  const amountCardBalanceX = amountCardBalance("x");
+  const amountCardBalanceY = amountCardBalance("y");
+  const pairedFillPairedToken = pairedFillSuggestion.pairedSide === "x" ? tokenX : tokenY;
+  const pairedFillSourceToken = pairedFillSourceSide === "x" ? tokenX : tokenY;
+  const pairedFillPairedSymbol = pairedFillSuggestion.pairedSide === "x" ? (nativeModeX ? "ETH" : tokenSymbol(tokenX)) : (nativeModeY ? "ETH" : tokenSymbol(tokenY));
+  const pairedFillSourceSymbol = pairedFillSourceSide === "x" ? (nativeModeX ? "ETH" : tokenSymbol(tokenX)) : (nativeModeY ? "ETH" : tokenSymbol(tokenY));
+  const pairedFillInput = pairedFillPairedToken === null ? "0" : formatUnits(pairedFillSuggestion.pairedAmount, pairedFillPairedToken.decimals);
+  const pairedFillFormattedSource = pairedFillSuggestion.sourceAmount === null ? "invalid" : formatTokenAmount(pairedFillSuggestion.sourceAmount, pairedFillSourceToken);
+  const pairedFillFormattedPaired = formatTokenAmount(pairedFillSuggestion.pairedAmount, pairedFillPairedToken);
+  const pairedFillState = pairedFillNativeBlockedSide !== null
+    ? "native-review-required"
+    : liquidityMode === "token-x" || liquidityMode === "token-y"
+      ? "one-sided"
+      : pairedFillApplied
+        ? "applied"
+        : pairedFillSuggestion.status === "unavailable"
+      ? "unavailable"
+      : "ready";
+  const pairedFillMessage = pairedFillNativeBlockedSide !== null
+    ? `Paired fill will not spend the full ETH balance. Use Native Max for a gas-reserved ${pairedFillNativeBlockedSide.toUpperCase()} amount, or switch to ERC-20 mode.`
+    : !connected
+      ? "Connect a wallet to calculate a suggestion from current balances."
+      : walletQuery.isError
+        ? "Wallet balances are unavailable. Retry the wallet read before applying a paired amount."
+      : walletBalanceReadPending
+        ? "Reading current wallet balances."
+        : liquidityMode === "token-x"
+          ? `${tokenSymbol(tokenY)} stays at exact zero for this one-sided ${tokenSymbol(tokenX)} range. No paired amount or swap is needed.`
+          : liquidityMode === "token-y"
+            ? `${tokenSymbol(tokenX)} stays at exact zero for this one-sided ${tokenSymbol(tokenY)} range. No paired amount or swap is needed.`
+        : pairedFillSuggestion.status === "unavailable"
+          ? pairedFillSuggestion.reason === "invalid-source-amount"
+            ? `Enter a positive ${pairedFillSourceSymbol} source amount first.`
+            : pairedFillSuggestion.reason === "source-balance-exceeded"
+              ? `The ${pairedFillSourceSymbol} source amount exceeds its current wallet balance.`
+              : pairedFillSuggestion.reason === "empty-paired-balance"
+                ? `The ${pairedFillPairedSymbol} wallet balance is empty, so it cannot be paired.`
+                : pairedFillSuggestion.reason === "missing-source-balance" || pairedFillSuggestion.reason === "missing-paired-balance"
+                  ? "Current wallet balances are unavailable."
+            : pairedFillSuggestion.reason === "rounding-underflow"
+              ? "Current balances are too small for a nonzero paired amount at this range."
+              : "A paired amount is unavailable until the current range, distribution, and balances are valid."
+            : pairedFillApplied
+              ? `Kept ${pairedFillFormattedSource} ${pairedFillSourceSymbol} and filled ${pairedFillFormattedPaired} ${pairedFillPairedSymbol} for this exact context. No swap or Zap was performed.`
+              : `Keep ${pairedFillFormattedSource} ${pairedFillSourceSymbol}; fill ${pairedFillFormattedPaired} ${pairedFillPairedSymbol}${pairedFillSuggestion.clamped ? " (clamped to its wallet balance)" : ""}. Nothing changes until you apply it.`;
+  const pairedFillCanApply =
+    connected &&
+    !onWrongChain &&
+    tokenX !== null &&
+    tokenY !== null &&
+    liquidityMode === "balanced" &&
+    pairedFillWalletReady &&
+    pairedFillNativeBlockedSide === null &&
+    pairedFillSuggestion.status === "ready" &&
+    !pairedFillApplied;
+  const pairedFillButtonLabel = liquidityMode === "token-x" || liquidityMode === "token-y"
+    ? "No pair needed"
+    : pairedFillApplied
+      ? `${pairedFillPairedSymbol} filled`
+      : pairedFillSuggestion.status !== "ready"
+        ? "Pair unavailable"
+        : `Fill ${pairedFillPairedSymbol}${pairedFillSuggestion.clamped ? " to balance" : ""}`;
+  const applyPairedFill = () => {
+    if (!pairedFillCanApply || tokenX === null || tokenY === null) return;
+    nativeAddMaxBindingRef.current = null;
+    pairedFillContextRef.current = pairedFillContextFingerprint;
+    if (pairedFillSuggestion.pairedSide === "x") setAmountXInput(pairedFillInput);
+    else setAmountYInput(pairedFillInput);
+    setPairedFillApplication({
+      amountX: pairedFillSuggestion.amountX.toString(),
+      amountY: pairedFillSuggestion.amountY.toString(),
+      contextFingerprint: pairedFillContextFingerprint,
+      pairedAmount: pairedFillSuggestion.pairedAmount.toString(),
+      pairedSide: pairedFillSuggestion.pairedSide,
+      sourceAmount: pairedFillSuggestion.sourceAmount!.toString(),
+      sourceSide: pairedFillSourceSide
+    });
+  };
+  const updateLiquidityAmountInput = (side: PairedFillSide, value: string) => {
+    nativeAddMaxBindingRef.current = null;
+    setPairedFillApplication(null);
+    setPairedFillSourceSide(side);
+    if (side === "x") setAmountXInput(value);
+    else setAmountYInput(value);
+  };
 
   return (
-    <div className="view-grid two-col">
+    <div className={`view-grid two-col${workspaceMatchesPool ? " liquidity-task-workspace" : ""}`}>
       {portfolioAction ? (
         <section className="snapshot-message ready portfolio-action-banner" data-testid="portfolio-action-handoff">
           {portfolioAction === "add"
@@ -8384,66 +8754,194 @@ function LiquidityView({
               : "Full exit prefilled at 100% across every loaded bin in this position."}
         </section>
       ) : null}
-      <section className="tool-panel" id="liquidity-add">
-        <div className="panel-heading">
-          <span>Add Liquidity</span>
-          <StatusBadge state={addPoolReady ? "ready" : "unavailable"} label={poolDescriptorLabel(selectedPool)} />
+      {workspaceMatchesPool ? (
+        <div
+          aria-labelledby={mobileWorkspaceNavigation ? "pool-mobile-market-tab" : undefined}
+          className="liquidity-market-column"
+          id="pool-mobile-market-panel"
+          role={mobileWorkspaceNavigation ? "tabpanel" : undefined}
+          tabIndex={mobileWorkspaceNavigation ? -1 : undefined}
+        >
+          <SwapMarketChart
+            candles={poolWorkspace?.analytics.candles.rows ?? []}
+            error={poolWorkspace?.analytics.candles.error ?? null}
+            interval={poolWorkspace?.analytics.candleInterval ?? "HOUR"}
+            loading={poolWorkspace?.analytics.candlesLoading ?? false}
+            onIntervalChange={poolWorkspace?.analytics.setCandleInterval ?? (() => undefined)}
+            pairAddress={primaryPool?.address ?? null}
+            pairLabel={`${tokenSymbol(tokenX)} / ${tokenSymbol(tokenY)}`}
+            status={poolWorkspace?.analytics.candles.status ?? "UNAVAILABLE"}
+            streamState={poolWorkspace?.analytics.candleStreamState ?? "unavailable"}
+          />
         </div>
+      ) : null}
+      {workspaceMatchesPool ? (
+        <div
+          aria-labelledby={mobileWorkspaceNavigation ? "pool-mobile-positions-tab" : undefined}
+          className="pool-positions-column"
+          id="pool-mobile-positions-panel"
+          role={mobileWorkspaceNavigation ? "tabpanel" : undefined}
+          tabIndex={mobileWorkspaceNavigation ? -1 : undefined}
+        >
+          <PoolWorkspaceOwnerPanel />
+        </div>
+      ) : null}
+      {!workspaceMatchesPool || initialSection !== "withdraw" ? (
+      <section
+        aria-labelledby={mobileWorkspaceNavigation ? "pool-mobile-trade-tab" : undefined}
+        className={workspaceMatchesPool ? "tool-panel liquidity-task-panel" : "tool-panel"}
+        id="liquidity-add"
+        role={mobileWorkspaceNavigation ? "tabpanel" : undefined}
+        tabIndex={mobileWorkspaceNavigation ? -1 : undefined}
+      >
+        {workspaceMatchesPool ? <PoolWorkspaceTaskTabs task="create" /> : null}
+        <LiquidityTaskBody compact={workspaceMatchesPool}>
+        {!workspaceMatchesPool ? (
+          <div className="panel-heading">
+            <span>Add Liquidity</span>
+            <StatusBadge state={addPoolReady ? "ready" : "unavailable"} label={poolDescriptorLabel(selectedPool)} />
+          </div>
+        ) : null}
 
-        <PoolSelect
-          id="liquidity-pair"
-          label="Pool"
-          onChange={onSelectedPoolChange}
-          pools={poolOptions}
-          selectedPoolId={selectedPoolId}
-        />
+        {workspaceMatchesPool ? (
+          <span className="field-label liquidity-task-amount-label">Amount</span>
+        ) : (
+          <PoolSelect
+            id="liquidity-pair"
+            label="Pool"
+            onChange={onSelectedPoolChange}
+            pools={poolOptions}
+            selectedPoolId={selectedPoolId}
+          />
+        )}
 
         {connected && liquidityWrappedNative !== null && liquidityWrappedNativeSide !== null ? (
           <fieldset className="routing-mode-control" data-testid="liquidity-native-mode">
             <legend>Wrapped-native deposit mode</legend>
             <div className="segmented" role="group" aria-label="Wrapped-native deposit mode">
-              <button aria-pressed={liquidityAssetMode === "native"} className={liquidityAssetMode === "native" ? "segment active" : "segment"} onClick={() => { nativeAddMaxBindingRef.current = null; setLiquidityAssetMode("native"); }} type="button">ETH · native</button>
-              <button aria-pressed={liquidityAssetMode === "erc20"} className={liquidityAssetMode === "erc20" ? "segment active" : "segment"} onClick={() => { nativeAddMaxBindingRef.current = null; setLiquidityAssetMode("erc20"); }} type="button">{liquidityWrappedNative.symbol} · ERC-20</button>
+              <button aria-pressed={liquidityAssetMode === "native"} className={liquidityAssetMode === "native" ? "segment active" : "segment"} onClick={() => { nativeAddMaxBindingRef.current = null; setPairedFillApplication(null); setLiquidityAssetMode("native"); }} type="button">ETH · native</button>
+              <button aria-pressed={liquidityAssetMode === "erc20"} className={liquidityAssetMode === "erc20" ? "segment active" : "segment"} onClick={() => { nativeAddMaxBindingRef.current = null; setPairedFillApplication(null); setLiquidityAssetMode("erc20"); }} type="button">{liquidityWrappedNative.symbol} · ERC-20</button>
             </div>
             <p data-testid="liquidity-wrapper-disclosure">ETH deposits use exact router transaction value and never approve {liquidityWrappedNative.symbol}. Unused native-side input is refunded as {liquidityWrappedNative.symbol} ERC-20 at {liquidityWrappedNative.address}. Native Max reserves a freshly reviewed 25%-buffered gas estimate and the final value is revalidated before wallet confirmation.</p>
           </fieldset>
         ) : null}
 
         <div className="liquidity-rows">
-          <div className="amount-box compact">
+          <div className="amount-box compact liquidity-amount-card" data-source={pairedFillSourceSide === "x" ? "true" : "false"} data-unused={liquidityMode === "token-y" ? "true" : "false"}>
+            <div className="liquidity-amount-card-meta">
+              <span>Balance</span>
+              <strong data-testid="liquidity-balance-x">{amountCardBalanceX}</strong>
+            </div>
             <input
               aria-label={`${nativeModeX ? "ETH" : tokenSymbol(tokenX)} liquidity amount`}
               data-testid="liquidity-amount-x"
               disabled={liquidityMode === "token-y"}
               inputMode="decimal"
               value={liquidityMode === "token-y" ? "0" : amountXInput}
-              onChange={(event) => { nativeAddMaxBindingRef.current = null; setAmountXInput(event.target.value); }}
+              onChange={(event) => updateLiquidityAmountInput("x", event.target.value)}
             />
-            <span>{nativeModeX ? "ETH" : tokenSymbol(tokenX)}</span>
+            <span className="liquidity-amount-token">{nativeModeX ? "ETH" : tokenSymbol(tokenX)}</span>
             <button aria-label={`Use maximum ${nativeModeX ? "ETH" : tokenSymbol(tokenX)} balance`} className="token-max-button" data-testid="liquidity-max-x" disabled={nativeModeX ? ((!nativeAdd || !addReady) && !canReuseNativeAddMaxObservation("x")) || nativeAddMaxPending : walletBalanceX === null || tokenX === null || liquidityMode === "token-y"} onClick={() => {
+              setPairedFillApplication(null);
+              setPairedFillSourceSide("x");
               if (nativeModeX) handleNativeAddMax("x");
               else if (walletBalanceX !== null && tokenX !== null) { nativeAddMaxBindingRef.current = null; setAmountXInput(maxAmountInput({ asset: "token", balance: walletBalanceX, decimals: tokenX.decimals })); }
             }} type="button">Max</button>
           </div>
-          <div className="amount-box compact">
+          <div className="amount-box compact liquidity-amount-card" data-source={pairedFillSourceSide === "y" ? "true" : "false"} data-unused={liquidityMode === "token-x" ? "true" : "false"}>
+            <div className="liquidity-amount-card-meta">
+              <span>Balance</span>
+              <strong data-testid="liquidity-balance-y">{amountCardBalanceY}</strong>
+            </div>
             <input
               aria-label={`${nativeModeY ? "ETH" : tokenSymbol(tokenY)} liquidity amount`}
               data-testid="liquidity-amount-y"
               disabled={liquidityMode === "token-x"}
               inputMode="decimal"
               value={liquidityMode === "token-x" ? "0" : amountYInput}
-              onChange={(event) => { nativeAddMaxBindingRef.current = null; setAmountYInput(event.target.value); }}
+              onChange={(event) => updateLiquidityAmountInput("y", event.target.value)}
             />
-            <span>{nativeModeY ? "ETH" : tokenSymbol(tokenY)}</span>
+            <span className="liquidity-amount-token">{nativeModeY ? "ETH" : tokenSymbol(tokenY)}</span>
             <button aria-label={`Use maximum ${nativeModeY ? "ETH" : tokenSymbol(tokenY)} balance`} className="token-max-button" data-testid="liquidity-max-y" disabled={nativeModeY ? ((!nativeAdd || !addReady) && !canReuseNativeAddMaxObservation("y")) || nativeAddMaxPending : walletBalanceY === null || tokenY === null || liquidityMode === "token-x"} onClick={() => {
+              setPairedFillApplication(null);
+              setPairedFillSourceSide("y");
               if (nativeModeY) handleNativeAddMax("y");
               else if (walletBalanceY !== null && tokenY !== null) { nativeAddMaxBindingRef.current = null; setAmountYInput(maxAmountInput({ asset: "token", balance: walletBalanceY, decimals: tokenY.decimals })); }
             }} type="button">Max</button>
           </div>
         </div>
-        {nativeModeX ? <div className="state-row" data-testid="liquidity-token-x-identity">ETH native asset · router wrapper {liquidityWrappedNative?.symbol} {liquidityWrappedNative?.address}</div> : <TokenIdentity token={tokenX} networkName={registry.chain.name} testId="liquidity-token-x-identity" />}
-        {nativeModeY ? <div className="state-row" data-testid="liquidity-token-y-identity">ETH native asset · router wrapper {liquidityWrappedNative?.symbol} {liquidityWrappedNative?.address}</div> : <TokenIdentity token={tokenY} networkName={registry.chain.name} testId="liquidity-token-y-identity" />}
-        <div className="state-row" data-testid="liquidity-range-mode">
+        <section aria-label="Liquidity amount suggestion" className="liquidity-paired-fill" data-state={pairedFillState} data-testid="liquidity-paired-fill">
+          <div className="liquidity-paired-fill-heading">
+            <strong>Suggested composition</strong>
+            {pairedFillSuggestion.status === "ready" && pairedFillNativeBlockedSide === null ? (
+              <span data-testid="liquidity-paired-fill-preview">
+                Keep {pairedFillFormattedSource} {pairedFillSourceSymbol} → fill {pairedFillFormattedPaired} {pairedFillPairedSymbol}{pairedFillSuggestion.clamped ? " · clamped" : ""}
+              </span>
+            ) : <span>{liquidityMode === "token-x" || liquidityMode === "token-y" ? "Pair not required" : "Unavailable"}</span>}
+          </div>
+          <p aria-live="polite" data-testid="liquidity-paired-fill-status" id="liquidity-paired-fill-status" role="status">{pairedFillMessage}</p>
+          <button aria-describedby="liquidity-paired-fill-status" className="secondary-button" data-testid="liquidity-paired-fill-apply" disabled={!pairedFillCanApply} onClick={applyPairedFill} type="button">
+            {pairedFillButtonLabel}
+          </button>
+        </section>
+        <LiquidityRangeEditor
+          advancedOpenByDefault={!workspaceMatchesPool}
+          activeBin={activeBin}
+          bins={distributionResult.preview}
+          compact={workspaceMatchesPool}
+          liveBins={rangeBackdrop.points}
+          liveBinsError={rangeBackdrop.error}
+          liveBinsState={rangeBackdrop.state}
+          lowerBinId={lowerBinId}
+          lowerBinInput={lowerBinInput}
+          lowerDelta={lowerDelta}
+          lowerDeltaInput={lowerDeltaInput}
+          lowerPriceInput={lowerPriceInput}
+          maxBins={MAX_LIQUIDITY_BINS}
+          narrowPresetInput={narrowPresetInput}
+          onApplyPreset={applyRangePreset}
+          onLowerBinInput={updateLowerBin}
+          onLowerDeltaInput={updateLowerDelta}
+          onLowerHandleChange={(next) => {
+            if (activeBin === null || upperBinId === null) return;
+            const nextLowerBin = activeBin + next;
+            commitAbsoluteRange(nextLowerBin, Math.min(upperBinId, nextLowerBin + MAX_LIQUIDITY_BINS - 1));
+          }}
+          onLowerPriceCommit={() => void updatePriceBoundary("lower", lowerPriceInput)}
+          onLowerPriceInput={(value) => {
+            setLowerPriceInput(value);
+            setRangeEditError("Review the edited minimum price");
+          }}
+          onNarrowPresetInput={setNarrowPresetInput}
+          onReset={() => applyRangePreset("3")}
+          onStrategyChange={(value) => { setPairedFillApplication(null); setLiquidityStrategy(value); }}
+          onUpperBinInput={updateUpperBin}
+          onUpperDeltaInput={updateUpperDelta}
+          onUpperHandleChange={(next) => {
+            if (activeBin === null || lowerBinId === null) return;
+            const nextUpperBin = activeBin + next;
+            commitAbsoluteRange(Math.max(lowerBinId, nextUpperBin - MAX_LIQUIDITY_BINS + 1), nextUpperBin);
+          }}
+          onUpperPriceCommit={() => void updatePriceBoundary("upper", upperPriceInput)}
+          onUpperPriceInput={(value) => {
+            setUpperPriceInput(value);
+            setRangeEditError("Review the edited maximum price");
+          }}
+          onWidePresetInput={setWidePresetInput}
+          rangeError={rangeControlError}
+          rangeSliderMax={rangeSliderMax}
+          rangeSliderMin={rangeSliderMin}
+          strategy={liquidityStrategy}
+          tokenXSymbol={tokenSymbol(tokenX)}
+          tokenYSymbol={tokenSymbol(tokenY)}
+          upperBinId={upperBinId}
+          upperBinInput={upperBinInput}
+          upperDelta={upperDelta}
+          upperDeltaInput={upperDeltaInput}
+          upperPriceInput={upperPriceInput}
+          widePresetInput={widePresetInput}
+        />
+        <div className={workspaceMatchesPool ? "state-row liquidity-position-summary" : "state-row"} data-testid="liquidity-range-mode">
           <Droplets size={16} />
           <span>{liquidityModeDescription(liquidityMode, tokenSymbol(tokenX), tokenSymbol(tokenY))}</span>
         </div>
@@ -8453,17 +8951,24 @@ function LiquidityView({
             <span>One-sided liquidity deposits one token directly into the selected bins. It does not perform a swap; use the Swap screen separately if you want to rebalance first.</span>
           </div>
         ) : null}
+        {liquidityMode === "balanced" ? (
+          <div className={workspaceMatchesPool ? "state-row liquidity-composition-note" : "state-row"} data-testid="liquidity-composition-guidance">
+            <CircleDollarSign size={16} />
+            <span>Balanced ranges require both tokens. Amounts stay user-controlled; Feather does not silently swap or auto-Zap composition.</span>
+          </div>
+        ) : null}
+
+        <LiquidityTransactionReview
+          compact={workspaceMatchesPool}
+          status={liquidityAddReview !== null ? "Pinned review ready" : connected && (needsXApproval || needsYApproval) ? "Approval required" : "Limits and approvals"}
+        >
+        {nativeModeX ? <div className="state-row" data-testid="liquidity-token-x-identity">ETH native asset · router wrapper {liquidityWrappedNative?.symbol} {liquidityWrappedNative?.address}</div> : <TokenIdentity token={tokenX} networkName={registry.chain.name} testId="liquidity-token-x-identity" />}
+        {nativeModeY ? <div className="state-row" data-testid="liquidity-token-y-identity">ETH native asset · router wrapper {liquidityWrappedNative?.symbol} {liquidityWrappedNative?.address}</div> : <TokenIdentity token={tokenY} networkName={registry.chain.name} testId="liquidity-token-y-identity" />}
         {liquidityAssetMode === "native" && !nativeAdd ? (
           <div className="state-row" data-testid="liquidity-native-unused-range"><CircleDollarSign size={16} /><span>This range uses only the non-wrapper token. Submission remains ERC-20 addLiquidity with 0 ETH value.</span></div>
         ) : null}
         {liquidityAssetMode === "native" && liquidityWrappedNativeSide !== null && (nativeSideAmount === null || nativeSideAmount <= 0n) && ((liquidityWrappedNativeSide === "x" && liquidityMode !== "token-y") || (liquidityWrappedNativeSide === "y" && liquidityMode !== "token-x")) ? (
           <div className="state-row warning" data-testid="liquidity-native-max-guidance"><AlertTriangle size={16} /><span>Enter a valid positive ETH probe amount before using Native Max; no wallet request is opened for the gas probe.</span></div>
-        ) : null}
-        {liquidityMode === "balanced" ? (
-          <div className="state-row" data-testid="liquidity-composition-guidance">
-            <CircleDollarSign size={16} />
-            <span>Balanced ranges require both tokens. Amounts stay user-controlled; Feather does not silently swap or auto-Zap composition.</span>
-          </div>
         ) : null}
         <div className="quote-grid">
           <MiniMetric label={`${nativeModeX ? "ETH" : tokenSymbol(tokenX)} balance`} value={nativeModeX ? nativeBalance !== null ? `${formatUnits(nativeBalance, 18)} ETH` : connected ? "loading" : "connect" : walletData ? formatTokenAmount(walletData.balanceX, tokenX) : connected ? "loading" : "connect"} />
@@ -8490,106 +8995,6 @@ function LiquidityView({
           error={liquidityAttestationQuery.error}
           loading={liquidityAttestationQuery.isLoading || liquidityAttestationQuery.isFetching}
         />
-
-        <fieldset className="strategy-picker" aria-label="Liquidity strategy">
-          <legend>Volatility strategy</legend>
-          {(["spot", "curve", "bid-ask"] as const).map((strategy) => (
-            <button
-              aria-pressed={liquidityStrategy === strategy}
-              className={liquidityStrategy === strategy ? "selected" : ""}
-              data-testid={`liquidity-strategy-${strategy}`}
-              key={strategy}
-              onClick={() => setLiquidityStrategy(strategy)}
-              type="button"
-            >
-              <strong>{strategy === "bid-ask" ? "Bid-Ask" : strategy[0].toUpperCase() + strategy.slice(1)}</strong>
-              <span>{strategy === "spot" ? "Even" : strategy === "curve" ? "Near price" : "Range edges"}</span>
-            </button>
-          ))}
-        </fieldset>
-
-        <fieldset className="range-presets" aria-label="Liquidity range presets">
-          <legend>Editable range presets</legend>
-          <label>
-            <span>Narrow bins</span>
-            <input aria-label="Narrow preset bin count" inputMode="numeric" value={narrowPresetInput} onChange={(event) => setNarrowPresetInput(event.target.value)} />
-            <button data-testid="liquidity-preset-narrow" onClick={() => applyRangePreset(narrowPresetInput)} type="button">Apply Narrow</button>
-          </label>
-          <label>
-            <span>Wide bins</span>
-            <input aria-label="Wide preset bin count" inputMode="numeric" value={widePresetInput} onChange={(event) => setWidePresetInput(event.target.value)} />
-            <button data-testid="liquidity-preset-wide" onClick={() => applyRangePreset(widePresetInput)} type="button">Apply Wide</button>
-          </label>
-        </fieldset>
-
-        <div className="range-sliders" data-testid="liquidity-range-sliders">
-          <label>Lower handle<input aria-label="Lower range handle" max={rangeSliderMax} min={rangeSliderMin} step="1" type="range" value={lowerDelta ?? 0} onChange={(event) => {
-            const next = Number(event.target.value);
-            if (activeBin === null || upperBinId === null) return;
-            const nextLowerBin = activeBin + next;
-            commitAbsoluteRange(nextLowerBin, Math.min(upperBinId, nextLowerBin + MAX_LIQUIDITY_BINS - 1));
-          }} /></label>
-          <label>Upper handle<input aria-label="Upper range handle" max={rangeSliderMax} min={rangeSliderMin} step="1" type="range" value={upperDelta ?? 0} onChange={(event) => {
-            const next = Number(event.target.value);
-            if (activeBin === null || lowerBinId === null) return;
-            const nextUpperBin = activeBin + next;
-            commitAbsoluteRange(Math.max(lowerBinId, nextUpperBin - MAX_LIQUIDITY_BINS + 1), nextUpperBin);
-          }} /></label>
-          <p>{lowerBinId !== null && upperBinId !== null && upperBinId >= lowerBinId ? `${upperBinId - lowerBinId + 1} bins` : "Invalid range"} · max {MAX_LIQUIDITY_BINS}. Every exact distribution is simulated before wallet submission.</p>
-        </div>
-
-        <div className="liquidity-range-fields" data-testid="liquidity-range-fields">
-          <label htmlFor="range-lower">
-            <span>Lower Delta</span>
-            <input id="range-lower" inputMode="numeric" value={lowerDeltaInput} onChange={(event) => updateLowerDelta(event.target.value)} />
-          </label>
-          <label htmlFor="range-lower-bin">
-            <span>Lower Bin</span>
-            <input id="range-lower-bin" inputMode="numeric" value={lowerBinInput} onChange={(event) => updateLowerBin(event.target.value)} />
-          </label>
-          <label htmlFor="range-min-price">
-            <span>Min {tokenSymbol(tokenY)} per {tokenSymbol(tokenX)}</span>
-            <input
-              id="range-min-price"
-              inputMode="decimal"
-              value={lowerPriceInput}
-              onChange={(event) => {
-                setLowerPriceInput(event.target.value);
-                setRangeEditError("Review the edited minimum price");
-              }}
-              onBlur={() => void updatePriceBoundary("lower", lowerPriceInput)}
-            />
-          </label>
-          <div className="range-inverse" data-testid="liquidity-min-price-inverse">
-            <span>Inverse min</span>
-            <output>{lowerInversePrice} {tokenSymbol(tokenX)} per {tokenSymbol(tokenY)}</output>
-          </div>
-          <label htmlFor="range-upper">
-            <span>Upper Delta</span>
-            <input id="range-upper" inputMode="numeric" value={upperDeltaInput} onChange={(event) => updateUpperDelta(event.target.value)} />
-          </label>
-          <label htmlFor="range-upper-bin">
-            <span>Upper Bin</span>
-            <input id="range-upper-bin" inputMode="numeric" value={upperBinInput} onChange={(event) => updateUpperBin(event.target.value)} />
-          </label>
-          <label htmlFor="range-max-price">
-            <span>Max {tokenSymbol(tokenY)} per {tokenSymbol(tokenX)}</span>
-            <input
-              id="range-max-price"
-              inputMode="decimal"
-              value={upperPriceInput}
-              onChange={(event) => {
-                setUpperPriceInput(event.target.value);
-                setRangeEditError("Review the edited maximum price");
-              }}
-              onBlur={() => void updatePriceBoundary("upper", upperPriceInput)}
-            />
-          </label>
-          <div className="range-inverse" data-testid="liquidity-max-price-inverse">
-            <span>Inverse max</span>
-            <output>{upperInversePrice} {tokenSymbol(tokenX)} per {tokenSymbol(tokenY)}</output>
-          </div>
-        </div>
 
         <div className="state-row warning liquidity-range-risk" data-testid="liquidity-range-risk">
           <AlertTriangle size={16} />
@@ -8618,9 +9023,9 @@ function LiquidityView({
         </div>
 
         <div className="quote-grid">
-          <MiniMetric label="Active Bin" value={activeBin?.toString() ?? "n/a"} />
-          <MiniMetric label="Min Bin" value={activeBin !== null && lowerDelta !== null ? String(activeBin + lowerDelta) : "n/a"} />
-          <MiniMetric label="Max Bin" value={activeBin !== null && upperDelta !== null ? String(activeBin + upperDelta) : "n/a"} />
+          {!workspaceMatchesPool ? <MiniMetric label="Active Bin" value={activeBin?.toString() ?? "n/a"} /> : null}
+          {!workspaceMatchesPool ? <MiniMetric label="Min Bin" value={activeBin !== null && lowerDelta !== null ? String(activeBin + lowerDelta) : "n/a"} /> : null}
+          {!workspaceMatchesPool ? <MiniMetric label="Max Bin" value={activeBin !== null && upperDelta !== null ? String(activeBin + upperDelta) : "n/a"} /> : null}
           <MiniMetric label="Liquidity Mode" value={liquidityMode ?? "n/a"} />
           <MiniMetric label="Bin Step" value={pool?.binStep.toString() ?? primaryPool?.binStep ?? "n/a"} />
           <MiniMetric label={`${nativeModeX ? "ETH" : tokenSymbol(tokenX)} allowance`} value={nativeModeX ? "not required for ETH" : walletData ? formatTokenAmount(walletData.allowanceX, tokenX) : "n/a"} />
@@ -8650,21 +9055,37 @@ function LiquidityView({
           token={tokenY}
         /> : <div className="state-row success" data-testid="liquidity-native-no-approval">ETH uses exact transaction value and never requests wrapper approval.</div>}
 
-        <LiquidityDistributionPreview
-          activeBin={activeBin}
-          bins={distributionResult.preview}
-          lowerBinId={lowerBinId}
-          lowerPrice={lowerPriceInput}
-          upperBinId={upperBinId}
-          upperPrice={upperPriceInput}
-        />
+        </LiquidityTransactionReview>
+        </LiquidityTaskBody>
 
+        <div className={workspaceMatchesPool ? "liquidity-action-dock" : undefined}>
+        {workspaceMatchesPool ? (
+          <dl className="liquidity-action-summary" data-testid="liquidity-action-summary">
+            <div>
+              <dt>Position</dt>
+              <dd>
+                {liquidityStrategy === "bid-ask" ? "Bid-Ask" : liquidityStrategy[0].toUpperCase() + liquidityStrategy.slice(1)}
+                {lowerBinId !== null && upperBinId !== null && upperBinId >= lowerBinId ? ` · ${upperBinId - lowerBinId + 1} bins` : " · range unavailable"}
+                {liquidityMode === "balanced" ? " · Two-sided" : liquidityMode === "token-x" ? ` · ${tokenSymbol(tokenX)} only` : ` · ${tokenSymbol(tokenY)} only`}
+              </dd>
+            </div>
+            <div>
+              <dt>Deposit</dt>
+              <dd>
+                {liquidityMode === "token-y" ? "0" : amountXInput || "0"} {nativeModeX ? "ETH" : tokenSymbol(tokenX)}
+                {" + "}
+                {liquidityMode === "token-x" ? "0" : amountYInput || "0"} {nativeModeY ? "ETH" : tokenSymbol(tokenY)}
+              </dd>
+            </div>
+          </dl>
+        ) : null}
         <div className="action-stack">
           {!nativeModeX ? <button
             className="secondary-button wide"
             data-testid="liquidity-approve-x-button"
+            hidden={workspaceMatchesPool && !needsXApproval}
             type="button"
-            aria-describedby="liquidity-x-approval-details"
+            aria-describedby="liquidity-x-approval-details liquidity-add-status"
             disabled={!canApproveX}
             title={approvalDisclosure({ amount: amountX, spender: registry.contracts.lbRouter, tokenSymbol: tokenSymbol(tokenX) })}
             onClick={handleApproveX}
@@ -8675,8 +9096,9 @@ function LiquidityView({
           {!nativeModeY ? <button
             className="secondary-button wide"
             data-testid="liquidity-approve-y-button"
+            hidden={workspaceMatchesPool && !needsYApproval}
             type="button"
-            aria-describedby="liquidity-y-approval-details"
+            aria-describedby="liquidity-y-approval-details liquidity-add-status"
             disabled={!canApproveY}
             title={approvalDisclosure({ amount: amountY, spender: registry.contracts.lbRouter, tokenSymbol: tokenSymbol(tokenY) })}
             onClick={handleApproveY}
@@ -8684,7 +9106,7 @@ function LiquidityView({
             {liquiditySimulationPending || approveYWrite.isPending || approveYReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <CheckCircle2 size={18} />}
             <span>{needsYApproval ? `Approve ${tokenSymbol(tokenY)}` : `${tokenSymbol(tokenY)} approved`}</span>
           </button> : null}
-          <button className="primary-button wide" data-testid="liquidity-add-button" type="button" disabled={!addReady} onClick={handleAddLiquidity}>
+          <button aria-describedby="liquidity-add-status" className="primary-button wide" data-testid="liquidity-add-button" type="button" disabled={!addReady} onClick={handleAddLiquidity}>
             {liquiditySimulationPending || addWrite.isPending || addReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <Droplets size={18} />}
             <span>{addButtonLabel === "Add liquidity" ? (liquidityAddReview?.executionFingerprint === addExecutionFingerprint ? "Confirm add liquidity" : "Review add liquidity") : addButtonLabel}</span>
           </button>
@@ -8701,6 +9123,7 @@ function LiquidityView({
           finalSuccessText={addSuccessReconciled ? "Liquidity added" : null}
           inputError={addInputError}
           insufficientBalance={insufficientX || insufficientY}
+          idleText={!connected ? "Connect wallet to continue" : undefined}
           pendingHash={submittedAddReceiptContext === addExecutionFingerprint
             ? addWrite.data
             : submittedApproveXReceiptContext === approveXExecutionFingerprint
@@ -8715,9 +9138,20 @@ function LiquidityView({
           revertedText={addReverted ? "Add liquidity reverted" : approveXReverted ? `${tokenSymbol(tokenX)} approval reverted` : approveYReverted ? `${tokenSymbol(tokenY)} approval reverted` : null}
           testId="liquidity-add-status"
         />
+        </div>
       </section>
+      ) : null}
 
-      <section className="info-panel" id="liquidity-withdraw">
+      {!workspaceMatchesPool || initialSection === "withdraw" ? (
+      <section
+        aria-labelledby={mobileWorkspaceNavigation ? "pool-mobile-trade-tab" : undefined}
+        className={workspaceMatchesPool ? "info-panel liquidity-task-panel" : "info-panel"}
+        id="liquidity-withdraw"
+        role={mobileWorkspaceNavigation ? "tabpanel" : undefined}
+        tabIndex={mobileWorkspaceNavigation ? -1 : undefined}
+      >
+        {workspaceMatchesPool ? <PoolWorkspaceTaskTabs task="manage" /> : null}
+        <LiquidityTaskBody compact={workspaceMatchesPool}>
         <div className="panel-heading">
           <span>{fullExit ? "Full exit" : "Partial withdrawal"}</span>
           <StatusBadge
@@ -8823,6 +9257,8 @@ function LiquidityView({
           {fullExitUi?.workflowKey === currentFullExitWorkflowKey ? <span>{fullExitUi.message}</span> : null}
         </section>
 
+        {workspaceMatchesPool ? <GasReview review={gasReview} /> : null}
+
         <PairAttestationReview
           attestation={liquidityExitAttestationQuery.error === null ? liquidityExitAttestationQuery.data ?? null : null}
           error={liquidityExitAttestationQuery.error}
@@ -8842,12 +9278,29 @@ function LiquidityView({
           pair={pool?.pair ?? null}
         />
 
+        <dl className="contract-list">
+          <div>
+            <dt>Pair</dt>
+            <dd>{formatCompactAddress(pool?.pair ?? primaryPool?.address)}</dd>
+          </div>
+          <div>
+            <dt>Deposits Indexed</dt>
+            <dd>{primaryPool?.depositCount ?? "0"}</dd>
+          </div>
+          <div>
+            <dt>Updated</dt>
+            <dd>Block {primaryPool?.updatedAtBlock ?? "n/a"}</dd>
+          </div>
+        </dl>
+        </LiquidityTaskBody>
+
+        <div className={workspaceMatchesPool ? "liquidity-action-dock" : undefined}>
         <div className="action-stack">
           <button
             className="secondary-button wide"
             data-testid="liquidity-approve-lb-button"
             type="button"
-            aria-describedby="remove-lb-approval-details"
+            aria-describedby="remove-lb-approval-details liquidity-remove-status"
             disabled={!canApproveLb}
             title={`Approve every LB token ID in pair ${pool?.pair ?? "not selected"} for operator ${registry.contracts.lbRouter}`}
             onClick={handleApproveLb}
@@ -8855,7 +9308,7 @@ function LiquidityView({
             {liquiditySimulationPending || approveLbWrite.isPending || approveLbReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <CheckCircle2 size={18} />}
             <span>{liveLbApproved ? "Pair-wide LB operator approved" : "Approve pair-wide LB operator"}</span>
           </button>
-          <button className="primary-button wide" data-testid="liquidity-remove-button" type="button" disabled={!removeReady} onClick={handleRemoveLiquidity}>
+          <button aria-describedby="liquidity-remove-status" className="primary-button wide" data-testid="liquidity-remove-button" type="button" disabled={!removeReady} onClick={handleRemoveLiquidity}>
             {liquiditySimulationPending || removeWrite.isPending || removeReceipt.isLoading ? <LoaderCircle className="spin" size={18} /> : <Droplets size={18} />}
             <span>{removeButtonLabel({ poolReady: removePoolReady, connected, fullExit, onWrongChain, invalidInput: removeInputError !== null, hasPosition: hasSelectedPositions, needsApproval: !liveLbApproved, insufficientGas: liquiditySimulationError?.startsWith("Insufficient ETH for gas") === true })}</span>
           </button>
@@ -8893,22 +9346,9 @@ function LiquidityView({
           hash={canonicalNativeRemoveHash}
           reconciliation={nativeRemoveReceiptReconciliationQuery.data}
         />
-
-        <dl className="contract-list">
-          <div>
-            <dt>Pair</dt>
-            <dd>{formatCompactAddress(pool?.pair ?? primaryPool?.address)}</dd>
-          </div>
-          <div>
-            <dt>Deposits Indexed</dt>
-            <dd>{primaryPool?.depositCount ?? "0"}</dd>
-          </div>
-          <div>
-            <dt>Updated</dt>
-            <dd>Block {primaryPool?.updatedAtBlock ?? "n/a"}</dd>
-          </div>
-        </dl>
+        </div>
       </section>
+      ) : null}
 
     </div>
   );
@@ -8974,60 +9414,398 @@ function BurnPlanWarnings({ plan }: { plan: PositionBurnPlanResult }) {
   );
 }
 
-function LiquidityDistributionPreview({
-  activeBin,
-  bins,
-  lowerBinId,
-  lowerPrice,
-  upperBinId,
-  upperPrice
+function LiquidityTransactionReview({
+  children,
+  compact,
+  status
 }: {
-  activeBin: number | null;
-  bins: LiquidityDistributionView[];
-  lowerBinId: number | null;
-  lowerPrice: string;
-  upperBinId: number | null;
-  upperPrice: string;
+  children: ReactNode;
+  compact: boolean;
+  status: string;
 }) {
-  if (bins.length === 0) {
-    return <EmptyState state="empty" />;
-  }
+  if (!compact) return <>{children}</>;
 
   return (
-    <div className="distribution-panel">
-      <div className="range-map" aria-label="Liquidity bin distribution">
-        {bins.map((bin) => {
-          const binId = Number(bin.binId);
-          const boundary = binId === lowerBinId ? "lower" : binId === upperBinId ? "upper" : null;
-          const price = boundary === "lower" ? lowerPrice : boundary === "upper" ? upperPrice : null;
-          return (
-            <span
-              aria-label={`Selected bin ${bin.binId}${binId === activeBin ? "; active bin" : ""}${boundary ? `; ${boundary} boundary${price ? `; ${price}` : ""}` : ""}`}
-              className={["bin", binId === activeBin ? "active" : "", boundary ? "boundary" : ""].filter(Boolean).join(" ")}
-              data-bin-id={bin.binId}
-              key={bin.key}
-              role="img"
-              style={{ height: bin.height }}
-              title={`Bin ${bin.binId}`}
-            />
-          );
-        })}
+    <details className="liquidity-review-details" data-testid="liquidity-transaction-review">
+      <summary>
+        <span>
+          <strong>Transaction review</strong>
+          <small>Safety, limits, balances and approvals</small>
+        </span>
+        <span>{status}</span>
+      </summary>
+      <div className="liquidity-review-body">{children}</div>
+    </details>
+  );
+}
+
+function LiquidityTaskBody({ children, compact }: { children: ReactNode; compact: boolean }) {
+  return compact ? <div className="liquidity-task-body">{children}</div> : <>{children}</>;
+}
+
+const RANGE_EDITOR_RADII = [8, 16, 24, 40, 69] as const;
+
+function LiquidityRangeEditor({
+  advancedOpenByDefault,
+  activeBin,
+  bins,
+  compact,
+  liveBins,
+  liveBinsError,
+  liveBinsState,
+  lowerBinId,
+  lowerBinInput,
+  lowerDelta,
+  lowerDeltaInput,
+  lowerPriceInput,
+  maxBins,
+  narrowPresetInput,
+  onApplyPreset,
+  onLowerBinInput,
+  onLowerDeltaInput,
+  onLowerHandleChange,
+  onLowerPriceCommit,
+  onLowerPriceInput,
+  onNarrowPresetInput,
+  onReset,
+  onStrategyChange,
+  onUpperBinInput,
+  onUpperDeltaInput,
+  onUpperHandleChange,
+  onUpperPriceCommit,
+  onUpperPriceInput,
+  onWidePresetInput,
+  rangeError,
+  rangeSliderMax,
+  rangeSliderMin,
+  strategy,
+  tokenXSymbol,
+  tokenYSymbol,
+  upperBinId,
+  upperBinInput,
+  upperDelta,
+  upperDeltaInput,
+  upperPriceInput,
+  widePresetInput
+}: {
+  advancedOpenByDefault: boolean;
+  activeBin: number | null;
+  bins: LiquidityDistributionView[];
+  compact: boolean;
+  liveBins: BinDistributionPoint[] | null;
+  liveBinsError: string | null;
+  liveBinsState: LoadState;
+  lowerBinId: number | null;
+  lowerBinInput: string;
+  lowerDelta: number | null;
+  lowerDeltaInput: string;
+  lowerPriceInput: string;
+  maxBins: number;
+  narrowPresetInput: string;
+  onApplyPreset: (value: string) => void;
+  onLowerBinInput: (value: string) => void;
+  onLowerDeltaInput: (value: string) => void;
+  onLowerHandleChange: (value: number) => void;
+  onLowerPriceCommit: () => void;
+  onLowerPriceInput: (value: string) => void;
+  onNarrowPresetInput: (value: string) => void;
+  onReset: () => void;
+  onStrategyChange: (strategy: LiquidityStrategy) => void;
+  onUpperBinInput: (value: string) => void;
+  onUpperDeltaInput: (value: string) => void;
+  onUpperHandleChange: (value: number) => void;
+  onUpperPriceCommit: () => void;
+  onUpperPriceInput: (value: string) => void;
+  onWidePresetInput: (value: string) => void;
+  rangeError: string | null;
+  rangeSliderMax: number;
+  rangeSliderMin: number;
+  strategy: LiquidityStrategy;
+  tokenXSymbol: string;
+  tokenYSymbol: string;
+  upperBinId: number | null;
+  upperBinInput: string;
+  upperDelta: number | null;
+  upperDeltaInput: string;
+  upperPriceInput: string;
+  widePresetInput: string;
+}) {
+  const [radiusIndex, setRadiusIndex] = useState(1);
+  const rangeTrackRef = useRef<HTMLDivElement>(null);
+  const radius = RANGE_EDITOR_RADII[radiusIndex]!;
+  const selectedById = new Map(bins.map((bin) => [Number(bin.binId), bin]));
+  const liveById = new Map((liveBins ?? []).map((bin) => [Number(bin.binId), bin]));
+  const selectedBinCount = lowerBinId !== null && upperBinId !== null && upperBinId >= lowerBinId
+    ? upperBinId - lowerBinId + 1
+    : null;
+  const sliderControlMin = Math.max(rangeSliderMin, Math.min(-radius, lowerDelta ?? 0));
+  const sliderControlMax = Math.min(rangeSliderMax, Math.max(radius, upperDelta ?? 0));
+  const sliderSpan = Math.max(1, sliderControlMax - sliderControlMin);
+  const lowerPosition = Math.max(0, Math.min(100, (((lowerDelta ?? sliderControlMin) - sliderControlMin) / sliderSpan) * 100));
+  const upperPosition = Math.max(0, Math.min(100, (((upperDelta ?? sliderControlMax) - sliderControlMin) / sliderSpan) * 100));
+  const activeViewportStart = activeBin === null ? lowerBinId ?? 0 : Math.max(0, activeBin - radius);
+  const activeViewportEnd = activeBin === null ? upperBinId ?? activeViewportStart : Math.min(MAX_LIQUIDITY_BIN_ID, activeBin + radius);
+  const unionStart = lowerBinId === null ? activeViewportStart : Math.min(activeViewportStart, lowerBinId);
+  const unionEnd = upperBinId === null ? activeViewportEnd : Math.max(activeViewportEnd, upperBinId);
+  const selectionIsFarFromActive = unionEnd - unionStart + 1 > 109;
+  const visualStart = selectionIsFarFromActive && lowerBinId !== null ? lowerBinId : unionStart;
+  const visualEnd = selectionIsFarFromActive && upperBinId !== null ? upperBinId : unionEnd;
+  const visualBinIds = Array.from({ length: Math.max(0, visualEnd - visualStart + 1) }, (_, index) => visualStart + index);
+  const selectedExtendsPastBackdrop = lowerBinId !== null && upperBinId !== null && liveBins !== null && (
+    !liveById.has(lowerBinId) || !liveById.has(upperBinId)
+  );
+  const handlesAreClose = Math.abs(upperPosition - lowerPosition) < 8;
+
+  const updateHandleFromPointer = (boundary: "lower" | "upper", clientX: number) => {
+    const track = rangeTrackRef.current;
+    if (track === null) return;
+
+    const bounds = track.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (clientX - bounds.left) / Math.max(1, bounds.width)));
+    const nextValue = Math.round(sliderControlMin + ratio * sliderSpan);
+    if (boundary === "lower") {
+      onLowerHandleChange(Math.min(nextValue, upperDelta ?? nextValue));
+      return;
+    }
+    onUpperHandleChange(Math.max(nextValue, lowerDelta ?? nextValue));
+  };
+
+  const updateHandleFromKey = (boundary: "lower" | "upper", key: string) => {
+    const direction = key === "ArrowLeft" || key === "ArrowDown" ? -1 : key === "ArrowRight" || key === "ArrowUp" ? 1 : 0;
+    if (direction === 0) return false;
+
+    if (boundary === "lower") {
+      const current = lowerDelta ?? 0;
+      onLowerHandleChange(Math.max(sliderControlMin, Math.min(current + direction, upperDelta ?? sliderControlMax)));
+    } else {
+      const current = upperDelta ?? 0;
+      onUpperHandleChange(Math.min(sliderControlMax, Math.max(current + direction, lowerDelta ?? sliderControlMin)));
+    }
+    return true;
+  };
+
+  return (
+    <section className={`liquidity-range-editor${compact ? " compact" : ""}`} data-testid="liquidity-range-editor">
+      <div className="range-editor-heading">
+        <div>
+          <strong>Price range</strong>
+          <span>{tokenYSymbol} per {tokenXSymbol}</span>
+        </div>
+        <div className="range-editor-heading-actions">
+          <button onClick={onReset} type="button">Reset</button>
+          <div className="range-editor-zoom" role="group" aria-label="Position range chart zoom">
+            <button aria-label="Zoom into position range chart" disabled={radiusIndex === 0} onClick={() => setRadiusIndex((current) => Math.max(0, current - 1))} type="button">−</button>
+            <button aria-label="Zoom out of position range chart" disabled={radiusIndex === RANGE_EDITOR_RADII.length - 1} onClick={() => setRadiusIndex((current) => Math.min(RANGE_EDITOR_RADII.length - 1, current + 1))} type="button">+</button>
+          </div>
+        </div>
       </div>
-      <details className="distribution-details" open={bins.length <= 15 ? true : undefined}>
+
+      <fieldset className="strategy-picker" aria-label="Liquidity strategy">
+        <legend>Strategy</legend>
+        {(["spot", "curve", "bid-ask"] as const).map((value) => (
+          <button
+            aria-pressed={strategy === value}
+            className={strategy === value ? "selected" : ""}
+            data-testid={`liquidity-strategy-${value}`}
+            key={value}
+            onClick={() => onStrategyChange(value)}
+            type="button"
+          >
+            <strong>{value === "bid-ask" ? "Bid-Ask" : value[0].toUpperCase() + value.slice(1)}</strong>
+            <span>{value === "spot" ? "Even" : value === "curve" ? "Near price" : "Range edges"}</span>
+          </button>
+        ))}
+      </fieldset>
+
+      <div className="range-editor-legend" aria-hidden="true">
+        <span><i className="live-x" />Pool {tokenXSymbol}</span>
+        <span><i className="live-y" />Pool {tokenYSymbol}</span>
+        <span><i className="selected" />New position</span>
+      </div>
+
+      <div className="range-editor-plot">
+        <div aria-describedby="liquidity-range-chart-description" className="range-editor-chart" aria-label="Liquidity bin distribution" role="img">
+          {visualBinIds.map((binId) => {
+            const live = liveById.get(binId);
+            const selected = selectedById.get(binId);
+            const boundary = binId === lowerBinId ? "lower" : binId === upperBinId ? "upper" : null;
+            const boundaryPrice = boundary === "lower" ? lowerPriceInput : boundary === "upper" ? upperPriceInput : null;
+            return (
+              <span
+                className={[
+                  "range-editor-bin",
+                  binId === activeBin ? "active" : "",
+                  boundary ? `boundary ${boundary}` : "",
+                  live === undefined ? "outside-backdrop" : ""
+                ].filter(Boolean).join(" ")}
+                data-bin-id={binId}
+                key={binId}
+              >
+                {live ? <i className="live-x" style={{ height: `${live.tokenX === "0" ? 0 : Math.max(4, live.tokenXHeight)}%` }} /> : null}
+                {live ? <i className="live-y" style={{ height: `${live.tokenY === "0" ? 0 : Math.max(4, live.tokenYHeight)}%` }} /> : null}
+                {selected ? (
+                  <b
+                    aria-label={`Selected bin${binId === activeBin ? "; active bin" : ""}${boundary ? `; ${boundary} boundary${boundaryPrice ? `; ${boundaryPrice}` : ""}` : ""}`}
+                    className="selected-distribution"
+                    role="img"
+                    style={{ height: selected.height }}
+                  />
+                ) : null}
+              </span>
+            );
+          })}
+          {liveBinsState === "loading" ? <span className="range-editor-chart-state">Loading pool reserves</span> : null}
+        </div>
+        <p className="visually-hidden" id="liquidity-range-chart-description">
+          Pool reserves and the proposed {strategy} position across bins {visualStart} through {visualEnd}. The active bin is {activeBin ?? "unavailable"}; the selected range is {lowerBinId ?? "invalid"} through {upperBinId ?? "invalid"}.
+        </p>
+        <div className="visually-hidden visually-hidden-table">
+          <table aria-label="Exact liquidity distribution data">
+            <caption>Pool reserves and proposed position weights by visible bin</caption>
+            <thead>
+              <tr><th>Bin</th><th>Pool {tokenXSymbol}</th><th>Pool {tokenYSymbol}</th><th>New {tokenXSymbol} weight</th><th>New {tokenYSymbol} weight</th></tr>
+            </thead>
+            <tbody>
+              {visualBinIds.map((binId) => {
+                const live = liveById.get(binId);
+                const selected = selectedById.get(binId);
+                return (
+                  <tr key={`${binId}-accessible`}>
+                    <th>{binId}{binId === activeBin ? " (active)" : ""}</th>
+                    <td>{live?.tokenX ?? "Outside indexed window"}</td>
+                    <td>{live?.tokenY ?? "Outside indexed window"}</td>
+                    <td>{selected?.xWeight ?? "0%"}</td>
+                    <td>{selected?.yWeight ?? "0%"}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+
+        <div
+          className={["range-editor-axis-control", handlesAreClose ? "handles-close" : ""].filter(Boolean).join(" ")}
+          data-testid="liquidity-range-sliders"
+          ref={rangeTrackRef}
+        >
+          <span className="range-editor-track-selection" aria-hidden="true" style={{ left: `${Math.min(lowerPosition, upperPosition)}%`, width: `${Math.max(0, Math.abs(upperPosition - lowerPosition))}%` }} />
+          {(["lower", "upper"] as const).map((boundary) => {
+            const isLower = boundary === "lower";
+            const value = isLower ? lowerDelta ?? 0 : upperDelta ?? 0;
+            const position = isLower ? lowerPosition : upperPosition;
+            return (
+              <button
+                aria-describedby={rangeError ? "liquidity-range-error" : undefined}
+                aria-invalid={rangeError ? true : undefined}
+                aria-label={`${isLower ? "Lower" : "Upper"} range handle`}
+                aria-valuemax={isLower ? upperDelta ?? sliderControlMax : sliderControlMax}
+                aria-valuemin={isLower ? sliderControlMin : lowerDelta ?? sliderControlMin}
+                aria-valuenow={value}
+                aria-valuetext={`${isLower ? "Minimum" : "Maximum"} ${isLower ? lowerPriceInput : upperPriceInput} ${tokenYSymbol} per ${tokenXSymbol}`}
+                className={`range-editor-thumb ${boundary}`}
+                key={boundary}
+                onKeyDown={(event) => {
+                  if (updateHandleFromKey(boundary, event.key)) event.preventDefault();
+                }}
+                onPointerDown={(event) => {
+                  event.currentTarget.setPointerCapture(event.pointerId);
+                }}
+                onPointerMove={(event) => {
+                  if (event.currentTarget.hasPointerCapture(event.pointerId)) updateHandleFromPointer(boundary, event.clientX);
+                }}
+                onPointerUp={(event) => {
+                  if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+                }}
+                role="slider"
+                style={{ left: `${position}%` }}
+                type="button"
+              >
+                <i aria-hidden="true" />
+                <span>{isLower ? "Min" : "Max"}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      <div className="range-editor-range-meta" aria-live="polite">
+        <strong>{selectedBinCount === null ? "Invalid range" : `${selectedBinCount} bins selected`}</strong>
+        <span>Maximum {maxBins}</span>
+      </div>
+      {liveBinsState !== "ready" ? (
+        <p className="range-editor-data-note" role="status">Existing pool liquidity is {liveBinsState}. {liveBinsError ?? "The exact new-position distribution remains available."}</p>
+      ) : selectedExtendsPastBackdrop ? (
+        <p className="range-editor-data-note">Part of the selected range is outside the indexed ±40-bin reserve backdrop. The new-position weights shown there are still exact.</p>
+      ) : selectionIsFarFromActive ? (
+        <p className="range-editor-data-note">The selected range is outside the current-price viewport, so this view is focused on the selected bins.</p>
+      ) : null}
+
+      <div className="liquidity-range-fields" data-testid="liquidity-range-fields">
+        <div className="range-editor-price-grid">
+          <label htmlFor="range-min-price">
+            <span>Min {tokenYSymbol} per {tokenXSymbol}</span>
+            <input aria-errormessage={rangeError ? "liquidity-range-error" : undefined} aria-invalid={rangeError ? true : undefined} aria-label={`Min ${tokenYSymbol} per ${tokenXSymbol}`} id="range-min-price" inputMode="decimal" value={lowerPriceInput} onChange={(event) => onLowerPriceInput(event.target.value)} onBlur={onLowerPriceCommit} />
+          </label>
+          <label htmlFor="range-max-price">
+            <span>Max {tokenYSymbol} per {tokenXSymbol}</span>
+            <input aria-errormessage={rangeError ? "liquidity-range-error" : undefined} aria-invalid={rangeError ? true : undefined} aria-label={`Max ${tokenYSymbol} per ${tokenXSymbol}`} id="range-max-price" inputMode="decimal" value={upperPriceInput} onChange={(event) => onUpperPriceInput(event.target.value)} onBlur={onUpperPriceCommit} />
+          </label>
+        </div>
+
+        {rangeError ? <p aria-atomic="true" className="range-editor-validation" id="liquidity-range-error" role="alert">{rangeError}</p> : null}
+
+        <details className="range-editor-advanced" open={advancedOpenByDefault ? true : undefined}>
+          <summary>Advanced range controls</summary>
+          <div className="range-editor-exact-grid">
+            <label htmlFor="range-lower">
+              <span>Lower delta</span>
+              <input aria-errormessage={rangeError ? "liquidity-range-error" : undefined} aria-invalid={rangeError ? true : undefined} id="range-lower" inputMode="numeric" value={lowerDeltaInput} onChange={(event) => onLowerDeltaInput(event.target.value)} />
+            </label>
+            <label htmlFor="range-upper">
+              <span>Upper delta</span>
+              <input aria-errormessage={rangeError ? "liquidity-range-error" : undefined} aria-invalid={rangeError ? true : undefined} id="range-upper" inputMode="numeric" value={upperDeltaInput} onChange={(event) => onUpperDeltaInput(event.target.value)} />
+            </label>
+            {!compact ? (
+              <>
+                <label htmlFor="range-lower-bin">
+                  <span>Lower bin</span>
+                  <input aria-errormessage={rangeError ? "liquidity-range-error" : undefined} aria-invalid={rangeError ? true : undefined} id="range-lower-bin" inputMode="numeric" value={lowerBinInput} onChange={(event) => onLowerBinInput(event.target.value)} />
+                </label>
+                <label htmlFor="range-upper-bin">
+                  <span>Upper bin</span>
+                  <input aria-errormessage={rangeError ? "liquidity-range-error" : undefined} aria-invalid={rangeError ? true : undefined} id="range-upper-bin" inputMode="numeric" value={upperBinInput} onChange={(event) => onUpperBinInput(event.target.value)} />
+                </label>
+              </>
+            ) : null}
+          </div>
+          <fieldset className="range-presets" aria-label="Liquidity range presets">
+            <legend>Editable presets</legend>
+            <label>
+              <span>Narrow bins</span>
+              <input aria-label="Narrow preset bin count" inputMode="numeric" value={narrowPresetInput} onChange={(event) => onNarrowPresetInput(event.target.value)} />
+              <button data-testid="liquidity-preset-narrow" onClick={() => onApplyPreset(narrowPresetInput)} type="button">Apply narrow</button>
+            </label>
+            <label>
+              <span>Wide bins</span>
+              <input aria-label="Wide preset bin count" inputMode="numeric" value={widePresetInput} onChange={(event) => onWidePresetInput(event.target.value)} />
+              <button data-testid="liquidity-preset-wide" onClick={() => onApplyPreset(widePresetInput)} type="button">Apply wide</button>
+            </label>
+          </fieldset>
+        </details>
+      </div>
+
+      {!compact ? <details className="distribution-details">
         <summary>Per-bin weights ({bins.length})</summary>
         <div className="distribution-table">
           {bins.map((bin) => (
             <div className="distribution-row" key={`${bin.key}-row`}>
-              <span>
-                {bin.delta} / {bin.binId}
-              </span>
+              <span>{bin.delta} / {bin.binId}</span>
               <span>X {bin.xWeight}</span>
               <span>Y {bin.yWeight}</span>
             </div>
           ))}
         </div>
-      </details>
-    </div>
+      </details> : null}
+    </section>
   );
 }
 
@@ -9035,6 +9813,7 @@ function LiquidityStateRows({
   actionError,
   finalActionPending,
   finalSuccessText,
+  idleText,
   inputError,
   insufficientBalance,
   pendingHash,
@@ -9046,6 +9825,7 @@ function LiquidityStateRows({
   actionError: string | null;
   finalActionPending: boolean;
   finalSuccessText: string | null;
+  idleText?: string;
   inputError: string | null;
   insufficientBalance: boolean;
   pendingHash: Address | undefined;
@@ -9065,7 +9845,9 @@ function LiquidityStateRows({
           ? { icon: <CheckCircle2 size={16} />, message: prerequisiteSuccessText, tone: "success" }
           : prerequisitePending || pendingHash
             ? { icon: <LoaderCircle className="spin" size={16} />, message: pendingHash ? `Pending ${formatCompactAddress(pendingHash)}` : "Awaiting approval wallet confirmation", tone: "pending" }
-          : { icon: <CheckCircle2 size={16} />, message: "Ready for wallet confirmation", tone: "ready" };
+          : idleText
+            ? { icon: <Wallet size={16} />, message: idleText, tone: "ready" }
+            : { icon: <CheckCircle2 size={16} />, message: "Ready for wallet confirmation", tone: "ready" };
 
   return (
     <div
@@ -9073,6 +9855,7 @@ function LiquidityStateRows({
       aria-live={state.tone === "failure" ? "assertive" : "polite"}
       className={`state-row transaction-status ${state.tone}`}
       data-testid={testId}
+      id={testId}
       role={state.tone === "failure" ? "alert" : "status"}
     >
       {state.icon}
@@ -9375,7 +10158,7 @@ function PositionsView({
     queryKey: ["walletPortfolio", environmentKey, registry.chainId, portfolioEndpoint, account.address],
     queryFn: () => {
       if (!account.address || !portfolioEndpoint) throw new Error("Analytics portfolio is unavailable");
-      return loadWalletPortfolio(`${portfolioEndpoint}/graphql`, account.address);
+      return loadWalletPortfolio(portfolioEndpoint, account.address);
     },
     enabled: connected && !onWrongChain && portfolioEndpoint !== null,
     refetchInterval: connected && !onWrongChain && portfolioEndpoint !== null ? SNAPSHOT_REFRESH_INTERVAL_MS : false,
@@ -9667,87 +10450,6 @@ function ActivityView({ snapshot }: { snapshot: AppSnapshot | undefined }) {
   );
 }
 
-function PoolFocusCard({ pool }: { pool: PoolRow | null }) {
-  const bars = useMemo(() => {
-    if (!pool) return [];
-    const reserveX = Number(formatUnits(BigInt(pool.reserveX), pool.tokenX?.decimals ?? 18));
-    const reserveY = Number(formatUnits(BigInt(pool.reserveY), pool.tokenY?.decimals ?? 18));
-    const base = Math.max(reserveX, reserveY, 1);
-    return [
-      { label: tokenSymbol(pool.tokenX), value: Math.max(12, (reserveX / base) * 100) },
-      { label: tokenSymbol(pool.tokenY), value: Math.max(12, (reserveY / base) * 100) }
-    ];
-  }, [pool]);
-
-  return (
-    <section className="info-panel">
-      <div className="panel-heading">
-        <span>Pool State</span>
-        <StatusBadge state={pool ? "ready" : "empty"} label={pool ? formatCompactAddress(pool.address) : "no pool"} />
-      </div>
-
-      {pool ? (
-        <>
-          <div className="reserve-bars">
-            {bars.map((bar) => (
-              <div className="bar-row" key={bar.label}>
-                <span>{bar.label}</span>
-                <div className="bar-track">
-                  <span style={{ width: `${bar.value}%` }} />
-                </div>
-              </div>
-            ))}
-          </div>
-          <dl className="contract-list">
-            <div>
-              <dt>Factory Pair</dt>
-              <dd>{formatCompactAddress(pool.address)}</dd>
-            </div>
-            <div>
-              <dt>Active ID</dt>
-              <dd>{pool.activeId ?? "n/a"}</dd>
-            </div>
-            <div>
-              <dt>Fees</dt>
-              <dd>
-                {formatTokenAmount(pool.feesX, pool.tokenX)} / {formatTokenAmount(pool.feesY, pool.tokenY)}
-              </dd>
-            </div>
-          </dl>
-        </>
-      ) : (
-        <EmptyState state="empty" />
-      )}
-    </section>
-  );
-}
-
-function MetricTile({ label, value, tone }: { label: string; value: string; tone: "good" | "warn" | "neutral" }) {
-  return (
-    <div className={`metric ${tone}`}>
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
-}
-
-function StatusPill({
-  icon: Icon,
-  label,
-  state
-}: {
-  icon: ComponentType<{ size?: number }>;
-  label: string;
-  state: LoadState;
-}) {
-  return (
-    <div className={`status-pill ${state}`}>
-      <Icon size={16} />
-      <span>{label}</span>
-    </div>
-  );
-}
-
 function StatusBadge({ state, label }: { state: LoadState; label: string }) {
   return <span className={`status-badge ${state}`}>{label}</span>;
 }
@@ -9777,18 +10479,6 @@ function EmptyState({ state }: { state: LoadState }) {
   );
 }
 
-function formatBlock(snapshot: AppSnapshot | undefined): string {
-  if (snapshot?.runtime.blockNumber === null || snapshot?.runtime.blockNumber === undefined) return "offline";
-  return snapshot.runtime.blockNumber.toString();
-}
-
-function formatPoolsMetric(snapshot: AppSnapshot | undefined): string {
-  if (!snapshot) return "0";
-
-  const pairCount = snapshot.indexer.pairCount ?? snapshot.indexer.pools.length.toString();
-  return isPartialPagination(snapshot.indexer.pagination.pools) ? `${snapshot.indexer.pools.length}+ / ${pairCount}` : pairCount;
-}
-
 function paginationBadgeLabel(count: number, pageInfo: PaginationInfo, unit: string): string {
   return isPartialPagination(pageInfo) ? `${count}+ ${unit}` : `${count} ${unit}`;
 }
@@ -9798,19 +10488,13 @@ function hasPartialActivity(snapshot: AppSnapshot | undefined): boolean {
 }
 
 function activityBadgeLabel(snapshot: AppSnapshot | undefined, count: number): string {
-  return hasPartialActivity(snapshot) ? `${count}+ events` : `${count} events`;
+  if (hasPartialActivity(snapshot)) return `${count}+ events`;
+  const windowed = snapshot?.indexer.pagination.swaps.windowed || snapshot?.indexer.pagination.liquidityEvents.windowed;
+  return windowed ? `Latest ${count} events` : `${count} events`;
 }
 
 function isPartialPagination(pageInfo: PaginationInfo | null | undefined): boolean {
   return Boolean(pageInfo?.capped || pageInfo?.failed);
-}
-
-function formatActiveBin(snapshot: AppSnapshot | undefined): string {
-  if (snapshot?.runtime.seededActiveId !== null && snapshot?.runtime.seededActiveId !== undefined) {
-    return snapshot.runtime.seededActiveId.toString();
-  }
-
-  return snapshot?.indexer.pools[0]?.activeId ?? "n/a";
 }
 
 function useHashRoute(): [
@@ -9820,7 +10504,8 @@ function useHashRoute(): [
   "add" | "withdraw" | null,
   string | null,
   string | null,
-  "add" | "partial" | "full" | null
+  "add" | "partial" | "full" | null,
+  PoolWorkspaceTask | null
 ] {
   const routeParts = () => window.location.hash.replace("#/", "").split("?", 1)[0].split("/");
   const readRoute = () => {
@@ -9863,12 +10548,17 @@ function useHashRoute(): [
     const [route, action] = routeParts();
     return route === "liquidity" && (action === "add" || action === "partial" || action === "full") ? action : null;
   };
+  const readWorkspaceTask = (): PoolWorkspaceTask | null => {
+    const workspaceRoute = parsePoolWorkspaceRoute(window.location.hash);
+    return workspaceRoute?.source === "canonical" ? workspaceRoute.task : null;
+  };
   const [routeKey, setRouteKeyState] = useState<RouteKey>(readRoute);
   const [poolDetailId, setPoolDetailId] = useState<string | null>(readPoolDetailId);
   const [liquiditySection, setLiquiditySection] = useState<"add" | "withdraw" | null>(readLiquiditySection);
   const [actionPoolId, setActionPoolId] = useState<string | null>(readActionPoolId);
   const [positionDetailId, setPositionDetailId] = useState<string | null>(readPositionDetailId);
   const [portfolioAction, setPortfolioAction] = useState<"add" | "partial" | "full" | null>(readPortfolioAction);
+  const [workspaceTask, setWorkspaceTask] = useState<PoolWorkspaceTask | null>(readWorkspaceTask);
 
   useEffect(() => {
     const listener = () => {
@@ -9878,6 +10568,7 @@ function useHashRoute(): [
       setActionPoolId(readActionPoolId());
       setPositionDetailId(readPositionDetailId());
       setPortfolioAction(readPortfolioAction());
+      setWorkspaceTask(readWorkspaceTask());
     };
     window.addEventListener("hashchange", listener);
     return () => window.removeEventListener("hashchange", listener);
@@ -9890,7 +10581,8 @@ function useHashRoute(): [
     setActionPoolId(null);
     setPositionDetailId(null);
     setPortfolioAction(null);
+    setWorkspaceTask(null);
   };
 
-  return [routeKey, setRouteKey, poolDetailId, liquiditySection, actionPoolId, positionDetailId, portfolioAction];
+  return [routeKey, setRouteKey, poolDetailId, liquiditySection, actionPoolId, positionDetailId, portfolioAction, workspaceTask];
 }

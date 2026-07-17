@@ -1,0 +1,23 @@
+---
+title: "Liquidity provider primer"
+description: "Learn how bin balances represent ownership, how fees accrue, and which risks LPs accept."
+slug: "liquidity/primer"
+section: "Liquidity"
+order: 1
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+Liquidity providers deposit one or both pool assets across selected price bins. In return, the pair contract records fungible balances for each owned bin.
+
+## Ownership model
+
+Your position is the complete set of nonzero bin balances held by one wallet in one pool. Overlapping deposits merge into those balances. A strategy name describes how a deposit was distributed, not a permanent onchain position type.
+
+## Fee model
+
+Eligible trading and composition fees remain in bin reserves. They increase the token claims represented by outstanding liquidity. Withdrawing burns liquidity and returns the corresponding reserves, including embedded fee value.
+
+<Risk title="LP returns are not guaranteed yield">
+Price movement, concentration, out-of-range time, token behavior, fees, gas, and contract risk can cause loss. Compare the result with simply holding both assets.
+</Risk>

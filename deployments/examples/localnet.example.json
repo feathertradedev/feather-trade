@@ -40,11 +40,11 @@
     "variableFeeControl": 40000
   },
   "seededPools": {
-    "wnativeUsdc": {
-      "activeId": 8388608,
+    "wethUsdc": {
+      "activeId": 8396213,
       "binStep": 10,
-      "pair": "0x4A47586912f0e03d9f3DCAa762fB8B659E52604b",
-      "tokenX": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+      "pair": "0xBF57b75d71d91e13C97693e4e5B850B0bE638DAc",
+      "tokenX": "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9",
       "tokenY": "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
     }
   },
@@ -59,11 +59,11 @@
     "routerWNative": "0x5FbDB2315678afecb367f032d93F642f64180aa3"
   },
   "smoke": {
-    "liquidityAmountX": "100000000000000000000",
-    "liquidityAmountY": "100000000000000000000",
-    "swapAmountIn": 1000000000000000000,
-    "swapAmountOut": 999000000000000000,
-    "swapTokenIn": "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+    "liquidityAmountX": "15000000000000000000",
+    "liquidityAmountY": "30000000000000000000000",
+    "swapAmountIn": 1000000000000000,
+    "swapAmountOut": 1998594640439506130,
+    "swapTokenIn": "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9",
     "swapTokenOut": "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
   }
 }

@@ -21,14 +21,18 @@ const server = await createServer({
 try {
   const {
     buildBinDistribution,
+    buildCenteredBinDistribution,
     buildCandleChartModel,
     formatRatioPercentE18,
     formatUsdE18,
     joinPoolWorkspaceRows,
+    shouldShowWorkspaceAnalyticsState,
     sortPoolWorkspaceRows,
+    summarizePoolPosition,
     workspaceAnalyticsState,
     workspaceMetricTiles
   } = await server.ssrLoadModule("/src/pool-workspace.ts");
+  const { coalescePositionHistory } = await server.ssrLoadModule("/src/data.ts");
 
   const pools = [pool(pairA), pool(pairB), pool(pairC)];
   const metrics = {
@@ -94,20 +98,69 @@ try {
   assert.equal(distribution[1].lbSupplyHeight, 100);
   assert.throws(() => buildBinDistribution([bin("1", "0", "0", "0"), bin("1", "0", "0", "0")], "1", 18, 18), /Duplicate pool bin/);
 
-  const healthState = workspaceAnalyticsState("READY", {
+  const centeredDistribution = buildCenteredBinDistribution([
+    bin("8388606", "5000000", "0", "20"),
+    bin("8388608", "10000000", "2000000000000000000", "10"),
+    bin("8388610", "0", "3000000000000000000", "30")
+  ], "8388608", 6, 18, 2);
+  assert.deepEqual(centeredDistribution.map((point) => point.binId), ["8388606", "8388607", "8388608", "8388609", "8388610"]);
+  assert.equal(centeredDistribution[2].active, true);
+  assert.equal(centeredDistribution[1].tokenX, "0");
+  assert.equal(centeredDistribution[1].tokenY, "0");
+  assert.equal(centeredDistribution[4].tokenY, "3");
+  const zeroActiveDistribution = buildCenteredBinDistribution([
+    bin("8388607", "1", "0", "1"),
+    bin("8388609", "0", "1", "1")
+  ], "8388608", 18, 18, 1);
+  assert.equal(zeroActiveDistribution.length, 3);
+  assert.equal(zeroActiveDistribution[1].active, true);
+  assert.equal(zeroActiveDistribution[1].tokenX, "0");
+  assert.equal(zeroActiveDistribution[1].tokenY, "0");
+  assert.equal(zeroActiveDistribution[1].lbSupply, "0");
+  assert.throws(() => buildCenteredBinDistribution([], "8388608", 18, 18, 0), /radius/);
+  assert.throws(() => buildCenteredBinDistribution([bin("1", "0", "0", "0"), bin("1", "0", "0", "0")], "1", 18, 18, 1), /Duplicate pool bin/);
+  assert.throws(() => buildCenteredBinDistribution([], "16777216", 18, 18, 1), /uint24/);
+
+  const positionSummary = summarizePoolPosition([
+    position("range-b", "101", "3000000000000000000", "8"),
+    position("closed", "99", "0", "12"),
+    position("range-a", "100", "2000000000000000000", "7")
+  ], "100");
+  assert.deepEqual(positionSummary, {
+    binCount: 2,
+    inActiveBin: true,
+    latestBlock: "8",
+    liquidity: "5000000000000000000",
+    maxBinId: "101",
+    minBinId: "100",
+    positionIds: ["range-a", "range-b"]
+  });
+  assert.equal(summarizePoolPosition([position("closed", "99", "0", "12")], "99"), null);
+  assert.equal(summarizePoolPosition([position("range-a", "100", "1", "7"), position("range-c", "102", "1", "7")], "101")?.inActiveBin, false);
+
+  const deposit = history("deposit", "DEPOSIT", "0xaaa", ["101", "100"]);
+  const mintEcho = history("mint", "TRANSFER_IN", "0xaaa", ["100", "101"]);
+  const transfer = history("transfer", "TRANSFER_OUT", "0xbbb", ["100"]);
+  assert.deepEqual(coalescePositionHistory([deposit, mintEcho, transfer]).map((row) => row.id), ["deposit", "transfer"]);
+
+  const staleHealth = {
     status: "READY", headBlock: "99", headHash: null, headTimestamp: 100, canonicalBlockCount: 1, reorgCount: 0,
     partialEventCount: 2, missingPriceTokens: [tokenX], fresh: false, headLagSeconds: 90, maxHeadLagSeconds: 60,
     backfillStatus: "running", backfillCursor: "10", backfillError: null, coverageStartTimestamp: "0",
     coverageThroughTimestamp: "90", prices: []
-  });
+  };
+  const healthState = workspaceAnalyticsState("READY", staleHealth);
   assert.equal(healthState.status, "PARTIAL");
   assert.match(healthState.detail, /90s behind/);
   assert.match(healthState.detail, /history backfill is running/);
   assert.match(healthState.detail, /2 partial events/);
   assert.match(healthState.detail, /1 token price unavailable/);
   assert.equal(workspaceAnalyticsState("UNAVAILABLE", null).status, "UNAVAILABLE");
+  assert.equal(shouldShowWorkspaceAnalyticsState("READY", null), false);
+  assert.equal(shouldShowWorkspaceAnalyticsState("PARTIAL", null), true);
+  assert.equal(shouldShowWorkspaceAnalyticsState("READY", staleHealth), true);
 
-  console.log("Pool workspace fixture passed: economic joins/sorts, null-zero truth, candle gaps/table data, bin distribution, and freshness semantics.");
+  console.log("Pool workspace fixture passed: economic joins/sorts, candle and bin models, owner position summaries, deduplicated history, and freshness semantics.");
 } finally {
   await server.close();
 }
@@ -123,8 +176,9 @@ function pool(address) {
 
 function metric(pair, overrides) {
   return {
-    pair, tokenX, tokenY, tvlUsdE18: "0", volume24hUsdE18: "0", lpFees24hUsdE18: null,
-    feeToTvlE18: "0", priceUsdE18: "1000000000000000000", asOfBlock: "99", asOfTimestamp: 100,
+    pair, tokenX, tokenY, tvlUsdE18: "0", volume24hUsdE18: "0", totalSwapFees24hUsdE18: "0",
+    protocolSwapFees24hUsdE18: null, lpFees24hUsdE18: null, feeToTvlE18: "0", feeBreakdownComplete: false,
+    priceUsdE18: "1000000000000000000", asOfBlock: "99", asOfTimestamp: 100,
     status: "READY", missingPriceTokens: [], ...overrides
   };
 }
@@ -133,7 +187,9 @@ function candle(startTimestamp, closeUsdE18, status) {
   return {
     pair: pairA, interval: "HOUR", startTimestamp, endTimestamp: startTimestamp + 3_600,
     openUsdE18: closeUsdE18, highUsdE18: closeUsdE18, lowUsdE18: closeUsdE18, closeUsdE18,
-    volumeUsdE18: closeUsdE18 === null ? null : "0", lpFeesUsdE18: closeUsdE18 === null ? null : "0",
+    volumeUsdE18: closeUsdE18 === null ? null : "0", totalSwapFeesUsdE18: "0",
+    protocolSwapFeesUsdE18: closeUsdE18 === null ? null : "0", lpFeesUsdE18: closeUsdE18 === null ? null : "0",
+    feeBreakdownComplete: closeUsdE18 !== null,
     tvlUsdE18: closeUsdE18, swapCount: closeUsdE18 === null ? 0 : 1, status,
     missingPriceTokens: closeUsdE18 === null ? [tokenX] : [], firstBlock: "1", lastBlock: "2"
   };
@@ -141,4 +197,15 @@ function candle(startTimestamp, closeUsdE18, status) {
 
 function bin(binId, reserveX, reserveY, totalSupply) {
   return { id: `bin-${binId}`, binId, reserveX, reserveY, totalSupply, updatedAtBlock: "1" };
+}
+
+function position(id, binId, liquidity, updatedAtBlock) {
+  return { id, owner: pairB, pair: pairA, binId, liquidity, updatedAtBlock };
+}
+
+function history(id, type, transactionHash, binIds) {
+  return {
+    id, type, transactionHash, blockNumber: "9", timestamp: "1720000000", amountX: null, amountY: null,
+    binIds, sender: pairB, to: pairB
+  };
 }

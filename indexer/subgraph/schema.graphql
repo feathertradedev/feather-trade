@@ -91,6 +91,7 @@ type Position @entity(immutable: false) {
 type Swap @entity(immutable: true) {
   id: ID!
   pair: Pair!
+  transactionFrom: Bytes!
   sender: Bytes!
   to: Bytes!
   activeId: BigInt!

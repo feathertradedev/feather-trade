@@ -1,5 +1,7 @@
 import { isAddress, type Address } from "viem";
 
+import { poolWorkspaceHref } from "./pool-workspace-route";
+
 export type PoolCategory = "all" | "active" | "stables";
 export type PoolSort = "swaps" | "deposits" | "updated" | "tvl" | "volume24h" | "lpFees24h" | "feeToTvl";
 export type PoolAction = "swap" | "add" | "withdraw";
@@ -92,8 +94,8 @@ export function poolDetailHref(poolId: string, state: PoolDiscoveryState): strin
 
 export function actionHref(action: PoolAction, poolId: string, returnTo: string): string {
   const base = action === "swap"
-    ? `#/swap/${encodeRoutePart(poolId)}`
-    : `#/liquidity/${action}/${encodeRoutePart(poolId)}`;
+    ? poolWorkspaceHref(poolId, "swap")
+    : poolWorkspaceHref(poolId, action === "add" ? "create" : "manage");
   const safeReturn = safeReturnHref(returnTo);
   if (safeReturn === null) return base;
   const params = new URLSearchParams({ returnTo: safeReturn });

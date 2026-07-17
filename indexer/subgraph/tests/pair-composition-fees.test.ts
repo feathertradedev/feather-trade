@@ -1,15 +1,16 @@
 import { Address, BigInt, Bytes, ethereum } from "@graphprotocol/graph-ts";
-import { afterEach, assert, clearStore, describe, newTypedMockEvent, test } from "matchstick-as/assembly/index";
+import { afterEach, assert, clearStore, createMockedFunction, describe, newTypedMockEvent, test } from "matchstick-as/assembly/index";
 
-import { CompositionFees } from "../generated/templates/LBPair/LBPair";
+import { CompositionFees, Swap as SwapEvent } from "../generated/templates/LBPair/LBPair";
 import { Pair } from "../generated/schema";
-import { handleCompositionFees } from "../src/pair";
+import { handleCompositionFees, handleSwap } from "../src/pair";
 
 const PAIR_ADDRESS = Address.fromString("0x1111111111111111111111111111111111111111");
 const FACTORY_ADDRESS = Address.fromString("0x2222222222222222222222222222222222222222");
 const TOKEN_X = Address.fromString("0x3333333333333333333333333333333333333333");
 const TOKEN_Y = Address.fromString("0x4444444444444444444444444444444444444444");
 const SENDER = Address.fromString("0x5555555555555555555555555555555555555555");
+const TRANSACTION_FROM = Address.fromString("0x6666666666666666666666666666666666666666");
 const TRANSACTION_HASH = Bytes.fromHexString(
   "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 );
@@ -48,6 +49,25 @@ describe("handleCompositionFees", () => {
 
   test("executes nonzero protocol-share aggregation exactly once", () => {
     executeCase(X_SEVEN_Y_NINE, X_TWO_Y_THREE, "18", "22", "4", "6", "7", "9", "2", "3");
+  });
+});
+
+describe("handleSwap", () => {
+  afterEach(() => {
+    clearStore();
+  });
+
+  test("persists the canonical transaction origin independently of the router sender", () => {
+    seedPair();
+    mockPairReserves();
+    const event = createSwapEvent();
+
+    handleSwap(event);
+
+    const swapId = TRANSACTION_HASH.toHexString() + "-0";
+    assert.entityCount("Swap", 1);
+    assert.fieldEquals("Swap", swapId, "transactionFrom", TRANSACTION_FROM.toHexString());
+    assert.fieldEquals("Swap", swapId, "sender", SENDER.toHexString());
   });
 });
 
@@ -128,4 +148,40 @@ function createCompositionFeesEvent(totalFees: Bytes, protocolFees: Bytes): Comp
     new ethereum.EventParam("protocolFees", ethereum.Value.fromFixedBytes(protocolFees))
   ];
   return event;
+}
+
+function createSwapEvent(): SwapEvent {
+  const event = newTypedMockEvent<SwapEvent>();
+  event.address = PAIR_ADDRESS;
+  event.block.number = BigInt.fromI32(123);
+  event.block.timestamp = BigInt.fromI32(456);
+  event.transaction.hash = TRANSACTION_HASH;
+  event.transaction.from = TRANSACTION_FROM;
+  event.logIndex = BigInt.fromI32(0);
+  event.parameters = [
+    new ethereum.EventParam("sender", ethereum.Value.fromAddress(SENDER)),
+    new ethereum.EventParam("to", ethereum.Value.fromAddress(TRANSACTION_FROM)),
+    new ethereum.EventParam("id", ethereum.Value.fromUnsignedBigInt(BigInt.fromI32(8388608))),
+    new ethereum.EventParam("amountsIn", ethereum.Value.fromFixedBytes(X_SEVEN)),
+    new ethereum.EventParam("amountsOut", ethereum.Value.fromFixedBytes(Y_NINE)),
+    new ethereum.EventParam("volatilityAccumulator", ethereum.Value.fromUnsignedBigInt(BigInt.fromI32(1))),
+    new ethereum.EventParam("totalFees", ethereum.Value.fromFixedBytes(ZERO_PACKED)),
+    new ethereum.EventParam("protocolFees", ethereum.Value.fromFixedBytes(ZERO_PACKED))
+  ];
+  return event;
+}
+
+function mockPairReserves(): void {
+  createMockedFunction(PAIR_ADDRESS, "getReserves", "getReserves():(uint128,uint128)")
+    .withArgs([])
+    .returns([
+      ethereum.Value.fromUnsignedBigInt(BigInt.fromI32(1000)),
+      ethereum.Value.fromUnsignedBigInt(BigInt.fromI32(2000))
+    ]);
+  createMockedFunction(PAIR_ADDRESS, "getBin", "getBin(uint24):(uint128,uint128)")
+    .withArgs([ethereum.Value.fromUnsignedBigInt(BigInt.fromI32(8388608))])
+    .returns([
+      ethereum.Value.fromUnsignedBigInt(BigInt.fromI32(100)),
+      ethereum.Value.fromUnsignedBigInt(BigInt.fromI32(200))
+    ]);
 }

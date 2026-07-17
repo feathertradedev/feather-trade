@@ -10,6 +10,7 @@ import {
   robinhoodDefaultManifest,
   robinhoodTestnetDefaultManifest
 } from "./default-manifests";
+import { normalizeAnalyticsEndpoint } from "./analytics-endpoint";
 
 export type EnvironmentKey = "localnet" | "robinhoodTestnet" | "robinhood";
 export type RouteKey = "home" | "swap" | "pools" | "liquidity" | "positions" | "activity";
@@ -26,12 +27,14 @@ declare const __PUBLIC_RELEASE_ENV__: "robinhoodTestnet" | "robinhood" | undefin
 
 export const publicReleaseEnvironment = __PUBLIC_RELEASE_ENV__;
 export const defaultEnvironmentKey: EnvironmentKey = publicReleaseEnvironment ?? "localnet";
+export const docsHref = import.meta.env.VITE_FEATHER_DOCS_URL || "/docs";
 const analyticsEndpoints: Record<EnvironmentKey, string | null> = {
-  localnet: normalizeOptionalUrl(import.meta.env.VITE_ANALYTICS_LOCALNET_URL ?? import.meta.env.VITE_ANALYTICS_URL),
-  robinhoodTestnet: normalizeOptionalUrl(import.meta.env.VITE_ANALYTICS_ROBINHOOD_TESTNET_URL),
-  robinhood: normalizeOptionalUrl(import.meta.env.VITE_ANALYTICS_ROBINHOOD_URL)
+  localnet: normalizeAnalyticsEndpoint(import.meta.env.VITE_ANALYTICS_LOCALNET_URL ?? import.meta.env.VITE_ANALYTICS_URL),
+  robinhoodTestnet: normalizeAnalyticsEndpoint(import.meta.env.VITE_ANALYTICS_ROBINHOOD_TESTNET_URL),
+  robinhood: normalizeAnalyticsEndpoint(import.meta.env.VITE_ANALYTICS_ROBINHOOD_URL)
 };
 
+/** Returns the complete GraphQL POST target. Callers must not append `/graphql`. */
 export function analyticsEndpointForRegistry(registry: DexRegistry): string | null {
   const environmentKey = registry.environment === "localnet"
     ? "localnet"
@@ -57,7 +60,7 @@ export const routes: Array<{
 ];
 
 export const brandLinks: BrandLink[] = [
-  ...optionalBrandLink("Docs", import.meta.env.VITE_FEATHER_DOCS_URL),
+  { href: docsHref, label: "Docs" },
   ...optionalBrandLink("Security", import.meta.env.VITE_FEATHER_SECURITY_URL),
   ...optionalBrandLink("X", import.meta.env.VITE_FEATHER_X_URL),
   ...optionalBrandLink("Discord", import.meta.env.VITE_FEATHER_DISCORD_URL)

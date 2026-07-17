@@ -1,0 +1,32 @@
+---
+title: "Slippage, deadlines, price impact, and minimum received"
+description: "Set bounded swap protection and understand how market movement can change the final result."
+slug: "pools/swap-settings"
+section: "Pools and trading"
+order: 5
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+## Slippage tolerance
+
+Slippage tolerance determines the protected minimum received. A wider tolerance makes execution possible across more price movement but permits a worse result. Feather does not silently increase it.
+
+## Deadline
+
+The deadline limits how long a prepared transaction remains eligible for execution. An expired transaction should fail instead of executing against much later market state.
+
+## Price impact
+
+Price impact estimates how much the trade itself changes execution price by consuming liquidity. Thin pools and large trades generally create more impact.
+
+| Review value | Meaning |
+| --- | --- |
+| Expected output | Current quoted amount before protection |
+| Minimum received | Lowest protected output under selected tolerance |
+| Execution price | Effective price for the reviewed trade |
+| Price impact | Estimated trade-driven movement from available liquidity |
+
+<Risk title="Settings cannot guarantee execution">
+State can change before confirmation. The transaction may revert, expire, or receive an amount above the minimum but below the earlier expectation.
+</Risk>

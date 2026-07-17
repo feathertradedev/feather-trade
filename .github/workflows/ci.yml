@@ -143,7 +143,21 @@ jobs:
   packages:
     name: SDK, Analytics, and Web
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    services:
+      analytics-postgres:
+        image: postgres:16.13-alpine@sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50
+        env:
+          POSTGRES_DB: analytics
+          POSTGRES_PASSWORD: analytics
+          POSTGRES_USER: analytics
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U analytics -d analytics"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -183,6 +197,8 @@ jobs:
         run: pnpm analytics:build
 
       - name: Test analytics
+        env:
+          ANALYTICS_TEST_DATABASE_URL: postgres://analytics:analytics@127.0.0.1:5432/analytics
         run: pnpm analytics:test
 
       - name: Typecheck web app

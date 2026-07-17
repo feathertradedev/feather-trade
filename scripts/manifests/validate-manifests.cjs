@@ -125,20 +125,27 @@ function validateLocalnet(manifest, displayPath, errors) {
   });
 
   const seededPools = validateObject(manifest.seededPools, `${displayPath}.seededPools`, errors);
-  const wnativeUsdc = seededPools && validateObject(seededPools.wnativeUsdc, `${displayPath}.seededPools.wnativeUsdc`, errors);
-  if (wnativeUsdc) {
-    expectAddress(wnativeUsdc.pair, `${displayPath}.seededPools.wnativeUsdc.pair`, errors, { allowZero: false });
-    expectAddress(wnativeUsdc.tokenX, `${displayPath}.seededPools.wnativeUsdc.tokenX`, errors, { allowZero: false });
-    expectAddress(wnativeUsdc.tokenY, `${displayPath}.seededPools.wnativeUsdc.tokenY`, errors, { allowZero: false });
-    expectInteger(wnativeUsdc.activeId, `${displayPath}.seededPools.wnativeUsdc.activeId`, errors);
-    expectInteger(wnativeUsdc.binStep, `${displayPath}.seededPools.wnativeUsdc.binStep`, errors, { min: 1 });
+  if (seededPools) {
+    rejectUnexpectedKeys(seededPools, new Set(["wethUsdc"]), `${displayPath}.seededPools`, errors);
   }
+  const wethUsdc = seededPools && validateObject(seededPools.wethUsdc, `${displayPath}.seededPools.wethUsdc`, errors);
+  validateSeededPool(wethUsdc, `${displayPath}.seededPools.wethUsdc`, errors);
 
   const smoke = validateObject(manifest.smoke, `${displayPath}.smoke`, errors);
   if (smoke) {
     expectAddress(smoke.swapTokenIn, `${displayPath}.smoke.swapTokenIn`, errors, { allowZero: false });
     expectAddress(smoke.swapTokenOut, `${displayPath}.smoke.swapTokenOut`, errors, { allowZero: false });
   }
+}
+
+function validateSeededPool(pool, path, errors) {
+  if (!pool) return;
+  rejectUnexpectedKeys(pool, new Set(["activeId", "binStep", "pair", "tokenX", "tokenY"]), path, errors);
+  expectAddress(pool.pair, `${path}.pair`, errors, { allowZero: false });
+  expectAddress(pool.tokenX, `${path}.tokenX`, errors, { allowZero: false });
+  expectAddress(pool.tokenY, `${path}.tokenY`, errors, { allowZero: false });
+  expectInteger(pool.activeId, `${path}.activeId`, errors);
+  expectInteger(pool.binStep, `${path}.binStep`, errors, { min: 1 });
 }
 
 function validateRobinhood(manifest, displayPath, errors) {

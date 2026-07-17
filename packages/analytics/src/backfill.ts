@@ -1,10 +1,12 @@
-import { FULL_HISTORY_START_TIMESTAMP, type AnalyticsEngine } from "./engine.js";
+import { FULL_HISTORY_START_TIMESTAMP, type AnalyticsEngine, type CanonicalHead } from "./engine.js";
 import type { BlockEnvelope } from "./types.js";
 
 export interface BackfillPage {
   blocks: BlockEnvelope[];
   nextCursor: string | null;
   hasMore: boolean;
+  canonicalHead?: CanonicalHead | null;
+  rewindTo?: CanonicalHead | null;
 }
 
 export interface BackfillResult {
@@ -31,10 +33,16 @@ export async function runBackfill(input: {
   let latestTimestamp: number | null = null;
   const priorBackfill = input.engine.exportCheckpoint().backfill;
   const priorCoverageStart = priorBackfill.coverageStartTimestamp;
-  const priorCoverageThrough = priorBackfill.coverageThroughTimestamp;
   const coverageStart = () =>
     input.startCursor == null ? FULL_HISTORY_START_TIMESTAMP : priorCoverageStart ?? earliestTimestamp;
-  const coverageThrough = () => latestTimestamp ?? priorCoverageThrough;
+  const coverageThrough = () => {
+    let timestamp = latestTimestamp ?? input.engine.exportCheckpointMetadata().backfill.coverageThroughTimestamp;
+    const canonicalHeadTimestamp = input.engine.getCanonicalHead()?.timestamp ?? null;
+    if (timestamp !== null && canonicalHeadTimestamp !== null) {
+      timestamp = Math.min(timestamp, canonicalHeadTimestamp);
+    }
+    return timestamp;
+  };
   if (input.startCursor != null && priorCoverageStart === null) {
     const message = "Cannot resume backfill without prior coverage state";
     input.engine.updateBackfillState({ status: "partial", cursor, error: message });
@@ -48,11 +56,17 @@ export async function runBackfill(input: {
       if (page.blocks.length === 0 && page.hasMore) {
         throw new Error("Backfill page cannot be empty while hasMore is true");
       }
+      if (page.rewindTo !== null && page.rewindTo !== undefined) {
+        input.engine.rewindCanonicalHead(page.rewindTo);
+      }
       for (const block of [...page.blocks].sort((a, b) => (a.number < b.number ? -1 : a.number > b.number ? 1 : 0))) {
         input.engine.ingestBlock(block);
         blocksLoaded += 1;
         earliestTimestamp = earliestTimestamp === null ? block.timestamp : Math.min(earliestTimestamp, block.timestamp);
         latestTimestamp = latestTimestamp === null ? block.timestamp : Math.max(latestTimestamp, block.timestamp);
+      }
+      if (!page.hasMore && page.canonicalHead !== null && page.canonicalHead !== undefined) {
+        input.engine.rewindCanonicalHead(page.canonicalHead);
       }
       pagesLoaded += 1;
 

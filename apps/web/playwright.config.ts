@@ -18,7 +18,7 @@ export default defineConfig({
     trace: "retain-on-failure"
   },
   webServer: {
-    command: `VITE_ANALYTICS_LOCALNET_URL=http://127.0.0.1:8787 pnpm exec vite --host 127.0.0.1 --port ${port}`,
+    command: `VITE_ANALYTICS_LOCALNET_URL=http://127.0.0.1:8787/graphql pnpm exec vite --host 127.0.0.1 --port ${port}`,
     reuseExistingServer: !process.env.CI,
     timeout: 60_000,
     url: baseURL

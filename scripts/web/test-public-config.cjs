@@ -97,7 +97,7 @@ const localnetFieldsPath = path.join(dir, "localnet-fields.latest.json");
 writeJson(localnetFieldsPath, {
   ...readJson(testnetManifestPath),
   seededPools: {
-    wnativeUsdc: {
+    wethUsdc: {
       activeId: 8_388_608,
       binStep: 10,
       pair: "0x1111111111111111111111111111111111111111",
