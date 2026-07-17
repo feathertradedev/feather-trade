@@ -2,6 +2,7 @@ import { expect, test } from "@playwright/test";
 import { decodeFunctionData, type Hex } from "viem";
 
 import { lbRouterAbi } from "../../../packages/sdk/src/abi";
+import { installMockAnalyticsStream } from "./fixtures/mock-analytics-stream";
 import { installMockRpc, SECOND_WNATIVE_USDC_PAIR, USDC, WNATIVE, WNATIVE_USDC_PAIR } from "./fixtures/mock-rpc";
 import { DEFAULT_ACCOUNT, installMockWallet, LOCALNET_CHAIN_ID, readMockWallet } from "./fixtures/mock-wallet";
 
@@ -46,55 +47,6 @@ async function submitReviewedSwap(page: Parameters<typeof installMockRpc>[0]) {
   await page.getByTestId("swap-submit-button").click();
 }
 
-async function installMockCandleStream(page: Parameters<typeof installMockRpc>[0]) {
-  await page.addInitScript(() => {
-    type TestWindow = Window & {
-      __testEmitCandle: (payload: unknown) => void;
-      __testAdvanceCandleClock: (milliseconds: number) => void;
-      __testFailCandleStream: () => void;
-      __testResetCandleStream: () => void;
-    };
-    let latest: TestEventSource | null = null;
-    class TestEventSource extends EventTarget {
-      onerror: ((event: Event) => void) | null = null;
-      onopen: ((event: Event) => void) | null = null;
-      readyState = 0;
-      readonly url: string;
-
-      constructor(url: string | URL) {
-        super();
-        this.url = String(url);
-        latest = this;
-        window.setTimeout(() => {
-          this.readyState = 1;
-          this.onopen?.(new Event("open"));
-        }, 0);
-      }
-
-      close() {
-        this.readyState = 2;
-      }
-    }
-
-    Object.defineProperty(window, "EventSource", { configurable: true, value: TestEventSource });
-    const testWindow = window as unknown as TestWindow;
-    testWindow.__testEmitCandle = (payload) => latest?.dispatchEvent(new MessageEvent("candle", { data: JSON.stringify(payload) }));
-    const originalNow = Date.now;
-    testWindow.__testAdvanceCandleClock = (milliseconds) => {
-      Date.now = () => originalNow() + milliseconds;
-    };
-    testWindow.__testFailCandleStream = () => {
-      const originalNow = Date.now;
-      Date.now = () => originalNow() + 46_000;
-      latest?.onerror?.(new Event("error"));
-      Date.now = originalNow;
-    };
-    testWindow.__testResetCandleStream = () => {
-      latest?.dispatchEvent(new MessageEvent("reset", { data: JSON.stringify({ cursor: "1000", reason: "canonical-reorg" }) }));
-    };
-  });
-}
-
 test("swap workspace renders all candle timeframes with Lightweight Charts", async ({ page }) => {
   const rpc = await installMockRpc(page, { includePairs: true });
 
@@ -123,7 +75,7 @@ test("swap workspace renders all candle timeframes with Lightweight Charts", asy
 });
 
 test("pool chart applies live candle replacements and exposes stream failure", async ({ page }) => {
-  await installMockCandleStream(page);
+  await installMockAnalyticsStream(page);
   const rpc = await installMockRpc(page, { includePairs: true });
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
   await selectPoolWorkspaceView(page, "Market");
@@ -182,6 +134,182 @@ test("pool chart applies live candle replacements and exposes stream failure", a
   await expect(chart.locator(".swap-chart-stream")).toHaveText("Stream stale");
 });
 
+test("pool workspace applies sparse canonical market updates without refetching the bootstrap", async ({ page }) => {
+  await installMockAnalyticsStream(page);
+  const rpc = await installMockRpc(page, { includePairs: true });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+  await expandPoolMetadata(page);
+  await expect.poll(() => page.getByTestId("pool-workspace-rail").evaluate((element) => ({
+    error: element.getAttribute("data-pool-stream-error"),
+    state: element.getAttribute("data-pool-stream-state")
+  }))).toEqual({ error: null, state: "live" });
+  await expect(page.locator(".pool-rail-price-block small")).toContainText("Live analytics");
+  const poolRequests = () => rpc.snapshot().graphRequests.filter((request) => request.query.includes("WebPoolState"));
+  await expect.poll(() => poolRequests().length).toBe(1);
+
+  const untouchedBin = page.locator(`[data-bin-id="${TEST_ACTIVE_ID - 1}"]`);
+  await expect(untouchedBin).toBeAttached();
+  await untouchedBin.evaluate((element) => element.setAttribute("data-node-sentinel", "retained"));
+
+  const blockHash = `0x${"4".repeat(64)}`;
+  const state = {
+    chainId: LOCALNET_CHAIN_ID,
+    pair: WNATIVE_USDC_PAIR.toLowerCase(),
+    tokenX: WNATIVE.toLowerCase(),
+    tokenY: USDC.toLowerCase(),
+    decimalsX: 18,
+    decimalsY: 18,
+    reserveX: "2000000000000000000",
+    reserveY: "319000000000000000000",
+    activeId: TEST_ACTIVE_ID,
+    binStep: 10,
+    marketPriceQuoteE18: "160000000000000000000",
+    priceUsdE18: "160000000000000000000",
+    tvlUsdE18: "321000000000000000000",
+    status: "READY",
+    missingPriceTokens: [],
+    feeState: {
+      static: {
+        baseFactor: "20", filterPeriod: "30", decayPeriod: "120", reductionFactor: "5000",
+        variableFeeControl: "100", protocolShare: "1000", maxVolatilityAccumulator: "100000"
+      },
+      variable: {
+        volatilityAccumulator: "1200", volatilityReference: "500", idReference: String(TEST_ACTIVE_ID), timeOfLastUpdate: "1720000001"
+      }
+    },
+    asOfBlock: "43",
+    asOfBlockHash: blockHash,
+    asOfTimestamp: 1_720_000_001,
+    revision: 2
+  };
+  const payload = {
+    cursor: "5",
+    update: {
+      eventId: `31337:${blockHash}:${WNATIVE_USDC_PAIR.toLowerCase()}:swap-43`,
+      state,
+      binReplacements: [{
+        chainId: LOCALNET_CHAIN_ID,
+        pair: WNATIVE_USDC_PAIR.toLowerCase(),
+        binId: String(TEST_ACTIVE_ID),
+        reserveX: "9000000000000000000",
+        reserveY: "1000000",
+        totalSupply: "10000000000000000000",
+        updatedAtBlock: "43",
+        updatedAtBlockHash: blockHash,
+        updatedAtTimestamp: 1_720_000_001,
+        revision: 2
+      }],
+      replaceBinWindow: false,
+      sourceEventIds: ["swap-43"]
+    }
+  };
+  await page.evaluate((value) => {
+    (window as unknown as Window & { __testEmitPoolState: (payload: unknown) => void }).__testEmitPoolState(value);
+  }, payload);
+
+  await expect(page.locator(".pool-rail-reserves dd").first()).toContainText("2");
+  await expect(untouchedBin).toHaveAttribute("data-node-sentinel", "retained");
+  expect(poolRequests()).toHaveLength(1);
+
+  await page.evaluate((value) => {
+    (window as unknown as Window & { __testEmitPoolState: (payload: unknown) => void }).__testEmitPoolState(value);
+  }, payload);
+  await page.waitForTimeout(100);
+  expect(poolRequests()).toHaveLength(1);
+
+  await page.evaluate(() => {
+    window.dispatchEvent(new Event("focus"));
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  await page.waitForTimeout(100);
+  expect(poolRequests()).toHaveLength(1);
+
+  const invalidFeeHash = `0x${"5".repeat(64)}`;
+  await page.evaluate((value) => {
+    (window as unknown as Window & { __testEmitPoolState: (payload: unknown) => void }).__testEmitPoolState(value);
+  }, {
+    cursor: "6",
+    update: {
+      ...payload.update,
+      eventId: `31337:${invalidFeeHash}:${WNATIVE_USDC_PAIR.toLowerCase()}:swap-44`,
+      state: {
+        ...state,
+        feeState: {
+          ...state.feeState,
+          static: { ...state.feeState.static, protocolShare: "3000" }
+        },
+        asOfBlock: "44",
+        asOfBlockHash: invalidFeeHash,
+        asOfTimestamp: 1_720_000_002,
+        revision: 3
+      },
+      binReplacements: [{
+        ...payload.update.binReplacements[0],
+        updatedAtBlock: "44",
+        updatedAtBlockHash: invalidFeeHash,
+        updatedAtTimestamp: 1_720_000_002,
+        revision: 3
+      }],
+      sourceEventIds: ["swap-44"]
+    }
+  });
+  await expect(page.locator(".pool-rail-fees-heading small")).toContainText("Pinned RPC fees");
+  await expect(page.locator(".pool-rail-fees-heading small")).toContainText("live fee state unavailable");
+
+  await page.evaluate(() => {
+    (window as unknown as Window & { __testFailPoolStream: () => void }).__testFailPoolStream();
+  });
+  await expect(page.locator(".pool-rail-price-block small")).toContainText("Stale analytics snapshot");
+  await expect(page.getByTestId("pool-workspace-rail").getByRole("status")).toContainText("updates are stale");
+
+  await page.evaluate(() => {
+    (window as unknown as Window & { __testResetPoolStream: () => void }).__testResetPoolStream();
+  });
+  await expect.poll(() => poolRequests().length).toBeGreaterThan(1);
+});
+
+test("an unavailable pool bootstrap retries only until the live handoff succeeds", async ({ page }) => {
+  await installMockAnalyticsStream(page);
+  const rpc = await installMockRpc(page, { analyticsMode: "error", includePairs: true });
+  const poolRequests = () => rpc.snapshot().graphRequests.filter((request) => request.query.includes("WebPoolState"));
+
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+  await expandPoolMetadata(page);
+  await expect(page.getByTestId("pool-workspace-rail")).toHaveAttribute("data-pool-stream-state", "unavailable");
+  await expect.poll(() => poolRequests().length).toBe(1);
+
+  rpc.update({ analyticsMode: "ready" });
+  await expect(page.getByTestId("pool-workspace-rail")).toHaveAttribute("data-pool-stream-state", "live", { timeout: 15_000 });
+  const requestsAfterHandoff = poolRequests().length;
+  expect(requestsAfterHandoff).toBeGreaterThan(1);
+
+  await page.waitForTimeout(10_500);
+  expect(poolRequests()).toHaveLength(requestsAfterHandoff);
+});
+
+test("same-height live pool state must match the pinned canonical hash", async ({ page }) => {
+  await installMockAnalyticsStream(page);
+  const pinnedHash = `0x${"6".repeat(64)}` as const;
+  const liveForkHash = `0x${"7".repeat(64)}` as const;
+  await installMockRpc(page, {
+    analyticsAsOfBlock: 42n,
+    analyticsHeadHash: liveForkHash,
+    blockHash: pinnedHash,
+    includePairs: true,
+    indexerBlockHash: pinnedHash,
+    indexerBlockNumber: 42n
+  });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+  await expandPoolMetadata(page);
+  await expect(page.getByTestId("pool-workspace-rail")).toHaveAttribute(
+    "data-pool-stream-error",
+    "Live pool state canonical hash differs from pinned RPC state"
+  );
+  await expect(page.getByTestId("pool-workspace-rail")).toHaveAttribute("data-pool-stream-state", "unavailable");
+  await expect(page.locator(".pool-rail-price-block small")).toContainText("RPC block 42");
+  await expect(page.locator(".pool-rail-price-block small")).not.toContainText("Live analytics");
+});
+
 test("candle intervals remain usable without page overflow on a narrow mobile viewport", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   const rpc = await installMockRpc(page, { includePairs: true });
@@ -201,7 +329,7 @@ test("candle intervals remain usable without page overflow on a narrow mobile vi
 });
 
 test("an SSE candle crossing a 1m boundary appends without refetching historical GraphQL", async ({ page }) => {
-  await installMockCandleStream(page);
+  await installMockAnalyticsStream(page);
   const rpc = await installMockRpc(page, { includePairs: true });
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
   await selectPoolWorkspaceView(page, "Market");
@@ -1388,9 +1516,9 @@ test("pool economics uses one pinned active ID and labels every market data sour
   await expect(priceBlock).toContainText("RPC block 42");
   const activeBar = page.getByTestId("pool-rail-liquidity-distribution").locator(".pool-rail-liquidity-bars > span.active");
   await expect(activeBar).toHaveAttribute("data-bin-id", String(pinnedActiveId));
-  await expect(activeBar).toHaveAttribute("aria-label", /WNATIVE 0; USDC 0; active bin/);
-  await expect(activeBar.locator("i.token-x")).toHaveCSS("height", "0px");
-  await expect(activeBar.locator("i.token-y")).toHaveCSS("height", "0px");
+  await expect(activeBar).toHaveAttribute("aria-label", /WNATIVE (?!0(?:;|$)).+; USDC (?!0(?:;|$)).+; active bin/);
+  await expect(activeBar.locator("i.token-x")).not.toHaveCSS("height", "0px");
+  await expect(activeBar.locator("i.token-y")).not.toHaveCSS("height", "0px");
 });
 
 test("liquidity distribution rejects an indexed active ID that lags the pinned RPC snapshot", async ({ page }) => {

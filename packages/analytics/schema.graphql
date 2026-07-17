@@ -82,6 +82,70 @@ type CandleConnection {
   streamCursor: String!
 }
 
+type PoolStaticFeeParameters {
+  baseFactor: BigInt!
+  filterPeriod: BigInt!
+  decayPeriod: BigInt!
+  reductionFactor: BigInt!
+  variableFeeControl: BigInt!
+  protocolShare: BigInt!
+  maxVolatilityAccumulator: BigInt!
+}
+
+type PoolVariableFeeParameters {
+  volatilityAccumulator: BigInt!
+  volatilityReference: BigInt!
+  idReference: BigInt!
+  timeOfLastUpdate: BigInt!
+}
+
+type PoolFeeState {
+  static: PoolStaticFeeParameters!
+  variable: PoolVariableFeeParameters!
+}
+
+type PoolState {
+  chainId: Int!
+  pair: ID!
+  tokenX: ID!
+  tokenY: ID!
+  decimalsX: Int!
+  decimalsY: Int!
+  reserveX: BigInt!
+  reserveY: BigInt!
+  activeId: Int!
+  binStep: Int!
+  marketPriceQuoteE18: BigInt!
+  priceUsdE18: BigInt
+  tvlUsdE18: BigInt
+  status: AnalyticsStatus!
+  missingPriceTokens: [ID!]!
+  feeState: PoolFeeState!
+  asOfBlock: BigInt!
+  asOfBlockHash: String!
+  asOfTimestamp: Int!
+  revision: Int!
+}
+
+type PoolBinState {
+  chainId: Int!
+  pair: ID!
+  binId: BigInt!
+  reserveX: BigInt!
+  reserveY: BigInt!
+  totalSupply: BigInt!
+  updatedAtBlock: BigInt!
+  updatedAtBlockHash: String!
+  updatedAtTimestamp: Int!
+  revision: Int!
+}
+
+type PoolStateSnapshot {
+  state: PoolState!
+  bins: [PoolBinState!]!
+  streamCursor: String!
+}
+
 type PositionBinAccounting {
   binId: BigInt!
   liquidity: BigInt!
@@ -147,6 +211,7 @@ type PriceHealth {
 
 type Query {
   poolMetrics(first: Int!, after: String, asOfTimestamp: Int): PoolMetricsConnection!
+  poolState(pair: ID!, radius: Int!): PoolStateSnapshot
   pairCandles(pair: ID!, interval: CandleInterval!, fromTimestamp: Int!, toTimestamp: Int!, first: Int!, after: String): CandleConnection!
   walletPositions(owner: ID!, first: Int!, after: String): WalletPairPositionConnection!
   analyticsHealth: AnalyticsHealth!

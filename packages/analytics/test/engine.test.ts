@@ -476,6 +476,245 @@ test("rolls back orphaned aggregates and position state on a reorg", () => {
   assert.equal(engine.getHealth().headHash, "0x23");
 });
 
+test("materializes canonical pool state with bounded bins and sparse absolute replacements", () => {
+  const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  const activeId = 8_388_608;
+  engine.ingestBlock({
+    ...block(1n, "0xc1", "0x00", 1_000, [poolObservation({
+      sourceId: "snapshot:1",
+      sourceEventIds: ["log:2", "log:1"],
+      activeId,
+      marketPriceQuoteE18: 101n * USD_SCALE,
+      reserveX: 10n * UNIT,
+      reserveY: 20n * UNIT,
+      bins: [
+        poolBin(activeId - 2, 1n, 0n, 1n),
+        poolBin(activeId - 1, 2n, 0n, 2n),
+        poolBin(activeId, 3n, 4n, 7n),
+        poolBin(activeId + 1, 0n, 5n, 5n),
+        poolBin(activeId + 2, 0n, 6n, 6n)
+      ]
+    })], [
+      price(TOKEN_X, "x-usd", 2n * USD_SCALE, 1_000, 1n),
+      price(TOKEN_Y, "y-usd", USD_SCALE, 1_000, 1n)
+    ]),
+    chainId: 31_337
+  });
+
+  const first = engine.queryPoolState({ pair: PAIR.toUpperCase(), radius: 1 });
+  assert(first);
+  assert.equal(first.state.chainId, 31_337);
+  assert.equal(first.state.activeId, activeId);
+  assert.equal(first.state.binStep, 10);
+  assert.equal(first.state.marketPriceQuoteE18, 101n * USD_SCALE);
+  assert.equal(first.state.priceUsdE18, 101n * USD_SCALE, "display price follows the active bin");
+  assert.equal(first.state.tvlUsdE18, 40n * USD_SCALE, "TVL remains valued from trusted token prices");
+  assert.equal(first.state.asOfBlockHash, "0xc1");
+  assert.equal(first.state.revision, 1);
+  assert.deepEqual(first.bins.map((bin) => bin.binId), [String(activeId - 1), String(activeId), String(activeId + 1)]);
+  assert.deepEqual(engine.listLastChangedPoolUpdates()[0].sourceEventIds, ["log:1", "log:2"]);
+  assert.equal(
+    engine.listLastChangedPoolUpdates()[0].eventId,
+    `31337:0xc1:${PAIR}:log:1,log:2`
+  );
+
+  engine.ingestBlock({
+    ...block(2n, "0xc2", "0xc1", 1_010, [poolObservation({
+      sourceId: "snapshot:2",
+      sourceEventIds: ["log:3"],
+      activeId: activeId + 1,
+      marketPriceQuoteE18: 102n * USD_SCALE,
+      reserveX: 9n * UNIT,
+      reserveY: 25n * UNIT,
+      bins: [
+        poolBin(activeId, 3n, 4n, 7n),
+        poolBin(activeId + 1, 0n, 8n, 8n),
+        poolBin(activeId + 2, 0n, 9n, 9n)
+      ]
+    })], [
+      price(TOKEN_X, "x-usd", 2n * USD_SCALE, 1_010, 2n),
+      price(TOKEN_Y, "y-usd", USD_SCALE, 1_010, 2n)
+    ]),
+    chainId: 31_337
+  });
+
+  const update = engine.listLastChangedPoolUpdates()[0];
+  assert.equal(update.state.revision, 2);
+  assert.equal(update.state.asOfBlockHash, "0xc2");
+  assert.deepEqual(update.binReplacements.map((bin) => [bin.binId, bin.revision]), [
+    [String(activeId + 1), 2],
+    [String(activeId + 2), 2]
+  ]);
+  assert.equal(update.binReplacements.some((bin) => bin.binId === String(activeId)), false, "unchanged bins are omitted");
+  assert.equal(engine.listPoolStates()[0].bins.length, 5, "the engine retains the complete observed canonical bin set");
+
+  engine.ingestBlock({
+    ...block(3n, "0xc3", "0xc2", 1_020, [poolObservation({
+      sourceId: "snapshot:3",
+      sourceEventIds: ["log:4"],
+      activeId: activeId + 1,
+      marketPriceQuoteE18: 102n * USD_SCALE,
+      reserveX: 9n * UNIT,
+      reserveY: 25n * UNIT,
+      bins: [
+        poolBin(activeId, 3n, 4n, 7n),
+        poolBin(activeId + 1, 0n, 8n, 8n),
+        poolBin(activeId + 2, 0n, 9n, 9n)
+      ],
+      replaceBinWindow: true
+    })]),
+    chainId: 31_337
+  });
+  const windowReplacement = engine.listLastChangedPoolUpdates()[0];
+  assert.equal(windowReplacement.replaceBinWindow, true);
+  assert.deepEqual(windowReplacement.binReplacements.map((bin) => [bin.binId, bin.revision]), [
+    [String(activeId), 1],
+    [String(activeId + 1), 2],
+    [String(activeId + 2), 2]
+  ], "window resets include every observed row without inventing bin revisions");
+  assert.equal(engine.listPoolStates()[0].bins.length, 3, "a complete window replacement discards bins outside the new window");
+
+  assert.throws(() => engine.queryPoolState({ pair: PAIR, radius: -1 }), /between 0 and 100/);
+  assert.throws(() => engine.queryPoolState({ pair: PAIR, radius: 101 }), /between 0 and 100/);
+});
+
+test("deduplicates canonical event sources and rejects source or block payload conflicts", () => {
+  const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  const sourcedSwap = {
+    ...swap(UNIT, 0n, 0n, 0n),
+    source: logSource("swap:1", "0xaa", 0)
+  };
+  const firstBlock = {
+    ...block(1n, "0xd1", "0x00", 2_000, [sourcedSwap, structuredClone(sourcedSwap)], [
+      price(TOKEN_X, "x-usd", USD_SCALE, 2_000, 1n),
+      price(TOKEN_Y, "y-usd", USD_SCALE, 2_000, 1n)
+    ]),
+    chainId: 31_337
+  };
+  assert.equal(engine.ingestBlock(firstBlock), "appended");
+  assert.equal(
+    engine.queryCandles({ pair: PAIR, interval: "minute", fromTimestamp: 1_980, toTimestamp: 1_980, first: 10 }).nodes[0].swapCount,
+    1
+  );
+  assert.equal(engine.ingestBlock(firstBlock), "duplicate");
+  assert.throws(
+    () => engine.ingestBlock({ ...firstBlock, timestamp: 2_001 }),
+    /changed payload/
+  );
+  engine.augmentHeadPositionSnapshots(engine.getCanonicalHead()!, [{
+    ...identity(),
+    kind: "position-snapshot",
+    owner: OWNER,
+    bins: []
+  }]);
+  assert.equal(
+    engine.ingestBlock(firstBlock),
+    "duplicate",
+    "mutable position enrichment does not make the original canonical payload look conflicting"
+  );
+
+  assert.throws(
+    () => new AnalyticsEngine(policies).ingestBlock({
+      ...block(1n, "0xd2", "0x00", 2_000, [sourcedSwap, { ...sourcedSwap, amountInX: 2n * UNIT }]),
+      chainId: 31_337
+    }),
+    /Canonical event source swap:1 changed payload/
+  );
+
+  const second = {
+    ...block(2n, "0xd3", "0xd1", 2_010, [structuredClone(sourcedSwap)]),
+    chainId: 31_337
+  };
+  assert.equal(engine.ingestBlock(second), "appended");
+  assert.equal(engine.listLastChangedCandles().length, 0, "an exact cross-block redelivery has no aggregate effect");
+});
+
+test("retains active-bin observations across legacy events that omit market fields", () => {
+  const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  engine.ingestBlock(block(1n, "0xd4", "0x00", 4_000, [marketSwap(5n * USD_SCALE, UNIT)], [
+    price(TOKEN_X, "x-usd", 2n * USD_SCALE, 4_000, 1n),
+    price(TOKEN_Y, "y-usd", USD_SCALE, 4_000, 1n)
+  ]));
+  engine.ingestBlock(block(2n, "0xd5", "0xd4", 4_010, [pairSnapshot(90n * UNIT, 110n * UNIT)], [
+    price(TOKEN_X, "x-usd", 2n * USD_SCALE, 4_010, 2n),
+    price(TOKEN_Y, "y-usd", USD_SCALE, 4_010, 2n)
+  ]));
+
+  const candle = engine.queryCandles({ pair: PAIR, interval: "minute", fromTimestamp: 3_960, toTimestamp: 3_960, first: 10 }).nodes[0];
+  assert.equal(candle.closeUsdE18, 5n * USD_SCALE);
+  assert.equal(candle.priceSource, "active-bin-quote-usd");
+});
+
+test("requires chain-scoped source identity for pool observations and rebuilds them on reorg", () => {
+  const activeId = 8_388_608;
+  const genesis = {
+    ...block(1n, "0xe1", "0x00", 3_000, [poolObservation({
+      sourceId: "snapshot:e1",
+      sourceEventIds: ["log:e1"],
+      activeId,
+      marketPriceQuoteE18: USD_SCALE,
+      bins: [poolBin(activeId, 1n, 1n, 2n)]
+    })], [
+      price(TOKEN_X, "x-usd", USD_SCALE, 3_000, 1n),
+      price(TOKEN_Y, "y-usd", USD_SCALE, 3_000, 1n)
+    ]),
+    chainId: 31_337
+  };
+  const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  engine.ingestBlock(genesis);
+  engine.ingestBlock({
+    ...block(2n, "0xe2", "0xe1", 3_010, [poolObservation({
+      sourceId: "snapshot:e2",
+      sourceEventIds: ["log:e2"],
+      activeId: activeId + 1,
+      marketPriceQuoteE18: 2n * USD_SCALE,
+      bins: [poolBin(activeId + 1, 0n, 5n, 5n)]
+    })]),
+    chainId: 31_337
+  });
+  assert.deepEqual(engine.listPoolStates()[0].bins.map((bin) => bin.binId), [String(activeId), String(activeId + 1)]);
+
+  assert.equal(engine.ingestBlock({
+    ...block(2n, "0xe3", "0xe1", 3_011, [poolObservation({
+      sourceId: "snapshot:e3",
+      sourceEventIds: ["log:e3"],
+      activeId: activeId - 1,
+      marketPriceQuoteE18: USD_SCALE / 2n,
+      bins: [poolBin(activeId - 1, 7n, 0n, 7n)]
+    })]),
+    chainId: 31_337
+  }), "reorg");
+  const rebuilt = engine.listPoolStates()[0];
+  assert.equal(rebuilt.state.asOfBlockHash, "0xe3");
+  assert.equal(rebuilt.state.revision, 2);
+  assert.deepEqual(rebuilt.bins.map((bin) => bin.binId), [String(activeId - 1), String(activeId)]);
+  assert.deepEqual(engine.listLastChangedPoolUpdates()[0].binReplacements.map((bin) => bin.binId), [String(activeId - 1)]);
+
+  const { chainId: _chainId, ...missingChain } = genesis;
+  assert.throws(() => new AnalyticsEngine(policies).ingestBlock(missingChain), /chain ID/);
+  assert.throws(
+    () => engine.ingestBlock({ ...block(3n, "0xe4", "0xe3", 3_012, []), chainId: 1 }),
+    /does not match canonical chain/
+  );
+
+  const invalidFee = poolObservation({
+    sourceId: "snapshot:invalid-fee",
+    sourceEventIds: ["log:invalid-fee"],
+    activeId,
+    marketPriceQuoteE18: USD_SCALE,
+    bins: [poolBin(activeId, 1n, 1n, 1n)]
+  });
+  if (invalidFee.kind !== "pair-snapshot" || invalidFee.poolState === undefined) throw new Error("invalid test fixture");
+  invalidFee.poolState.feeState.static.protocolShare = 2_501n;
+  assert.throws(
+    () => new AnalyticsEngine(policies).ingestBlock({
+      ...block(1n, "0xe5", "0x00", 3_000, [invalidFee]),
+      chainId: 31_337
+    }),
+    /protocol fee share.*canonical unsigned range/
+  );
+});
+
 test("groups per-bin balances and computes proportional realized and unrealized P&L", () => {
   const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
   engine.ingestBlock(
@@ -743,6 +982,31 @@ test("reports partial and capped backfills with resumable cursors", async () => 
   });
   assert.equal(resumed.status, "complete");
   assert.equal(resumedEngine.exportCheckpoint().backfill.coverageThroughTimestamp, 100);
+
+  const rollbackEngine = new AnalyticsEngine(policies);
+  rollbackEngine.ingestBlock(block(1n, "0x81", "0x00", 60, []));
+  rollbackEngine.ingestBlock(block(2n, "0x82", "0x81", 120, []));
+  rollbackEngine.ingestBlock(block(3n, "0x83", "0x82", 180, []));
+  rollbackEngine.updateBackfillState({
+    status: "complete",
+    cursor: "4",
+    error: null,
+    coverageStartTimestamp: FULL_HISTORY_START_TIMESTAMP,
+    coverageThroughTimestamp: 180
+  });
+  const rolledBack = await runBackfill({
+    engine: rollbackEngine,
+    startCursor: "4",
+    fetchPage: async () => ({
+      blocks: [],
+      canonicalHead: { number: 2n, hash: "0x82", timestamp: 120 },
+      nextCursor: "3",
+      hasMore: false
+    })
+  });
+  assert.equal(rolledBack.status, "complete");
+  assert.equal(rollbackEngine.getHealth(120).headBlock, 2n);
+  assert.equal(rollbackEngine.exportCheckpoint().backfill.coverageThroughTimestamp, 120);
 });
 
 test("serves and restores the bounded GraphQL query surface", async () => {
@@ -941,6 +1205,64 @@ function marketSwap(marketPriceQuoteE18: bigint, amountInX: bigint): SwapAnalyti
     activeId: 8_388_608,
     binStep: 10
   };
+}
+
+function poolObservation(input: {
+  sourceId: string;
+  sourceEventIds: string[];
+  activeId: number;
+  marketPriceQuoteE18: bigint;
+  bins: Array<{ binId: string; reserveX: bigint; reserveY: bigint; totalSupply: bigint }>;
+  reserveX?: bigint;
+  reserveY?: bigint;
+  replaceBinWindow?: boolean;
+}): AnalyticsEvent {
+  return {
+    ...identity(),
+    kind: "pair-snapshot",
+    reserveX: input.reserveX ?? 100n * UNIT,
+    reserveY: input.reserveY ?? 100n * UNIT,
+    activeId: input.activeId,
+    binStep: 10,
+    marketPriceQuoteE18: input.marketPriceQuoteE18,
+    source: {
+      eventId: input.sourceId,
+      transactionHash: null,
+      logIndex: null,
+      sequence: 0,
+      kind: "block-snapshot"
+    },
+    poolState: {
+      feeState: {
+        static: {
+          baseFactor: 1n,
+          filterPeriod: 2n,
+          decayPeriod: 3n,
+          reductionFactor: 4n,
+          variableFeeControl: 5n,
+          protocolShare: 6n,
+          maxVolatilityAccumulator: 10n
+        },
+        variable: {
+          volatilityAccumulator: 8n,
+          volatilityReference: 9n,
+          idReference: BigInt(input.activeId),
+          timeOfLastUpdate: 10n
+        }
+      },
+      binUpdates: input.bins,
+      sourceEventIds: input.sourceEventIds,
+      replaceBinWindow: input.replaceBinWindow ?? false
+    }
+  };
+}
+
+function poolBin(binId: number, reserveX: bigint, reserveY: bigint, totalSupply: bigint) {
+  return { binId: String(binId), reserveX, reserveY, totalSupply };
+}
+
+function logSource(eventId: string, transactionHash: `0x${string}`, logIndex: number) {
+  return { eventId, transactionHash, logIndex, sequence: logIndex, kind: "log" as const };
 }
 
 function liquidity(kind: "deposit" | "withdraw", bins: Array<{ binId: string; liquidityDelta: bigint; amountX: bigint; amountY: bigint }>): AnalyticsEvent {

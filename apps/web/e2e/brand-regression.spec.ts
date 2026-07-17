@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 
+import { installMockAnalyticsStream } from "./fixtures/mock-analytics-stream";
 import { installMockRpc } from "./fixtures/mock-rpc";
 import { installMockWallet, LOCALNET_CHAIN_ID, ROBINHOOD_TESTNET_CHAIN_ID } from "./fixtures/mock-wallet";
 
@@ -82,6 +83,7 @@ test("canonical Feather pools mobile", async ({ page }, testInfo) => {
 
 test("canonical Feather pool workspace desktop", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium");
+  await installMockAnalyticsStream(page);
   await installMockRpc(page, { includePairs: true });
   await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/pools");
@@ -98,6 +100,7 @@ test("canonical Feather pool workspace desktop", async ({ page }, testInfo) => {
 
 test("canonical Feather pool workspace mobile", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile-chromium");
+  await installMockAnalyticsStream(page);
   await installMockRpc(page, { includePairs: true });
   await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/pools");

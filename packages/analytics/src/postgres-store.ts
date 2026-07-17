@@ -1,21 +1,31 @@
 import { Pool, type PoolClient } from "pg";
 
 import type { AnalyticsCheckpoint, AnalyticsCheckpointMetadata } from "./engine.js";
-import { decodeTaggedJson, encodeTaggedJson, type AnalyticsStateStore, type CandleStreamEvent } from "./service.js";
+import {
+  decodeTaggedJson,
+  encodeTaggedJson,
+  streamTopic,
+  type AnalyticsStateStore,
+  type CandleStreamEvent,
+  type PoolStatePersistenceChange
+} from "./service.js";
 import type { Candle } from "./types.js";
 
 const DEFAULT_REPLAY_SIZE = 2_048;
+const DEFAULT_GLOBAL_REPLAY_SIZE = 8_192;
 
 export interface PostgresAnalyticsStoreOptions {
   connectionString: string;
   schema?: string;
   replaySize?: number;
+  globalReplaySize?: number;
 }
 
 export class PostgresAnalyticsStore implements AnalyticsStateStore {
   readonly #pool: Pool;
   readonly #schema: string;
   readonly #replaySize: number;
+  readonly #globalReplaySize: number;
   #initialization: Promise<void> | null = null;
 
   constructor(options: PostgresAnalyticsStoreOptions) {
@@ -24,6 +34,10 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
     if (!/^[a-z_][a-z0-9_]*$/.test(this.#schema)) throw new Error("Analytics PostgreSQL schema name is invalid");
     this.#replaySize = options.replaySize ?? DEFAULT_REPLAY_SIZE;
     if (!Number.isSafeInteger(this.#replaySize) || this.#replaySize <= 0) throw new Error("Analytics replay size must be positive");
+    this.#globalReplaySize = options.globalReplaySize ?? DEFAULT_GLOBAL_REPLAY_SIZE;
+    if (!Number.isSafeInteger(this.#globalReplaySize) || this.#globalReplaySize <= 0) {
+      throw new Error("Analytics global replay size must be positive");
+    }
     this.#pool = new Pool({ connectionString: options.connectionString, max: 5 });
   }
 
@@ -39,22 +53,28 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
     return checkpoint;
   }
 
-  async save(checkpoint: AnalyticsCheckpoint, candles: readonly Candle[]): Promise<void> {
-    await this.#saveCanonicalState(checkpoint, candles, null);
+  async save(
+    checkpoint: AnalyticsCheckpoint,
+    candles: readonly Candle[],
+    poolStates?: readonly PoolStatePersistenceChange[]
+  ): Promise<void> {
+    await this.#saveCanonicalState(checkpoint, candles, null, poolStates ?? null);
   }
 
   async saveCanonicalStateAndCandleEvents(
     checkpoint: AnalyticsCheckpoint,
     candles: readonly Candle[],
-    events: readonly CandleStreamEvent[]
+    events: readonly CandleStreamEvent[],
+    poolStates?: readonly PoolStatePersistenceChange[]
   ): Promise<void> {
-    await this.#saveCanonicalState(checkpoint, candles, events);
+    await this.#saveCanonicalState(checkpoint, candles, events, poolStates ?? null);
   }
 
   async #saveCanonicalState(
     checkpoint: AnalyticsCheckpoint,
     candles: readonly Candle[],
-    events: readonly CandleStreamEvent[] | null
+    events: readonly CandleStreamEvent[] | null,
+    poolStates: readonly PoolStatePersistenceChange[] | null
   ): Promise<void> {
     await this.#initialize();
     const client = await this.#pool.connect();
@@ -98,7 +118,8 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
            WHERE incoming.pair = stored.pair AND incoming.interval = stored.interval AND incoming.start_timestamp = stored.start_timestamp
          )`
       );
-      if (events !== null) await this.#writeCandleEvents(client, events);
+      if (poolStates !== null) await this.#replacePoolStates(client, poolStates);
+      if (events !== null) await this.#writeStreamEvents(client, events);
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK");
@@ -111,25 +132,28 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
   async appendCanonicalState(
     metadata: AnalyticsCheckpointMetadata,
     block: AnalyticsCheckpoint["blocks"][number],
-    candles: readonly Candle[]
+    candles: readonly Candle[],
+    poolStates?: readonly PoolStatePersistenceChange[]
   ): Promise<void> {
-    await this.#appendCanonicalState(metadata, block, candles, null);
+    await this.#appendCanonicalState(metadata, block, candles, null, poolStates ?? null);
   }
 
   async appendCanonicalStateAndCandleEvents(
     metadata: AnalyticsCheckpointMetadata,
     block: AnalyticsCheckpoint["blocks"][number],
     candles: readonly Candle[],
-    events: readonly CandleStreamEvent[]
+    events: readonly CandleStreamEvent[],
+    poolStates?: readonly PoolStatePersistenceChange[]
   ): Promise<void> {
-    await this.#appendCanonicalState(metadata, block, candles, events);
+    await this.#appendCanonicalState(metadata, block, candles, events, poolStates ?? null);
   }
 
   async #appendCanonicalState(
     metadata: AnalyticsCheckpointMetadata,
     block: AnalyticsCheckpoint["blocks"][number],
     candles: readonly Candle[],
-    events: readonly CandleStreamEvent[] | null
+    events: readonly CandleStreamEvent[] | null,
+    poolStates: readonly PoolStatePersistenceChange[] | null
   ): Promise<void> {
     await this.#initialize();
     const client = await this.#pool.connect();
@@ -167,7 +191,8 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
              payload = EXCLUDED.payload`
         );
       }
-      if (events !== null) await this.#writeCandleEvents(client, events);
+      if (poolStates !== null) await this.#upsertPoolStates(client, poolStates);
+      if (events !== null) await this.#writeStreamEvents(client, events);
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK");
@@ -180,7 +205,7 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
   async loadCandleEvents(): Promise<CandleStreamEvent[]> {
     await this.#initialize();
     const result = await this.#pool.query<{ payload: unknown }>(
-      `SELECT payload FROM ${this.#schema}.candle_stream_events ORDER BY cursor ASC`
+      `SELECT payload FROM ${this.#schema}.stream_events ORDER BY cursor ASC`
     );
     return result.rows.map((row) => decodePayload<CandleStreamEvent>(row.payload));
   }
@@ -191,7 +216,7 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
     const client = await this.#pool.connect();
     try {
       await client.query("BEGIN");
-      await this.#writeCandleEvents(client, events);
+      await this.#writeStreamEvents(client, events);
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK");
@@ -213,28 +238,121 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
   async #createSchema(): Promise<void> {
     const client = await this.#pool.connect();
     try {
+      await client.query("BEGIN");
       await client.query(`CREATE SCHEMA IF NOT EXISTS ${this.#schema}`);
       await createTables(client, this.#schema);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
     } finally {
       client.release();
     }
   }
 
-  async #writeCandleEvents(client: PoolClient, events: readonly CandleStreamEvent[]): Promise<void> {
+  async #writeStreamEvents(client: PoolClient, events: readonly CandleStreamEvent[]): Promise<void> {
     if (events.length === 0) return;
     for (const event of events) {
-      await client.query(
-        `INSERT INTO ${this.#schema}.candle_stream_events (cursor, pair, interval, event_type, payload)
-         VALUES ($1, $2, $3, $4, $5::jsonb)
-         ON CONFLICT (cursor) DO UPDATE SET pair = EXCLUDED.pair, interval = EXCLUDED.interval, event_type = EXCLUDED.event_type, payload = EXCLUDED.payload`,
-        [event.cursor, event.pair, event.interval, event.type, encodeTaggedJson(event)]
+      const topic = streamTopic(event);
+      const result = await client.query(
+        `INSERT INTO ${this.#schema}.stream_events AS stored (cursor, topic, pair, interval, event_type, payload)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+         ON CONFLICT (cursor) DO UPDATE SET cursor = stored.cursor
+         WHERE stored.topic = EXCLUDED.topic
+           AND stored.pair IS NOT DISTINCT FROM EXCLUDED.pair
+           AND stored.interval IS NOT DISTINCT FROM EXCLUDED.interval
+           AND stored.event_type = EXCLUDED.event_type
+           AND stored.payload = EXCLUDED.payload
+         RETURNING cursor`,
+        [event.cursor, topic, event.pair, event.interval, event.type, encodeTaggedJson(event)]
       );
+      if (result.rowCount !== 1) throw new Error(`Stream cursor ${event.cursor} conflicts with an immutable persisted event`);
     }
     await client.query(
-      `DELETE FROM ${this.#schema}.candle_stream_events
-       WHERE cursor NOT IN (SELECT cursor FROM ${this.#schema}.candle_stream_events ORDER BY cursor DESC LIMIT $1)`,
+      `DELETE FROM ${this.#schema}.stream_events stored
+       USING (
+         SELECT cursor, ROW_NUMBER() OVER (PARTITION BY topic ORDER BY cursor DESC) AS topic_rank
+         FROM ${this.#schema}.stream_events
+       ) ranked
+       WHERE stored.cursor = ranked.cursor AND ranked.topic_rank > $1`,
       [this.#replaySize]
     );
+    await client.query(
+      `DELETE FROM ${this.#schema}.stream_events stored
+       USING (
+         SELECT cursor
+         FROM ${this.#schema}.stream_events
+         ORDER BY cursor DESC
+         OFFSET $1
+       ) stale
+       WHERE stored.cursor = stale.cursor`,
+      [this.#globalReplaySize]
+    );
+  }
+
+  async #replacePoolStates(
+    client: PoolClient,
+    changes: readonly PoolStatePersistenceChange[]
+  ): Promise<void> {
+    await client.query(`TRUNCATE ${this.#schema}.pool_bins, ${this.#schema}.pool_states`);
+    await this.#upsertPoolStates(client, changes);
+  }
+
+  async #upsertPoolStates(
+    client: PoolClient,
+    changes: readonly PoolStatePersistenceChange[]
+  ): Promise<void> {
+    for (const change of changes) {
+      const state = change.state;
+      await client.query(
+        `INSERT INTO ${this.#schema}.pool_states
+           (chain_id, pair, as_of_block, as_of_block_hash, revision, payload)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+         ON CONFLICT (chain_id, pair) DO UPDATE SET
+           as_of_block = EXCLUDED.as_of_block,
+           as_of_block_hash = EXCLUDED.as_of_block_hash,
+           revision = EXCLUDED.revision,
+           payload = EXCLUDED.payload`,
+        [
+          state.chainId,
+          state.pair,
+          state.asOfBlock.toString(),
+          state.asOfBlockHash,
+          state.revision,
+          encodeTaggedJson(state)
+        ]
+      );
+      if (change.replaceBinWindow) {
+        await client.query(
+          `DELETE FROM ${this.#schema}.pool_bins WHERE chain_id = $1 AND pair = $2`,
+          [state.chainId, state.pair]
+        );
+      }
+      for (const bin of change.bins) {
+        if (bin.chainId !== state.chainId || bin.pair.toLowerCase() !== state.pair.toLowerCase()) {
+          throw new Error(`Pool bin ${bin.binId} does not belong to ${state.chainId}:${state.pair}`);
+        }
+        await client.query(
+          `INSERT INTO ${this.#schema}.pool_bins
+             (chain_id, pair, bin_id, updated_at_block, updated_at_block_hash, revision, payload)
+           VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+           ON CONFLICT (chain_id, pair, bin_id) DO UPDATE SET
+             updated_at_block = EXCLUDED.updated_at_block,
+             updated_at_block_hash = EXCLUDED.updated_at_block_hash,
+             revision = EXCLUDED.revision,
+             payload = EXCLUDED.payload`,
+          [
+            bin.chainId,
+            bin.pair,
+            bin.binId,
+            bin.updatedAtBlock.toString(),
+            bin.updatedAtBlockHash,
+            bin.revision,
+            encodeTaggedJson(bin)
+          ]
+        );
+      }
+    }
   }
 }
 
@@ -262,6 +380,27 @@ async function createTables(client: PoolClient, schema: string): Promise<void> {
       PRIMARY KEY (pair, interval, start_timestamp)
     );
     CREATE INDEX IF NOT EXISTS candles_history_idx ON ${schema}.candles (pair, interval, start_timestamp DESC);
+    CREATE TABLE IF NOT EXISTS ${schema}.pool_states (
+      chain_id INTEGER NOT NULL,
+      pair TEXT NOT NULL,
+      as_of_block NUMERIC(78, 0) NOT NULL,
+      as_of_block_hash TEXT NOT NULL,
+      revision INTEGER NOT NULL,
+      payload JSONB NOT NULL,
+      PRIMARY KEY (chain_id, pair)
+    );
+    CREATE TABLE IF NOT EXISTS ${schema}.pool_bins (
+      chain_id INTEGER NOT NULL,
+      pair TEXT NOT NULL,
+      bin_id NUMERIC(78, 0) NOT NULL,
+      updated_at_block NUMERIC(78, 0) NOT NULL,
+      updated_at_block_hash TEXT NOT NULL,
+      revision INTEGER NOT NULL,
+      payload JSONB NOT NULL,
+      PRIMARY KEY (chain_id, pair, bin_id),
+      FOREIGN KEY (chain_id, pair) REFERENCES ${schema}.pool_states (chain_id, pair) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS pool_bins_window_idx ON ${schema}.pool_bins (chain_id, pair, bin_id);
     CREATE TABLE IF NOT EXISTS ${schema}.candle_stream_events (
       cursor BIGINT PRIMARY KEY,
       pair TEXT,
@@ -270,6 +409,52 @@ async function createTables(client: PoolClient, schema: string): Promise<void> {
       payload JSONB NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS ${schema}.stream_events (
+      cursor BIGINT PRIMARY KEY,
+      topic TEXT NOT NULL,
+      pair TEXT,
+      interval TEXT,
+      event_type TEXT NOT NULL CHECK (event_type IN ('candle', 'pool-state', 'reset')),
+      payload JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS stream_events_topic_cursor_idx ON ${schema}.stream_events (topic, cursor DESC);
+    LOCK TABLE ${schema}.candle_stream_events IN ACCESS EXCLUSIVE MODE;
+    LOCK TABLE ${schema}.stream_events IN SHARE ROW EXCLUSIVE MODE;
+    DO $migration$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM ${schema}.candle_stream_events legacy
+        JOIN ${schema}.stream_events current USING (cursor)
+        WHERE current.topic IS DISTINCT FROM CASE
+            WHEN legacy.event_type = 'reset' THEN 'reset'
+            ELSE 'candle:' || LOWER(legacy.pair) || ':' || legacy.interval
+          END
+          OR current.pair IS DISTINCT FROM legacy.pair
+          OR current.interval IS DISTINCT FROM legacy.interval
+          OR current.event_type IS DISTINCT FROM legacy.event_type
+          OR current.payload IS DISTINCT FROM legacy.payload
+      ) THEN
+        RAISE EXCEPTION 'Legacy candle stream cursor conflicts with an immutable stream event';
+      END IF;
+    END
+    $migration$;
+    INSERT INTO ${schema}.stream_events (cursor, topic, pair, interval, event_type, payload, created_at)
+    SELECT
+      cursor,
+      CASE
+        WHEN event_type = 'reset' THEN 'reset'
+        ELSE 'candle:' || LOWER(pair) || ':' || interval
+      END,
+      pair,
+      interval,
+      event_type,
+      payload,
+      created_at
+    FROM ${schema}.candle_stream_events
+    ON CONFLICT (cursor) DO NOTHING;
+    TRUNCATE ${schema}.candle_stream_events;
   `);
 }
 

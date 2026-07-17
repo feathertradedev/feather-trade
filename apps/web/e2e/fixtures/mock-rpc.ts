@@ -218,6 +218,7 @@ interface GraphRequest {
     interval?: "ONE_MINUTE" | "FIVE_MINUTES" | "FIFTEEN_MINUTES" | "HOUR" | "FOUR_HOURS" | "DAY" | "WEEK";
     owner?: string;
     pair?: string;
+    radius?: number;
     pairId?: string;
     skip?: number;
     toTimestamp?: number;
@@ -351,6 +352,64 @@ function mockAnalyticsResponse(body: GraphRequest, options: MockRpcOptions): Rec
       missingPriceTokens: partial ? [metadata.tokenX.toLowerCase()] : []
     })).sort((left, right) => left.pair.localeCompare(right.pair));
     return { data: { poolMetrics: { nodes, pageInfo: { endCursor: null, hasNextPage: false, partial } } } };
+  }
+  if (query.includes("WebPoolState")) {
+    const pair = (body.variables?.pair ?? WNATIVE_USDC_PAIR).toLowerCase();
+    const metadata = allPairMetadata(options).find((candidate) => candidate.pair.toLowerCase() === pair);
+    if (metadata === undefined) return { data: { poolState: null } };
+    const radius = Math.max(0, Math.min(100, body.variables?.radius ?? 40));
+    const activeId = activeIdFor(options);
+    const block = String(options.analyticsAsOfBlock ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER);
+    const blockHash = options.analyticsHeadHash ?? options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222";
+    const reserveX = String(options.pairReserveX ?? 1_000n * 10n ** 18n);
+    const reserveY = String(options.pairReserveY ?? 160_000n * 10n ** 18n);
+    const bins = Array.from({ length: radius * 2 + 1 }, (_, index) => {
+      const binId = Math.max(0, activeId - radius) + index;
+      return {
+        chainId: options.chainId ?? LOCALNET_CHAIN_ID,
+        pair,
+        binId: String(binId),
+        reserveX: String(options.binReserveX ?? BigInt(100 + index) * 10n ** 18n),
+        reserveY: String(options.binReserveY ?? BigInt(200 + index) * 10n ** 18n),
+        totalSupply: String(options.binTotalSupply ?? BigInt(300 + index) * 10n ** 18n),
+        updatedAtBlock: block,
+        updatedAtBlockHash: blockHash,
+        updatedAtTimestamp: 1_720_000_000,
+        revision: 1
+      };
+    }).filter((bin) => Number(bin.binId) <= 16_777_215);
+    return { data: { poolState: {
+      state: {
+        chainId: options.chainId ?? LOCALNET_CHAIN_ID,
+        pair,
+        tokenX: metadata.tokenX.toLowerCase(),
+        tokenY: metadata.tokenY.toLowerCase(),
+        decimalsX: 18,
+        decimalsY: 18,
+        reserveX,
+        reserveY,
+        activeId,
+        binStep: Number(metadata.binStep),
+        marketPriceQuoteE18: "160000000000000000000",
+        priceUsdE18: partial ? null : "160000000000000000000",
+        tvlUsdE18: partial ? null : "320000000000000000000000",
+        status: analyticsStatus,
+        missingPriceTokens: partial ? [metadata.tokenX.toLowerCase()] : [],
+        feeState: {
+          static: {
+            baseFactor: "20", filterPeriod: "30", decayPeriod: "120", reductionFactor: "5000",
+            variableFeeControl: "100", protocolShare: "1000", maxVolatilityAccumulator: "100000"
+          },
+          variable: { volatilityAccumulator: "1000", volatilityReference: "500", idReference: String(activeId), timeOfLastUpdate: "1720000000" }
+        },
+        asOfBlock: block,
+        asOfBlockHash: blockHash,
+        asOfTimestamp: 1_720_000_000,
+        revision: 1
+      },
+      bins,
+      streamCursor: "0"
+    } } };
   }
   if (query.includes("WebPairCandles")) {
     const pair = body.variables?.pair ?? WNATIVE_USDC_PAIR.toLowerCase();

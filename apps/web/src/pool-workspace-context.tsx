@@ -9,13 +9,20 @@ import {
   CANDLE_LOOKBACK_SECONDS,
   candleBoundary,
   candleStreamUrl,
+  applyPoolStateUpdate,
   isCandleStreamStale,
+  isPoolStreamStale,
   loadAnalyticsHealth,
   loadPairCandles,
   loadPoolMetrics,
+  loadPoolState,
   parseCandleStreamPayload,
+  parsePoolStreamPayload,
+  poolStreamUrl,
   type AnalyticsPage,
+  type AnalyticsValue,
   type CandleInterval,
+  type LivePoolSnapshot,
   type PairCandle,
   type PoolAnalyticsMetric
 } from "./analytics-data";
@@ -48,6 +55,7 @@ import { loadPinnedPoolEconomics, type PinnedPoolEconomics } from "./pool-econom
 
 const WORKSPACE_REFRESH_INTERVAL_MS = 10_000;
 export type CandleStreamState = "connecting" | "live" | "stale" | "unavailable";
+export type PoolStreamState = "connecting" | "live" | "stale" | "snapshot-only" | "unavailable";
 
 export interface PoolWorkspaceContextValue {
   activity: {
@@ -78,6 +86,12 @@ export interface PoolWorkspaceContextValue {
     error: string | null;
     state: LoadState;
     value: PoolIndexerSnapshot | null;
+  };
+  liveMarket: {
+    bins: BinRow[];
+    error: string | null;
+    state: PoolStreamState;
+    value: LivePoolSnapshot | null;
   };
   bins: BinRow[];
   binsError: string | null;
@@ -129,6 +143,8 @@ export function PoolWorkspaceProvider({
   const [candleInterval, setCandleInterval] = useState<CandleInterval>("HOUR");
   const [candleStreamState, setCandleStreamState] = useState<CandleStreamState>("connecting");
   const [candleStreamGeneration, setCandleStreamGeneration] = useState(0);
+  const [poolStreamState, setPoolStreamState] = useState<PoolStreamState>("connecting");
+  const [poolStreamGeneration, setPoolStreamGeneration] = useState(0);
   const candleWindow = useMemo(() => {
     const end = candleBoundary(Math.floor(Date.now() / 1_000), candleInterval);
     return { end, start: end - CANDLE_LOOKBACK_SECONDS[candleInterval] };
@@ -158,6 +174,28 @@ export function PoolWorkspaceProvider({
     placeholderData: (previous) => previous,
     refetchInterval: false,
     refetchOnWindowFocus: "always",
+    retry: false
+  });
+  const livePoolQueryKey = useMemo(
+    () => ["canonicalLivePoolState", environmentKey, analyticsEndpoint, pool.address, poolStreamGeneration] as const,
+    [analyticsEndpoint, environmentKey, pool.address, poolStreamGeneration]
+  );
+  const livePoolQuery = useQuery({
+    queryKey: livePoolQueryKey,
+    queryFn: () => loadPoolState(analyticsEndpoint, pool.address, 40),
+    // Recover from an unavailable bootstrap without ever polling over a
+    // completed history-to-live handoff. Once a snapshot supplies its cursor,
+    // only the stream or an explicit reset may advance this cache.
+    refetchInterval: (query) => query.state.data?.value == null
+      ? WORKSPACE_REFRESH_INTERVAL_MS
+      : false,
+    // This bootstrap is the immutable history-to-live handoff. Reusing its
+    // cache is safe because the SSE cursor catches up or explicitly resets;
+    // an unrelated focus/reconnect refetch could otherwise overwrite newer
+    // sparse replacements that already arrived on the stream.
+    refetchOnMount: false,
+    refetchOnReconnect: false,
+    refetchOnWindowFocus: false,
     retry: false
   });
 
@@ -222,6 +260,66 @@ export function PoolWorkspaceProvider({
       source.close();
     };
   }, [analyticsEndpoint, candleInterval, candleQueryKey, candleStreamGeneration, candlesQuery.data?.streamCursor, candlesQuery.isPlaceholderData, pool.address, queryClient]);
+
+  useEffect(() => {
+    const snapshot = livePoolQuery.data?.value;
+    if (snapshot === null || snapshot === undefined) {
+      setPoolStreamState(livePoolQuery.isPending ? "connecting" : "unavailable");
+      return;
+    }
+    if (analyticsEndpoint === null || typeof EventSource === "undefined") {
+      setPoolStreamState("snapshot-only");
+      return;
+    }
+
+    let lastActivityAt = Date.now();
+    let resetRequested = false;
+    setPoolStreamState("connecting");
+    const source = new EventSource(poolStreamUrl(analyticsEndpoint, pool.address, snapshot.streamCursor));
+    const noteActivity = () => {
+      lastActivityAt = Date.now();
+      setPoolStreamState("live");
+    };
+    const reset = () => {
+      if (resetRequested) return;
+      resetRequested = true;
+      setPoolStreamState("connecting");
+      source.close();
+      setPoolStreamGeneration((generation) => generation + 1);
+    };
+    const onPoolState = (event: MessageEvent<string>) => {
+      try {
+        const update = parsePoolStreamPayload(JSON.parse(event.data), pool.address);
+        let applied = false;
+        queryClient.setQueryData<AnalyticsValue<LivePoolSnapshot>>(livePoolQueryKey, (current) => {
+          if (current?.value === null || current?.value === undefined) return current;
+          const next = applyPoolStateUpdate(current.value, update);
+          applied = next !== current.value;
+          return next === current.value ? current : { ...current, value: next, status: next.state.status, error: null };
+        });
+        if (applied) noteActivity();
+      } catch {
+        reset();
+      }
+    };
+    source.addEventListener("pool-state", onPoolState as EventListener);
+    source.addEventListener("heartbeat", noteActivity);
+    source.addEventListener("reset", reset);
+    source.onopen = noteActivity;
+    source.onerror = () => {
+      if (!resetRequested) {
+        setPoolStreamState(isPoolStreamStale(lastActivityAt, Date.now()) ? "stale" : "connecting");
+      }
+    };
+    const staleTimer = window.setInterval(() => {
+      if (!resetRequested && isPoolStreamStale(lastActivityAt, Date.now())) setPoolStreamState("stale");
+    }, 5_000);
+
+    return () => {
+      window.clearInterval(staleTimer);
+      source.close();
+    };
+  }, [analyticsEndpoint, livePoolQuery.data?.value !== null && livePoolQuery.data?.value !== undefined, livePoolQuery.isPending, livePoolQueryKey, pool.address, poolStreamGeneration, queryClient]);
   const healthQuery = useQuery({
     queryKey: ["canonicalPoolAnalyticsHealth", environmentKey, analyticsEndpoint],
     queryFn: () => loadAnalyticsHealth(analyticsEndpoint),
@@ -378,6 +476,17 @@ export function PoolWorkspaceProvider({
     candlesQuery.isError ? "UNAVAILABLE" : "PARTIAL",
     errorMessage(candlesQuery.error)
   );
+  const rawLivePoolSnapshot = livePoolQuery.data?.value ?? null;
+  const livePoolAttestationError = attestLivePoolSnapshot(rawLivePoolSnapshot, registry, pool, economicsValue ?? null);
+  const livePoolSnapshot = livePoolAttestationError === null ? rawLivePoolSnapshot : null;
+  const livePoolBins: BinRow[] = livePoolSnapshot?.bins.map((bin) => ({
+    id: `${bin.pair}-${bin.binId}`,
+    binId: bin.binId,
+    reserveX: bin.reserveX,
+    reserveY: bin.reserveY,
+    totalSupply: bin.totalSupply,
+    updatedAtBlock: bin.updatedAtBlock
+  })) ?? [];
   const positions = positionsQuery.data?.rows ?? [];
   const positionsPartial = Boolean(positionsQuery.data?.pageInfo.capped || positionsQuery.data?.pageInfo.failed);
   const history = historyQuery.data?.rows ?? [];
@@ -534,6 +643,12 @@ export function PoolWorkspaceProvider({
       state: indexerSnapshotState,
       value: indexerSnapshot ?? null
     },
+    liveMarket: {
+      bins: livePoolBins,
+      error: livePoolAttestationError ?? livePoolQuery.data?.error ?? errorMessage(livePoolQuery.error),
+      state: livePoolAttestationError === null ? poolStreamState : "unavailable",
+      value: livePoolSnapshot
+    },
     pool,
     portfolio: {
       error: errorMessage(portfolioQuery.error),
@@ -578,9 +693,15 @@ export function PoolWorkspaceProvider({
     indexerSnapshotQuery.error,
     indexerSnapshot,
     indexerSnapshotState,
+    livePoolBins,
+    livePoolAttestationError,
+    livePoolQuery.data?.error,
+    livePoolQuery.error,
+    livePoolSnapshot,
     metricPage,
     pool,
     poolActivityWalletOnly,
+    poolStreamState,
     portfolioHeadPinned,
     portfolioPartial,
     portfolioPosition,
@@ -634,6 +755,37 @@ function economicsMatchesIndexerSnapshot(economics: PinnedPoolEconomics, snapsho
     economics.factory.toLowerCase() === snapshot.factory.toLowerCase() &&
     economics.tokenX.toLowerCase() === snapshot.tokenX.toLowerCase() &&
     economics.tokenY.toLowerCase() === snapshot.tokenY.toLowerCase();
+}
+
+function attestLivePoolSnapshot(
+  snapshot: LivePoolSnapshot | null,
+  registry: DexRegistry,
+  pool: PoolRow,
+  economics: PinnedPoolEconomics | null
+): string | null {
+  if (snapshot === null) return null;
+  if (economics === null) return "Live pool state is waiting for pinned RPC market attestation";
+  const state = snapshot.state;
+  if (state.chainId !== registry.chainId) return "Live pool state chain differs from the selected environment";
+  if (state.pair.toLowerCase() !== pool.address.toLowerCase()) return "Live pool state pair differs from the selected market";
+  if (
+    state.tokenX.toLowerCase() !== pool.tokenXAddress.toLowerCase() ||
+    state.tokenY.toLowerCase() !== pool.tokenYAddress.toLowerCase() ||
+    state.tokenX.toLowerCase() !== economics.tokenX.toLowerCase() ||
+    state.tokenY.toLowerCase() !== economics.tokenY.toLowerCase()
+  ) return "Live pool token identity differs from pinned RPC state";
+  if (pool.tokenX === null || pool.tokenY === null || state.decimalsX !== pool.tokenX.decimals || state.decimalsY !== pool.tokenY.decimals) {
+    return "Live pool token decimals differ from allowlisted metadata";
+  }
+  if (BigInt(state.binStep) !== BigInt(pool.binStep) || BigInt(state.binStep) !== economics.binStep) {
+    return "Live pool bin step differs from pinned RPC state";
+  }
+  const liveBlock = BigInt(state.asOfBlock);
+  if (liveBlock < economics.blockNumber) return "Live pool state is older than pinned RPC state";
+  if (liveBlock === economics.blockNumber && state.asOfBlockHash.toLowerCase() !== economics.blockHash.toLowerCase()) {
+    return "Live pool state canonical hash differs from pinned RPC state";
+  }
+  return null;
 }
 
 function emptyAnalyticsPage<T>(status: "PARTIAL" | "UNAVAILABLE", error: string | null): AnalyticsPage<T> {

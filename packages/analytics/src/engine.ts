@@ -13,7 +13,14 @@ import type {
   Hex,
   LiquidityAnalyticsEvent,
   PairIdentity,
+  PairSnapshotEvent,
+  PoolBinSnapshot,
+  PoolBinState,
   PoolMetrics,
+  PoolState,
+  PoolStateObservation,
+  PoolStateSnapshot,
+  PoolStateUpdate,
   PositionBinAccounting,
   PositionSnapshotEvent,
   PositionTransferEvent,
@@ -49,8 +56,12 @@ interface PairState extends PairIdentity {
   priceUsdE18: bigint | null;
   priceSource: CandlePriceSource;
   quoteToken: string;
+  activeId: number | null;
+  binStep: number | null;
+  marketPriceQuoteE18: bigint | null;
   missingPriceTokens: Set<string>;
   updatedAtBlock: bigint;
+  updatedAtBlockHash: Hex;
   updatedAtTimestamp: number;
 }
 
@@ -118,6 +129,11 @@ interface ValuedAmounts {
   missingPriceTokens: Set<string>;
 }
 
+interface CanonicalEventContext {
+  chainId: number | null;
+  sources: ReadonlyMap<string, string>;
+}
+
 export interface AnalyticsEngineOptions {
   assumeCompleteHistory?: boolean;
   maxHeadLagSeconds?: number;
@@ -162,6 +178,11 @@ export class AnalyticsEngine {
   #flows: FlowRow[] = [];
   #candles = new Map<string, MutableCandle>();
   #positions = new Map<string, MutableWalletPairPosition>();
+  #poolStates = new Map<string, PoolState>();
+  #poolBins = new Map<string, Map<string, PoolBinState>>();
+  #lastChangedPoolUpdates: PoolStateUpdate[] = [];
+  #canonicalChainId: number | null = null;
+  #canonicalEventFingerprints = new Map<string, string>();
   #lastChangedCandleKeys = new Set<string>();
   #reorgCount = 0;
   #partialEventCount = 0;
@@ -189,25 +210,38 @@ export class AnalyticsEngine {
 
   ingestBlock(block: BlockEnvelope): "appended" | "duplicate" | "reorg" {
     validateBlock(block);
-    const existing = this.#blocks.find((candidate) => candidate.hash.toLowerCase() === block.hash.toLowerCase());
-    if (existing) {
+    const existingIndex = this.#blocks.findIndex((candidate) => sameHash(candidate.hash, block.hash));
+    if (existingIndex >= 0) {
+      const existing = this.#blocks[existingIndex]!;
       if (existing.number !== block.number) throw new Error(`Block hash ${block.hash} changed number`);
+      const incoming = canonicalizeBlock(block, canonicalEventContext(this.#blocks.slice(0, existingIndex)));
+      if (!sameBlockPayload(existing, withMissingPositionSnapshots(incoming, existing))) {
+        throw new Error(`Block hash ${block.hash} changed payload`);
+      }
       this.#lastChangedCandleKeys = new Set();
+      this.#lastChangedPoolUpdates = [];
       return "duplicate";
     }
 
     const head = this.#blocks.at(-1);
     if (!head) {
-      this.#blocks.push(cloneBlock(block));
-      this.#lastChangedCandleKeys = this.#applyCanonicalAppend(block, null);
-      this.#advanceCoverage(block.timestamp);
+      const incoming = canonicalizeBlock(block, { chainId: null, sources: new Map() });
+      this.#blocks.push(cloneBlock(incoming));
+      this.#lastChangedCandleKeys = this.#applyCanonicalAppend(incoming, null);
+      this.#recordCanonicalEventIdentities(incoming);
+      this.#advanceCoverage(incoming.timestamp);
       return "appended";
     }
 
     if (block.number === head.number + 1n && sameHash(block.parentHash, head.hash)) {
-      this.#blocks.push(cloneBlock(block));
-      this.#lastChangedCandleKeys = this.#applyCanonicalAppend(block, head.timestamp);
-      this.#advanceCoverage(block.timestamp);
+      const incoming = canonicalizeBlock(block, {
+        chainId: this.#canonicalChainId,
+        sources: this.#canonicalEventFingerprints
+      });
+      this.#blocks.push(cloneBlock(incoming));
+      this.#lastChangedCandleKeys = this.#applyCanonicalAppend(incoming, head.timestamp);
+      this.#recordCanonicalEventIdentities(incoming);
+      this.#advanceCoverage(incoming.timestamp);
       return "appended";
     }
 
@@ -221,11 +255,54 @@ export class AnalyticsEngine {
       throw new Error(`Block ${block.number} does not follow parent ${parent.number}`);
     }
 
-    this.#blocks.splice(parentIndex + 1, this.#blocks.length, cloneBlock(block));
+    const incoming = canonicalizeBlock(block, canonicalEventContext(this.#blocks.slice(0, parentIndex + 1)));
+    this.#blocks.splice(parentIndex + 1, this.#blocks.length, cloneBlock(incoming));
+    this.#replaceCanonicalEventIdentityIndex();
     this.#reorgCount += 1;
     this.#rebuild();
     this.#lastChangedCandleKeys = new Set(this.#candles.keys());
-    this.#advanceCoverage(block.timestamp);
+    this.#advanceCoverage(incoming.timestamp);
+    return "reorg";
+  }
+
+  /**
+   * Reconciles a canonical head that moved strictly backwards without a
+   * replacement child block yet. This is required for local snapshot/revert
+   * workflows: keeping the orphan suffix query-visible until the chain grows
+   * again would make pool state and replay cursors non-canonical.
+   */
+  rewindCanonicalHead(expectedHead: CanonicalHead): "duplicate" | "reorg" {
+    if (expectedHead.number < 0n || !Number.isSafeInteger(expectedHead.timestamp) || expectedHead.timestamp < 0) {
+      throw new Error("Canonical rewind head is invalid");
+    }
+    if (!/^0x[0-9a-fA-F]+$/.test(expectedHead.hash)) throw new Error("Canonical rewind hash must be hex");
+    const index = this.#blocks.findIndex((block) => block.number === expectedHead.number);
+    if (index < 0) {
+      throw new ReorgBeyondCanonicalHistoryError(
+        `Canonical rewind head ${expectedHead.number}:${expectedHead.hash} is outside retained history`
+      );
+    }
+    const retained = this.#blocks[index]!;
+    if (!sameHash(retained.hash, expectedHead.hash) || retained.timestamp !== expectedHead.timestamp) {
+      throw new CanonicalHeadChangedError(
+        `Canonical rewind head ${expectedHead.number}:${expectedHead.hash} does not match retained ${retained.hash}`
+      );
+    }
+    if (index === this.#blocks.length - 1) {
+      this.#lastChangedCandleKeys = new Set();
+      this.#lastChangedPoolUpdates = [];
+      return "duplicate";
+    }
+
+    this.#blocks.splice(index + 1);
+    this.#replaceCanonicalEventIdentityIndex();
+    this.#reorgCount += 1;
+    this.#rebuild();
+    this.#lastChangedCandleKeys = new Set(this.#candles.keys());
+    this.#lastChangedPoolUpdates = [];
+    if (this.#coverageThroughTimestamp !== null) {
+      this.#coverageThroughTimestamp = Math.min(this.#coverageThroughTimestamp, retained.timestamp);
+    }
     return "reorg";
   }
 
@@ -279,14 +356,17 @@ export class AnalyticsEngine {
     const replacementKeys = new Set(
       snapshots.map((snapshot) => `${normalize(snapshot.owner)}:${normalize(snapshot.pair)}`)
     );
-    head.events = [
+    const candidate: BlockEnvelope = { ...head, events: [
       ...head.events.filter(
         (event) =>
           event.kind !== "position-snapshot" ||
           !replacementKeys.has(`${normalize(event.owner)}:${normalize(event.pair)}`)
       ),
       ...structuredClone(snapshots)
-    ];
+    ] };
+    validateBlock(candidate);
+    head.events = canonicalizeBlock(candidate, canonicalEventContext(this.#blocks.slice(0, -1))).events;
+    this.#replaceCanonicalEventIdentityIndex();
     this.#rebuild();
   }
 
@@ -420,6 +500,40 @@ export class AnalyticsEngine {
       );
   }
 
+  queryPoolState(input: { pair: string; radius: number }): PoolStateSnapshot | null {
+    if (!Number.isSafeInteger(input.radius) || input.radius < 0 || input.radius > 100) {
+      throw new Error("Pool-state radius must be an integer between 0 and 100");
+    }
+    const pair = normalize(input.pair);
+    const state = this.#poolStates.get(pair);
+    if (state === undefined) return null;
+    const minimumBinId = BigInt(state.activeId - input.radius);
+    const maximumBinId = BigInt(state.activeId + input.radius);
+    return structuredClone({
+      state,
+      bins: sortedPoolBins(this.#poolBins.get(pair)).filter((bin) => {
+        const binId = BigInt(bin.binId);
+        return binId >= minimumBinId && binId <= maximumBinId;
+      })
+    });
+  }
+
+  listPoolStates(): PoolStateSnapshot[] {
+    return [...this.#poolStates.values()]
+      .sort((left, right) => left.chainId - right.chainId || left.pair.localeCompare(right.pair))
+      .map((state) => structuredClone({ state, bins: sortedPoolBins(this.#poolBins.get(state.pair)) }));
+  }
+
+  listLastChangedPoolUpdates(): PoolStateUpdate[] {
+    return structuredClone(
+      [...this.#lastChangedPoolUpdates].sort((left, right) =>
+        left.state.chainId - right.state.chainId ||
+        left.state.pair.localeCompare(right.state.pair) ||
+        left.eventId.localeCompare(right.eventId)
+      )
+    );
+  }
+
   queryWalletPositions(input: { owner: string; first: number; after?: string | null }): Connection<WalletPairPosition> {
     const owner = normalize(input.owner);
     const head = this.#blocks.at(-1) ?? null;
@@ -445,6 +559,9 @@ export class AnalyticsEngine {
     this.#flows = [];
     this.#candles = new Map();
     this.#positions = new Map();
+    this.#poolStates = new Map();
+    this.#poolBins = new Map();
+    this.#lastChangedPoolUpdates = [];
     this.#partialEventCount = 0;
     this.#missingPriceTokens = new Set();
 
@@ -506,27 +623,44 @@ export class AnalyticsEngine {
   }
 
   #applyCanonicalBlock(block: BlockEnvelope): void {
+    this.#lastChangedPoolUpdates = [];
     for (const sample of block.prices) this.#priceBook.apply(sample, block.timestamp);
-    for (const event of block.events) this.#applyEvent(event, block.number, block.hash, block.timestamp);
+    for (const event of block.events) {
+      this.#applyEvent(event, block.chainId ?? null, block.number, block.hash, block.timestamp);
+    }
   }
 
-  #applyEvent(event: AnalyticsEvent, blockNumber: bigint, blockHash: Hex, timestamp: number): void {
+  #applyEvent(
+    event: AnalyticsEvent,
+    chainId: number | null,
+    blockNumber: bigint,
+    blockHash: Hex,
+    timestamp: number
+  ): void {
     this.#eventIsPartial = false;
     if (event.kind === "position-snapshot") {
       this.#applyPositionSnapshot(event, blockNumber, timestamp);
     } else if (event.kind === "position-transfer") {
       this.#applyPositionTransfer(event);
     } else {
-      const pair = this.#updatePair(event, blockNumber, timestamp);
+      const pair = this.#updatePair(event, blockNumber, blockHash, timestamp);
       this.#updateCandlesForSnapshot(pair, blockNumber, blockHash, timestamp);
 
       if (event.kind === "swap") this.#applySwap(event, pair, blockNumber, blockHash, timestamp);
       if (event.kind === "deposit" || event.kind === "withdraw") this.#applyLiquidity(event, timestamp);
+      if (event.kind === "pair-snapshot" && event.poolState !== undefined) {
+        this.#applyPoolStateObservation(event, pair, chainId!, blockNumber, blockHash, timestamp);
+      }
     }
     if (this.#eventIsPartial) this.#partialEventCount += 1;
   }
 
-  #updatePair(event: Exclude<AnalyticsEvent, PositionSnapshotEvent | PositionTransferEvent>, blockNumber: bigint, timestamp: number): PairState {
+  #updatePair(
+    event: Exclude<AnalyticsEvent, PositionSnapshotEvent | PositionTransferEvent>,
+    blockNumber: bigint,
+    blockHash: Hex,
+    timestamp: number
+  ): PairState {
     const identity = normalizePair(event);
     const current = this.#pairs.get(identity.pair);
     if (current && !samePairIdentity(current, identity)) throw new Error(`Pair identity changed for ${identity.pair}`);
@@ -534,7 +668,7 @@ export class AnalyticsEngine {
     const reserves = valueAmounts(identity, event.reserveX, event.reserveY, this.#priceBook, timestamp);
     const tokenXPrice = this.#priceBook.get(identity.tokenX, timestamp);
     const tokenYPrice = this.#priceBook.get(identity.tokenY, timestamp);
-    const observedQuotePrice = event.marketPriceQuoteE18 ?? null;
+    const observedQuotePrice = event.marketPriceQuoteE18 ?? current?.marketPriceQuoteE18 ?? null;
     const activeBinPrice = observedQuotePrice === null || tokenYPrice.priceUsdE18 === null
       ? null
       : (observedQuotePrice * tokenYPrice.priceUsdE18) / USD_SCALE;
@@ -551,14 +685,95 @@ export class AnalyticsEngine {
       priceUsdE18,
       priceSource,
       quoteToken: identity.tokenY,
+      activeId: event.activeId ?? current?.activeId ?? null,
+      binStep: event.binStep ?? current?.binStep ?? null,
+      marketPriceQuoteE18: observedQuotePrice,
       missingPriceTokens: union(reserves.missingPriceTokens, priceMissing),
       updatedAtBlock: blockNumber,
+      updatedAtBlockHash: blockHash,
       updatedAtTimestamp: timestamp
     };
     this.#pairs.set(identity.pair, pair);
     this.#pairSnapshots.push(pair);
     this.#recordPartial(pair.missingPriceTokens);
     return pair;
+  }
+
+  #applyPoolStateObservation(
+    event: PairSnapshotEvent,
+    pair: PairState,
+    chainId: number,
+    blockNumber: bigint,
+    blockHash: Hex,
+    timestamp: number
+  ): void {
+    const observation = event.poolState!;
+    const currentState = this.#poolStates.get(pair.pair);
+    if (currentState !== undefined && currentState.chainId !== chainId) {
+      throw new Error(`Pool ${pair.pair} changed chain identity`);
+    }
+    if (pair.activeId === null || pair.binStep === null || pair.marketPriceQuoteE18 === null) {
+      throw new Error("Pool-state observations require active ID, bin step, and market price");
+    }
+
+    const state: PoolState = {
+      chainId,
+      pair: pair.pair,
+      tokenX: pair.tokenX,
+      tokenY: pair.tokenY,
+      decimalsX: pair.decimalsX,
+      decimalsY: pair.decimalsY,
+      reserveX: pair.reserveX,
+      reserveY: pair.reserveY,
+      activeId: pair.activeId,
+      binStep: pair.binStep,
+      marketPriceQuoteE18: pair.marketPriceQuoteE18,
+      priceUsdE18: pair.priceUsdE18,
+      tvlUsdE18: pair.tvlUsdE18,
+      status: pair.priceUsdE18 === null || pair.tvlUsdE18 === null ? "partial" : "ready",
+      missingPriceTokens: [...pair.missingPriceTokens].sort(),
+      feeState: structuredClone(observation.feeState),
+      asOfBlock: blockNumber,
+      asOfBlockHash: blockHash,
+      asOfTimestamp: timestamp,
+      revision: (currentState?.revision ?? 0) + 1
+    };
+    this.#poolStates.set(pair.pair, state);
+
+    const previousBins = this.#poolBins.get(pair.pair) ?? new Map<string, PoolBinState>();
+    const bins = observation.replaceBinWindow ? new Map<string, PoolBinState>() : previousBins;
+    this.#poolBins.set(pair.pair, bins);
+    const binReplacements: PoolBinState[] = [];
+    for (const snapshot of observation.binUpdates) {
+      const current = previousBins.get(snapshot.binId);
+      if (current !== undefined && samePoolBinSnapshot(current, snapshot)) {
+        if (observation.replaceBinWindow) {
+          bins.set(current.binId, current);
+          binReplacements.push(current);
+        }
+        continue;
+      }
+      const replacement: PoolBinState = {
+        ...structuredClone(snapshot),
+        chainId,
+        pair: pair.pair,
+        updatedAtBlock: blockNumber,
+        updatedAtBlockHash: blockHash,
+        updatedAtTimestamp: timestamp,
+        revision: (current?.revision ?? 0) + 1
+      };
+      bins.set(replacement.binId, replacement);
+      binReplacements.push(replacement);
+    }
+
+    const sourceEventIds = [...observation.sourceEventIds].sort();
+    this.#lastChangedPoolUpdates.push({
+      eventId: `${chainId}:${blockHash.toLowerCase()}:${pair.pair}:${sourceEventIds.join(",")}`,
+      state,
+      binReplacements: binReplacements.sort(comparePoolBins),
+      replaceBinWindow: observation.replaceBinWindow,
+      sourceEventIds
+    });
   }
 
   #applySwap(event: SwapAnalyticsEvent, pair: PairState, blockNumber: bigint, blockHash: Hex, timestamp: number): void {
@@ -937,6 +1152,24 @@ export class AnalyticsEngine {
   #advanceCoverage(timestamp: number): void {
     if (this.#backfillStatus === "complete") this.#coverageThroughTimestamp = timestamp;
   }
+
+  #recordCanonicalEventIdentities(block: BlockEnvelope): void {
+    if (block.chainId !== undefined) this.#canonicalChainId ??= block.chainId;
+    if (block.chainId === undefined) return;
+    for (const event of block.events) {
+      if (event.source === undefined) continue;
+      this.#canonicalEventFingerprints.set(
+        `${block.chainId}:${event.source.eventId}`,
+        canonicalFingerprint(event)
+      );
+    }
+  }
+
+  #replaceCanonicalEventIdentityIndex(): void {
+    const context = canonicalEventContext(this.#blocks);
+    this.#canonicalChainId = context.chainId;
+    this.#canonicalEventFingerprints = new Map(context.sources);
+  }
 }
 
 function valueAmounts(
@@ -959,6 +1192,23 @@ function valueAmounts(
       tokenAmountToUsd(amountY, pair.decimalsY, priceY ?? 0n),
     missingPriceTokens: missing
   };
+}
+
+function sortedPoolBins(bins: Map<string, PoolBinState> | undefined): PoolBinState[] {
+  return bins === undefined ? [] : [...bins.values()].sort(comparePoolBins);
+}
+
+function comparePoolBins(left: PoolBinSnapshot, right: PoolBinSnapshot): number {
+  const leftId = BigInt(left.binId);
+  const rightId = BigInt(right.binId);
+  return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
+}
+
+function samePoolBinSnapshot(left: PoolBinSnapshot, right: PoolBinSnapshot): boolean {
+  return left.binId === right.binId &&
+    left.reserveX === right.reserveX &&
+    left.reserveY === right.reserveY &&
+    left.totalSupply === right.totalSupply;
 }
 
 function normalizePair(pair: PairIdentity): PairIdentity {
@@ -1290,13 +1540,138 @@ function cloneBlock(block: BlockEnvelope): BlockEnvelope {
   return structuredClone(block);
 }
 
+function canonicalEventContext(blocks: readonly BlockEnvelope[]): CanonicalEventContext {
+  let chainId: number | null = null;
+  const sources = new Map<string, string>();
+  for (const block of blocks) {
+    if (block.chainId !== undefined) {
+      if (chainId !== null && chainId !== block.chainId) {
+        throw new Error("Canonical history contains multiple chain IDs");
+      }
+      chainId = block.chainId;
+    }
+    if (block.chainId === undefined) continue;
+    for (const event of block.events) {
+      if (event.source === undefined) continue;
+      const key = `${block.chainId}:${event.source.eventId}`;
+      const fingerprint = canonicalFingerprint(event);
+      const previous = sources.get(key);
+      if (previous !== undefined && previous !== fingerprint) {
+        throw new Error(`Canonical event source ${event.source.eventId} changed payload`);
+      }
+      sources.set(key, fingerprint);
+    }
+  }
+  return { chainId, sources };
+}
+
+function canonicalizeBlock(block: BlockEnvelope, context: CanonicalEventContext): BlockEnvelope {
+  if (block.chainId !== undefined && context.chainId !== null && block.chainId !== context.chainId) {
+    throw new Error(`Block chain ID ${block.chainId} does not match canonical chain ${context.chainId}`);
+  }
+
+  const seen = new Map<string, string>();
+
+  const events: AnalyticsEvent[] = [];
+  for (const event of block.events) {
+    if (event.source === undefined) {
+      events.push(structuredClone(event));
+      continue;
+    }
+    const key = `${block.chainId!}:${event.source.eventId}`;
+    const fingerprint = canonicalFingerprint(event);
+    const previous = seen.get(key) ?? context.sources.get(key);
+    if (previous !== undefined) {
+      if (previous !== fingerprint) throw new Error(`Canonical event source ${event.source.eventId} changed payload`);
+      continue;
+    }
+    seen.set(key, fingerprint);
+    events.push(structuredClone(event));
+  }
+  const observedPoolPairs = new Set<string>();
+  for (const [index, event] of events.entries()) {
+    if (event.kind !== "pair-snapshot" || event.poolState === undefined) continue;
+    const pair = normalize(event.pair);
+    if (observedPoolPairs.has(pair)) throw new Error(`Pool ${pair} has multiple end-of-block observations`);
+    observedPoolPairs.add(pair);
+    const laterMarketEvent = events.slice(index + 1).find((candidate) =>
+      candidate.kind !== "position-snapshot" &&
+      candidate.kind !== "position-transfer" &&
+      normalize(candidate.pair) === pair
+    );
+    if (laterMarketEvent !== undefined) {
+      throw new Error(`Pool ${pair} observation must be the final market event in its block`);
+    }
+  }
+  return { ...structuredClone(block), events };
+}
+
+function sameBlockPayload(left: BlockEnvelope, right: BlockEnvelope): boolean {
+  return canonicalFingerprint(comparableBlockPayload(left)) === canonicalFingerprint(comparableBlockPayload(right));
+}
+
+function comparableBlockPayload(block: BlockEnvelope): BlockEnvelope {
+  const snapshots = block.events
+    .filter((event): event is PositionSnapshotEvent => event.kind === "position-snapshot")
+    .sort((left, right) =>
+      normalize(left.owner).localeCompare(normalize(right.owner)) ||
+      normalize(left.pair).localeCompare(normalize(right.pair))
+    );
+  return {
+    ...block,
+    hash: block.hash.toLowerCase() as Hex,
+    parentHash: block.parentHash.toLowerCase() as Hex,
+    events: [...block.events.filter((event) => event.kind !== "position-snapshot"), ...snapshots]
+  };
+}
+
+function withMissingPositionSnapshots(incoming: BlockEnvelope, existing: BlockEnvelope): BlockEnvelope {
+  const incomingKeys = new Set(
+    incoming.events.flatMap((event) => event.kind === "position-snapshot"
+      ? [`${normalize(event.owner)}:${normalize(event.pair)}`]
+      : [])
+  );
+  const retainedSnapshots = existing.events.filter((event) =>
+    event.kind === "position-snapshot" &&
+    !incomingKeys.has(`${normalize(event.owner)}:${normalize(event.pair)}`)
+  );
+  return retainedSnapshots.length === 0
+    ? incoming
+    : { ...incoming, events: [...incoming.events, ...structuredClone(retainedSnapshots)] };
+}
+
+function canonicalFingerprint(value: unknown): string {
+  return JSON.stringify(canonicalJsonValue(value));
+}
+
+function canonicalJsonValue(value: unknown): unknown {
+  if (typeof value === "bigint") return { $bigint: value.toString() };
+  if (Array.isArray(value)) return value.map(canonicalJsonValue);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([, entry]) => entry !== undefined)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, entry]) => [key, canonicalJsonValue(entry)])
+    );
+  }
+  return value;
+}
+
 function validateBlock(block: BlockEnvelope): void {
   if (block.number < 0n) throw new Error("Block number must be non-negative");
   if (!Number.isSafeInteger(block.timestamp) || block.timestamp < 0) throw new Error("Block timestamp must be a non-negative integer");
+  if (block.chainId !== undefined && (!Number.isSafeInteger(block.chainId) || block.chainId <= 0)) {
+    throw new Error("Block chain ID must be a positive safe integer when present");
+  }
   if (!/^0x[0-9a-fA-F]+$/.test(block.hash) || !/^0x[0-9a-fA-F]+$/.test(block.parentHash)) {
     throw new Error("Block hashes must be hex strings");
   }
   for (const event of block.events) {
+    if (event.source !== undefined) {
+      if (block.chainId === undefined) throw new Error("Canonical event sources require a block chain ID");
+      validateCanonicalEventSource(event.source);
+    }
     if (event.kind === "swap") {
       if (event.feeX < 0n || event.feeY < 0n) throw new Error("Total swap fees must be non-negative");
       if (event.protocolFeeX !== undefined && event.protocolFeeX !== null && event.protocolFeeX < 0n ||
@@ -1319,6 +1694,99 @@ function validateBlock(block: BlockEnvelope): void {
       (!Number.isSafeInteger(event.binStep) || event.binStep <= 0 || event.binStep > 0xff_ff)) {
       throw new Error("Bin step must fit a nonzero uint16 when present");
     }
+    if (event.kind === "pair-snapshot" && event.poolState !== undefined) {
+      if (block.chainId === undefined || event.source === undefined || event.source.kind !== "block-snapshot") {
+        throw new Error("Pool-state observations require a chain ID and block-snapshot source");
+      }
+      if (event.activeId === undefined || event.activeId === null ||
+        event.binStep === undefined || event.binStep === null ||
+        event.marketPriceQuoteE18 === undefined || event.marketPriceQuoteE18 === null) {
+        throw new Error("Pool-state observations require active ID, bin step, and market price");
+      }
+      validatePoolStateObservation(event.poolState);
+    }
+  }
+}
+
+function validateCanonicalEventSource(source: NonNullable<AnalyticsEvent["source"]>): void {
+  if (typeof source.eventId !== "string" || source.eventId.length === 0 || source.eventId.trim() !== source.eventId) {
+    throw new Error("Canonical event source ID must be a non-empty trimmed string");
+  }
+  if (!Number.isSafeInteger(source.sequence) || source.sequence < 0) {
+    throw new Error("Canonical event source sequence must be a non-negative safe integer");
+  }
+  if (source.kind === "log") {
+    if (source.transactionHash === null || !/^0x[0-9a-fA-F]+$/.test(source.transactionHash)) {
+      throw new Error("Canonical log sources require a transaction hash");
+    }
+    if (source.logIndex === null || !Number.isSafeInteger(source.logIndex) || source.logIndex < 0) {
+      throw new Error("Canonical log sources require a non-negative log index");
+    }
+    return;
+  }
+  if (source.kind !== "block-snapshot" || source.transactionHash !== null || source.logIndex !== null) {
+    throw new Error("Canonical block-snapshot sources cannot include transaction log identity");
+  }
+}
+
+function validatePoolStateObservation(observation: PairSnapshotEvent["poolState"]): void {
+  if (observation === undefined) return;
+  if (!Array.isArray(observation.sourceEventIds) || observation.sourceEventIds.length === 0) {
+    throw new Error("Pool-state observations require at least one source event ID");
+  }
+  const sourceIds = new Set<string>();
+  for (const sourceId of observation.sourceEventIds) {
+    if (typeof sourceId !== "string" || sourceId.length === 0 || sourceId.trim() !== sourceId) {
+      throw new Error("Pool-state source event IDs must be non-empty trimmed strings");
+    }
+    if (sourceIds.has(sourceId)) throw new Error(`Duplicate pool-state source event ID ${sourceId}`);
+    sourceIds.add(sourceId);
+  }
+  if (typeof observation.replaceBinWindow !== "boolean") {
+    throw new Error("Pool-state replaceBinWindow must be a boolean");
+  }
+  validatePoolFeeState(observation.feeState);
+  const bins = new Set<string>();
+  for (const bin of observation.binUpdates) {
+    if (!/^[0-9]+$/.test(bin.binId) || BigInt(bin.binId) > 0xff_ffffn) {
+      throw new Error(`Pool bin ID ${bin.binId} must fit uint24`);
+    }
+    if (bins.has(bin.binId)) throw new Error(`Duplicate pool bin replacement ${bin.binId}`);
+    bins.add(bin.binId);
+    if (bin.reserveX < 0n || bin.reserveY < 0n || bin.totalSupply < 0n) {
+      throw new Error(`Pool bin ${bin.binId} values must be non-negative`);
+    }
+  }
+}
+
+function validatePoolFeeState(fees: PoolStateObservation["feeState"]): void {
+  const staticFees = fees.static;
+  const variableFees = fees.variable;
+  validateUint(staticFees.baseFactor, 0xffffn, "Pool base factor");
+  validateUint(staticFees.filterPeriod, 0xfffn, "Pool fee filter period");
+  validateUint(staticFees.decayPeriod, 0xfffn, "Pool fee decay period");
+  validateUint(staticFees.reductionFactor, 10_000n, "Pool fee reduction factor");
+  validateUint(staticFees.variableFeeControl, 0xff_ffffn, "Pool variable fee control");
+  validateUint(staticFees.protocolShare, 2_500n, "Pool protocol fee share");
+  validateUint(staticFees.maxVolatilityAccumulator, 0xf_ffffn, "Pool maximum volatility accumulator");
+  validateUint(variableFees.volatilityAccumulator, 0xf_ffffn, "Pool volatility accumulator");
+  validateUint(variableFees.volatilityReference, 0xf_ffffn, "Pool volatility reference");
+  validateUint(variableFees.idReference, 0xff_ffffn, "Pool fee ID reference");
+  validateUint(variableFees.timeOfLastUpdate, 0xff_ffff_ffffn, "Pool fee update time");
+  if (staticFees.filterPeriod > staticFees.decayPeriod) {
+    throw new Error("Pool fee filter period cannot exceed decay period");
+  }
+  if (
+    variableFees.volatilityAccumulator > staticFees.maxVolatilityAccumulator ||
+    variableFees.volatilityReference > staticFees.maxVolatilityAccumulator
+  ) {
+    throw new Error("Pool variable fee state exceeds its configured volatility maximum");
+  }
+}
+
+function validateUint(value: bigint, maximum: bigint, label: string): void {
+  if (typeof value !== "bigint" || value < 0n || value > maximum) {
+    throw new Error(`${label} is outside its canonical unsigned range`);
   }
 }
 

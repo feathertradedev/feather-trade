@@ -70,13 +70,18 @@ preflight responses and CORS headers; wildcards are not supported and the
 authenticated ingestion endpoint is never exposed through CORS. A same-origin
 reverse proxy may leave the allowlist empty.
 
-On a fresh state path the CLI refuses to serve until
-`ANALYTICS_BLOCK_SOURCE_MODULE` completes canonical backfill. The module exports
-`createBlockSource()`, returning `fetchPage(cursor)` and optionally
-`followLive(ingest)`. Backfill status/cursor/error and coverage bounds are
-checkpointed; partial/capped startup exits instead of serving zero activity as
-complete. A restored complete checkpoint may use authenticated
-`/internal/blocks` without a source module.
+The CLI refuses to serve until `ANALYTICS_BLOCK_SOURCE_MODULE` completes a
+canonical startup reconciliation. The module exports `createBlockSource()`,
+returning `fetchPage(cursor)` and optionally `startupCursor(checkpoint)` and
+`followLive(ingest, reconcileHead)`. Sources must explicitly attest a persisted
+cursor through `startupCursor`; otherwise startup replays from the source's
+beginning. The local adapter always returns `null` so its process-local pool
+progression and canonical hash window are rebuilt deterministically from the
+manifest `startBlock`. Backfill status/cursor/error and coverage bounds are
+checkpointed, and partial/capped startup exits rather than serving incomplete
+state as ready. A canonical block source and position snapshot module are
+required at startup; authenticated `/internal/blocks` is only an additional
+ingestion path.
 
 `ANALYTICS_PRICE_VERIFIER_MODULE` exports `createPriceVerifier()`, returning a
 `PriceSampleVerifier`. The verifier receives the signed Chainlink report and

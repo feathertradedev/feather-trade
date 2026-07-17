@@ -18,7 +18,19 @@ try {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = mockFetch;
   const { normalizeAnalyticsEndpoint } = await server.ssrLoadModule("/src/analytics-endpoint.ts");
-  const { CANDLE_STREAM_STALE_AFTER_MS, isCandleStreamStale, loadAnalyticsHealth, loadPairCandles, loadPoolMetrics } = await server.ssrLoadModule("/src/analytics-data.ts");
+  const {
+    CANDLE_STREAM_STALE_AFTER_MS,
+    POOL_STREAM_STALE_AFTER_MS,
+    applyPoolStateUpdate,
+    isCandleStreamStale,
+    isPoolStreamStale,
+    loadAnalyticsHealth,
+    loadPairCandles,
+    loadPoolMetrics,
+    loadPoolState,
+    parsePoolStreamPayload,
+    poolStreamUrl
+  } = await server.ssrLoadModule("/src/analytics-data.ts");
 
   assert.equal(normalizeAnalyticsEndpoint(" https://analytics.example.test/graphql/ "), endpoint);
   assert.equal(normalizeAnalyticsEndpoint(undefined), null);
@@ -30,6 +42,9 @@ try {
   assert.equal(CANDLE_STREAM_STALE_AFTER_MS, 45_000);
   assert.equal(isCandleStreamStale(1_000, 45_999), false);
   assert.equal(isCandleStreamStale(1_000, 46_000), true);
+  assert.equal(POOL_STREAM_STALE_AFTER_MS, 45_000);
+  assert.equal(isPoolStreamStale(1_000, 45_999), false);
+  assert.equal(isPoolStreamStale(1_000, 46_000), true);
 
   const metrics = await loadPoolMetrics(endpoint, [pairB.toUpperCase().replace("0X", "0x"), pairA], undefined, { pageSize: 1 });
   assert.equal(metrics.status, "PARTIAL");
@@ -63,6 +78,46 @@ try {
   assert.equal(candles.rows[1].openUsdE18, null);
   assert.deepEqual(candles.rows[1].missingPriceTokens, [tokenX]);
   assert.equal(candles.streamCursor, "7");
+
+  const pool = await loadPoolState(endpoint, pairA, 1);
+  assert.equal(pool.status, "READY");
+  assert.equal(pool.value?.streamCursor, "7");
+  assert.deepEqual(pool.value?.bins.map((bin) => bin.binId), ["8388607", "8388608", "8388609"]);
+  assert.equal(
+    poolStreamUrl(endpoint, pairA, "7"),
+    `https://analytics.example.test/events/pools?pair=${pairA}&after=7`
+  );
+  const update = parsePoolStreamPayload({ cursor: "9", update: poolUpdate() }, pairA);
+  const untouched = pool.value.bins[2];
+  const applied = applyPoolStateUpdate(pool.value, update);
+  assert.equal(applied.streamCursor, "9");
+  assert.equal(applied.state.activeId, 8_388_609);
+  assert.equal(applied.bins.find((bin) => bin.binId === "8388608")?.reserveX, "222");
+  assert.equal(applied.bins.find((bin) => bin.binId === "8388609"), untouched);
+  assert.equal(applyPoolStateUpdate(applied, update), applied, "exact duplicate delivery is a no-op");
+  assert.throws(
+    () => applyPoolStateUpdate(applied, { ...update, eventId: "different-event" }),
+    /cursor was reused/
+  );
+  assert.throws(
+    () => parsePoolStreamPayload({ cursor: "10", update: { ...poolUpdate(), state: { ...poolState(), pair: pairB } } }, pairA),
+    /foreign pair/
+  );
+  assert.throws(
+    () => parsePoolStreamPayload({
+      cursor: "10",
+      update: {
+        ...poolUpdate(),
+        binReplacements: [poolBin(8_388_608, {
+          updatedAtBlock: "100",
+          updatedAtBlockHash: `0x${"c".repeat(64)}`,
+          updatedAtTimestamp: 9_001,
+          revision: 2
+        })]
+      }
+    }, pairA),
+    /bin canonical hash differs/
+  );
 
   const health = await loadAnalyticsHealth(endpoint);
   assert.equal(health.value?.status, "PARTIAL");
@@ -105,6 +160,14 @@ async function mockFetch(url, init) {
     return response({ data: { pairCandles: { ...connection(nodes, after === null ? "candles-1" : "candles-2", after === null, after !== null), streamCursor: "7" } } });
   }
 
+  if (query.includes("WebPoolState")) {
+    return response({ data: { poolState: {
+      state: poolState(),
+      bins: [8_388_607, 8_388_608, 8_388_609].map((binId) => poolBin(binId)),
+      streamCursor: "7"
+    } } });
+  }
+
   if (query.includes("WebAnalyticsHealth")) {
     return response({ data: { analyticsHealth: {
       status: "READY", headBlock: "99", headHash: `0x${"1".repeat(64)}`, headTimestamp: 9_000,
@@ -138,6 +201,76 @@ function candle(startTimestamp, status) {
     swapCount: partial ? 0 : 1, status, missingPriceTokens: partial ? [tokenX] : [], firstBlock: "90", lastBlock: "99",
     firstBlockHash: `0x${"9".repeat(64)}`, lastBlockHash: `0x${"a".repeat(64)}`, finalized: true, revision: 3,
     priceSource: "active-bin-quote-usd", quoteToken: tokenY
+  };
+}
+
+function poolState(overrides = {}) {
+  return {
+    chainId: 31_337,
+    pair: pairA,
+    tokenX,
+    tokenY,
+    decimalsX: 18,
+    decimalsY: 6,
+    reserveX: "1000",
+    reserveY: "2000",
+    activeId: 8_388_608,
+    binStep: 10,
+    marketPriceQuoteE18: "1000000000000000000",
+    priceUsdE18: "160000000000000000000",
+    tvlUsdE18: "320000000000000000000",
+    status: "READY",
+    missingPriceTokens: [],
+    feeState: {
+      static: {
+        baseFactor: "20", filterPeriod: "30", decayPeriod: "120", reductionFactor: "5000",
+        variableFeeControl: "100", protocolShare: "1000", maxVolatilityAccumulator: "100000"
+      },
+      variable: { volatilityAccumulator: "1000", volatilityReference: "500", idReference: "8388608", timeOfLastUpdate: "1000" }
+    },
+    asOfBlock: "99",
+    asOfBlockHash: `0x${"a".repeat(64)}`,
+    asOfTimestamp: 9_000,
+    revision: 1,
+    ...overrides
+  };
+}
+
+function poolBin(binId, overrides = {}) {
+  return {
+    chainId: 31_337,
+    pair: pairA,
+    binId: String(binId),
+    reserveX: "100",
+    reserveY: "200",
+    totalSupply: "300",
+    updatedAtBlock: "99",
+    updatedAtBlockHash: `0x${"a".repeat(64)}`,
+    updatedAtTimestamp: 9_000,
+    revision: 1,
+    ...overrides
+  };
+}
+
+function poolUpdate() {
+  return {
+    eventId: `31337:0x${"b".repeat(64)}:${pairA}:swap-1`,
+    state: poolState({
+      activeId: 8_388_609,
+      asOfBlock: "100",
+      asOfBlockHash: `0x${"b".repeat(64)}`,
+      asOfTimestamp: 9_001,
+      revision: 2
+    }),
+    binReplacements: [poolBin(8_388_608, {
+      reserveX: "222",
+      updatedAtBlock: "100",
+      updatedAtBlockHash: `0x${"b".repeat(64)}`,
+      updatedAtTimestamp: 9_001,
+      revision: 2
+    })],
+    replaceBinWindow: false,
+    sourceEventIds: ["swap-1"]
   };
 }
 

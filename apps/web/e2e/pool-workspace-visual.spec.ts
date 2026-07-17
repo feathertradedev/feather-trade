@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 
+import { installMockAnalyticsStream } from "./fixtures/mock-analytics-stream";
 import { installMockRpc, WNATIVE_USDC_PAIR, type MockRpcOptions } from "./fixtures/mock-rpc";
 import { installMockWallet, LOCALNET_CHAIN_ID } from "./fixtures/mock-wallet";
 
@@ -31,6 +32,7 @@ for (const visualCase of CASES) {
   test(`canonical pool workspace ${visualCase.name}`, async ({ page }, testInfo) => {
     await page.clock.setFixedTime("2026-07-12T14:00:00Z");
     await page.emulateMedia({ reducedMotion: "reduce" });
+    await installMockAnalyticsStream(page);
     await installMockRpc(page, visualCase.options);
     await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
 
@@ -62,14 +64,26 @@ for (const visualCase of CASES) {
       await expect(page.getByTestId("pool-workspace-owner-panel")).toHaveScreenshot(snapshotName, screenshotOptions);
     } else {
       if (visualCase.expandMetadata) {
-        await page.getByTestId("pool-workspace-state").evaluate((state) => {
+        const state = page.getByTestId("pool-workspace-state");
+        if (testInfo.project.name === "chromium") {
+          await expect.poll(() => state.evaluate((element) => {
+            const rail = element.closest<HTMLElement>(".pool-workspace-rail");
+            return rail !== null && rail.scrollHeight > rail.clientHeight + 1;
+          })).toBe(true);
+        }
+        await state.evaluate((element, desktop) => {
+          const state = element as HTMLElement;
           const rail = state.closest<HTMLElement>(".pool-workspace-rail");
-          if (rail && rail.scrollHeight > rail.clientHeight + 1) {
-            rail.scrollTop = Math.max(0, (state as HTMLElement).offsetTop - 16);
+          if (desktop && rail) {
+            rail.scrollTop = Math.max(0, state.offsetTop - 16);
           } else {
             state.scrollIntoView({ behavior: "auto", block: "center" });
           }
-        });
+        }, testInfo.project.name === "chromium");
+        if (testInfo.project.name === "chromium") {
+          await page.evaluate(() => window.scrollTo({ behavior: "auto", left: 0, top: 0 }));
+          await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(0);
+        }
       } else {
         await page.evaluate(() => window.scrollTo({ behavior: "auto", left: 0, top: 0 }));
         await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(0);

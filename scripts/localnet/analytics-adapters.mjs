@@ -7,6 +7,14 @@ const UINT128_MASK = (1n << 128n) - 1n;
 const Q128 = 1n << 128n;
 const USD_SCALE = 10n ** 18n;
 const GET_PRICE_FROM_ID_SELECTOR = "0x4c7cffbd";
+const GET_BIN_SELECTOR = "0x0abe9688";
+const TOTAL_SUPPLY_SELECTOR = "0xbd85b039";
+const GET_STATIC_FEE_PARAMETERS_SELECTOR = "0x7ca0de30";
+const GET_VARIABLE_FEE_PARAMETERS_SELECTOR = "0x8d7024e5";
+const POOL_BIN_RADIUS = 40;
+const MAX_INCREMENTAL_BIN_READS = POOL_BIN_RADIUS * 2 + 1;
+const MAX_UINT24 = 0xff_ff_ff;
+const DEFAULT_REORG_RETENTION_BLOCKS = 256;
 const DEFAULT_RPC_URL = "http://127.0.0.1:8545";
 const DEFAULT_INDEXER_URL = "http://127.0.0.1:8000/subgraphs/name/robinhood-lb/localnet";
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -58,42 +66,120 @@ const POSITION_QUERY = `
 export async function createBlockSource(options = {}) {
   const config = await loadConfig(options);
   const decimals = new Map();
+  const canonicalBlocks = new Map();
+  let poolProgress = new Map();
   let nextBlock = config.startBlock;
+  let firstFetch = true;
 
   await assertLocalChain(config);
 
+  function startupCursor() {
+    // The source's poolProgress and canonical hash window are intentionally
+    // process-local. Rebuild them from manifest startBlock on every process
+    // start instead of treating a persisted service cursor as sufficient.
+    return null;
+  }
+
   async function fetchPage(cursor) {
-    const start = cursor === null ? config.startBlock : parseCursor(cursor);
+    // poolProgress is intentionally process-local and affects whether a block
+    // carries a sparse observation or a full replacement. A fresh adapter must
+    // therefore rebuild it from the manifest's deployment block before it can
+    // safely honor a persisted analytics cursor. This also guarantees that an
+    // offline reorg which regrew past that cursor cannot skip its replacement
+    // ancestors. Pages after the first successful fetch resume normally.
+    const requestedStart = firstFetch
+      ? config.startBlock
+      : cursor === null
+        ? config.startBlock
+        : parseCursor(cursor);
     const target = await waitForExactHead(config);
+    const canonicalHead = canonicalHeadFromTarget(target);
+    const reorgStart = await findReorgStart(config, canonicalBlocks, target.number);
+    const start = reorgStart === null ? requestedStart : Math.min(requestedStart, reorgStart);
+    let rewindTo = null;
+    if (reorgStart !== null) {
+      if (reorgStart > target.number) {
+        const retainedHead = canonicalBlocks.get(target.number)?.block;
+        if (retainedHead === undefined || retainedHead.hash !== target.hash) {
+          throw new Error(`Cannot reconcile rolled-back local head ${target.number}:${target.hash}`);
+        }
+        rewindTo = {
+          number: retainedHead.number,
+          hash: retainedHead.hash,
+          timestamp: retainedHead.timestamp
+        };
+      }
+      for (const number of [...canonicalBlocks.keys()]) {
+        if (number >= reorgStart) canonicalBlocks.delete(number);
+      }
+      poolProgress = clonePoolProgress(canonicalBlocks.get(reorgStart - 1)?.poolProgressAfter ?? new Map());
+    }
     if (start > target.number) {
-      nextBlock = start;
-      return { blocks: [], nextCursor: String(start), hasMore: false };
+      // A live cursor can sit beyond a head that rolled back between polls.
+      // Continue from the attested head's child as the chain regrows.
+      nextBlock = target.number + 1;
+      firstFetch = false;
+      return { blocks: [], canonicalHead, nextCursor: String(nextBlock), hasMore: false, rewindTo };
     }
 
     const end = Math.min(target.number, start + config.pageSize - 1);
     const blocks = [];
     for (let number = start; number <= end; number += 1) {
-      blocks.push(await loadBlock(config, decimals, number));
+      const cached = canonicalBlocks.get(number);
+      if (cached !== undefined) {
+        blocks.push(cached.block);
+        poolProgress = clonePoolProgress(cached.poolProgressAfter);
+        continue;
+      }
+      const workingPoolProgress = clonePoolProgress(poolProgress);
+      const block = await loadBlock(config, decimals, workingPoolProgress, number);
+      poolProgress = workingPoolProgress;
+      blocks.push(block);
+      canonicalBlocks.set(number, { block, poolProgressAfter: clonePoolProgress(poolProgress) });
+      trimCanonicalCache(canonicalBlocks, config.reorgRetentionBlocks);
     }
     nextBlock = end + 1;
+    firstFetch = false;
     return {
       blocks,
+      canonicalHead,
       nextCursor: String(nextBlock),
-      hasMore: end < target.number
+      hasMore: end < target.number,
+      rewindTo
     };
   }
 
-  async function followLive(ingest) {
+  async function followLive(ingest, reconcileHead) {
     let cursor = String(nextBlock);
     while (!config.signal?.aborted) {
       const page = await fetchPage(cursor);
+      if (page.rewindTo != null) {
+        if (typeof reconcileHead !== "function") {
+          throw new Error("Local analytics source detected a head rollback but no canonical-head reconciler is configured");
+        }
+        await reconcileHead(page.rewindTo);
+      }
       for (const block of page.blocks) await ingest(block);
+      if (!page.hasMore && page.canonicalHead != null) {
+        if (typeof reconcileHead !== "function") {
+          throw new Error("Local analytics source cannot attest its canonical head without a reconciler");
+        }
+        await reconcileHead(page.canonicalHead);
+      }
       cursor = page.nextCursor ?? cursor;
       if (!page.hasMore) await delay(config.pollIntervalMs, config.signal);
     }
   }
 
-  return { fetchPage, followLive };
+  return { fetchPage, startupCursor, followLive };
+}
+
+function canonicalHeadFromTarget(target) {
+  return {
+    number: BigInt(target.number),
+    hash: target.hash,
+    timestamp: target.timestamp
+  };
 }
 
 export async function createPositionSnapshotProvider(options = {}) {
@@ -147,12 +233,16 @@ export async function createPositionSnapshotProvider(options = {}) {
 
       return [...grouped.values()]
         .map((snapshot) => ({ ...snapshot, bins: snapshot.bins.sort(compareBinIds) }))
-        .sort((left, right) => left.pair.localeCompare(right.pair));
+        .sort((left, right) => left.pair.localeCompare(right.pair))
+        .map((snapshot, sequence) => ({
+          ...snapshot,
+          source: blockSnapshotSource(expectedHash, `${snapshot.pair}:${owner}:position`, sequence)
+        }));
     }
   };
 }
 
-async function loadBlock(config, decimals, number) {
+async function loadBlock(config, decimals, poolProgress, number) {
   const rpcBlock = await rpc(config, "eth_getBlockByNumber", [quantity(number), false]);
   assertRpcBlock(rpcBlock, number);
   const blockHash = hash(rpcBlock.hash, `RPC block ${number} hash`);
@@ -170,11 +260,13 @@ async function loadBlock(config, decimals, number) {
     });
   }
 
-  const transfers = boundedRows(data.transferBatchEvents, "transferBatchEvents").map(parseTransfer);
+  const sourceRegistry = createSourceRegistry();
+  const transfers = canonicalRows(data.transferBatchEvents, "transferBatchEvents", sourceRegistry)
+    .map(({ row, source }) => parseTransfer(row, source));
   const consumedTransfers = new Set();
   const ordered = [];
 
-  for (const row of boundedRows(data.swaps, "swaps")) {
+  for (const { row, source } of canonicalRows(data.swaps, "swaps", sourceRegistry)) {
     const pair = requirePair(identities, row.pair?.id);
     const observation = await marketObservation(config, pair, safeNumber(row.activeId, "swap activeId"), number);
     const feeX = unsigned(row.totalFeeX, "swap totalFeeX");
@@ -186,6 +278,7 @@ async function loadBlock(config, decimals, number) {
     }
     ordered.push({
       order: eventOrder(row.id),
+      source,
       event: {
         ...pair,
         ...observation,
@@ -200,7 +293,7 @@ async function loadBlock(config, decimals, number) {
     });
   }
 
-  for (const row of boundedRows(data.liquidityEvents, "liquidityEvents")) {
+  for (const { row, source } of canonicalRows(data.liquidityEvents, "liquidityEvents", sourceRegistry)) {
     const kind = String(row.type).toUpperCase() === "DEPOSIT"
       ? "deposit"
       : String(row.type).toUpperCase() === "WITHDRAW"
@@ -232,7 +325,7 @@ async function loadBlock(config, decimals, number) {
         amountY: amounts.amountY
       };
     });
-    ordered.push({ order: eventOrder(row.id), event: { ...pair, kind, owner, bins } });
+    ordered.push({ order: eventOrder(row.id), source, event: { ...pair, kind, owner, bins } });
   }
 
   transfers.forEach((transfer, index) => {
@@ -240,6 +333,7 @@ async function loadBlock(config, decimals, number) {
     const pair = requirePair(identities, transfer.pair);
     ordered.push({
       order: transfer.order,
+      source: transfer.source,
       event: {
         pair: pair.pair,
         tokenX: pair.tokenX,
@@ -255,12 +349,33 @@ async function loadBlock(config, decimals, number) {
   });
 
   ordered.sort((left, right) => left.order - right.order);
-  const events = ordered.map((entry) => entry.event);
-  for (const pair of [...identities.values()].sort((left, right) => left.pair.localeCompare(right.pair))) {
-    events.push({ ...pair, kind: "pair-snapshot" });
+  const events = ordered.map((entry, sequence) => ({
+    ...entry.event,
+    source: { ...entry.source, sequence }
+  }));
+  const logEventCount = events.length;
+  const pairEntries = [...identities.values()].sort((left, right) => left.pair.localeCompare(right.pair));
+  for (const [pairIndex, pair] of pairEntries.entries()) {
+    const snapshotSource = blockSnapshotSource(blockHash, `${pair.pair}:pool`, logEventCount + pairIndex);
+    const poolState = await poolStateObservation({
+      config,
+      number,
+      pair,
+      priorActiveId: poolProgress.get(pair.pair)?.activeId ?? null,
+      events,
+      snapshotSource
+    });
+    events.push({
+      ...pair,
+      kind: "pair-snapshot",
+      source: snapshotSource,
+      ...(poolState === null ? {} : { poolState })
+    });
+    poolProgress.set(pair.pair, { activeId: pair.activeId });
   }
 
   return {
+    chainId: config.chainId,
     number: BigInt(number),
     hash: blockHash,
     parentHash: hash(rpcBlock.parentHash, `RPC block ${number} parent hash`),
@@ -277,6 +392,187 @@ async function loadBlock(config, decimals, number) {
     })),
     events
   };
+}
+
+async function findReorgStart(config, canonicalBlocks, targetNumber) {
+  const cachedNumbers = [...canonicalBlocks.keys()];
+  const hasOrphanedSuffix = cachedNumbers.some((number) => number > targetNumber);
+  const overlapping = [...canonicalBlocks.keys()]
+    .filter((number) => number <= targetNumber)
+    .sort((left, right) => right - left);
+  if (overlapping.length === 0) {
+    if (hasOrphanedSuffix) {
+      throw new Error(`Local head rollback exceeds the retained ${config.reorgRetentionBlocks}-block source window`);
+    }
+    return null;
+  }
+
+  for (const number of overlapping) {
+    const rpcBlock = await rpc(config, "eth_getBlockByNumber", [quantity(number), false]);
+    assertRpcBlock(rpcBlock, number);
+    if (hash(rpcBlock.hash, `RPC block ${number} hash`) === canonicalBlocks.get(number).block.hash) {
+      if (hasOrphanedSuffix && number === targetNumber) return targetNumber + 1;
+      return number === overlapping[0] ? null : number + 1;
+    }
+  }
+  throw new Error(`Local reorg exceeds the retained ${config.reorgRetentionBlocks}-block source window`);
+}
+
+function trimCanonicalCache(canonicalBlocks, retentionBlocks) {
+  const numbers = [...canonicalBlocks.keys()].sort((left, right) => left - right);
+  while (numbers.length > retentionBlocks) canonicalBlocks.delete(numbers.shift());
+}
+
+function clonePoolProgress(progress) {
+  return new Map([...progress.entries()].map(([pair, value]) => [pair, { ...value }]));
+}
+
+async function poolStateObservation({ config, number, pair, priorActiveId, events, snapshotSource }) {
+  if (pair.activeId === null || pair.activeId === undefined) return null;
+  const touched = events.filter((event) =>
+    event.pair === pair.pair && (event.kind === "swap" || event.kind === "deposit" || event.kind === "withdraw")
+  );
+  if (priorActiveId !== null && touched.length === 0 && priorActiveId === pair.activeId) return null;
+
+  const selection = selectObservedBinIds({
+    priorActiveId,
+    activeId: pair.activeId,
+    events: touched
+  });
+  const [feeState, binUpdates] = await Promise.all([
+    readPoolFeeState(config, pair.pair, number),
+    mapWithConcurrency(selection.binIds, 8, (binId) => readPoolBin(config, pair.pair, binId, number))
+  ]);
+  const sourceEventIds = touched.map((event) => event.source.eventId);
+  if (selection.replaceBinWindow || sourceEventIds.length === 0) sourceEventIds.push(snapshotSource.eventId);
+  return {
+    feeState,
+    binUpdates,
+    sourceEventIds: [...new Set(sourceEventIds)],
+    replaceBinWindow: selection.replaceBinWindow
+  };
+}
+
+function selectObservedBinIds({ priorActiveId, activeId, events }) {
+  if (priorActiveId === null) {
+    return { binIds: centeredBinWindow(activeId), replaceBinWindow: true };
+  }
+
+  const ids = new Set();
+  let cursor = priorActiveId;
+  let exceeded = false;
+  const addRange = (left, right) => {
+    const low = Math.max(0, Math.min(left, right));
+    const high = Math.min(MAX_UINT24, Math.max(left, right));
+    if (high < low) return;
+    if (high - low + 1 > MAX_INCREMENTAL_BIN_READS) {
+      exceeded = true;
+      return;
+    }
+    for (let id = low; id <= high; id += 1) {
+      ids.add(id);
+      if (ids.size > MAX_INCREMENTAL_BIN_READS) {
+        exceeded = true;
+        return;
+      }
+    }
+  };
+
+  for (const event of events) {
+    if (event.kind === "swap" && event.activeId !== null && event.activeId !== undefined) {
+      addRange(cursor, event.activeId);
+      cursor = event.activeId;
+    }
+    if (event.kind === "deposit" || event.kind === "withdraw") {
+      for (const bin of event.bins) {
+        const binId = safeNumber(bin.binId, "liquidity bin id");
+        ids.add(binId);
+        if (ids.size > MAX_INCREMENTAL_BIN_READS) exceeded = true;
+      }
+    }
+  }
+  addRange(cursor, activeId);
+  ids.add(activeId);
+
+  if (activeId > priorActiveId) {
+    addRange(priorActiveId + POOL_BIN_RADIUS + 1, activeId + POOL_BIN_RADIUS);
+  } else if (activeId < priorActiveId) {
+    addRange(activeId - POOL_BIN_RADIUS, priorActiveId - POOL_BIN_RADIUS - 1);
+  }
+
+  if (exceeded || ids.size > MAX_INCREMENTAL_BIN_READS) {
+    return { binIds: centeredBinWindow(activeId), replaceBinWindow: true };
+  }
+  return { binIds: [...ids].sort((left, right) => left - right), replaceBinWindow: false };
+}
+
+function centeredBinWindow(activeId) {
+  const low = Math.max(0, activeId - POOL_BIN_RADIUS);
+  const high = Math.min(MAX_UINT24, activeId + POOL_BIN_RADIUS);
+  return Array.from({ length: high - low + 1 }, (_, index) => low + index);
+}
+
+async function readPoolBin(config, pair, binId, blockNumber) {
+  if (!Number.isSafeInteger(binId) || binId < 0 || binId > MAX_UINT24) throw new Error("Pool bin ID is out of range");
+  const argument = encodeWord(BigInt(binId));
+  const [binResult, supplyResult] = await Promise.all([
+    rpc(config, "eth_call", [{ to: pair, data: `${GET_BIN_SELECTOR}${argument}` }, quantity(blockNumber)]),
+    rpc(config, "eth_call", [{ to: pair, data: `${TOTAL_SUPPLY_SELECTOR}${argument}` }, quantity(blockNumber)])
+  ]);
+  const [reserveX, reserveY] = decodeWords(binResult, 2, `bin ${binId} reserves for ${pair}`);
+  const [totalSupply] = decodeWords(supplyResult, 1, `bin ${binId} total supply for ${pair}`);
+  assertFitsUnsigned(reserveX, 128, `bin ${binId} reserveX`);
+  assertFitsUnsigned(reserveY, 128, `bin ${binId} reserveY`);
+  return { binId: String(binId), reserveX, reserveY, totalSupply };
+}
+
+async function readPoolFeeState(config, pair, blockNumber) {
+  const block = quantity(blockNumber);
+  const [staticResult, variableResult] = await Promise.all([
+    rpc(config, "eth_call", [{ to: pair, data: GET_STATIC_FEE_PARAMETERS_SELECTOR }, block]),
+    rpc(config, "eth_call", [{ to: pair, data: GET_VARIABLE_FEE_PARAMETERS_SELECTOR }, block])
+  ]);
+  const [baseFactor, filterPeriod, decayPeriod, reductionFactor, variableFeeControl, protocolShare, maxVolatilityAccumulator] =
+    decodeWords(staticResult, 7, `static fee parameters for ${pair}`);
+  const [volatilityAccumulator, volatilityReference, idReference, timeOfLastUpdate] =
+    decodeWords(variableResult, 4, `variable fee parameters for ${pair}`);
+  [baseFactor, filterPeriod, decayPeriod, reductionFactor, protocolShare]
+    .forEach((value, index) => assertFitsUnsigned(value, 16, `static fee parameter ${index}`));
+  [variableFeeControl, maxVolatilityAccumulator, volatilityAccumulator, volatilityReference, idReference]
+    .forEach((value, index) => assertFitsUnsigned(value, 24, `fee parameter ${index}`));
+  assertFitsUnsigned(timeOfLastUpdate, 40, "variable fee timeOfLastUpdate");
+  return {
+    static: { baseFactor, filterPeriod, decayPeriod, reductionFactor, variableFeeControl, protocolShare, maxVolatilityAccumulator },
+    variable: { volatilityAccumulator, volatilityReference, idReference, timeOfLastUpdate }
+  };
+}
+
+function decodeWords(value, count, label) {
+  if (typeof value !== "string" || !new RegExp(`^0x[0-9a-fA-F]{${count * 64}}$`).test(value)) {
+    throw new Error(`Invalid ${label}`);
+  }
+  return Array.from({ length: count }, (_, index) => BigInt(`0x${value.slice(2 + index * 64, 2 + (index + 1) * 64)}`));
+}
+
+function encodeWord(value) {
+  return value.toString(16).padStart(64, "0");
+}
+
+function assertFitsUnsigned(value, bits, label) {
+  if (value < 0n || value >= 1n << BigInt(bits)) throw new Error(`${label} does not fit uint${bits}`);
+}
+
+async function mapWithConcurrency(values, limit, mapper) {
+  const results = new Array(values.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, values.length) }, async () => {
+    while (next < values.length) {
+      const index = next;
+      next += 1;
+      results[index] = await mapper(values[index], index);
+    }
+  }));
+  return results;
 }
 
 async function loadConfig(options) {
@@ -304,6 +600,11 @@ async function loadConfig(options) {
     pageSize: boundedPositive(options.pageSize ?? process.env.ANALYTICS_LOCALNET_PAGE_SIZE ?? 50, 500, "page size"),
     pollIntervalMs: boundedPositive(options.pollIntervalMs ?? process.env.ANALYTICS_LOCALNET_POLL_MS ?? 1000, 60_000, "poll interval"),
     syncTimeoutMs: boundedPositive(options.syncTimeoutMs ?? process.env.ANALYTICS_LOCALNET_SYNC_TIMEOUT_MS ?? 60_000, 600_000, "sync timeout"),
+    reorgRetentionBlocks: boundedPositive(
+      options.reorgRetentionBlocks ?? process.env.ANALYTICS_LOCALNET_REORG_BLOCKS ?? DEFAULT_REORG_RETENTION_BLOCKS,
+      10_000,
+      "reorg retention blocks"
+    ),
     priceUsdE18: positiveBigInt(options.priceUsdE18 ?? process.env.ANALYTICS_LOCALNET_PRICE_USD_E18 ?? "1000000000000000000", "local price"),
     policies: normalizedPolicies,
     signal: options.signal ?? null
@@ -321,17 +622,18 @@ async function waitForExactHead(config) {
   const rpcBlock = await rpc(config, "eth_getBlockByNumber", [quantity(rpcNumber), false]);
   assertRpcBlock(rpcBlock, rpcNumber);
   const rpcHash = hash(rpcBlock.hash, "RPC head hash");
+  const rpcTimestamp = hexQuantity(rpcBlock.timestamp, "RPC head timestamp");
   while (true) {
     const data = await graph(config, HEAD_QUERY, {});
     const meta = parseGraphMeta(data._meta);
     if (meta.hasIndexingErrors) throw new Error("Indexer reports indexing errors");
     if (meta.number === rpcNumber) {
       if (meta.hash !== rpcHash) throw new Error(`RPC/indexer head hash mismatch at block ${rpcNumber}`);
-      return { number: rpcNumber, hash: rpcHash };
+      return { number: rpcNumber, hash: rpcHash, timestamp: rpcTimestamp };
     }
     // The local chain can advance while the indexer catches the captured
     // target. Per-block loads below still verify the canonical target hash.
-    if (meta.number > rpcNumber) return { number: rpcNumber, hash: rpcHash };
+    if (meta.number > rpcNumber) return { number: rpcNumber, hash: rpcHash, timestamp: rpcTimestamp };
     if (Date.now() >= deadline) throw new Error(`Indexer did not reach RPC head ${rpcNumber} before timeout`);
     await delay(Math.min(config.pollIntervalMs, 250), config.signal);
   }
@@ -379,7 +681,7 @@ async function tokenDecimals(config, cache, token, blockNumber) {
   return value;
 }
 
-function parseTransfer(row) {
+function parseTransfer(row, source) {
   const ids = decimalsArray(row.ids, "transfer ids");
   const amounts = unsignedArray(row.amounts, "transfer amounts");
   if (ids.length !== amounts.length) throw new Error("Transfer ids/amounts length mismatch");
@@ -390,7 +692,59 @@ function parseTransfer(row) {
     to: address(row.to, "transfer to"),
     ids,
     amounts,
-    transactionHash: hash(row.transactionHash, "transfer transaction hash")
+    transactionHash: hash(row.transactionHash, "transfer transaction hash"),
+    source
+  };
+}
+
+function createSourceRegistry() {
+  return { byEventId: new Map(), byLog: new Map(), byLogIndex: new Map() };
+}
+
+function canonicalRows(value, label, registry) {
+  const result = [];
+  for (const row of boundedRows(value, label)) {
+    const eventId = nonEmptyString(row?.id, `${label} event id`).toLowerCase();
+    const transactionHash = hash(row?.transactionHash, `${label} transaction hash`);
+    const logIndex = eventOrder(eventId);
+    if (eventId !== `${transactionHash}-${logIndex}`) {
+      throw new Error(`Canonical event id ${eventId} does not match transaction/log identity`);
+    }
+    const signature = JSON.stringify(row);
+    const existingEvent = registry.byEventId.get(eventId);
+    if (existingEvent !== undefined) {
+      if (existingEvent.label !== label || existingEvent.signature !== signature) {
+        throw new Error(`Conflicting duplicate canonical event id ${eventId}`);
+      }
+      continue;
+    }
+    const logKey = `${transactionHash}:${logIndex}`;
+    const existingLog = registry.byLog.get(logKey);
+    if (existingLog !== undefined && existingLog !== eventId) {
+      throw new Error(`Conflicting canonical log identity ${logKey}`);
+    }
+    const existingLogIndex = registry.byLogIndex.get(logIndex);
+    if (existingLogIndex !== undefined && existingLogIndex !== eventId) {
+      throw new Error(`Conflicting canonical block log index ${logIndex}`);
+    }
+    registry.byEventId.set(eventId, { label, signature });
+    registry.byLog.set(logKey, eventId);
+    registry.byLogIndex.set(logIndex, eventId);
+    result.push({
+      row,
+      source: { eventId, transactionHash, logIndex, sequence: 0, kind: "log" }
+    });
+  }
+  return result;
+}
+
+function blockSnapshotSource(blockHash, identity, sequence) {
+  return {
+    eventId: `${blockHash}:${identity}`,
+    transactionHash: null,
+    logIndex: null,
+    sequence,
+    kind: "block-snapshot"
   };
 }
 
@@ -407,10 +761,10 @@ function requirePair(identities, value) {
 }
 
 function assertGraphMeta(value, expected) {
-  const meta = parseGraphMeta(value, false);
+  const meta = parseGraphMeta(value);
   if (meta.hasIndexingErrors) throw new Error("Indexer reports indexing errors");
   if (meta.number !== expected.number) throw new Error(`Indexer returned block ${meta.number}, expected ${expected.number}`);
-  if (meta.hash !== null && meta.hash !== expected.hash) {
+  if (meta.hash !== expected.hash) {
     throw new Error(`RPC/indexer hash mismatch at block ${expected.number}`);
   }
 }

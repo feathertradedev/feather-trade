@@ -49,22 +49,37 @@ const service = await AnalyticsApiService.create({
 });
 const blockSource = await loadBlockSource(process.env.ANALYTICS_BLOCK_SOURCE_MODULE ?? null);
 const initialHealth = service.getHealth();
-const coverageComplete =
-  initialHealth.backfillStatus === "complete" &&
-  initialHealth.coverageStartTimestamp !== null &&
-  initialHealth.coverageThroughTimestamp !== null &&
-  (initialHealth.headTimestamp === null || initialHealth.coverageThroughTimestamp >= initialHealth.headTimestamp);
-if (!coverageComplete) {
-  if (blockSource === null) {
-    throw new Error("ANALYTICS_BLOCK_SOURCE_MODULE is required until canonical backfill is complete");
-  }
-  const result = await service.backfill(blockSource.fetchPage, {
-    startCursor: initialHealth.backfillCursor,
-    maxPages: numberFromEnv("ANALYTICS_BACKFILL_MAX_PAGES", 10_000)
-  });
-  if (result.status !== "complete") {
-    throw new Error(`Analytics backfill stopped ${result.status} at ${result.cursor ?? "start"}: ${result.error ?? "page cap"}`);
-  }
+if (blockSource === null) {
+  throw new Error("ANALYTICS_BLOCK_SOURCE_MODULE is required for canonical startup attestation and live ingestion");
+}
+const retainedHead = initialHealth.headBlock === null
+  ? null
+  : {
+      number: initialHealth.headBlock,
+      hash: initialHealth.headHash!,
+      timestamp: initialHealth.headTimestamp!
+    };
+// A source must opt in before a persisted cursor is trusted. The local source
+// deliberately returns null because its process-local pool progression must be
+// rebuilt from deployment for deterministic envelopes and offline-reorg safety.
+const startCursor = blockSource.startupCursor === undefined
+  ? null
+  : await blockSource.startupCursor({
+      persistedCursor: initialHealth.backfillCursor,
+      retainedHead
+    });
+if (startCursor !== null && typeof startCursor !== "string") {
+  throw new Error("Analytics block source startupCursor() must return a string or null");
+}
+// Always reconcile the canonical source before opening HTTP, even when
+// persisted coverage was previously complete. The final page's exact head
+// attestation trims an offline rollback/orphan suffix.
+const result = await service.backfill(blockSource.fetchPage, {
+  startCursor,
+  maxPages: numberFromEnv("ANALYTICS_BACKFILL_MAX_PAGES", 10_000)
+});
+if (result.status !== "complete") {
+  throw new Error(`Analytics backfill stopped ${result.status} at ${result.cursor ?? "start"}: ${result.error ?? "page cap"}`);
 }
 const host = process.env.ANALYTICS_HOST ?? "127.0.0.1";
 const port = numberFromEnv("ANALYTICS_PORT", 8787);
@@ -77,7 +92,10 @@ const server = await startAnalyticsHttpServer({
 });
 process.stdout.write(`Feather analytics listening on http://${host}:${port}\n`);
 if (blockSource?.followLive) {
-  void blockSource.followLive((block) => service.ingestBlock(block)).catch(async (error: unknown) => {
+  void blockSource.followLive(
+    (block) => service.ingestBlock(block),
+    (head) => service.reconcileCanonicalHead(head)
+  ).catch(async (error: unknown) => {
     process.stderr.write(`Analytics live source failed: ${error instanceof Error ? error.message : String(error)}\n`);
     const closed = new Promise<void>((resolve) => server.close(() => resolve()));
     server.closeAllConnections();
@@ -126,7 +144,15 @@ async function loadBlockSource(modulePath: string | null): Promise<AnalyticsBloc
   if (typeof loaded.createBlockSource !== "function") {
     throw new Error("ANALYTICS_BLOCK_SOURCE_MODULE must export createBlockSource()");
   }
-  return loaded.createBlockSource();
+  const source = await loaded.createBlockSource();
+  if (
+    source === null || typeof source !== "object" ||
+    typeof source.fetchPage !== "function" ||
+    (source.startupCursor !== undefined && typeof source.startupCursor !== "function")
+  ) {
+    throw new Error("ANALYTICS_BLOCK_SOURCE_MODULE must provide fetchPage() and a valid optional startupCursor()");
+  }
+  return source;
 }
 
 async function loadPositionSnapshotProvider(modulePath: string | null): Promise<PositionSnapshotProvider | null> {

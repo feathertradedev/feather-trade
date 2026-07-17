@@ -5,6 +5,7 @@ import {
   normalizeQ128Price,
   priceQ128FromActiveId
 } from "../../../packages/sdk/src/liquidity-price";
+import { quoteCurrentFeeRates, type CurrentFeeRates } from "@robinhood-lb/sdk/liquidity-review";
 
 import { formatCompactAddress, formatTokenAmount, tokenSymbol, type PoolRow } from "./data";
 import { returnHrefFromAction, samePairPools } from "./pool-discovery";
@@ -194,8 +195,9 @@ function PoolBinStepSelector({ pool, pools }: { pool: PoolRow; pools: PoolRow[] 
 
 function PoolWorkspaceRail({ mobileWorkspaceNavigation }: { mobileWorkspaceNavigation: boolean }) {
   const workspace = usePoolWorkspace();
-  const metricTiles = workspaceMetricTiles(workspace.analytics.row.metric).map((tile) => workspace.economics.value === null
-    ? workspace.economics.state === "loading"
+  const marketIdentityAvailable = workspace.liveMarket.value !== null || workspace.economics.value !== null;
+  const metricTiles = workspaceMetricTiles(workspace.analytics.row.metric).map((tile) => !marketIdentityAvailable
+    ? workspace.economics.state === "loading" || workspace.liveMarket.state === "connecting"
       ? { ...tile, status: "PARTIAL" as const, value: "Loading…" }
       : { ...tile, status: "UNAVAILABLE" as const, value: "Unavailable" }
     : tile);
@@ -211,8 +213,8 @@ function PoolWorkspaceRail({ mobileWorkspaceNavigation }: { mobileWorkspaceNavig
     query.addEventListener("change", handleChange);
     return () => query.removeEventListener("change", handleChange);
   }, []);
-  const currentActiveId = workspace.economics.value?.activeId.toString() ?? null;
-  const currentPrice = workspace.economics.state === "loading"
+  const currentActiveId = workspace.liveMarket.value?.state.activeId.toString() ?? workspace.economics.value?.activeId.toString() ?? null;
+  const currentPrice = workspace.liveMarket.value === null && workspace.economics.state === "loading"
     ? "Loading…"
     : formatCurrentPoolPrice(workspace.pool, inversePrice, currentActiveId);
   const baseSymbol = tokenSymbol(inversePrice ? workspace.pool.tokenY : workspace.pool.tokenX);
@@ -233,6 +235,8 @@ function PoolWorkspaceRail({ mobileWorkspaceNavigation }: { mobileWorkspaceNavig
       aria-label="Pool market details"
       aria-labelledby={mobileWorkspaceNavigation ? "pool-mobile-market-tab" : undefined}
       className="pool-workspace-rail"
+      data-pool-stream-error={workspace.liveMarket.error ?? undefined}
+      data-pool-stream-state={workspace.liveMarket.state}
       data-testid="pool-workspace-rail"
       id="pool-mobile-market-metadata"
     >
@@ -249,6 +253,9 @@ function PoolWorkspaceRail({ mobileWorkspaceNavigation }: { mobileWorkspaceNavig
         </span>
         <span aria-hidden="true">{detailsOpen ? "Hide details" : "Show details"}</span>
       </button>
+      <span aria-atomic="true" className="visually-hidden" role="status">
+        {poolStreamStatusAnnouncement(workspace.liveMarket.state, workspace.liveMarket.error)}
+      </span>
       <div className="pool-workspace-rail-content" hidden={!detailsOpen} id="pool-workspace-rail-details">
       <section className="pool-rail-section pool-rail-overview">
         <div className="pool-rail-pair-row">
@@ -288,11 +295,11 @@ function PoolWorkspaceRail({ mobileWorkspaceNavigation }: { mobileWorkspaceNavig
         <dl aria-label="Pool token reserves">
           <div>
             <dt><i className="pool-token-dot token-x" />{tokenSymbol(workspace.pool.tokenX)}</dt>
-            <dd>{formatSnapshotReserve(workspace.indexerSnapshot.value?.reserveX, workspace.pool.tokenX, workspace.economics.value !== null, workspace.indexerSnapshot.state === "loading" || workspace.economics.state === "loading")}</dd>
+            <dd>{formatSnapshotReserve(workspace.liveMarket.value?.state.reserveX ?? workspace.indexerSnapshot.value?.reserveX, workspace.pool.tokenX, workspace.liveMarket.value !== null || workspace.economics.value !== null, workspace.liveMarket.value === null && (workspace.indexerSnapshot.state === "loading" || workspace.economics.state === "loading"))}</dd>
           </div>
           <div>
             <dt><i className="pool-token-dot token-y" />{tokenSymbol(workspace.pool.tokenY)}</dt>
-            <dd>{formatSnapshotReserve(workspace.indexerSnapshot.value?.reserveY, workspace.pool.tokenY, workspace.economics.value !== null, workspace.indexerSnapshot.state === "loading" || workspace.economics.state === "loading")}</dd>
+            <dd>{formatSnapshotReserve(workspace.liveMarket.value?.state.reserveY ?? workspace.indexerSnapshot.value?.reserveY, workspace.pool.tokenY, workspace.liveMarket.value !== null || workspace.economics.value !== null, workspace.liveMarket.value === null && (workspace.indexerSnapshot.state === "loading" || workspace.economics.state === "loading"))}</dd>
           </div>
         </dl>
         <small className="pool-rail-data-source">{indexedReserveSourceLabel(workspace)}</small>
@@ -332,24 +339,26 @@ function PoolWorkspaceRail({ mobileWorkspaceNavigation }: { mobileWorkspaceNavig
 
 function PoolRailFeeEconomics() {
   const workspace = usePoolWorkspace();
-  const economics = workspace.economics.value;
+  const pinned = workspace.economics.value;
+  const liveRates = livePoolFeeRates(workspace);
+  const feeRates = liveRates ?? pinned?.feeRates ?? null;
   return (
     <section className="pool-rail-fees" data-testid="pool-fee-economics">
       <div className="pool-rail-fees-heading">
         <span className="pool-rail-label">Current active-bin fees</span>
-        <small>{economicsSourceLabel(workspace)}</small>
+        <small>{liveRates === null ? pinnedFeeSourceLabel(workspace) : economicsSourceLabel(workspace)}</small>
       </div>
-      {economics === null ? (
+      {feeRates === null ? (
         <p>{workspace.economics.state === "loading" ? "Reading pinned fee state…" : workspace.economics.error ?? "Pinned fee state is unavailable."}</p>
       ) : (
         <dl>
-          <div><dt>Base fee</dt><dd>{formatRatioPercentE18(economics.feeRates.baseFeeRate.toString())}</dd></div>
-          <div><dt>Variable fee</dt><dd>{formatRatioPercentE18(economics.feeRates.variableFeeRate.toString())}</dd></div>
-          <div className="total"><dt>Current active-bin total</dt><dd>{formatRatioPercentE18(economics.feeRates.totalFeeRate.toString())}</dd></div>
-          <div><dt>Protocol share of fee</dt><dd>{formatFeeSharePercent(economics.feeRates.protocolShare)}</dd></div>
-          <div><dt>Protocol fee rate</dt><dd>{formatRatioPercentE18(economics.feeRates.protocolFeeRate.toString())}</dd></div>
-          <div><dt>LP net share of fee</dt><dd>{formatFeeSharePercent(10_000n - economics.feeRates.protocolShare)}</dd></div>
-          <div><dt>LP net fee rate</dt><dd>{formatRatioPercentE18(economics.feeRates.lpNetFeeRate.toString())}</dd></div>
+          <div><dt>Base fee</dt><dd>{formatRatioPercentE18(feeRates.baseFeeRate.toString())}</dd></div>
+          <div><dt>Variable fee</dt><dd>{formatRatioPercentE18(feeRates.variableFeeRate.toString())}</dd></div>
+          <div className="total"><dt>Current active-bin total</dt><dd>{formatRatioPercentE18(feeRates.totalFeeRate.toString())}</dd></div>
+          <div><dt>Protocol share of fee</dt><dd>{formatFeeSharePercent(feeRates.protocolShare)}</dd></div>
+          <div><dt>Protocol fee rate</dt><dd>{formatRatioPercentE18(feeRates.protocolFeeRate.toString())}</dd></div>
+          <div><dt>LP net share of fee</dt><dd>{formatFeeSharePercent(10_000n - feeRates.protocolShare)}</dd></div>
+          <div><dt>LP net fee rate</dt><dd>{formatRatioPercentE18(feeRates.lpNetFeeRate.toString())}</dd></div>
         </dl>
       )}
     </section>
@@ -364,7 +373,10 @@ function PoolRailLiquidityDistribution() {
   const radius = DISTRIBUTION_RADII[radiusIndex]!;
   const tokenX = tokenSymbol(workspace.pool.tokenX);
   const tokenY = tokenSymbol(workspace.pool.tokenY);
-  const currentActiveId = workspace.economics.value?.activeId.toString() ?? null;
+  const currentActiveId = workspace.liveMarket.value?.state.activeId.toString() ?? workspace.economics.value?.activeId.toString() ?? null;
+  const displayBins = workspace.liveMarket.value !== null ? workspace.liveMarket.bins : workspace.bins;
+  const displayBinsState = workspace.liveMarket.value !== null ? "ready" : workspace.binsState;
+  const displayBinsError = workspace.liveMarket.value === null ? workspace.binsError : workspace.liveMarket.error;
   const distribution = useMemo(() => {
     if (currentActiveId === null) {
       return {
@@ -381,7 +393,7 @@ function PoolRailLiquidityDistribution() {
       return {
         error: null,
         points: buildCenteredBinDistribution(
-          workspace.bins,
+          displayBins,
           currentActiveId,
           workspace.pool.tokenX.decimals,
           workspace.pool.tokenY.decimals,
@@ -391,7 +403,7 @@ function PoolRailLiquidityDistribution() {
     } catch (error) {
       return { error: error instanceof Error ? error.message : "Liquidity distribution is unavailable.", points: null };
     }
-  }, [currentActiveId, radius, workspace.bins, workspace.economics.error, workspace.economics.state, workspace.pool.tokenX, workspace.pool.tokenY]);
+  }, [currentActiveId, displayBins, radius, workspace.economics.error, workspace.economics.state, workspace.pool.tokenX, workspace.pool.tokenY]);
   const rangePercent = formatBinRangePercent(workspace.pool.binStep, radius);
 
   return (
@@ -420,12 +432,12 @@ function PoolRailLiquidityDistribution() {
         <span><i className="pool-token-dot token-x" />{tokenX}</span>
         <span><i className="pool-token-dot token-y" />{tokenY}</span>
       </div>
-      {workspace.binsState === "loading" ? (
+      {displayBinsState === "loading" ? (
         <div className="pool-rail-liquidity-skeleton" aria-label="Loading liquidity distribution">
           {Array.from({ length: 17 }, (_, index) => <i key={index} />)}
         </div>
-      ) : distribution.points === null || workspace.binsState !== "ready" ? (
-        <p className="pool-rail-liquidity-empty">{distribution.error ?? workspace.binsError ?? `Liquidity data is ${workspace.binsState}.`}</p>
+      ) : distribution.points === null || displayBinsState !== "ready" ? (
+        <p className="pool-rail-liquidity-empty">{distribution.error ?? displayBinsError ?? `Liquidity data is ${displayBinsState}.`}</p>
       ) : (
         <>
           <div
@@ -475,6 +487,19 @@ function formatCurrentPoolPrice(pool: PoolRow, inverse: boolean, activeId = pool
 }
 
 function economicsSourceLabel(workspace: ReturnType<typeof usePoolWorkspace>): string {
+  const live = workspace.liveMarket.value?.state;
+  if (live !== undefined) {
+    const prefix = workspace.liveMarket.state === "live"
+      ? "Live analytics"
+      : workspace.liveMarket.state === "stale"
+        ? "Stale analytics snapshot"
+        : workspace.liveMarket.state === "snapshot-only"
+          ? "Analytics snapshot"
+          : "Analytics stream connecting";
+    const pinned = workspace.economics.value;
+    const pinnedLabel = pinned === null ? "" : ` · pinned RPC block ${pinned.blockNumber}`;
+    return `${prefix} · block ${live.asOfBlock}${pinnedLabel} · ${freshnessLabel(live.asOfTimestamp)}`;
+  }
   const economics = workspace.economics.value;
   if (economics !== null) {
     return `RPC block ${economics.blockNumber} · indexed snapshot · ${freshnessLabel(Number(economics.blockTimestamp))}`;
@@ -484,12 +509,76 @@ function economicsSourceLabel(workspace: ReturnType<typeof usePoolWorkspace>): s
     : "Pinned RPC state unavailable";
 }
 
+function pinnedFeeSourceLabel(workspace: ReturnType<typeof usePoolWorkspace>): string {
+  const pinned = workspace.economics.value;
+  if (pinned !== null) {
+    const liveUnavailable = workspace.liveMarket.value === null ? "" : " · live fee state unavailable";
+    return `Pinned RPC fees · block ${pinned.blockNumber}${liveUnavailable} · ${freshnessLabel(Number(pinned.blockTimestamp))}`;
+  }
+  return workspace.economics.state === "loading"
+    ? "Pinned RPC fee state loading"
+    : "Pinned RPC fee state unavailable";
+}
+
+function poolStreamStatusAnnouncement(
+  state: ReturnType<typeof usePoolWorkspace>["liveMarket"]["state"],
+  error: string | null
+): string {
+  switch (state) {
+    case "live": return "Live pool market updates connected.";
+    case "stale": return "Live pool market updates are stale. Displaying the latest canonical snapshot.";
+    case "connecting": return "Connecting to live pool market updates.";
+    case "snapshot-only": return "Live pool market updates are unavailable. Displaying a canonical snapshot.";
+    case "unavailable": return error === null
+      ? "Live pool market data is unavailable."
+      : `Live pool market data is unavailable: ${error}`;
+  }
+}
+
 function indexedReserveSourceLabel(workspace: ReturnType<typeof usePoolWorkspace>): string {
+  const live = workspace.liveMarket.value?.state;
+  if (live !== undefined) {
+    const prefix = workspace.liveMarket.state === "live" ? "Live canonical reserves" : "Canonical reserve snapshot";
+    const indexed = workspace.indexerSnapshot.value;
+    const indexedLabel = indexed === null
+      ? ""
+      : ` · Indexed reserves · snapshot block ${indexed.blockNumber} · last pool update block ${indexed.updatedAtBlock}`;
+    return `${prefix} · block ${live.asOfBlock}${indexedLabel} · ${freshnessLabel(live.asOfTimestamp)}`;
+  }
   const snapshot = workspace.indexerSnapshot.value;
   if (snapshot === null) {
     return workspace.indexerSnapshot.state === "loading" ? "Indexed reserves · snapshot loading" : "Indexed reserves unavailable";
   }
   return `Indexed reserves · snapshot block ${snapshot.blockNumber} · last pool update block ${snapshot.updatedAtBlock}`;
+}
+
+function livePoolFeeRates(workspace: ReturnType<typeof usePoolWorkspace>): CurrentFeeRates | null {
+  const live = workspace.liveMarket.value?.state;
+  if (live === undefined) return null;
+  try {
+    return quoteCurrentFeeRates({
+      activeId: BigInt(live.activeId),
+      binStep: BigInt(live.binStep),
+      blockTimestamp: BigInt(live.asOfTimestamp),
+      staticFees: {
+        baseFactor: BigInt(live.feeState.static.baseFactor),
+        filterPeriod: BigInt(live.feeState.static.filterPeriod),
+        decayPeriod: BigInt(live.feeState.static.decayPeriod),
+        reductionFactor: BigInt(live.feeState.static.reductionFactor),
+        variableFeeControl: BigInt(live.feeState.static.variableFeeControl),
+        protocolShare: BigInt(live.feeState.static.protocolShare),
+        maxVolatilityAccumulator: BigInt(live.feeState.static.maxVolatilityAccumulator)
+      },
+      variableFees: {
+        volatilityAccumulator: BigInt(live.feeState.variable.volatilityAccumulator),
+        volatilityReference: BigInt(live.feeState.variable.volatilityReference),
+        idReference: BigInt(live.feeState.variable.idReference),
+        timeOfLastUpdate: BigInt(live.feeState.variable.timeOfLastUpdate)
+      }
+    });
+  } catch {
+    return null;
+  }
 }
 
 function formatSnapshotReserve(value: string | undefined, token: PoolRow["tokenX"], decimalsVerified: boolean, loading: boolean): string {

@@ -43,6 +43,24 @@ export interface PairIdentity {
   decimalsY: number;
 }
 
+/**
+ * Canonical source identity retained from the indexer. Log identities are
+ * chain-scoped by the containing BlockEnvelope. Legacy checkpoints may omit
+ * this field, but live adapters must provide it so duplicate delivery is
+ * idempotent and conflicting duplicates fail closed.
+ */
+export interface CanonicalEventSource {
+  eventId: string;
+  transactionHash: Hex | null;
+  logIndex: number | null;
+  sequence: number;
+  kind: "log" | "block-snapshot";
+}
+
+export interface CanonicalEventMetadata {
+  source?: CanonicalEventSource;
+}
+
 export interface PairMarketObservation {
   /** Active-bin token-Y-per-token-X price, normalized to 18 decimals. */
   marketPriceQuoteE18?: bigint | null;
@@ -50,13 +68,57 @@ export interface PairMarketObservation {
   binStep?: number | null;
 }
 
-export interface PairSnapshotEvent extends PairIdentity, PairMarketObservation {
+export interface PoolStaticFeeParameters {
+  baseFactor: bigint;
+  filterPeriod: bigint;
+  decayPeriod: bigint;
+  reductionFactor: bigint;
+  variableFeeControl: bigint;
+  protocolShare: bigint;
+  maxVolatilityAccumulator: bigint;
+}
+
+export interface PoolVariableFeeParameters {
+  volatilityAccumulator: bigint;
+  volatilityReference: bigint;
+  idReference: bigint;
+  timeOfLastUpdate: bigint;
+}
+
+export interface PoolFeeState {
+  static: PoolStaticFeeParameters;
+  variable: PoolVariableFeeParameters;
+}
+
+/** Complete, absolute state for one bin at a canonical block. */
+export interface PoolBinSnapshot {
+  binId: string;
+  reserveX: bigint;
+  reserveY: bigint;
+  totalSupply: bigint;
+}
+
+/**
+ * End-of-block pool observation. The adapter consolidates all logs for the
+ * pair and exact-reads only the affected bins. Arithmetic deltas are never
+ * sent over the live-state path.
+ */
+export interface PoolStateObservation {
+  feeState: PoolFeeState;
+  binUpdates: PoolBinSnapshot[];
+  sourceEventIds: string[];
+  /** Forces clients to discard their bin window before applying replacements. */
+  replaceBinWindow: boolean;
+}
+
+export interface PairSnapshotEvent extends PairIdentity, PairMarketObservation, CanonicalEventMetadata {
   kind: "pair-snapshot";
   reserveX: bigint;
   reserveY: bigint;
+  poolState?: PoolStateObservation;
 }
 
-export interface SwapAnalyticsEvent extends PairIdentity, PairMarketObservation {
+export interface SwapAnalyticsEvent extends PairIdentity, PairMarketObservation, CanonicalEventMetadata {
   kind: "swap";
   amountInX: bigint;
   amountInY: bigint;
@@ -79,7 +141,7 @@ export interface PositionBinChange {
   amountY: bigint;
 }
 
-export interface LiquidityAnalyticsEvent extends PairIdentity, PairMarketObservation {
+export interface LiquidityAnalyticsEvent extends PairIdentity, PairMarketObservation, CanonicalEventMetadata {
   kind: "deposit" | "withdraw";
   owner: string;
   bins: PositionBinChange[];
@@ -94,13 +156,13 @@ export interface PositionBinValuation {
   amountY: bigint;
 }
 
-export interface PositionSnapshotEvent extends PairIdentity {
+export interface PositionSnapshotEvent extends PairIdentity, CanonicalEventMetadata {
   kind: "position-snapshot";
   owner: string;
   bins: PositionBinValuation[];
 }
 
-export interface PositionTransferEvent extends PairIdentity {
+export interface PositionTransferEvent extends PairIdentity, CanonicalEventMetadata {
   kind: "position-transfer";
   from: string;
   to: string;
@@ -115,12 +177,61 @@ export type AnalyticsEvent =
   | PositionTransferEvent;
 
 export interface BlockEnvelope {
+  /** Required for live pool-state ingestion; omitted only by legacy checkpoints. */
+  chainId?: number;
   number: bigint;
   hash: Hex;
   parentHash: Hex;
   timestamp: number;
   prices: PriceSample[];
   events: AnalyticsEvent[];
+}
+
+export interface PoolBinState extends PoolBinSnapshot {
+  chainId: number;
+  pair: string;
+  updatedAtBlock: bigint;
+  updatedAtBlockHash: Hex;
+  updatedAtTimestamp: number;
+  revision: number;
+}
+
+export interface PoolState {
+  chainId: number;
+  pair: string;
+  tokenX: string;
+  tokenY: string;
+  decimalsX: number;
+  decimalsY: number;
+  reserveX: bigint;
+  reserveY: bigint;
+  activeId: number;
+  binStep: number;
+  marketPriceQuoteE18: bigint;
+  /** Display/candle price only; never an authoritative TVL input. */
+  priceUsdE18: bigint | null;
+  tvlUsdE18: bigint | null;
+  status: AnalyticsStatus;
+  missingPriceTokens: string[];
+  feeState: PoolFeeState;
+  asOfBlock: bigint;
+  asOfBlockHash: Hex;
+  asOfTimestamp: number;
+  revision: number;
+}
+
+export interface PoolStateSnapshot {
+  state: PoolState;
+  bins: PoolBinState[];
+}
+
+/** Complete scalar replacement plus only the bins changed in one block. */
+export interface PoolStateUpdate {
+  eventId: string;
+  state: PoolState;
+  binReplacements: PoolBinState[];
+  replaceBinWindow: boolean;
+  sourceEventIds: string[];
 }
 
 export interface BlockSubmission extends Omit<BlockEnvelope, "prices"> {
