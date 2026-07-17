@@ -1,0 +1,23 @@
+---
+title: "Spot, Curve, and Bid-Ask strategies"
+description: "Compare Feather's three deterministic liquidity distributions and choose one without assuming guaranteed returns."
+slug: "liquidity/strategies"
+section: "Liquidity"
+order: 3
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+Strategies calculate relative weights across the selected bins. They do not create durable strategy accounts and do not rebalance automatically.
+
+| Strategy | Distribution | Typical tradeoff |
+| --- | --- | --- |
+| Spot | Equal weight across eligible bins | Simple, even coverage |
+| Curve | More weight toward the active price | Greater near-market concentration |
+| Bid-Ask | More weight toward range edges | More edge concentration and different conversion behavior |
+
+Each token side is normalized independently. The preview must match the exact bin IDs and weights sent for review.
+
+<Risk title="A strategy is an input, not a forecast">
+No distribution guarantees fee income, time in range, protection from conversion, or better performance than holding the tokens.
+</Risk>

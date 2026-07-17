@@ -4,6 +4,7 @@ packages:
   - "indexer/*"
 allowBuilds:
   '@reown/appkit': false
+  esbuild: true
 enableGlobalVirtualStore: false
 minimumReleaseAgeExclude:
   - '@wagmi/connectors@8.0.22'

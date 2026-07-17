@@ -101,6 +101,8 @@
     "web:test:safety": "pnpm --filter @robinhood-lb/web test:safety",
     "web:test:transaction-journal": "pnpm --filter @robinhood-lb/web test:transaction-journal",
     "web:test:token-safety": "pnpm --filter @robinhood-lb/web test:token-safety",
+    "web:docs:validate": "pnpm --filter @robinhood-lb/web docs:validate",
+    "web:docs:test": "pnpm --filter @robinhood-lb/web docs:test",
     "web:typecheck": "pnpm --filter @robinhood-lb/web typecheck",
     "web:fixture:public": "node scripts/web/create-public-config-fixture.cjs",
     "web:test:public-config": "node scripts/web/test-public-config.cjs",

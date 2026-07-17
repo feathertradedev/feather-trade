@@ -1,0 +1,24 @@
+---
+title: "Create and add to positions"
+description: "Choose amounts, range, and strategy, then approve and submit liquidity without inventing separate deposit lots."
+slug: "liquidity/create-add"
+section: "Liquidity"
+order: 5
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+<Steps>
+1. Open the exact pool and choose **Create Position** or **Add More**.
+2. Enter token amounts and choose a range of no more than 69 bins.
+3. Select Spot, Curve, or Bid-Ask and inspect every projected weight.
+4. Review minimum amounts, slippage, bin tolerance, deadline, recipient, refund destination, and gas estimate.
+5. Complete each required approval.
+6. Review refreshed balances and pool state, then submit the liquidity transaction.
+</Steps>
+
+Adding to bins you already own increases the same fungible balances. The application may preserve deposit history for accounting, but it must not imply that overlapping deposits remain separately withdrawable.
+
+<Warning title="Amounts can require more than one transaction">
+Each nonzero ERC-20 side can need its own approval before the final add. Approval success is not position creation.
+</Warning>

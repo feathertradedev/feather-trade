@@ -1,0 +1,27 @@
+---
+title: "Events and errors"
+description: "Interpret core Liquidity Book receipts and failure categories after verified mainnet publication."
+slug: "contracts/events-errors"
+section: "Contracts for builders"
+order: 8
+audience: "builder"
+lastReviewed: "2026-07-14"
+---
+
+Verified event signatures and decoded examples will publish with mainnet contracts.
+
+## Event families
+
+- Pair creation identifies tokens, bin step, and the new pair.
+- Swap records sender, recipient, active ID movement, amounts, fees, and protocol share.
+- Deposited-to-bins and withdrawn-from-bins identify affected IDs and packed token amounts.
+- Composition-fee events identify active-bin fees paid during imbalanced placement.
+- Transfer events move fungible bin balances between owners.
+
+## Error handling
+
+Classify failures before retrying: invalid path, unsupported preset, stale active state, expired deadline, insufficient output, insufficient allowance, insufficient balance, unauthorized operator, or contract identity mismatch.
+
+<Callout title="Receipts need context">
+Interpret logs against the exact verified contract address and block. Do not decode a matching topic from an unrelated contract as a Feather event.
+</Callout>

@@ -1,0 +1,21 @@
+---
+title: "Transaction review and simulation"
+description: "Understand which identity, value, settings, and live-state details Feather binds before wallet handoff."
+slug: "safety/transaction-review"
+section: "Safety and troubleshooting"
+order: 5
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+Before wallet handoff, Feather binds the account, chain, deployment, pool, token order, amounts, settings, recipient, refund destination, approval state, and current market context into one executable review.
+
+## Simulation
+
+The exact target, calldata, and native value are simulated against current chain state. A simulation failure blocks submission and should identify the condition that needs attention.
+
+Changing account, chain, pool, direction, amount, strategy, range, slippage, deadline, approval, balance, active bin, or other bound context invalidates the review.
+
+<Warning title="Inspect the wallet request again">
+Simulation reduces avoidable failure but cannot replace wallet review or guarantee confirmation. Reject any wallet request that differs from the application disclosure.
+</Warning>

@@ -1,0 +1,24 @@
+---
+title: "Price ranges, active bins, and bin steps"
+description: "Choose a bounded bin range and understand how location relative to the active bin changes token composition."
+slug: "liquidity/ranges-bins"
+section: "Liquidity"
+order: 2
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+A liquidity range is a contiguous selection of price bins. Narrow ranges concentrate capital near selected prices. Wide ranges spread it across more prices.
+
+## Position relative to the market
+
+- Bins above the active bin accept token X.
+- Bins below the active bin accept token Y.
+- The active bin can accept both assets.
+- A range wholly on one side can support a direct one-sided deposit.
+
+Range handles, price fields, bin IDs, and displayed composition must stay synchronized. Feather supports at most 69 bins in one prepared range and rejects larger selections.
+
+<Warning title="The active bin can move during review">
+A changed active bin can alter eligible composition, fees, or transaction parameters. Feather refreshes and requires a new review instead of submitting stale arrays.
+</Warning>

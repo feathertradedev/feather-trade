@@ -1,0 +1,29 @@
+---
+title: "Wallet and network problems"
+description: "Troubleshoot missing providers, locked wallets, rejected permissions, wrong chains, and stale account state."
+slug: "safety/wallet-network"
+section: "Safety and troubleshooting"
+order: 10
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+## Wallet is not detected
+
+Confirm a supported wallet is installed and enabled. Reload after installation. If several injected wallets are present, select the intended provider explicitly.
+
+## Wallet is locked or unauthorized
+
+Unlock it, open the account-access control, and authorize the site. A rejected permission is not a successful connection.
+
+## Wrong chain
+
+Use the application's network switch request and inspect it in the wallet. If the visible wallet network is correct but Feather still blocks execution, refresh and verify that all configured chain checks agree.
+
+## Wrong account or stale balances
+
+Confirm the displayed full address. Disconnect and reconnect only when needed, then wait for owner-specific balances, approvals, and positions to reload.
+
+<Warning title="Never add an unknown network from a support message">
+Use chain details presented by the official application and verify them independently.
+</Warning>

@@ -210,6 +210,7 @@ test("Feather tertiary text token keeps AA contrast on carbon surfaces", async (
   test.skip(testInfo.project.name !== "chromium");
   await installMockRpc(page, { includePairs: true });
   await page.goto("/#/swap");
+  await expect(page.locator(".app-shell")).toBeVisible();
 
   const contrastRatios = await page.evaluate(() => {
     const parseColor = (value: string) => {

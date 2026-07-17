@@ -1,0 +1,23 @@
+---
+title: "Multi-transaction exits"
+description: "Exit positions that exceed safe calldata or gas limits through resumable, independently reviewed batches."
+slug: "liquidity/multi-transaction-exits"
+section: "Liquidity"
+order: 9
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+A position with many live bins can exceed a safe single-transaction limit. Feather splits it into simulated batches only when the complete position is known.
+
+## Batch behavior
+
+Each batch has its own bin set, review, gas estimate, wallet request, hash, and receipt. Before the next batch, Feather refreshes the remaining live balances and rebuilds the plan.
+
+If one batch is rejected or reverts, already confirmed batches remain final. Resume from the remaining set rather than replaying completed burns.
+
+<Warning title="Batch exits are not atomic">
+Price, reserves, and composition can change between transactions. The position is not fully exited until every positive live balance is zero.
+</Warning>
+
+When safe batching is unavailable, Feather blocks the action instead of constructing a transaction expected to exceed limits.

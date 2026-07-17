@@ -1,0 +1,27 @@
+---
+title: "Connect, disconnect, and switch networks"
+description: "Connect the intended wallet account, recover from provider errors, and safely change account or network."
+slug: "getting-started/connect"
+section: "Getting started"
+order: 3
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+## Connect
+
+Choose **Connect**, select the intended wallet if more than one is available, and approve account access in the wallet. Feather displays the connected address after the provider confirms access.
+
+Common connection failures include a locked wallet, rejected permission, no installed provider, or a provider that has not authorized the site. Unlock the wallet or grant access, then retry from the application.
+
+## Switch networks
+
+When prompted, inspect the requested chain details in the wallet. Reject an unexpected chain. After a successful switch, Feather reloads chain-specific pools, balances, approvals, and positions.
+
+## Disconnect or change accounts
+
+Disconnecting clears the local connection. Changing accounts invalidates any unsubmitted review because owner, balance, allowance, and recipient context changed.
+
+<Warning title="A submitted wallet request cannot be cancelled by editing the page">
+After the wallet receives or broadcasts a transaction, later form edits create a separate draft. They do not alter the original request or hash.
+</Warning>

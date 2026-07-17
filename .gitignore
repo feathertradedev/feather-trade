@@ -35,6 +35,10 @@ broadcast/
 # Historical planning artifacts
 plan/
 docs/
+!apps/web/docs/
+!apps/web/docs/**
+!apps/web/src/docs/
+!apps/web/src/docs/**
 
 # Local chain/runtime state
 .local/

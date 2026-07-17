@@ -1,0 +1,29 @@
+---
+title: "Understand your first pool"
+description: "Read token order, pool address, bin step, price, fees, liquidity, and activity before taking action."
+slug: "getting-started/first-pool"
+section: "Getting started"
+order: 5
+audience: "user"
+lastReviewed: "2026-07-16"
+---
+
+Open a pool from Discover and verify its exact identity before trading or providing liquidity.
+
+## Identity
+
+Confirm the token names and addresses, pool contract address, token order, and bin step. Feather uses the chain selected by the deployed application; verify the requested chain in your wallet before signing. Two pools can use the same tokens while having different addresses and economic behavior.
+
+## Market state
+
+Review the displayed price, liquidity distribution, fee parameters, and recent price activity. Missing USD values are not the same as zero value. Empty pools have no executable swap liquidity.
+
+## Choose an action
+
+- **Swap** exchanges one pool asset for the other.
+- **Create Position** distributes supplied assets across selected bins.
+- **Manage** inspects or removes liquidity already owned by the connected wallet.
+
+<Callout title="Pool context stays attached">
+Action panels retain the selected pool. If the address or bin step changes, Feather requires a new review rather than silently substituting another pool.
+</Callout>

@@ -1,0 +1,23 @@
+---
+title: "LBQuoter"
+description: "Use the verified mainnet quoter to evaluate exact-input v2.2 paths without treating a quote as execution."
+slug: "contracts/quoter"
+section: "Contracts for builders"
+order: 6
+audience: "builder"
+lastReviewed: "2026-07-14"
+---
+
+LBQuoter evaluates registered candidate paths and returns expected amounts and fee information without changing state.
+
+## Safe quote handling
+
+Validate every returned pair, token transition, bin step, version, amount, and fee. Reject routes that are empty, inconsistent, use an unsupported version, or differ from the original request.
+
+A quote becomes stale when pool state, amount, direction, token metadata, chain, or deployment changes. Build the router path from the exact reviewed quote and simulate it again before submission.
+
+<Warning title="Quote output is not protected output">
+Apply an explicit minimum received and deadline. A read-only quote cannot guarantee later execution or reserve availability.
+</Warning>
+
+Exact verified signatures and examples publish with the mainnet deployment.

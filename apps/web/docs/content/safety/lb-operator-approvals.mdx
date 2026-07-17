@@ -1,0 +1,23 @@
+---
+title: "Pair-wide LB operator approvals"
+description: "Understand the broad approval used to remove Liquidity Book balances through the router."
+slug: "safety/lb-operator-approvals"
+section: "Safety and troubleshooting"
+order: 2
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+Liquidity Book balances use a pair-wide operator approval. This permission differs from a token allowance.
+
+## Scope
+
+The approval authorizes the router to operate all bin balances issued by one LBPair contract for your wallet. It is not limited to the bins currently selected in the withdrawal form.
+
+Review the full pair contract address, full router address, connected owner, network, current approval state, and persistent all-bin scope.
+
+<Warning title="Selected bins do not narrow approval scope">
+The withdrawal transaction burns only its specified bins, but the standing operator permission applies across that pair contract until revoked.
+</Warning>
+
+If approval already exists, Feather skips the request. A stale or revoked state requires a fresh check before removal.

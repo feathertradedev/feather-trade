@@ -1,0 +1,25 @@
+---
+title: "Gas estimates and transaction costs"
+description: "Read buffered network-fee estimates, preserve native balance, and understand estimate drift."
+slug: "safety/gas"
+section: "Safety and troubleshooting"
+order: 4
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+Every approval, pool creation, swap, add, and removal is an EVM transaction that consumes gas.
+
+## Estimated cost
+
+Feather simulates the exact transaction, estimates its gas requirement, applies a documented buffer, and combines it with the current gas price. This is not an exact final-cost guarantee.
+
+The wallet can present updated fee information. Price or gas changes before acceptance can require a refreshed review.
+
+## Insufficient gas
+
+An ETH shortage is distinct from an insufficient token balance. Token Max uses the token balance, while ETH Max preserves a native reserve for the transaction and any required approvals.
+
+<Callout title="Gas is not refundable position rent">
+Liquidity Book positions do not create refundable accounts. Network fees pay for computation and confirmation.
+</Callout>

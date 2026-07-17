@@ -1,0 +1,28 @@
+---
+title: "Read the pool workspace"
+description: "Understand the persistent pool header, market views, owner position, history, and action rail."
+slug: "pools/workspace"
+section: "Pools and trading"
+order: 2
+audience: "user"
+lastReviewed: "2026-07-16"
+---
+
+The pool workspace keeps market context visible while you inspect or prepare an action.
+
+## Persistent identity
+
+The header shows the token pair, full pool address, bin step, and fee information. The market area carries the current displayed price and surfaces an explicit state when source data is unavailable. Copy the full address when comparing it with an explorer or wallet request.
+
+## Workspace regions
+
+- The market view shows selectable price-history intervals and liquidity distribution.
+- The position view shows holdings owned by the connected wallet in this pool.
+- History distinguishes swaps, liquidity additions, and removals.
+- The action rail switches between Create Position, Swap, and Manage without changing pools.
+
+On mobile, these regions become tabs, drawers, or sheets. The selected pool and transaction review remain available without horizontal page scrolling.
+
+<Callout title="Deep links identify one exact pool">
+Reloading or sharing a pool URL must not fall back to a different address when the requested pool is missing or unsupported.
+</Callout>

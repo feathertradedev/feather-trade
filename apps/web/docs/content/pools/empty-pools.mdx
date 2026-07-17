@@ -1,0 +1,25 @@
+---
+title: "Empty pools and initial liquidity"
+description: "Understand a newly created pool with no swap liquidity and add its first position safely."
+slug: "pools/empty-pools"
+section: "Pools and trading"
+order: 7
+audience: "user"
+lastReviewed: "2026-07-14"
+---
+
+A confirmed pool can exist before it has liquidity. The workspace displays its initial price and creation state without inventing volume, value, or reserves.
+
+## What is unavailable
+
+Swaps remain disabled until compatible liquidity exists. Missing activity is not an error, and absent USD metrics must not be shown as zero-value trading.
+
+## Add initial liquidity
+
+Choose **Create Position**, then select a range, distribution, and token amounts. The creation transaction and liquidity transaction are separate unless the review explicitly proves otherwise.
+
+If pool creation succeeds but the liquidity step is rejected or reverts, the pool still exists. Reopen it, refresh the active price and balances, and prepare a new liquidity review. Do not retry pool creation.
+
+<Warning title="Creation does not guarantee a market">
+A new contract address has no inherent liquidity, users, price accuracy, or asset quality.
+</Warning>
