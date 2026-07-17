@@ -11,6 +11,8 @@ The package provides:
   TVL, and LP-net fee/TVL metrics;
 - 1m, 5m, 15m, 1h, 4h, 1d, and Monday-aligned 1w OHLC/volume/fee/TVL candles;
 - bounded historical GraphQL pages plus resumable SSE candle replacements;
+- a bounded, visible-pool discovery query with canonical hourly trends and
+  failure-isolated presentation metadata;
 - grouped owner/pair/bin balances with cost basis and realized/unrealized P&L;
 - parent-hash reorg rollback and deterministic replay;
 - resumable, capped backfill helpers and cursor-limited query methods; and
@@ -65,10 +67,24 @@ bearer token; ingestion stays disabled if no token is configured. Use exported
 `encodeTaggedJson` for bigint-safe payloads.
 
 `ANALYTICS_CORS_ORIGINS` is a comma-separated exact-origin allowlist for the
-browser-facing `/graphql` endpoint. Allowed origins receive bounded OPTIONS
-preflight responses and CORS headers; wildcards are not supported and the
-authenticated ingestion endpoint is never exposed through CORS. A same-origin
-reverse proxy may leave the allowlist empty.
+browser-facing `/graphql`, candle/pool event, and token-image proxy endpoints.
+Allowed origins receive bounded OPTIONS preflight responses and CORS headers;
+wildcards are not supported and the authenticated ingestion endpoint is never
+exposed through CORS. A same-origin reverse proxy may leave the allowlist
+empty. Local stack startup explicitly allows both `http://127.0.0.1:15173` and
+`http://localhost:15173`.
+
+`poolDiscovery` accepts between one and 100 unique canonical pair addresses and
+returns only canonical engine metrics, active-bin prices, and the latest 24
+hourly candle closes for those requested pools. DEX Screener enrichment is
+presentation-only: exact chain/base-token matches may supply market cap and a
+relative `/token-images/<opaque-key>` fallback logo. FDV is never substituted.
+Successes and failures are bounded in an in-memory TTL/LRU cache. The image
+proxy cannot accept a provider URL; it serves only URLs already retained by
+that cache, restricts sources to the official `cdn.dexscreener.com` host, and
+validates HTTPS, raster content type, file signature, and response size. None
+of this provider data participates in trusted pricing, TVL, allowlisting,
+routing, or transactions.
 
 The CLI refuses to serve until `ANALYTICS_BLOCK_SOURCE_MODULE` completes a
 canonical startup reconciliation. The module exports `createBlockSource()`,

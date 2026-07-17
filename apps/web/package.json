@@ -22,6 +22,7 @@
     "test:full-exit-policy": "node scripts/test-full-exit-policy.mjs",
     "test:lb-operator-approval": "node scripts/test-lb-operator-approval.mjs",
     "test:pool-selection": "node scripts/test-pool-selection.mjs",
+    "test:pool-discovery": "node scripts/test-pool-discovery.mjs && node scripts/test-pool-discovery-model.mjs",
     "test:pool-economics": "node scripts/test-pool-economics.mjs",
     "test:pool-workspace-route": "node scripts/test-pool-workspace-route.mjs",
     "test:positions": "node scripts/test-position-burn-plan.mjs",

@@ -230,6 +230,7 @@ import {
   discoveryHref,
   filterPoolPage,
   parsePoolDiscoveryState,
+  poolDetailHref,
   returnHrefFromAction,
   type PoolDiscoveryState
 } from "./pool-discovery";
@@ -238,25 +239,22 @@ import {
   CANDLE_LOOKBACK_LABELS,
   CANDLE_LOOKBACK_SECONDS,
   candleBoundary,
-  loadAnalyticsHealth,
   loadPairCandles,
-  loadPoolMetrics,
+  loadPoolDiscoveryBatches,
   type AnalyticsPage,
   type AnalyticsStatus,
   type CandleInterval,
-  type PairCandle,
-  type PoolAnalyticsMetric
+  type PairCandle
 } from "./analytics-data";
 import {
   buildCenteredBinDistribution,
-  joinPoolWorkspaceRows,
-  shouldShowWorkspaceAnalyticsState,
-  sortPoolWorkspaceRows,
-  workspaceAnalyticsState,
-  workspaceMetricTiles,
-  type BinDistributionPoint,
-  type PoolEconomicSort
+  type BinDistributionPoint
 } from "./pool-workspace";
+import {
+  buildPoolDiscoveryRequests,
+  buildPoolDiscoveryRows,
+  type PoolDiscoveryDisplayRow
+} from "./pool-discovery-model";
 import {
   parsePoolWorkspaceRoute,
   poolWorkspaceHref,
@@ -673,6 +671,8 @@ function DexShell() {
 
   useEffect(() => {
     if (routeKey !== "pools" || poolDetailId === null || workspaceTask !== "market") return;
+    const workspacePath = window.location.hash.split("?", 1)[0];
+    if (!workspacePath.endsWith("/market")) return;
     const returnContext = returnHrefFromAction(window.location.hash) ?? window.location.hash;
     const returnHref = discoveryHref(parsePoolDiscoveryState(returnContext));
     const createHref = actionHref("add", poolDetailId, returnHref);
@@ -1287,7 +1287,15 @@ function ContentView({
     setSelectedPoolId(poolId);
 
     if (routeKey === "pools" && workspaceTask !== null) {
-      window.location.hash = poolWorkspaceHref(poolId, workspaceTask === "market" ? "create" : workspaceTask);
+      const returnHref = returnHrefFromAction(window.location.hash);
+      if (workspaceTask === "market") {
+        window.location.hash = poolDetailHref(poolId, parsePoolDiscoveryState(returnHref ?? window.location.hash));
+      } else {
+        const href = poolWorkspaceHref(poolId, workspaceTask);
+        window.location.hash = returnHref === null
+          ? href
+          : `${href}?${new URLSearchParams({ returnTo: returnHref }).toString()}`;
+      }
       return;
     }
 
@@ -4130,7 +4138,6 @@ function PoolsView({
 }) {
   const registry = registries[environmentKey];
   const account = useAccount();
-  const poolState = isPartialPagination(snapshot?.indexer.pagination.pools) ? "partial" : pools.length > 0 ? "ready" : snapshotState;
   const [discoveryState, setDiscoveryState] = useState<PoolDiscoveryState>(() =>
     typeof window === "undefined" ? { ...DEFAULT_POOL_DISCOVERY_STATE } : parsePoolDiscoveryState(window.location.hash)
   );
@@ -4153,38 +4160,32 @@ function PoolsView({
     refetchOnWindowFocus: "always",
     retry: false
   });
-  const poolAddressKey = pools.map((pool) => pool.address.toLowerCase()).sort().join("|");
-  const metricsQuery = useQuery({
-    queryKey: ["poolWorkspaceMetrics", environmentKey, analyticsEndpoint, poolAddressKey],
-    queryFn: () => loadPoolMetrics(analyticsEndpoint, pools.map((pool) => pool.address)),
-    enabled: pools.length > 0,
+  const discoveryRequests = useMemo(
+    () => buildPoolDiscoveryRequests(pools),
+    [pools]
+  );
+  const discoveryRequestKey = discoveryRequests
+    .map((request) => `${request.pair}:${request.preferredQuoteToken ?? "auto"}`)
+    .join("|");
+  const discoveryQuery = useQuery({
+    queryKey: ["poolDiscovery", environmentKey, analyticsEndpoint, discoveryRequestKey],
+    queryFn: () => loadPoolDiscoveryBatches(analyticsEndpoint, discoveryRequests),
+    enabled: discoveryRequests.length > 0,
     refetchInterval: SNAPSHOT_REFRESH_INTERVAL_MS,
     refetchOnWindowFocus: "always",
     retry: false
   });
-  const analyticsHealthQuery = useQuery({
-    queryKey: ["poolWorkspaceHealth", environmentKey, analyticsEndpoint],
-    queryFn: () => loadAnalyticsHealth(analyticsEndpoint),
-    refetchInterval: SNAPSHOT_REFRESH_INTERVAL_MS,
-    refetchOnWindowFocus: "always",
-    retry: false
-  });
-  const metricsPage: AnalyticsPage<PoolAnalyticsMetric> = metricsQuery.data ?? {
+  const discoveryAnalytics = discoveryQuery.data ?? {
     rows: [],
-    status: metricsQuery.isError ? "UNAVAILABLE" : "PARTIAL",
-    error: metricsQuery.error instanceof Error ? metricsQuery.error.message : null,
+    status: discoveryQuery.isError ? "UNAVAILABLE" as const : "PARTIAL" as const,
+    error: discoveryQuery.error instanceof Error ? discoveryQuery.error.message : null,
     pageInfo: { endCursor: null, hasNextPage: false, partial: true, pagesLoaded: 0 },
     streamCursor: null
   };
-  const workspaceRows = useMemo(() => joinPoolWorkspaceRows(pools, metricsPage), [metricsPage, pools]);
-  const workspaceRowsByPair = useMemo(
-    () => new Map(workspaceRows.map((row) => [row.pool.address.toLowerCase(), row])),
-    [workspaceRows]
+  const discoveryRows = useMemo(
+    () => buildPoolDiscoveryRows(pools, discoveryAnalytics, analyticsEndpoint),
+    [analyticsEndpoint, pools, discoveryAnalytics]
   );
-  const economicRanks = useMemo(() => {
-    if (!isPoolEconomicSort(discoveryState.sort)) return null;
-    return new Map(sortPoolWorkspaceRows(workspaceRows, discoveryState.sort).map((row, index) => [row.pool.address.toLowerCase(), index]));
-  }, [discoveryState.sort, workspaceRows]);
   const ownerLiquidity = ownerPortfolioQuery.data
     ? buildOwnerLiquidityIndex(ownerPortfolioQuery.data.positions, {
         capped: ownerPortfolioQuery.data.pageInfo.hasNextPage,
@@ -4192,19 +4193,8 @@ function PoolsView({
       })
     : null;
   const filteredPage = useMemo(
-    () => filterPoolPage(pools, discoveryState, ownerLiquidity, pageSize, (left, right, sort) => {
-      if (!isPoolEconomicSort(sort) || economicRanks === null) return null;
-      return (economicRanks.get(left.address.toLowerCase()) ?? Number.MAX_SAFE_INTEGER) -
-        (economicRanks.get(right.address.toLowerCase()) ?? Number.MAX_SAFE_INTEGER);
-    }),
-    [discoveryState, economicRanks, ownerLiquidity, pools]
-  );
-  const analyticsState = metricsQuery.isPending || analyticsHealthQuery.isPending
-    ? { status: "PARTIAL" as const, label: "Loading application analytics", detail: "Pool metrics and freshness are being resolved." }
-    : workspaceAnalyticsState(metricsPage.status, analyticsHealthQuery.data?.value ?? null);
-  const analyticsStateVisible = !metricsQuery.isPending && shouldShowWorkspaceAnalyticsState(
-    metricsPage.status,
-    analyticsHealthQuery.data?.value ?? null
+    () => filterPoolPage(discoveryRows, discoveryState, ownerLiquidity, pageSize),
+    [discoveryRows, discoveryState, ownerLiquidity]
   );
 
   useEffect(() => {
@@ -4224,6 +4214,19 @@ function PoolsView({
     setCreationOpen(false);
     requestAnimationFrame(() => creationLaunchRef.current?.focus());
   }, []);
+  const sortPools = (sort: PoolDiscoveryState["sort"]) => {
+    updateDiscovery({
+      sort,
+      direction: discoveryState.sort === sort
+        ? discoveryState.direction === "desc" ? "asc" : "desc"
+        : "desc"
+    });
+  };
+  const marketFiltersActive = discoveryState.sort !== DEFAULT_POOL_DISCOVERY_STATE.sort ||
+    discoveryState.direction !== DEFAULT_POOL_DISCOVERY_STATE.direction ||
+    discoveryState.minTvlUsd !== null ||
+    discoveryState.minVolume24hUsd !== null ||
+    discoveryState.minLpFees24hUsd !== null;
 
   return (
     <div className="view-grid">
@@ -4237,35 +4240,35 @@ function PoolsView({
           snapshot={snapshot}
         />
       ) : null}
-      <section className="table-panel">
-        <div className="panel-heading">
-          <span>Liquidity pools</span>
+      <section aria-labelledby="pools-discovery-title" className="pools-discovery">
+        <header className="pools-discovery-header">
+          <div className="pools-discovery-heading">
+            <h1 id="pools-discovery-title">Pools</h1>
+            <span className="pools-discovery-count">
+              {pools.length} {pools.length === 1 ? "pool" : "pools"}
+            </span>
+          </div>
           <div className="pool-heading-actions">
-            <StatusBadge
-              state={poolState}
-              label={snapshot?.indexer.pagination.pools ? paginationBadgeLabel(pools.length, snapshot.indexer.pagination.pools, "pools") : snapshotState}
-            />
             <button className="primary-button" data-testid="pool-create-launch" onClick={() => setCreationOpen(true)} ref={creationLaunchRef} type="button">Create pool</button>
           </div>
-        </div>
+        </header>
         {rpcOverlay ? (
-          <div className="state-row warning" data-testid="pool-rpc-overlay" role="status">
+          <div className="pools-discovery-warning" data-testid="pool-rpc-overlay" role="status">
             <Server size={16} />
             <span>{rpcOverlay.recovery.kind === "duplicate"
               ? `Resolved from the live factory at block ${rpcOverlay.row.updatedAtBlock}; the exact RPC workspace remains available while indexing catches up.`
               : `Confirmed by RPC at block ${rpcOverlay.row.updatedAtBlock}; indexing is catching up. This empty pool cannot quote swaps.`}</span>
           </div>
         ) : null}
-        {analyticsStateVisible ? (
-          <div className={`workspace-analytics-state ${analyticsState.status.toLowerCase()}`} data-testid="pool-analytics-state" role="status">
-            <span>{analyticsState.label}</span>
-            {analyticsState.detail ? <small>{analyticsState.detail}</small> : null}
-            {metricsPage.error ? <small>{metricsPage.error}</small> : null}
-          </div>
+        {!discoveryQuery.isPending && discoveryAnalytics.status === "UNAVAILABLE" && pools.length > 0 ? (
+          <p className="pools-discovery-warning" data-testid="pool-discovery-warning" role="alert">
+            <AlertTriangle aria-hidden="true" size={15} />
+            <span title={discoveryAnalytics.error ?? undefined}>Market analytics could not load. Pool links remain available.</span>
+          </p>
         ) : null}
-        <div className="pool-controls">
-          <label>
-            <span className="field-label">Search</span>
+        <div className="pools-discovery-toolbar">
+          <label className="pools-discovery-search">
+            <span className="visually-hidden">Search pools</span>
             <input
               aria-label="Search pools"
               onChange={(event) => updateDiscovery({ query: event.target.value })}
@@ -4273,10 +4276,10 @@ function PoolsView({
               value={discoveryState.query}
             />
           </label>
-          <div className="pool-filter-chips" role="group" aria-label="Pool category">
+          <div className="pools-category-tabs" role="group" aria-label="Pool category">
             {(["all", "active", "stables"] as const).map((value) => (
               <button
-                className={discoveryState.category === value ? "filter-chip active" : "filter-chip"}
+                className={discoveryState.category === value ? "active" : undefined}
                 key={value}
                 onClick={() => updateDiscovery({ category: value })}
                 type="button"
@@ -4286,7 +4289,7 @@ function PoolsView({
             ))}
             <button
               aria-pressed={discoveryState.hasLiquidity}
-              className={discoveryState.hasLiquidity ? "filter-chip active" : "filter-chip"}
+              className={discoveryState.hasLiquidity ? "active" : undefined}
               disabled={!account.address && !discoveryState.hasLiquidity}
               onClick={() => updateDiscovery({ hasLiquidity: !discoveryState.hasLiquidity })}
               type="button"
@@ -4294,59 +4297,115 @@ function PoolsView({
               My liquidity
             </button>
           </div>
-          <label>
-            <span className="field-label">Sort</span>
-            <select
-              aria-label="Sort pools"
-              onChange={(event) => updateDiscovery({ sort: event.target.value as PoolDiscoveryState["sort"] })}
-              value={discoveryState.sort}
-            >
-              <option value="tvl">TVL</option>
-              <option value="volume24h">24h volume</option>
-              <option value="lpFees24h">24h LP fees</option>
-              <option value="feeToTvl">24h LP fee / TVL</option>
-              <option value="swaps">Swap count</option>
-              <option value="deposits">Deposit count</option>
-              <option value="updated">Recently updated</option>
-            </select>
-          </label>
+          <details className="pools-filter-disclosure">
+            <summary>Filters</summary>
+            <div className="pools-filter-panel">
+              <div className="pools-filter-grid">
+                <label>
+                  <span>Sort by</span>
+                  <select
+                    aria-label="Sort pools"
+                    onChange={(event) => updateDiscovery({ sort: event.target.value as PoolDiscoveryState["sort"] })}
+                    value={discoveryState.sort}
+                  >
+                    <option value="volume24h">24h volume</option>
+                    <option value="priceChange">24h change</option>
+                    <option value="marketCap">Market cap</option>
+                    <option value="tvl">TVL</option>
+                    <option value="lpFees24h">24h LP fees</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Direction</span>
+                  <select
+                    aria-label="Sort direction"
+                    onChange={(event) => updateDiscovery({ direction: event.target.value as PoolDiscoveryState["direction"] })}
+                    value={discoveryState.direction}
+                  >
+                    <option value="desc">High to low</option>
+                    <option value="asc">Low to high</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Minimum TVL</span>
+                  <input
+                    aria-label="Minimum TVL in USD"
+                    inputMode="decimal"
+                    onChange={(event) => updateDiscovery({ minTvlUsd: event.target.value || null })}
+                    placeholder="USD"
+                    value={discoveryState.minTvlUsd ?? ""}
+                  />
+                </label>
+                <label>
+                  <span>Minimum volume</span>
+                  <input
+                    aria-label="Minimum 24 hour volume in USD"
+                    inputMode="decimal"
+                    onChange={(event) => updateDiscovery({ minVolume24hUsd: event.target.value || null })}
+                    placeholder="USD"
+                    value={discoveryState.minVolume24hUsd ?? ""}
+                  />
+                </label>
+                <label>
+                  <span>Minimum LP fees</span>
+                  <input
+                    aria-label="Minimum 24 hour LP fees in USD"
+                    inputMode="decimal"
+                    onChange={(event) => updateDiscovery({ minLpFees24hUsd: event.target.value || null })}
+                    placeholder="USD"
+                    value={discoveryState.minLpFees24hUsd ?? ""}
+                  />
+                </label>
+                <button
+                  className="pools-filter-reset"
+                  disabled={!marketFiltersActive}
+                  onClick={() => updateDiscovery({
+                    sort: DEFAULT_POOL_DISCOVERY_STATE.sort,
+                    direction: DEFAULT_POOL_DISCOVERY_STATE.direction,
+                    minTvlUsd: null,
+                    minVolume24hUsd: null,
+                    minLpFees24hUsd: null
+                  })}
+                  type="button"
+                >
+                  Reset market filters
+                </button>
+              </div>
+            </div>
+          </details>
         </div>
         {pools.length > 0 ? (
           <>
-            <div className="pool-table discovery-table">
-              <div className="table-row header">
-                <span>Pool</span>
-                <span>TVL</span>
-                <span>24h volume</span>
-                <span>24h LP fees</span>
-                <span>24h LP fee / TVL</span>
-                <span>Action</span>
+            {filteredPage.rows.length > 0 ? (
+              <div className="pools-market-table-wrap">
+                <table className="pools-market-table" data-testid="pools-market-table">
+                  <caption className="visually-hidden">DLMM pool market data</caption>
+                  <colgroup><col /><col /><col /><col /><col /><col /><col /></colgroup>
+                  <thead>
+                    <tr>
+                      <th scope="col">Pair</th>
+                      <PoolSortableHeader activeSort={discoveryState.sort} direction={discoveryState.direction} label="24h price trend" onSort={sortPools} sort="priceChange" />
+                      <PoolSortableHeader activeSort={discoveryState.sort} direction={discoveryState.direction} label="Market cap" onSort={sortPools} sort="marketCap" />
+                      <th scope="col">Pool price</th>
+                      <PoolSortableHeader activeSort={discoveryState.sort} direction={discoveryState.direction} label="TVL" onSort={sortPools} sort="tvl" />
+                      <PoolSortableHeader activeSort={discoveryState.sort} direction={discoveryState.direction} label="24h LP fees" onSort={sortPools} sort="lpFees24h" />
+                      <PoolSortableHeader activeSort={discoveryState.sort} direction={discoveryState.direction} label="24h volume" onSort={sortPools} sort="volume24h" />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredPage.rows.map((row) => (
+                      <PoolDiscoveryTableRow
+                        href={poolDetailHref(row.pool.id, discoveryState)}
+                        key={row.pool.id}
+                        row={row}
+                      />
+                    ))}
+                  </tbody>
+                </table>
               </div>
-              {filteredPage.rows.map((pool) => {
-                const workspaceRow = workspaceRowsByPair.get(pool.address.toLowerCase()) ?? null;
-                const tiles = workspaceMetricTiles(workspaceRow?.metric ?? null);
-                const workspaceHref = actionHref("add", pool.id, discoveryHref(discoveryState));
-                return <div className="table-row" key={pool.id}>
-                  <a className="pair-name" href={workspaceHref}>
-                    {tokenSymbol(pool.tokenX)} / {tokenSymbol(pool.tokenY)}
-                    <small>DLMM · bin step {pool.binStep} · {formatCompactAddress(pool.address)}</small>
-                    <small>{pool.tokenX?.name ?? "Unknown token"} · {pool.tokenXAddress} · chain {pool.tokenX?.chainId ?? "?"} · review {pool.tokenX?.risk.reviewStatus ?? "unlisted"}</small>
-                    <small>{pool.tokenY?.name ?? "Unknown token"} · {pool.tokenYAddress} · chain {pool.tokenY?.chainId ?? "?"} · review {pool.tokenY?.risk.reviewStatus ?? "unlisted"}</small>
-                  </a>
-                  <WorkspaceTableMetric tile={tiles[0]} />
-                  <WorkspaceTableMetric tile={tiles[1]} />
-                  <WorkspaceTableMetric tile={tiles[2]} />
-                  <WorkspaceTableMetric tile={tiles[3]} />
-                  <a className="secondary-button" href={workspaceHref}>
-                    Open pool
-                  </a>
-                  {workspaceRow?.analyticsIssue ? <small className="workspace-row-issue">{workspaceRow.analyticsIssue}</small> : null}
-                </div>;
-              })}
-            </div>
-            {filteredPage.rows.length === 0 ? <p className="inline-empty">No pools match these filters.</p> : null}
+            ) : <p className="pools-discovery-empty">No pools match these filters.</p>}
             {discoveryState.hasLiquidity && filteredPage.ownerStatus !== "ready" ? (
-              <p className="state-row warning" data-testid="owner-pool-filter-status">
+              <p className="state-row warning pools-discovery-owner-status" data-testid="owner-pool-filter-status">
                 {!account.address
                   ? "Connect a wallet to filter pools by your liquidity."
                   : ownerFilterLoading
@@ -4361,7 +4420,7 @@ function PoolsView({
             ) : null}
             <div className="pagination-controls" aria-label="Pool pages">
               <button disabled={filteredPage.page === 0} onClick={() => updateDiscovery({ page: Math.max(0, filteredPage.page - 1) }, false)} type="button">Previous</button>
-              <span>Page {filteredPage.page + 1} of {filteredPage.pageCount} · {filteredPage.filteredCount} pools</span>
+              <span>Page {filteredPage.page + 1} of {filteredPage.pageCount} / {filteredPage.filteredCount} pools</span>
               <button disabled={filteredPage.page + 1 >= filteredPage.pageCount} onClick={() => updateDiscovery({ page: Math.min(filteredPage.pageCount - 1, filteredPage.page + 1) }, false)} type="button">Next</button>
             </div>
           </>
@@ -4373,17 +4432,184 @@ function PoolsView({
   );
 }
 
-function isPoolEconomicSort(sort: PoolDiscoveryState["sort"]): sort is PoolEconomicSort {
-  return sort === "tvl" || sort === "volume24h" || sort === "lpFees24h" || sort === "feeToTvl";
+function PoolDiscoveryTableRow({ href, row }: { href: string; row: PoolDiscoveryDisplayRow<PoolRow> }) {
+  const pairLabel = `${row.baseToken.symbol} / ${row.quoteToken.symbol}`;
+  return (
+    <tr data-pool-id={row.pool.id} data-testid="pool-discovery-row">
+      <th scope="row">
+        <a aria-label={`Open ${pairLabel} pool`} className="pool-pair-link" href={href}>
+          <span className="pool-token-stack">
+            <PoolTokenMark
+              address={row.baseToken.address}
+              fallbackColor={row.baseToken.logo.fallbackColor}
+              fallbackLabel={row.baseToken.logo.fallbackLabel}
+              logoUrl={row.baseToken.logo.src}
+            />
+            <PoolTokenMark
+              address={row.quoteToken.address}
+              fallbackColor={row.quoteToken.logo.fallbackColor}
+              fallbackLabel={row.quoteToken.logo.fallbackLabel}
+              logoUrl={row.quoteToken.logo.src}
+            />
+          </span>
+          <span className="pool-pair-copy">
+            <span className="pool-pair-symbols">{pairLabel}</span>
+            <span className="pool-pair-meta">DLMM · bin step {row.pool.binStep}</span>
+          </span>
+        </a>
+      </th>
+      <td className="pool-trend-column">
+        <span className="pool-mobile-label">24h price trend</span>
+        <PoolSparkline
+          ariaLabel={`${pairLabel} 24 hour price trend${row.priceChange24hE18 === null ? "" : `, ${row.priceChange24hPct}`}`}
+          change={row.priceChange24hE18 === null ? null : row.priceChange24hPct}
+          segments={row.trend.segments}
+          title={row.trend.title}
+        />
+      </td>
+      <td>
+        <PoolMarketValue
+          label="Market cap"
+          testId="pool-market-cap"
+          unavailableReason={row.marketCap.title}
+          value={row.marketCap.available ? row.marketCap.display : null}
+        />
+      </td>
+      <td>
+        <PoolMarketValue
+          detail={`${row.quoteToken.symbol} per ${row.baseToken.symbol}`}
+          label="Pool price"
+          unavailableReason={row.poolPrice.title}
+          value={row.poolPrice.available ? row.poolPrice.display : null}
+        />
+      </td>
+      <td>
+        <PoolMarketValue label="TVL" unavailableReason={row.tvl.title} value={row.tvl.available ? row.tvl.display : null} />
+      </td>
+      <td>
+        <PoolMarketValue label="24h LP fees" unavailableReason={row.lpFees24h.title} value={row.lpFees24h.available ? row.lpFees24h.display : null} />
+      </td>
+      <td>
+        <PoolMarketValue label="24h volume" unavailableReason={row.volume24h.title} value={row.volume24h.available ? row.volume24h.display : null} />
+      </td>
+    </tr>
+  );
 }
 
-function WorkspaceTableMetric({ tile }: { tile: ReturnType<typeof workspaceMetricTiles>[number] }) {
+function PoolTokenMark({
+  address,
+  fallbackColor,
+  fallbackLabel,
+  logoUrl
+}: {
+  address: Address;
+  fallbackColor: string;
+  fallbackLabel: string;
+  logoUrl: string | null;
+}) {
+  const [logoFailed, setLogoFailed] = useState(false);
+  useEffect(() => setLogoFailed(false), [address, logoUrl]);
+  const showLogo = logoUrl !== null && !logoFailed;
   return (
-    <span className="workspace-table-metric" data-analytics-status={tile.status}>
-      <small className="workspace-table-label">{tile.label}</small>
-      <strong>{tile.value}</strong>
-      <small>{tile.status === "READY" ? "ready" : tile.status.toLowerCase()}</small>
+    <span
+      aria-hidden="true"
+      className="pool-token-mark"
+      data-fallback={showLogo ? "false" : "true"}
+      style={{ background: fallbackColor }}
+    >
+      {showLogo ? <img alt="" onError={() => setLogoFailed(true)} src={logoUrl} /> : fallbackLabel}
     </span>
+  );
+}
+
+function PoolMarketValue({
+  detail,
+  label,
+  testId,
+  unavailableReason,
+  value
+}: {
+  detail?: string | null;
+  label: string;
+  testId?: string;
+  unavailableReason: string;
+  value: string | null;
+}) {
+  return (
+    <span className="pool-market-value" data-testid={testId}>
+      <span className="pool-mobile-label">{label}</span>
+      {value === null ? (
+        <span aria-label={`${label} unavailable`} className="pool-value-unavailable" title={unavailableReason}>-</span>
+      ) : (
+        <span>{value}</span>
+      )}
+      {value !== null && detail ? <small>{detail}</small> : null}
+    </span>
+  );
+}
+
+function PoolSparkline({
+  ariaLabel,
+  change,
+  segments,
+  title
+}: {
+  ariaLabel: string;
+  change: string | null;
+  segments: readonly (readonly { x: number; y: number }[])[];
+  title: string;
+}) {
+  if (segments.length === 0) {
+    return <span aria-label="24 hour price trend unavailable" className="pool-value-unavailable" title={title}>-</span>;
+  }
+  const tone = change === null || change === "0%" || change === "0.00%" || change === "+0.00%"
+    ? "neutral"
+    : change.startsWith("-") ? "negative" : "positive";
+  return (
+    <span className={`pool-trend-cell ${tone}`}>
+      <svg aria-label={ariaLabel} className="pool-sparkline" preserveAspectRatio="none" role="img" viewBox="0 0 104 34">
+        <title>{title}</title>
+        {segments.map((segment, index) => (
+          <polyline
+            key={`${index}-${segment[0]?.x ?? 0}`}
+            points={segment.map((point) => `${(point.x * 1.04).toFixed(2)},${(point.y * 0.34).toFixed(2)}`).join(" ")}
+          />
+        ))}
+      </svg>
+      {change === null
+        ? <span aria-label="24 hour price change unavailable" className="pool-value-unavailable" title="At least two canonical hourly closes are required.">-</span>
+        : <span className={`pool-trend-value ${tone}`}>{change}</span>}
+    </span>
+  );
+}
+
+function PoolSortableHeader({
+  activeSort,
+  direction,
+  label,
+  onSort,
+  sort
+}: {
+  activeSort: PoolDiscoveryState["sort"];
+  direction: PoolDiscoveryState["direction"];
+  label: string;
+  onSort: (sort: PoolDiscoveryState["sort"]) => void;
+  sort: PoolDiscoveryState["sort"];
+}) {
+  const active = activeSort === sort;
+  const ariaSort = active ? direction === "asc" ? "ascending" : "descending" : "none";
+  return (
+    <th aria-sort={ariaSort} scope="col">
+      <button
+        aria-label={active ? `Sort by ${label}, currently ${ariaSort}` : `Sort by ${label}`}
+        className={active ? "pool-sort-button active" : "pool-sort-button"}
+        onClick={() => onSort(sort)}
+        type="button"
+      >
+        <span>{label}</span>
+        {active ? <span aria-hidden="true" className="pool-sort-indicator">{direction === "asc" ? "↑" : "↓"}</span> : null}
+      </button>
+    </th>
   );
 }
 

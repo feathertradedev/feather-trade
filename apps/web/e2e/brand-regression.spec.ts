@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 import { installMockAnalyticsStream } from "./fixtures/mock-analytics-stream";
-import { installMockRpc } from "./fixtures/mock-rpc";
+import { installMockRpc, LOCALNET_ANALYTICS_URL, USDC, WNATIVE } from "./fixtures/mock-rpc";
 import { installMockWallet, LOCALNET_CHAIN_ID, ROBINHOOD_TESTNET_CHAIN_ID } from "./fixtures/mock-wallet";
 
 const screenshotOptions = {
@@ -17,6 +17,60 @@ test.beforeEach(async ({ page }) => {
 async function connectWallet(page: Parameters<typeof installMockRpc>[0]) {
   await page.getByTestId("wallet-connect-button").click();
   await expect(page.getByTestId("wallet-account-button")).toBeVisible();
+}
+
+async function installBrandDiscoveryProjection(page: Parameters<typeof installMockRpc>[0]) {
+  await page.route(LOCALNET_ANALYTICS_URL, async (route) => {
+    const request = route.request();
+    if (request.method() !== "POST") return route.fallback();
+    const body = JSON.parse(request.postData() ?? "{}") as {
+      query?: string;
+      variables?: { pools?: { pair: string }[] };
+    };
+    if (!body.query?.includes("WebPoolDiscovery")) return route.fallback();
+    const startTimestamp = 1_720_000_800;
+    const pattern = [160n, 164n, 161n, 168n, 166n, 172n, 169n, 176n, 174n, 181n, 178n, 184n];
+    const poolDiscovery = (body.variables?.pools ?? []).map((requested) => ({
+      pair: requested.pair.toLowerCase(),
+      chainId: LOCALNET_CHAIN_ID,
+      tokenX: WNATIVE.toLowerCase(),
+      tokenY: USDC.toLowerCase(),
+      displayBaseToken: WNATIVE.toLowerCase(),
+      displayQuoteToken: USDC.toLowerCase(),
+      poolPriceQuotePerBaseE18: "184000000000000000000",
+      hourlyCloses: pattern.map((close, index) => ({
+        startTimestamp: startTimestamp + index * 3_600,
+        closeUsdE18: String(close * 10n ** 18n),
+        quoteToken: USDC.toLowerCase(),
+        finalized: index < pattern.length - 1,
+        revision: index + 1,
+        priceSource: "active-bin-quote-usd",
+        firstBlockHash: `0x${(700 + index).toString(16).padStart(64, "0")}`,
+        lastBlockHash: `0x${(700 + index).toString(16).padStart(64, "0")}`
+      })),
+      priceChange24hE18: "150000000000000000",
+      tvlUsdE18: "500000000000000000000000",
+      lpNetSwapFees24hUsdE18: "240000000000000000000",
+      volume24hUsdE18: "120000000000000000000000",
+      status: "READY",
+      missingPriceTokens: [],
+      asOfBlock: "42",
+      asOfBlockHash: `0x${"22".repeat(32)}`,
+      asOfTimestamp: startTimestamp + pattern.length * 3_600,
+      marketMetadata: {
+        marketCapUsdE18: "12345000000000000000000000",
+        source: "dex-screener",
+        fetchedAt: startTimestamp + pattern.length * 3_600,
+        logoPath: `/token-images/${"b".repeat(64)}`,
+        logoSource: "dex-screener"
+      }
+    }));
+    await route.fulfill({
+      body: JSON.stringify({ data: { poolDiscovery } }),
+      contentType: "application/json",
+      status: 200
+    });
+  });
 }
 
 test("canonical Feather landing desktop", async ({ page }, testInfo) => {
@@ -66,18 +120,20 @@ test("canonical Feather swap mobile", async ({ page }, testInfo) => {
 test("canonical Feather pools desktop", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium");
   await installMockRpc(page, { includePairs: true });
+  await installBrandDiscoveryProjection(page);
   await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/pools");
-  await expect(page.locator(".panel-heading").filter({ hasText: "Pools" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Pools" })).toBeVisible();
   await expect(page).toHaveScreenshot("feather-pools-desktop.png", screenshotOptions);
 });
 
 test("canonical Feather pools mobile", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile-chromium");
   await installMockRpc(page, { includePairs: true });
+  await installBrandDiscoveryProjection(page);
   await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/pools");
-  await expect(page.locator(".panel-heading").filter({ hasText: "Pools" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Pools" })).toBeVisible();
   await expect(page).toHaveScreenshot("feather-pools-mobile.png", screenshotOptions);
 });
 
@@ -87,8 +143,8 @@ test("canonical Feather pool workspace desktop", async ({ page }, testInfo) => {
   await installMockRpc(page, { includePairs: true });
   await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/pools");
-  await page.locator(".discovery-table .pair-name").first().click();
-  await expect(page).toHaveURL(/#\/pools\/.+\/create\?returnTo=/);
+  await page.locator(".pool-pair-link").first().click();
+  await expect(page).toHaveURL(/#\/pools\/.+$/);
   await expect(page.getByRole("tablist", { name: "Pool workspace views" })).toBeHidden();
   await expect(page.getByTestId("swap-market-chart")).toBeVisible();
   await expect(page.getByTestId("pool-workspace-rail")).toBeVisible();
@@ -104,8 +160,8 @@ test("canonical Feather pool workspace mobile", async ({ page }, testInfo) => {
   await installMockRpc(page, { includePairs: true });
   await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/pools");
-  await page.locator(".discovery-table .pair-name").first().click();
-  await expect(page).toHaveURL(/#\/pools\/.+\/create\?returnTo=/);
+  await page.locator(".pool-pair-link").first().click();
+  await expect(page).toHaveURL(/#\/pools\/.+$/);
   const views = page.getByRole("tablist", { name: "Pool workspace views" });
   await expect(views.getByRole("tab", { name: "Trade" })).toHaveAttribute("aria-selected", "true");
   await expect(page.getByTestId("swap-market-chart")).toBeHidden();

@@ -8,7 +8,7 @@ import {
 import { quoteCurrentFeeRates, type CurrentFeeRates } from "@robinhood-lb/sdk/liquidity-review";
 
 import { formatCompactAddress, formatTokenAmount, tokenSymbol, type PoolRow } from "./data";
-import { returnHrefFromAction, samePairPools } from "./pool-discovery";
+import { returnHrefForPoolWorkspace, samePairPools } from "./pool-discovery";
 import { buildCenteredBinDistribution, formatRatioPercentE18, workspaceMetricTiles } from "./pool-workspace";
 import { PoolWorkspaceProvider, usePoolWorkspace } from "./pool-workspace-context";
 import { parsePoolWorkspaceRoute, poolWorkspaceHref, type PoolWorkspaceTask } from "./pool-workspace-route";
@@ -48,7 +48,7 @@ export function PoolWorkspaceShell({
 }
 
 function PoolWorkspaceScaffold({ children, pool, pools }: { children: ReactNode; pool: PoolRow; pools: PoolRow[] }) {
-  const returnHref = returnHrefFromAction(window.location.hash);
+  const returnHref = returnHrefForPoolWorkspace(window.location.hash);
   const routeTask = parsePoolWorkspaceRoute(window.location.hash)?.task ?? "create";
   const tradePanelId = routeTask === "swap" ? "swap-task-panel" : routeTask === "manage" ? "liquidity-withdraw" : "liquidity-add";
   const mobileWorkspaceNavigation = useMediaQuery("(max-width: 720px)");
@@ -146,7 +146,7 @@ function PoolMobileWorkspaceNav({
 
 export function PoolWorkspaceTaskTabs({ task }: { task: PoolWorkspaceTask }) {
   const workspace = usePoolWorkspace();
-  const returnHref = returnHrefFromAction(window.location.hash);
+  const returnHref = returnHrefForPoolWorkspace(window.location.hash);
 
   return (
     <nav aria-label="Pool tasks" className="pool-workspace-tasks">
@@ -172,7 +172,7 @@ function PoolBinStepSelector({ pool, pools }: { pool: PoolRow; pools: PoolRow[] 
   });
   if (choices.length <= 1) return null;
   const routeTask = parsePoolWorkspaceRoute(window.location.hash)?.task ?? "create";
-  const returnHref = returnHrefFromAction(window.location.hash);
+  const returnHref = returnHrefForPoolWorkspace(window.location.hash);
 
   return (
     <label className="pool-workspace-tier-selector">

@@ -207,6 +207,9 @@ jobs:
       - name: Test web GraphQL pagination
         run: pnpm web:test:pagination
 
+      - name: Test web pool discovery
+        run: pnpm web:test:pool-discovery
+
       - name: Test web pool selection
         run: pnpm web:test:pool-selection
 

@@ -1494,26 +1494,39 @@ test("pool discovery deep-links to real indexed bins and preselects liquidity ac
   await page.goto("/#/pools");
   await connectWallet(page);
 
-  await expect(page.getByText("Liquidity pools")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Pools" })).toBeVisible();
   await page.getByLabel("Search pools").fill("WNATIVE");
-  const discoveryRow = page.locator(".discovery-table .table-row").filter({ hasText: "WNATIVE / USDC" });
+  const discoveryRow = page.getByTestId("pool-discovery-row").filter({ hasText: "WNATIVE / USDC" });
   await expect(discoveryRow).toHaveCount(1);
   if (testInfo.project.name === "mobile-chromium") {
-    await expect.poll(() => discoveryRow.evaluate((element) => getComputedStyle(element).gridTemplateColumns.split(" ").length)).toBe(1);
+    await expect.poll(() => discoveryRow.evaluate((element) => getComputedStyle(element).gridTemplateColumns.split(" ").length)).toBe(2);
   }
-  await page.getByRole("link", { name: /WNATIVE \/ USDC/ }).click();
+  await page.getByRole("link", { name: /Open WNATIVE \/ USDC pool/ }).click();
 
-  await expect(page).toHaveURL(/#\/pools\/.+\/create\?returnTo=/);
+  await expect(page).toHaveURL(/#\/pools\/.+\?q=WNATIVE/);
+  const workspaceViews = page.getByRole("tablist", { name: "Pool workspace views" });
+  if (testInfo.project.name === "mobile-chromium") {
+    await workspaceViews.getByRole("tab", { name: "Market" }).click();
+  }
   const distribution = page.getByTestId("pool-rail-liquidity-distribution");
   await expect(distribution).toBeVisible();
   await expect(distribution.locator(".pool-rail-liquidity-bars > span")).toHaveCount(33);
   await expect(distribution.locator(".pool-rail-liquidity-bars > span.active")).toHaveCount(1);
   await expect(page.getByTestId("swap-market-chart")).toBeVisible();
+  if (testInfo.project.name === "mobile-chromium") {
+    await workspaceViews.getByRole("tab", { name: "Trade" }).click();
+  }
   await expect.poll(() => rpc.snapshot().graphQueries.some((query) => query.includes("PairBinWindow"))).toBe(true);
   await expect.poll(() => rpc.snapshot().graphQueries.some((query) => query.includes("OwnerPairPositions"))).toBe(true);
 
   await page.reload();
+  if (testInfo.project.name === "mobile-chromium") {
+    await workspaceViews.getByRole("tab", { name: "Market" }).click();
+  }
   await expect(distribution.locator(".pool-rail-liquidity-bars > span")).toHaveCount(33);
+  if (testInfo.project.name === "mobile-chromium") {
+    await workspaceViews.getByRole("tab", { name: "Trade" }).click();
+  }
 
   await page.getByRole("navigation", { name: "Pool tasks" }).getByRole("link", { name: "Manage" }).click();
   await expect(page).toHaveURL(/#\/pools\/0x.+\/manage\?returnTo=/i);
@@ -1521,7 +1534,7 @@ test("pool discovery deep-links to real indexed bins and preselects liquidity ac
   await expect(page.locator("#liquidity-withdraw")).toBeVisible();
 
   await page.goBack();
-  await expect(page).toHaveURL(/#\/pools\/0x.+\/create/i);
+  await expect(page).toHaveURL(/#\/pools\/0x.+\?q=WNATIVE/i);
   await expect(page.locator("#liquidity-add")).toBeVisible();
   await expect(page.getByTestId("canonical-pool-workspace")).toHaveAttribute("data-pool-id", WNATIVE_USDC_PAIR.toLowerCase());
   await expect(page.locator("#liquidity-pair")).toHaveCount(0);

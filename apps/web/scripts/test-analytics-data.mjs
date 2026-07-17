@@ -11,6 +11,7 @@ const pairB = "0x00000000000000000000000000000000000000b2";
 const tokenX = "0x00000000000000000000000000000000000000c3";
 const tokenY = "0x00000000000000000000000000000000000000d4";
 let mode = "normal";
+const discoveryBatchSizes = [];
 
 const server = await createServer({ configFile: resolve(webRoot, "vite.config.ts"), root: webRoot, logLevel: "error", server: { hmr: false, middlewareMode: true } });
 
@@ -26,10 +27,13 @@ try {
     isPoolStreamStale,
     loadAnalyticsHealth,
     loadPairCandles,
+    loadPoolDiscovery,
+    loadPoolDiscoveryBatches,
     loadPoolMetrics,
     loadPoolState,
     parsePoolStreamPayload,
-    poolStreamUrl
+    poolStreamUrl,
+    resolveAnalyticsAssetUrl
   } = await server.ssrLoadModule("/src/analytics-data.ts");
 
   assert.equal(normalizeAnalyticsEndpoint(" https://analytics.example.test/graphql/ "), endpoint);
@@ -67,6 +71,109 @@ try {
   const duplicate = await loadPoolMetrics(endpoint, [pairA]);
   assert.equal(duplicate.status, "PARTIAL");
   assert.match(duplicate.error, /duplicate key/);
+  mode = "normal";
+
+  const discovery = await loadPoolDiscovery(endpoint, [{ pair: pairA, preferredQuoteToken: tokenY }]);
+  assert.equal(discovery.status, "READY");
+  assert.equal(discovery.rows.length, 1);
+  assert.equal(discovery.rows[0].displayBaseToken, tokenX);
+  assert.equal(discovery.rows[0].displayQuoteToken, tokenY);
+  assert.equal(discovery.rows[0].hourlyCloses.length, 2);
+  assert.equal(discovery.rows[0].priceChange24hE18, "100000000000000000");
+  assert.equal(discovery.rows[0].marketMetadata?.source, "dex-screener");
+  assert.equal(
+    resolveAnalyticsAssetUrl(endpoint, `/token-images/${"a".repeat(64)}`),
+    `https://analytics.example.test/token-images/${"a".repeat(64)}`
+  );
+  assert.equal(resolveAnalyticsAssetUrl(endpoint, "https://evil.test/image.png"), null);
+  assert.equal(resolveAnalyticsAssetUrl(endpoint, `/not-token-images/${"a".repeat(64)}`), null);
+  assert.equal(resolveAnalyticsAssetUrl(endpoint, `/token-images/${"A".repeat(64)}`), null);
+
+  const batchedRequests = Array.from({ length: 205 }, (_, index) => ({
+    pair: address(index + 1_000),
+    preferredQuoteToken: tokenY
+  }));
+  mode = "batched-discovery";
+  discoveryBatchSizes.length = 0;
+  const batchedDiscovery = await loadPoolDiscoveryBatches(endpoint, batchedRequests);
+  assert.equal(batchedDiscovery.status, "READY");
+  assert.equal(batchedDiscovery.pageInfo.pagesLoaded, 3);
+  assert.deepEqual(discoveryBatchSizes, [100, 100, 5], "each discovery transport stays within the 100-pool bound");
+  assert.deepEqual(
+    batchedDiscovery.rows.map((row) => row.pair),
+    batchedRequests.map((request) => request.pair),
+    "batched discovery results preserve global request order"
+  );
+
+  mode = "batched-tail-failure";
+  discoveryBatchSizes.length = 0;
+  const partialBatches = await loadPoolDiscoveryBatches(endpoint, batchedRequests.slice(0, 101));
+  assert.equal(partialBatches.status, "PARTIAL");
+  assert.equal(partialBatches.pageInfo.partial, true);
+  assert.equal(partialBatches.pageInfo.pagesLoaded, 1);
+  assert.equal(partialBatches.rows.length, 100);
+  assert.deepEqual(discoveryBatchSizes, [100, 1]);
+  assert.match(partialBatches.error, /1 of 2 discovery batches were unavailable/);
+
+  const unavailableBatches = await loadPoolDiscoveryBatches(null, batchedRequests);
+  assert.equal(unavailableBatches.status, "UNAVAILABLE");
+  assert.equal(unavailableBatches.rows.length, 0);
+  assert.equal(unavailableBatches.pageInfo.pagesLoaded, 0);
+  assert.equal(unavailableBatches.error, "Analytics endpoint is not configured");
+  mode = "normal";
+
+  mode = "malformed-metadata";
+  const isolatedMetadata = await loadPoolDiscovery(endpoint, [{ pair: pairA }]);
+  assert.equal(isolatedMetadata.status, "READY");
+  assert.equal(isolatedMetadata.rows[0].marketMetadata, null, "provider corruption is isolated from canonical economics");
+  mode = "wrong-metadata-source";
+  const isolatedSource = await loadPoolDiscovery(endpoint, [{ pair: pairA }]);
+  assert.equal(isolatedSource.status, "READY");
+  assert.equal(isolatedSource.rows[0].marketMetadata, null);
+  mode = "null-metadata";
+  const nullMetadata = await loadPoolDiscovery(endpoint, [{ pair: pairA }]);
+  assert.equal(nullMetadata.status, "READY");
+  assert.equal(nullMetadata.rows[0].marketMetadata, null);
+  mode = "nullable-value";
+  const nullableValue = await loadPoolDiscovery(endpoint, [{ pair: pairA }]);
+  assert.equal(nullableValue.status, "READY", "one unavailable value does not become a transport-wide failure");
+  assert.equal(nullableValue.rows[0].poolPriceQuotePerBaseE18, null);
+  mode = "zero-price";
+  const zeroPrice = await loadPoolDiscovery(endpoint, [{ pair: pairA }]);
+  assert.equal(zeroPrice.status, "READY");
+  assert.equal(zeroPrice.rows[0].poolPriceQuotePerBaseE18, null, "a zero ratio degrades as unavailable rather than being inverted");
+  mode = "missing-discovery";
+  const missingDiscovery = await loadPoolDiscovery(endpoint, [{ pair: pairA }]);
+  assert.equal(missingDiscovery.status, "PARTIAL");
+  assert.equal(missingDiscovery.rows.length, 0);
+  assert.equal(missingDiscovery.error, null);
+  mode = "negative-change";
+  const negativeChange = await loadPoolDiscovery(endpoint, [{ pair: pairA }]);
+  assert.equal(negativeChange.rows[0].priceChange24hE18, "-100000000000000000");
+  mode = "duplicate-discovery";
+  const duplicateDiscovery = await loadPoolDiscovery(endpoint, [{ pair: pairA }]);
+  assert.equal(duplicateDiscovery.status, "UNAVAILABLE");
+  assert.match(duplicateDiscovery.error, /Duplicate pool discovery result/);
+  mode = "foreign-discovery";
+  const foreignDiscovery = await loadPoolDiscovery(endpoint, [{ pair: pairA }]);
+  assert.equal(foreignDiscovery.status, "UNAVAILABLE");
+  assert.match(foreignDiscovery.error, /foreign pair/);
+  mode = "reversed-discovery";
+  const reversedDiscovery = await loadPoolDiscovery(endpoint, [{ pair: pairA }, { pair: pairB }]);
+  assert.equal(reversedDiscovery.status, "UNAVAILABLE");
+  assert.match(reversedDiscovery.error, /preserve requested order/);
+  mode = "too-many-closes";
+  const tooManyCloses = await loadPoolDiscovery(endpoint, [{ pair: pairA }]);
+  assert.equal(tooManyCloses.status, "UNAVAILABLE");
+  assert.match(tooManyCloses.error, /more than 24/);
+  mode = "unaligned-close";
+  const unalignedClose = await loadPoolDiscovery(endpoint, [{ pair: pairA }]);
+  assert.equal(unalignedClose.status, "UNAVAILABLE");
+  assert.match(unalignedClose.error, /not aligned/);
+  mode = "transport-failure";
+  const transportFailure = await loadPoolDiscovery(endpoint, [{ pair: pairA }]);
+  assert.equal(transportFailure.status, "UNAVAILABLE");
+  assert.match(transportFailure.error, /HTTP 503/);
   mode = "normal";
 
   const candles = await loadPairCandles(endpoint, pairA, "HOUR", 3_600, 7_200, { pageSize: 1 });
@@ -132,6 +239,11 @@ try {
   assert.equal(unavailable.rows.length, 0);
 
   await assert.rejects(() => loadPoolMetrics(endpoint, [pairA, pairA.toUpperCase().replace("0X", "0x")]), /Duplicate requested pool/);
+  await assert.rejects(() => loadPoolDiscovery(endpoint, []), /between 1 and 100/);
+  await assert.rejects(() => loadPoolDiscovery(endpoint, Array.from({ length: 101 }, (_, index) => ({
+    pair: `0x${(index + 1).toString(16).padStart(40, "0")}`
+  }))), /between 1 and 100/);
+  await assert.rejects(() => loadPoolDiscovery(endpoint, [{ pair: pairA }, { pair: pairA.toUpperCase().replace("0X", "0x") }]), /Duplicate requested discovery pool/);
   await assert.rejects(() => loadPoolMetrics(endpoint, [pairA], undefined, { pageSize: 101 }), /pageSize must be between 1 and 100/);
   await assert.rejects(() => loadPoolMetrics(endpoint, [pairA], undefined, { maxPages: 6 }), /maxPages must be between 1 and 5/);
   await assert.rejects(() => loadAnalyticsHealth(endpoint, { timeoutMs: 60_001 }), /timeoutMs must be between 1 and 60000/);
@@ -158,6 +270,41 @@ async function mockFetch(url, init) {
     const after = variables.after ?? null;
     const nodes = after === null ? [candle(3_600, "READY")] : [candle(7_200, "PARTIAL")];
     return response({ data: { pairCandles: { ...connection(nodes, after === null ? "candles-1" : "candles-2", after === null, after !== null), streamCursor: "7" } } });
+  }
+
+  if (query.includes("WebPoolDiscovery")) {
+    if (mode === "transport-failure") return new Response("unavailable", { status: 503 });
+    if (mode === "batched-discovery" || mode === "batched-tail-failure") {
+      discoveryBatchSizes.push(variables.pools.length);
+      assert(variables.pools.length > 0 && variables.pools.length <= 100);
+      if (mode === "batched-tail-failure" && variables.pools.length === 1) {
+        return new Response("unavailable", { status: 503 });
+      }
+      return response({
+        data: {
+          poolDiscovery: variables.pools.map((request) => discoveryRow(request.pair))
+        }
+      });
+    }
+    assert(variables.pools.length === 1 || mode === "reversed-discovery");
+    assert.equal(variables.pools[0].pair, pairA);
+    if (mode === "missing-discovery") return response({ data: { poolDiscovery: [] } });
+    const row = discoveryRow();
+    if (mode === "malformed-metadata") row.marketMetadata.logoPath = "/docs";
+    if (mode === "wrong-metadata-source") row.marketMetadata.source = "anything-else";
+    if (mode === "null-metadata") row.marketMetadata = null;
+    if (mode === "nullable-value") row.poolPriceQuotePerBaseE18 = null;
+    if (mode === "zero-price") row.poolPriceQuotePerBaseE18 = "0";
+    if (mode === "negative-change") row.priceChange24hE18 = "-100000000000000000";
+    if (mode === "duplicate-discovery") return response({ data: { poolDiscovery: [row, { ...row }] } });
+    if (mode === "foreign-discovery") return response({ data: { poolDiscovery: [{ ...row, pair: pairB }] } });
+    if (mode === "reversed-discovery") return response({ data: { poolDiscovery: [{ ...row, pair: pairB }, row] } });
+    if (mode === "too-many-closes") row.hourlyCloses = Array.from({ length: 25 }, (_, index) => ({
+      ...row.hourlyCloses[0],
+      startTimestamp: index * 3_600
+    }));
+    if (mode === "unaligned-close") row.hourlyCloses[0].startTimestamp = 3_601;
+    return response({ data: { poolDiscovery: [row] } });
   }
 
   if (query.includes("WebPoolState")) {
@@ -202,6 +349,48 @@ function candle(startTimestamp, status) {
     firstBlockHash: `0x${"9".repeat(64)}`, lastBlockHash: `0x${"a".repeat(64)}`, finalized: true, revision: 3,
     priceSource: "active-bin-quote-usd", quoteToken: tokenY
   };
+}
+
+function discoveryRow(pairAddress = pairA) {
+  return {
+    pair: pairAddress,
+    chainId: 31_337,
+    tokenX,
+    tokenY,
+    displayBaseToken: tokenX,
+    displayQuoteToken: tokenY,
+    poolPriceQuotePerBaseE18: "160000000000000000000",
+    hourlyCloses: [3_600, 7_200].map((startTimestamp, index) => ({
+      startTimestamp,
+      closeUsdE18: index === 0 ? "100000000000000000000" : "110000000000000000000",
+      quoteToken: tokenY,
+      finalized: true,
+      revision: 1,
+      priceSource: "active-bin-quote-usd",
+      firstBlockHash: `0x${"4".repeat(64)}`,
+      lastBlockHash: `0x${"5".repeat(64)}`
+    })),
+    priceChange24hE18: "100000000000000000",
+    tvlUsdE18: "1000000000000000000000",
+    lpNetSwapFees24hUsdE18: "1000000000000000000",
+    volume24hUsdE18: "100000000000000000000",
+    status: "READY",
+    missingPriceTokens: [],
+    asOfBlock: "99",
+    asOfBlockHash: `0x${"6".repeat(64)}`,
+    asOfTimestamp: 9_000,
+    marketMetadata: {
+      marketCapUsdE18: "10000000000000000000000",
+      source: "dex-screener",
+      fetchedAt: 9_000,
+      logoPath: `/token-images/${"a".repeat(64)}`,
+      logoSource: "dex-screener"
+    }
+  };
+}
+
+function address(value) {
+  return `0x${value.toString(16).padStart(40, "0")}`;
 }
 
 function poolState(overrides = {}) {

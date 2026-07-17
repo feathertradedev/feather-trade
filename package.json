@@ -96,6 +96,7 @@
     "web:test:pair-attestation": "pnpm --filter @robinhood-lb/web test:pair-attestation",
     "web:test:liquidity-review": "pnpm --filter @robinhood-lb/web test:liquidity-review",
     "web:test:full-exit-policy": "pnpm --filter @robinhood-lb/web test:full-exit-policy",
+    "web:test:pool-discovery": "pnpm --filter @robinhood-lb/web test:pool-discovery",
     "web:test:pool-selection": "pnpm --filter @robinhood-lb/web test:pool-selection",
     "web:test:positions": "pnpm --filter @robinhood-lb/web test:positions",
     "web:test:safety": "pnpm --filter @robinhood-lb/web test:safety",

@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { AnalyticsEngine } from "./engine.js";
+import { DexScreenerMarketMetadataProvider } from "./discovery-metadata.js";
 import { PostgresAnalyticsStore } from "./postgres-store.js";
 import {
   AnalyticsApiService,
@@ -45,7 +46,8 @@ const service = await AnalyticsApiService.create({
   store,
   allowFixedTestPrices,
   priceVerifier,
-  positionSnapshotProvider
+  positionSnapshotProvider,
+  marketMetadataProvider: new DexScreenerMarketMetadataProvider()
 });
 const blockSource = await loadBlockSource(process.env.ANALYTICS_BLOCK_SOURCE_MODULE ?? null);
 const initialHealth = service.getHealth();

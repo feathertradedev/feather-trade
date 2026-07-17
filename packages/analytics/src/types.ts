@@ -290,6 +290,59 @@ export interface PoolMetrics {
   missingPriceTokens: string[];
 }
 
+export interface PoolDiscoveryRequest {
+  pair: string;
+  preferredQuoteToken?: string | null;
+}
+
+export interface PoolDiscoveryHourlyClose {
+  startTimestamp: number;
+  closeUsdE18: bigint;
+  quoteToken: string;
+  finalized: boolean;
+  revision: number;
+  priceSource: CandlePriceSource;
+  firstBlockHash: Hex;
+  lastBlockHash: Hex;
+}
+
+/**
+ * Presentation-only provider data. This is deliberately separate from the
+ * canonical analytics values and must never participate in pricing, TVL,
+ * allowlisting, routing, or transaction construction.
+ */
+export interface PoolDiscoveryMarketMetadata {
+  marketCapUsdE18: bigint | null;
+  source: "dex-screener";
+  fetchedAt: number;
+  /** Relative, opaque analytics proxy path. Never a provider URL. */
+  logoPath: string | null;
+  logoSource: "dex-screener" | null;
+}
+
+export interface PoolDiscoveryPool {
+  pair: string;
+  chainId: number | null;
+  tokenX: string;
+  tokenY: string;
+  displayBaseToken: string;
+  displayQuoteToken: string;
+  /** Display quote tokens per display base token, normalized to 18 decimals. */
+  poolPriceQuotePerBaseE18: bigint | null;
+  hourlyCloses: PoolDiscoveryHourlyClose[];
+  /** Signed percentage change, where 1e18 is 100%. */
+  priceChange24hE18: bigint | null;
+  tvlUsdE18: bigint | null;
+  lpNetSwapFees24hUsdE18: bigint | null;
+  volume24hUsdE18: bigint | null;
+  status: AnalyticsStatus;
+  missingPriceTokens: string[];
+  asOfBlock: bigint;
+  asOfBlockHash: Hex;
+  asOfTimestamp: number;
+  marketMetadata: PoolDiscoveryMarketMetadata | null;
+}
+
 export interface PositionBinAccounting {
   binId: string;
   liquidity: bigint;
