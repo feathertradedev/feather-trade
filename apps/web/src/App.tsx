@@ -9257,6 +9257,8 @@ function LiquidityView({
           {fullExitUi?.workflowKey === currentFullExitWorkflowKey ? <span>{fullExitUi.message}</span> : null}
         </section>
 
+        {workspaceMatchesPool ? <GasReview review={gasReview} /> : null}
+
         <PairAttestationReview
           attestation={liquidityExitAttestationQuery.error === null ? liquidityExitAttestationQuery.data ?? null : null}
           error={liquidityExitAttestationQuery.error}

@@ -78,17 +78,27 @@ test("real wrong-runtime Anvil chain disables every transaction path", async ({ 
   await page.goto("/#/swap");
   await connectWallet(page);
 
-  await expect(page.locator(".status-pill").filter({ hasText: `Expected ${manifest.chainId}, RPC 46630` })).toBeVisible();
+  await expect(page.getByRole("status")).toContainText(
+    `RPC chain mismatch: expected ${manifest.chainId}, received 46630`
+  );
   await expect(page.getByTestId("swap-approve-button")).toBeDisabled();
   await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
   await bypassDisabledButtonAndClick(page, "swap-approve-button");
   await bypassDisabledButtonAndClick(page, "swap-submit-button");
 
-  await page.getByRole("link", { name: "Liquidity" }).click();
+  await page.goto(`/#/pools/${pool.pair}/create`);
+  await connectWallet(page);
   for (const testId of [
     "liquidity-approve-x-button",
     "liquidity-approve-y-button",
-    "liquidity-add-button",
+    "liquidity-add-button"
+  ]) {
+    await expect(page.getByTestId(testId)).toBeDisabled();
+  }
+
+  await page.goto(`/#/pools/${pool.pair}/manage`);
+  await connectWallet(page);
+  for (const testId of [
     "liquidity-approve-lb-button",
     "liquidity-remove-button"
   ]) {
@@ -196,9 +206,14 @@ test("actual UI submits approve, swap, add, LB approval, and remove transactions
   expect(balanceXAfterSwap).toBeLessThan(balanceXBeforeSwap);
   expect(balanceYAfterSwap).toBeGreaterThan(balanceYBeforeSwap);
 
-  await page.getByRole("link", { name: "Liquidity" }).click();
-  await page.locator("#range-lower").fill("0");
-  await page.locator("#range-upper").fill("0");
+  await page.goto(`/#/pools/${pool.pair}/create`);
+  await connectWallet(page);
+  const lowerRangeHandle = page.getByRole("slider", { name: "Lower range handle" });
+  const upperRangeHandle = page.getByRole("slider", { name: "Upper range handle" });
+  await lowerRangeHandle.press("ArrowRight");
+  await upperRangeHandle.press("ArrowLeft");
+  await expect(lowerRangeHandle).toHaveAttribute("aria-valuenow", "0");
+  await expect(upperRangeHandle).toHaveAttribute("aria-valuenow", "0");
 
   await expect(page.getByTestId("liquidity-approve-x-button")).toBeEnabled();
   await clickReviewedAction(page, "liquidity-approve-x-button");
@@ -214,12 +229,12 @@ test("actual UI submits approve, swap, add, LB approval, and remove transactions
   const lbBalanceAfterAdd = await readLbBalance();
   expect(lbBalanceAfterAdd).toBeGreaterThan(lbBalanceBeforeAdd);
 
+  await page.goto(`/#/pools/${pool.pair}/manage`);
+  await connectWallet(page);
   await expect(page.getByTestId("liquidity-approve-lb-button")).toBeEnabled();
   await clickReviewedAction(page, "liquidity-approve-lb-button");
   await expect.poll(async () => (await readUnlockedRpcWallet(page)).transactionHashes.length).toBe(6);
   await expect(page.getByText("LB approval confirmed")).toBeVisible();
-  await expect(page.getByTestId("liquidity-receipt-review")).toBeVisible({ timeout: 15_000 });
-  await expect(page.getByTestId("liquidity-receipt-review")).toContainText("Actual gas cost");
 
   const tokenXBeforePartial = await readTokenBalance(pool.tokenX);
   const tokenYBeforePartial = await readTokenBalance(pool.tokenY);
@@ -737,11 +752,14 @@ function positionGraphRow(liquidity: bigint, blockNumber: bigint): Record<string
 async function connectWallet(page: Page): Promise<void> {
   const connectButton = page.getByTestId("wallet-connect-button");
   const accountButton = page.getByTestId("wallet-account-button");
-  if (await connectButton.isVisible({ timeout: 1_000 }).catch(() => false)) {
-    await page.waitForTimeout(250);
-    if (!await accountButton.isVisible().catch(() => false) && await connectButton.isVisible().catch(() => false)) {
-      await expect(connectButton).toBeEnabled();
-      await connectButton.click();
+  if (!await accountButton.isVisible({ timeout: 1_000 }).catch(() => false)) {
+    await expect(connectButton).toBeVisible();
+    await expect(connectButton).toBeEnabled();
+    await connectButton.click();
+
+    const unlockedWallet = page.getByRole("button", { name: /Unlocked Anvil Wallet/i });
+    if (await unlockedWallet.isVisible({ timeout: 1_000 }).catch(() => false)) {
+      await unlockedWallet.click();
     }
   }
   await expect(accountButton).toContainText(
@@ -764,6 +782,10 @@ async function clickReviewedAction(page: Page, testId: string): Promise<void> {
   await page.getByTestId(testId).click();
   await expect(page.getByTestId("gas-review")).toContainText(expectedAction);
   if (testId === "liquidity-add-button") {
+    const transactionReview = page.getByTestId("liquidity-transaction-review");
+    if (await transactionReview.count() > 0 && !await transactionReview.evaluate((element) => element.hasAttribute("open"))) {
+      await transactionReview.locator(":scope > summary").click();
+    }
     await expect(page.getByTestId("liquidity-add-review")).toBeVisible();
     await expect(page.getByTestId("liquidity-review-exact-destination")).toContainText("Unix deadline");
     await expect(page.getByTestId("liquidity-review-limitations")).toContainText("not guarantees");

@@ -42,6 +42,9 @@ function positive(value) {
 
 function amountEq(actual, expected) {
   try {
+    if (typeof expected === "number" && Number.isInteger(expected) && !Number.isSafeInteger(expected)) {
+      return Number(String(actual || "0")) === expected;
+    }
     return BigInt(String(actual || "0")) === BigInt(String(expected || "0"));
   } catch (_) {
     return false;
