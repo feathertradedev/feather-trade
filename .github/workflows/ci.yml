@@ -84,9 +84,6 @@ jobs:
       - name: Test VPS deployment validator
         run: pnpm vps:test
 
-      - name: Validate operator runbooks
-        run: pnpm release:runbooks:validate
-
       - name: Test operator runbook validator
         run: pnpm release:runbooks:test
 

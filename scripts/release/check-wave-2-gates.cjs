@@ -320,7 +320,8 @@ const gates = [
   ["launch-health-helper-tests", "#61", "PR-blocking", "ops", "pnpm launch:health:test"],
   ["observability", "#61", "manual launch-blocking", "ops", "docs/wave-2/observability-incident-response.md"],
   ["observability-definitions", "#61", "PR-blocking", "ops", "pnpm observability:validate && pnpm observability:test && pnpm observability:redaction:test"],
-  ["operator-runbooks", "#47/#52/#53/#61", "PR-blocking", "ops", "pnpm release:runbooks:validate && pnpm release:runbooks:test"],
+  ["operator-runbooks", "#47/#52/#53/#61", "manual launch-blocking", "ops", "pnpm release:runbooks:validate && pnpm release:runbooks:test"],
+  ["operator-runbook-validator-tests", "#47/#52/#53/#61", "PR-blocking", "ops", "pnpm release:runbooks:test"],
   ["testnet-evidence-packet", "#55", "PR-blocking", "release", "pnpm release:testnet-evidence:check && pnpm release:testnet-evidence:test"],
   ["testnet-rehearsal", "#55", "manual launch-blocking", "release", "docs/wave-2/testnet-launch-rehearsal-evidence.md"],
   ["review-remediation-tracker", "#112", "release reconciliation", "release", "GitHub issue #112 checklist and evidence comments"]
@@ -582,10 +583,16 @@ function validate() {
   }
 
   const ciWorkflow = readText(".github/workflows/ci.yml");
-  for (const command of ["pnpm release:web-promotion:test", "pnpm release:runbooks:validate", "pnpm release:runbooks:test"]) {
+  for (const command of ["pnpm release:web-promotion:test", "pnpm release:runbooks:test"]) {
     const escaped = command.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const occurrences = [...ciWorkflow.matchAll(new RegExp(`^\\s*run:\\s*${escaped}\\s*$`, "gm"))].length;
     if (occurrences !== 1) errors.push(`CI workflow must run ${command} exactly once`);
+  }
+  const repositoryRunbookValidation = [...ciWorkflow.matchAll(
+    /^\s*run:\s*pnpm release:runbooks:validate\s*$/gm
+  )].length;
+  if (repositoryRunbookValidation !== 0) {
+    errors.push("CI must not validate the operator-owned, untracked runbook corpus; run that launch gate manually");
   }
 
   const subgraphPackage = readJson("indexer/subgraph/package.json");

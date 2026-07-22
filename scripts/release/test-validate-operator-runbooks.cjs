@@ -40,7 +40,15 @@ function expectInvalid(options, pattern, mutate) {
   }
 }
 
-assert.equal(run(repo).status, 0, "repository runbooks should validate");
+{
+  const root = fixture();
+  try {
+    const result = run(root);
+    assert.equal(result.status, 0, `expected valid fixture, got: ${result.stdout}${result.stderr}`);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
 
 expectInvalid({ monitorSlug: "../escape" }, /strict lowercase slug/);
 expectInvalid({ monitorSlug: "/tmp/escape" }, /strict lowercase slug/);
