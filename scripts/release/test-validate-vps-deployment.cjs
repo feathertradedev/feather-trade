@@ -100,8 +100,8 @@ try {
   restore(temp, "infra/vps/Caddyfile");
 
   mutate(temp, "infra/vps/Caddyfile", (source) => source.replace(
-    "@analytics_public path /graphql /events/candles /events/pools",
-    "@analytics_public path /graphql /events/candles /events/pools /internal/debug"
+    "@analytics_public path /graphql /events/candles /events/pools /token-images/*",
+    "@analytics_public path /graphql /events/candles /events/pools /token-images/* /internal/debug"
   ));
   expectFailure(temp, /public analytics matcher must contain only/);
   restore(temp, "infra/vps/Caddyfile");

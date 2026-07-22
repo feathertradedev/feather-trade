@@ -3,7 +3,7 @@ import { decodeFunctionData, type Hex } from "viem";
 
 import { lbRouterAbi } from "../../../packages/sdk/src/abi";
 import { installMockAnalyticsStream } from "./fixtures/mock-analytics-stream";
-import { installMockRpc, SECOND_WNATIVE_USDC_PAIR, USDC, WNATIVE, WNATIVE_USDC_PAIR } from "./fixtures/mock-rpc";
+import { installMockRpc, LOCALNET_ANALYTICS_URL, SECOND_WNATIVE_USDC_PAIR, USDC, WNATIVE, WNATIVE_USDC_PAIR } from "./fixtures/mock-rpc";
 import { DEFAULT_ACCOUNT, installMockWallet, LOCALNET_CHAIN_ID, readMockWallet } from "./fixtures/mock-wallet";
 
 const ONE_TOKEN = 10n ** 18n;
@@ -13,6 +13,59 @@ const TEST_Q128 = 1n << 128n;
 async function connectWallet(page: Parameters<typeof installMockRpc>[0]) {
   await page.getByTestId("wallet-connect-button").click();
   await expect(page.getByTestId("wallet-account-button")).toBeVisible();
+}
+
+async function installMockDiscoveryProjection(page: Parameters<typeof installMockRpc>[0]) {
+  await page.route(LOCALNET_ANALYTICS_URL, async (route) => {
+    const request = route.request();
+    if (request.method() !== "POST") return route.fallback();
+    const body = JSON.parse(request.postData() ?? "{}") as {
+      query?: string;
+      variables?: { pools?: { pair: string; preferredQuoteToken?: string | null }[] };
+    };
+    if (!body.query?.includes("WebPoolDiscovery")) return route.fallback();
+    const startTimestamp = 1_720_000_800;
+    const poolDiscovery = (body.variables?.pools ?? []).map((requested, index) => ({
+      pair: requested.pair.toLowerCase(),
+      chainId: LOCALNET_CHAIN_ID,
+      tokenX: WNATIVE.toLowerCase(),
+      tokenY: USDC.toLowerCase(),
+      displayBaseToken: WNATIVE.toLowerCase(),
+      displayQuoteToken: USDC.toLowerCase(),
+      poolPriceQuotePerBaseE18: "160000000000000000000",
+      hourlyCloses: [160n, 164n, 162n, 168n].map((close, closeIndex) => ({
+        startTimestamp: startTimestamp + closeIndex * 3_600,
+        closeUsdE18: String(close * 10n ** 18n),
+        quoteToken: USDC.toLowerCase(),
+        finalized: closeIndex < 3,
+        revision: closeIndex + 1,
+        priceSource: "active-bin-quote-usd",
+        firstBlockHash: `0x${(500 + closeIndex).toString(16).padStart(64, "0")}`,
+        lastBlockHash: `0x${(500 + closeIndex).toString(16).padStart(64, "0")}`
+      })),
+      priceChange24hE18: "50000000000000000",
+      tvlUsdE18: String((500_000n - BigInt(index) * 10_000n) * 10n ** 18n),
+      lpNetSwapFees24hUsdE18: String((240n - BigInt(index)) * 10n ** 18n),
+      volume24hUsdE18: String((120_000n - BigInt(index) * 1_000n) * 10n ** 18n),
+      status: "READY",
+      missingPriceTokens: [],
+      asOfBlock: "42",
+      asOfBlockHash: `0x${"22".repeat(32)}`,
+      asOfTimestamp: startTimestamp + 4 * 3_600,
+      marketMetadata: {
+        marketCapUsdE18: "12345000000000000000000000",
+        source: "dex-screener",
+        fetchedAt: startTimestamp + 4 * 3_600,
+        logoPath: `/token-images/${"c".repeat(64)}`,
+        logoSource: "dex-screener"
+      }
+    }));
+    await route.fulfill({
+      body: JSON.stringify({ data: { poolDiscovery } }),
+      contentType: "application/json",
+      status: 200
+    });
+  });
 }
 
 async function selectPoolWorkspaceView(
@@ -1427,6 +1480,7 @@ test("unified pool workspace preserves URL filters, analytics, actions, and acce
     if (request.url().startsWith("http://127.0.0.1:8787")) analyticsUrls.push(request.url());
   });
   await installMockRpc(page, { includePairs: true, includePositions: true, poolBinCount: 5, poolCount: 2 });
+  await installMockDiscoveryProjection(page);
   await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
 
   await page.goto("/#/pools?q=WNATIVE&sort=tvl&page=1&mine=1");
@@ -1445,28 +1499,22 @@ test("unified pool workspace preserves URL filters, analytics, actions, and acce
   await expect(page.getByTestId("pool-analytics-state")).toHaveCount(0);
   expect(analyticsUrls.length).toBeGreaterThan(0);
   expect(analyticsUrls.every((url) => url === "http://127.0.0.1:8787/graphql")).toBe(true);
-  await expect(page.locator(".workspace-table-metric").filter({ hasText: "$500,000" })).toBeVisible();
-  const discoveryMetrics = page.locator(".discovery-table .table-row:not(.header)").first().locator(".workspace-table-metric");
-  for (const [index, label, value] of [
-    [0, "TVL", "$500,000"],
-    [1, "24h volume", "$120,000"],
-    [2, "24h LP fees", "$240"],
-    [3, "24h LP fee / TVL", "0.04%"]
-  ] as const) {
-    await expect(discoveryMetrics.nth(index)).toContainText(label);
-    await expect(discoveryMetrics.nth(index)).toContainText(value);
-  }
+  const firstDiscoveryRow = page.getByTestId("pool-discovery-row").first();
+  await expect(firstDiscoveryRow).toContainText("$500K");
+  await expect(firstDiscoveryRow).toContainText("$120K");
+  await expect(firstDiscoveryRow).toContainText("$240");
+  await expect(firstDiscoveryRow).toContainText("$12.35M");
+  await expect(firstDiscoveryRow).toContainText("160");
 
-  const poolLink = page.locator(".discovery-table .pair-name").first();
+  const poolLink = page.locator(".pool-pair-link").first();
   const poolHref = await poolLink.getAttribute("href");
   expect(poolHref).not.toBeNull();
-  const returnHref = new URLSearchParams(poolHref!.split("?", 2)[1]).get("returnTo");
-  expect(returnHref).toContain("q=WNATIVE");
-  expect(returnHref).toContain("sort=tvl");
-  expect(returnHref).toContain("mine=1");
+  expect(poolHref).toContain("q=WNATIVE");
+  expect(poolHref).toContain("sort=tvl");
+  expect(poolHref).toContain("mine=1");
   await poolLink.click();
 
-  await expect(page).toHaveURL(/#\/pools\/.+\/create\?returnTo=/);
+  await expect(page).toHaveURL(/#\/pools\/.+\?q=WNATIVE/);
   await expect(page.getByTestId("pool-workspace-state")).toHaveCount(0);
   await expandPoolMetadata(page);
   await expect(page.getByTestId("swap-market-chart")).toBeVisible();
@@ -1475,7 +1523,7 @@ test("unified pool workspace preserves URL filters, analytics, actions, and acce
   await expect(page.getByTestId("pool-candle-workspace")).toHaveCount(0);
   await expect(page.getByTestId("pool-bin-distribution-table")).toHaveCount(0);
   await expect(page.getByRole("link", { name: "Market overview" })).toHaveCount(0);
-  await expect(page.getByTestId("pool-action-back")).toBeVisible();
+  await expect(page.getByTestId("pool-action-back")).toHaveAttribute("href", /#\/pools\?q=WNATIVE/);
   await expect(page.locator("#liquidity-pair")).toHaveCount(0);
   await page.getByTestId("pool-action-back").click();
   await expect(page).toHaveURL(/#\/pools\?/);
@@ -1615,7 +1663,7 @@ test("pool workspace fails closed for foreign-owner and stale owner analytics", 
   await page.goto("/#/pools?mine=1");
   await connectWallet(page);
   await expect(page.getByTestId("owner-pool-filter-status")).toContainText("unavailable");
-  await expect(page.locator(".discovery-table .table-row:not(.header)")).toHaveCount(0);
+  await expect(page.getByTestId("pool-discovery-row")).toHaveCount(0);
 });
 
 test("stale owner analytics remains partial while verified current liquidity stays visible", async ({ page }, testInfo) => {
@@ -1625,14 +1673,14 @@ test("stale owner analytics remains partial while verified current liquidity sta
   await page.goto("/#/pools?mine=1");
   await connectWallet(page);
   await expect(page.getByTestId("owner-pool-filter-status")).toContainText("partial");
-  await expect(page.locator(".discovery-table .table-row:not(.header)")).toHaveCount(1);
+  await expect(page.getByTestId("pool-discovery-row")).toHaveCount(1);
 });
 
 test("analytics token identity mismatches remain partial in the unified workspace", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium");
   await installMockRpc(page, { analyticsCandleGap: true, analyticsMetricTokenMismatch: true, includePairs: true });
   await page.goto("/#/pools");
-  await page.locator(".discovery-table .pair-name").first().click();
+  await page.locator(".pool-pair-link").first().click();
   await expect(page.getByTestId("pool-workspace-state")).toContainText("Analytics token identity does not match");
   await expect(page.getByTestId("pool-workspace-state")).toHaveClass(/partial/);
   await expect(page.getByTestId("swap-market-chart")).toBeVisible();
@@ -1645,7 +1693,7 @@ test("unknown token decimals never fabricate bin reserve amounts", async ({ page
     pairTokenX: "0x000000000000000000000000000000000000bEEF"
   });
   await page.goto("/#/pools");
-  await page.locator(".discovery-table .pair-name").first().click();
+  await page.locator(".pool-pair-link").first().click();
   await expect(page.getByTestId("pool-rail-liquidity-distribution")).toContainText("Pool bin identity or token decimals are unavailable.");
   await expect(page.getByTestId("pool-rail-liquidity-distribution").locator(".pool-rail-liquidity-bars")).toHaveCount(0);
 });
@@ -1656,7 +1704,7 @@ test("historical zero-only positions are excluded from My liquidity", async ({ p
   await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/pools?mine=1");
   await connectWallet(page);
-  await expect(page.locator(".discovery-table .table-row:not(.header)")).toHaveCount(0);
+  await expect(page.getByTestId("pool-discovery-row")).toHaveCount(0);
   await expect(page.getByText("No pools match these filters.")).toBeVisible();
   await expect(page.getByTestId("owner-pool-filter-status")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "My liquidity" })).toHaveAttribute("aria-pressed", "true");

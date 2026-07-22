@@ -23,6 +23,11 @@ import {
 
 import { runBackfill, type BackfillResult } from "./backfill.js";
 import {
+  marketMetadataLookupKey,
+  type MarketMetadataProvider,
+  type ProxiedTokenImage
+} from "./discovery-metadata.js";
+import {
   AnalyticsEngine,
   CanonicalHeadChangedError,
   type AnalyticsCheckpoint,
@@ -39,6 +44,8 @@ import type {
   PriceSubmission,
   PositionSnapshotEvent,
   PoolBinState,
+  PoolDiscoveryPool,
+  PoolDiscoveryRequest,
   PoolState,
   PoolStateSnapshot,
   PoolStateUpdate,
@@ -183,6 +190,7 @@ export interface AnalyticsApiServiceOptions {
   priceVerifier?: PriceSampleVerifier | null;
   positionSnapshotProvider?: PositionSnapshotProvider | null;
   positionSnapshotTimeoutMs?: number;
+  marketMetadataProvider?: MarketMetadataProvider | null;
 }
 
 export interface PriceSampleVerifier {
@@ -493,6 +501,7 @@ export class AnalyticsApiService {
   readonly #priceVerifier: PriceSampleVerifier | null;
   readonly #positionSnapshotProvider: PositionSnapshotProvider | null;
   readonly #positionSnapshotTimeoutMs: number;
+  readonly #marketMetadataProvider: MarketMetadataProvider | null;
   readonly #stream = new CandleStreamHub();
   readonly #mutations = new AsyncMutex();
   readonly #graphqlExecutions = new BoundedExecutor(
@@ -527,6 +536,7 @@ export class AnalyticsApiService {
       this.#positionSnapshotTimeoutMs < 1 || this.#positionSnapshotTimeoutMs > 120_000) {
       throw new Error("positionSnapshotTimeoutMs must be an integer between 1 and 120000");
     }
+    this.#marketMetadataProvider = options.marketMetadataProvider ?? null;
   }
 
   static async create(options: AnalyticsApiServiceOptions): Promise<AnalyticsApiService> {
@@ -722,6 +732,8 @@ export class AnalyticsApiService {
       rootValue: {
         poolMetrics: (args: { first: number; after?: string | null; asOfTimestamp?: number }) =>
           this.#readCommitted(() => mapConnection(this.#engine.queryPoolMetrics(args), mapPoolMetrics)),
+        poolDiscovery: (args: { pools: PoolDiscoveryRequest[]; asOfTimestamp?: number }) =>
+          this.queryPoolDiscovery(args).then((rows) => rows.map(mapPoolDiscovery)),
         pairCandles: (args: {
           pair: string;
           interval: GraphqlCandleInterval;
@@ -748,6 +760,38 @@ export class AnalyticsApiService {
         analyticsHealth: () => this.#readCommitted(() => mapHealth(this.#engine.getHealth()))
       }
     }));
+  }
+
+  async queryPoolDiscovery(args: {
+    pools: readonly PoolDiscoveryRequest[];
+    asOfTimestamp?: number;
+  }): Promise<PoolDiscoveryPool[]> {
+    const rows = await this.#readCommitted(() => this.#engine.queryPoolDiscovery(args));
+    if (this.#marketMetadataProvider === null) return rows;
+    const lookups = rows.flatMap((row) => row.chainId === null
+      ? []
+      : [{ chainId: row.chainId, address: row.displayBaseToken }]
+    );
+    let metadata: Map<string, PoolDiscoveryPool["marketMetadata"]>;
+    try {
+      metadata = await this.#marketMetadataProvider.load(lookups);
+    } catch {
+      return rows;
+    }
+    return rows.map((row) => ({
+      ...row,
+      marketMetadata: row.chainId === null
+        ? null
+        : metadata.get(marketMetadataLookupKey(row.chainId, row.displayBaseToken)) ?? null
+    }));
+  }
+
+  async loadTokenImage(opaqueKey: string): Promise<ProxiedTokenImage | null> {
+    try {
+      return await this.#marketMetadataProvider?.loadImage(opaqueKey) ?? null;
+    } catch {
+      return null;
+    }
   }
 
   async queryWalletPositions(args: {
@@ -1048,7 +1092,8 @@ export async function startAnalyticsHttpServer(options: AnalyticsHttpServerOptio
     try {
       const origin = request.headers.origin;
       const pathname = new URL(request.url ?? "/", "http://analytics.local").pathname;
-      const corsRoute = pathname === "/graphql" || pathname === "/events/candles" || pathname === "/events/pools";
+      const corsRoute = pathname === "/graphql" || pathname === "/events/candles" ||
+        pathname === "/events/pools" || pathname.startsWith("/token-images/");
       const corsAllowed = corsRoute && origin !== undefined && corsOrigins.has(origin);
       if (corsRoute && origin !== undefined && !corsAllowed) {
         sendJson(response, 403, { error: "Origin is not allowed" });
@@ -1143,6 +1188,36 @@ async function routeRequest(
     await openQuotaBoundStream(request, response, service, context, () =>
       openPoolStream(request, response, service, url)
     );
+    return;
+  }
+  if (request.method === "GET" && url.pathname.startsWith("/token-images/") && url.search === "") {
+    const opaqueKey = url.pathname.slice("/token-images/".length);
+    const image = await service.loadTokenImage(opaqueKey);
+    if (image === null) {
+      sendJson(response, 404, { error: "Token image is unavailable" });
+      return;
+    }
+    if (request.headers["if-none-match"] === image.etag) {
+      response.writeHead(304, {
+        etag: image.etag,
+        "cache-control": "public, max-age=3600, stale-while-revalidate=86400",
+        "content-security-policy": "default-src 'none'; sandbox",
+        "cross-origin-resource-policy": "cross-origin",
+        "x-content-type-options": "nosniff"
+      });
+      response.end();
+      return;
+    }
+    response.writeHead(200, {
+      "content-type": image.contentType,
+      "content-length": String(image.body.byteLength),
+      "cache-control": "public, max-age=3600, stale-while-revalidate=86400",
+      "content-security-policy": "default-src 'none'; sandbox",
+      "cross-origin-resource-policy": "cross-origin",
+      "x-content-type-options": "nosniff",
+      etag: image.etag
+    });
+    response.end(image.body);
     return;
   }
   if (request.method === "GET" && url.pathname === "/metrics") {
@@ -1512,6 +1587,10 @@ function mapConnection<T, U>(connection: { nodes: T[]; pageInfo: unknown }, map:
 }
 
 function mapPoolMetrics<T extends { status: string }>(value: T) {
+  return { ...value, status: value.status.toUpperCase() };
+}
+
+function mapPoolDiscovery(value: PoolDiscoveryPool) {
   return { ...value, status: value.status.toUpperCase() };
 }
 

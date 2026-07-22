@@ -9,6 +9,7 @@ import {
   verifyAnalyticsRuntimeCustody,
   type VerifiedAnalyticsRuntimeFile
 } from "./custody.js";
+import { DexScreenerMarketMetadataProvider } from "./discovery-metadata.js";
 import { PostgresAnalyticsStore } from "./postgres-store.js";
 import {
   AnalyticsInfrastructureState,
@@ -182,7 +183,8 @@ export async function startAnalyticsRuntime(
       allowFixedTestPrices: config.allowFixedTestPrices,
       priceVerifier,
       positionSnapshotProvider,
-      positionSnapshotTimeoutMs: numberFromEnv(env, "ANALYTICS_POSITION_SNAPSHOT_TIMEOUT_MS", 5_000)
+      positionSnapshotTimeoutMs: numberFromEnv(env, "ANALYTICS_POSITION_SNAPSHOT_TIMEOUT_MS", 5_000),
+      marketMetadataProvider: new DexScreenerMarketMetadataProvider()
     });
     const initialHealth = service.getHealth();
     const retainedHead = initialHealth.headBlock === null

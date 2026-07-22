@@ -253,7 +253,7 @@ function validateCaddy(source, errors) {
     "{$FEATHER_DOCS_DOMAIN}",
     "https://{$FEATHER_DOCS_DOMAIN}{uri} 308",
     "https://{$FEATHER_APP_DOMAIN}{uri} 308",
-    "@analytics_public path /graphql /events/candles /events/pools",
+    "@analytics_public path /graphql /events/candles /events/pools /token-images/*",
     "@analytics_graphql path /graphql",
     "request_body @analytics_graphql",
     "max_size 64KB",
@@ -277,8 +277,8 @@ function validateCaddy(source, errors) {
     errors.push("Caddyfile reverse proxy must use the exact public analytics matcher");
   }
   const publicMatcher = source.match(/^\s*@analytics_public\s+path\s+(.+)$/m)?.[1]?.trim();
-  if (publicMatcher !== "/graphql /events/candles /events/pools") {
-    errors.push("Caddyfile public analytics matcher must contain only the implemented GraphQL and SSE paths");
+  if (publicMatcher !== "/graphql /events/candles /events/pools /token-images/*") {
+    errors.push("Caddyfile public analytics matcher must contain only the implemented GraphQL, SSE, and token-image paths");
   }
 }
 

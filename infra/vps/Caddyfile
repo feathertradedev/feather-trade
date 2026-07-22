@@ -58,7 +58,7 @@
 
 		# This is the complete same-origin public analytics surface. Do not
 		# replace it with a broad prefix or a catch-all reverse proxy.
-		@analytics_public path /graphql /events/candles /events/pools
+		@analytics_public path /graphql /events/candles /events/pools /token-images/*
 		reverse_proxy @analytics_public analytics:8787 {
 			header_up X-Forwarded-For {remote_host}
 			flush_interval -1

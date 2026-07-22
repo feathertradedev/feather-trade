@@ -47,6 +47,51 @@ type PoolMetricsConnection {
   pageInfo: PageInfo!
 }
 
+input PoolDiscoveryRequest {
+  pair: ID!
+  preferredQuoteToken: ID
+}
+
+type PoolDiscoveryHourlyClose {
+  startTimestamp: Int!
+  closeUsdE18: BigInt!
+  quoteToken: ID!
+  finalized: Boolean!
+  revision: Int!
+  priceSource: String!
+  firstBlockHash: String!
+  lastBlockHash: String!
+}
+
+type PoolDiscoveryMarketMetadata {
+  marketCapUsdE18: BigInt
+  source: String!
+  fetchedAt: Int!
+  logoPath: String
+  logoSource: String
+}
+
+type PoolDiscoveryPool {
+  pair: ID!
+  chainId: Int
+  tokenX: ID!
+  tokenY: ID!
+  displayBaseToken: ID!
+  displayQuoteToken: ID!
+  poolPriceQuotePerBaseE18: BigInt
+  hourlyCloses: [PoolDiscoveryHourlyClose!]!
+  priceChange24hE18: BigInt
+  tvlUsdE18: BigInt
+  lpNetSwapFees24hUsdE18: BigInt
+  volume24hUsdE18: BigInt
+  status: AnalyticsStatus!
+  missingPriceTokens: [ID!]!
+  asOfBlock: BigInt!
+  asOfBlockHash: String!
+  asOfTimestamp: Int!
+  marketMetadata: PoolDiscoveryMarketMetadata
+}
+
 type Candle {
   pair: ID!
   interval: CandleInterval!
@@ -211,6 +256,7 @@ type PriceHealth {
 
 type Query {
   poolMetrics(first: Int!, after: String, asOfTimestamp: Int): PoolMetricsConnection!
+  poolDiscovery(pools: [PoolDiscoveryRequest!]!, asOfTimestamp: Int): [PoolDiscoveryPool!]!
   poolState(pair: ID!, radius: Int!): PoolStateSnapshot
   pairCandles(pair: ID!, interval: CandleInterval!, fromTimestamp: Int!, toTimestamp: Int!, first: Int!, after: String): CandleConnection!
   walletPositions(owner: ID!, first: Int!, after: String): WalletPairPositionConnection!

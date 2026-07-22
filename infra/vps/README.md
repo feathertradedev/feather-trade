@@ -247,7 +247,8 @@ docker compose --env-file /etc/feather/host.env \
 The static site remains available if analytics is unhealthy; missing analytics
 degrades the read-only market UX and must never change transaction authority.
 Compose checks the private `/readyz` endpoint, while Caddy exposes only
-`/graphql`, `/events/candles`, and `/events/pools`.
+`/graphql`, `/events/candles`, `/events/pools`, and the bounded
+`/token-images/*` raster-image proxy.
 
 Verify after startup:
 

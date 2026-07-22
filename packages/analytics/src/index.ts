@@ -1,4 +1,5 @@
 export * from "./backfill.js";
+export * from "./discovery-metadata.js";
 export * from "./engine.js";
 export * from "./fixed.js";
 export * from "./pricing.js";

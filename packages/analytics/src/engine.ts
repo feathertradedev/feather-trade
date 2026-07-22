@@ -16,6 +16,8 @@ import type {
   PairSnapshotEvent,
   PoolBinSnapshot,
   PoolBinState,
+  PoolDiscoveryPool,
+  PoolDiscoveryRequest,
   PoolMetrics,
   PoolState,
   PoolStateObservation,
@@ -36,6 +38,7 @@ const WEEK_SECONDS = 7 * DAY_SECONDS;
 const MONDAY_EPOCH_OFFSET_SECONDS = 4 * DAY_SECONDS;
 const MAX_PAGE_SIZE = 100;
 const MAX_CANDLE_POINTS = 500;
+const MAX_DISCOVERY_POOLS = 100;
 const USD_SCALE = 10n ** 18n;
 export const FULL_HISTORY_START_TIMESTAMP = Number.MIN_SAFE_INTEGER;
 
@@ -481,6 +484,102 @@ export class AnalyticsEngine {
         return this.#poolMetrics(pair, asOfTimestamp);
       }
     );
+  }
+
+  queryPoolDiscovery(input: {
+    pools: readonly PoolDiscoveryRequest[];
+    asOfTimestamp?: number;
+  }): PoolDiscoveryPool[] {
+    if (!Array.isArray(input.pools) || input.pools.length === 0 || input.pools.length > MAX_DISCOVERY_POOLS) {
+      throw new Error(`Pool discovery requires between 1 and ${MAX_DISCOVERY_POOLS} pools`);
+    }
+    if (input.asOfTimestamp !== undefined &&
+      (!Number.isSafeInteger(input.asOfTimestamp) || input.asOfTimestamp < 0)) {
+      throw new Error("Pool discovery asOfTimestamp must be a non-negative safe integer");
+    }
+
+    const requests = input.pools.map((request) => ({
+      pair: canonicalEvmAddress(request.pair, "Pool discovery pair"),
+      preferredQuoteToken: request.preferredQuoteToken === undefined || request.preferredQuoteToken === null
+        ? null
+        : canonicalEvmAddress(request.preferredQuoteToken, "Pool discovery preferred quote token")
+    }));
+    const uniquePairs = new Set(requests.map((request) => request.pair));
+    if (uniquePairs.size !== requests.length) throw new Error("Pool discovery pair requests must be unique");
+
+    const head = this.#blocks.at(-1);
+    const asOfTimestamp = input.asOfTimestamp ?? head?.timestamp ?? 0;
+    return requests.flatMap((request) => {
+      const pair = this.#pairStateAt(request.pair, asOfTimestamp);
+      if (pair === null) return [];
+      const metrics = this.#poolMetrics(pair, asOfTimestamp);
+      const eligibleCloses: Candle[] = [];
+      const currentHour = candleBoundary(asOfTimestamp, "hour");
+      for (let offset = 24; offset >= 0; offset -= 1) {
+        const startTimestamp = currentHour - offset * HOUR_SECONDS;
+        const candle = this.#candles.get(`${pair.pair}:hour:${startTimestamp}`);
+        if (candle === undefined || candle.closeUsdE18 === null || candle.lastBlock > pair.updatedAtBlock) continue;
+        eligibleCloses.push(finalizeCandle(candle, head?.timestamp ?? null));
+      }
+      const closes = eligibleCloses.slice(-24);
+      const candleQuoteToken = [...closes].reverse().find((candle) =>
+        candle.quoteToken === pair.tokenX || candle.quoteToken === pair.tokenY
+      )?.quoteToken ?? null;
+      const displayQuoteToken = candleQuoteToken ?? (
+        request.preferredQuoteToken === pair.tokenX || request.preferredQuoteToken === pair.tokenY
+          ? request.preferredQuoteToken
+          : pair.tokenY
+      );
+      const displayBaseToken = displayQuoteToken === pair.tokenY ? pair.tokenX : pair.tokenY;
+      const poolPriceQuotePerBaseE18 = pair.marketPriceQuoteE18 === null
+        ? null
+        : displayQuoteToken === pair.tokenY
+          ? pair.marketPriceQuoteE18
+          : invertE18(pair.marketPriceQuoteE18);
+      const hourlyCloses = closes.map((candle) => ({
+        startTimestamp: candle.startTimestamp,
+        closeUsdE18: candle.closeUsdE18!,
+        quoteToken: candle.quoteToken,
+        finalized: candle.finalized,
+        revision: candle.revision,
+        priceSource: candle.priceSource,
+        firstBlockHash: candle.firstBlockHash,
+        lastBlockHash: candle.lastBlockHash
+      }));
+      const latestCloseStart = closes.at(-1)?.startTimestamp ?? null;
+      const baselineCandle = latestCloseStart === null
+        ? undefined
+        : this.#candles.get(`${pair.pair}:hour:${latestCloseStart - DAY_SECONDS}`);
+      const firstClose = baselineCandle !== undefined && baselineCandle.lastBlock <= pair.updatedAtBlock
+        ? baselineCandle.closeUsdE18
+        : null;
+      const lastClose = hourlyCloses.at(-1)?.closeUsdE18 ?? null;
+      const priceChange24hE18 = firstClose === null || firstClose <= 0n || lastClose === null
+        ? null
+        : ((lastClose - firstClose) * USD_SCALE) / firstClose;
+      const missingPriceTokens = new Set([...metrics.missingPriceTokens, ...pair.missingPriceTokens]);
+
+      return [{
+        pair: pair.pair,
+        chainId: this.#canonicalChainId,
+        tokenX: pair.tokenX,
+        tokenY: pair.tokenY,
+        displayBaseToken,
+        displayQuoteToken,
+        poolPriceQuotePerBaseE18,
+        hourlyCloses,
+        priceChange24hE18,
+        tvlUsdE18: metrics.tvlUsdE18,
+        lpNetSwapFees24hUsdE18: metrics.lpNetSwapFees24hUsdE18,
+        volume24hUsdE18: metrics.volume24hUsdE18,
+        status: metrics.status,
+        missingPriceTokens: [...missingPriceTokens].sort(),
+        asOfBlock: pair.updatedAtBlock,
+        asOfBlockHash: pair.updatedAtBlockHash,
+        asOfTimestamp: metrics.asOfTimestamp,
+        marketMetadata: null
+      }];
+    });
   }
 
   queryCandles(input: {
@@ -2121,6 +2220,41 @@ function sameHash(a: string, b: string): boolean {
 
 function normalize(value: string): string {
   return value.toLowerCase();
+}
+
+function appendMapArray<T>(rows: Map<string, T[]>, key: string, value: T): void {
+  const existing = rows.get(key);
+  if (existing === undefined) rows.set(key, [value]);
+  else existing.push(value);
+}
+
+function timestampWindow(rows: readonly FlowRow[], exclusiveFrom: number, inclusiveThrough: number): readonly FlowRow[] {
+  let low = 0;
+  let high = rows.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (rows[middle]!.timestamp <= exclusiveFrom) low = middle + 1;
+    else high = middle;
+  }
+  const start = low;
+  high = rows.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (rows[middle]!.timestamp <= inclusiveThrough) low = middle + 1;
+    else high = middle;
+  }
+  return rows.slice(start, low);
+}
+
+function canonicalEvmAddress(value: string, label: string): string {
+  if (typeof value !== "string" || !/^0x[0-9a-fA-F]{40}$/.test(value)) {
+    throw new Error(`${label} must be a canonical EVM address`);
+  }
+  return value.toLowerCase();
+}
+
+function invertE18(value: bigint): bigint | null {
+  return value <= 0n ? null : (USD_SCALE * USD_SCALE) / value;
 }
 
 function addAll(target: Set<string>, source: Set<string>): void {
