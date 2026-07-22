@@ -53,10 +53,26 @@ ANALYTICS_PRICE_VERIFIER_MODULE=/absolute/path/chainlink-verifier.mjs \
 ANALYTICS_BLOCK_SOURCE_MODULE=/absolute/path/archive-block-source.mjs \
 ANALYTICS_POSITION_SNAPSHOT_MODULE=/absolute/path/position-snapshot-provider.mjs \
 ANALYTICS_CORS_ORIGINS=https://app.testnet.example.com \
+ANALYTICS_ENVIRONMENT=localnet \
 ANALYTICS_STATE_PATH=.local/analytics/checkpoint.json \
 ANALYTICS_INGEST_TOKEN='replace-with-a-secret' \
 pnpm --filter @robinhood-lb/analytics start
 ```
+
+That checkpoint example is local-development configuration. Outside localnet,
+the CLI requires managed PostgreSQL with exactly `sslmode=verify-full` plus an
+`ANALYTICS_DEPLOYMENT_IDENTITY`, canonical `ANALYTICS_RUNTIME_CUSTODY` inventory,
+and its `ANALYTICS_RUNTIME_CUSTODY_SHA256`. Generate the inventory from the four
+reviewed policy/adapter files with `pnpm analytics:custody:build -- ...` as shown
+in [`infra/vps/README.md`](../../infra/vps/README.md). Production startup verifies
+regular non-symlink files and imports the held, hash-verified module bytes.
+
+Mainnet rollout remains blocked on the checkpoint-v2 materialized-anchor and
+bounded-suffix migration documented in the VPS runbook. Checkpoint v1 rebuilds
+derived state from the complete canonical block history; pruning that history
+without a persisted anchor would silently corrupt reorg recovery, candles, and
+position cost basis. The current engine is suitable for deterministic/local
+validation, not unbounded mainnet retention.
 
 The server binds to `127.0.0.1:8787` by default. `POST /graphql` serves bounded
 queries. `POST /internal/blocks` accepts tagged-JSON `BlockSubmission` payloads
@@ -68,7 +84,8 @@ bearer token; ingestion stays disabled if no token is configured. Use exported
 browser-facing `/graphql` endpoint. Allowed origins receive bounded OPTIONS
 preflight responses and CORS headers; wildcards are not supported and the
 authenticated ingestion endpoint is never exposed through CORS. A same-origin
-reverse proxy may leave the allowlist empty.
+reverse proxy that preserves the browser's `Origin` header must configure the
+exact public app origin. The VPS Compose configuration does this automatically.
 
 The CLI refuses to serve until `ANALYTICS_BLOCK_SOURCE_MODULE` completes a
 canonical startup reconciliation. The module exports `createBlockSource()`,
@@ -94,5 +111,7 @@ confidence checks are independently enforced inside the replay core.
 `ANALYTICS_POSITION_SNAPSHOT_MODULE` exports
 `createPositionSnapshotProvider()`. The provider performs a bounded owner query
 at the requested canonical head and returns raw per-bin token claims. The
-service attaches/reconciles those snapshots at that exact head before resolving
-`walletPositions`; it never enumerates every holder on every block.
+service applies those snapshots to an isolated, head-checked response view
+before resolving `walletPositions`; a public read cannot mutate or persist the
+canonical engine state. The provider never enumerates every holder on every
+block.

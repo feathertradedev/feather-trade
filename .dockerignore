@@ -1,0 +1,106 @@
+# Never send repository history, credentials, or local operator state to a
+# Docker daemon. Production configuration is injected at runtime.
+.git
+.git/**
+.env
+.env.*
+*.env
+**/.env
+**/.env.*
+**/*.env
+!**/.env.example
+.npmrc
+**/.npmrc
+*.key
+*.pem
+*.p12
+*.pfx
+.local
+.local/**
+
+# Dependency and package-manager caches.
+node_modules
+**/node_modules
+.pnpm-store
+**/.pnpm-store
+
+# Generated build, chain, test, and coverage artifacts.
+dist
+**/dist
+build
+**/build
+out
+**/out
+cache
+**/cache
+broadcast
+**/broadcast
+coverage
+**/coverage
+playwright-report
+**/playwright-report
+test-results
+**/test-results
+*.log
+*.tsbuildinfo
+
+# Generated deployment state is mounted explicitly when an approved runtime
+# adapter needs it; it must never be baked into a reusable image.
+deployments/localnet/*.json
+deployments/robinhood/*/*.json
+
+# OS and editor state.
+.DS_Store
+.idea
+.vscode
+
+# The analytics image is the only repository-root Docker build. After the
+# explicit secret denies above, reduce its context to the exact build inputs.
+*
+!.dockerignore
+!package.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!packages/
+!packages/analytics/
+!packages/analytics/Dockerfile
+!packages/analytics/package.json
+!packages/analytics/tsconfig.json
+!packages/analytics/schema.graphql
+!packages/analytics/src/
+!packages/analytics/src/*.ts
+
+# Docker evaluates the last matching rule. Repeat secret-bearing file denies
+# after the source allowlist as defense in depth. The positive source rule is
+# deliberately limited to the package's top-level TypeScript files, so nested
+# generated output and credentials cannot enter the build context.
+.env
+.env.*
+*.env
+**/.env
+**/.env.*
+**/*.env
+.npmrc
+**/.npmrc
+*.key
+*.pem
+*.p12
+*.pfx
+.local
+.local/**
+node_modules
+**/node_modules
+.pnpm-store
+**/.pnpm-store
+dist
+**/dist
+build
+**/build
+out
+**/out
+cache
+**/cache
+coverage
+**/coverage
+*.log
+*.tsbuildinfo

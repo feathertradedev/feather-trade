@@ -18,7 +18,10 @@ requireFile("docs/index.html");
 requireFile("docs/pools/swap/index.html");
 requireFile("docs/contracts/mainnet-deployments/index.html");
 requireFile("sitemap.xml");
-requireFile("_worker.js");
+
+for (const controlFile of ["_worker.js", "_headers", "_redirects"]) {
+  if (fs.existsSync(path.join(dist, controlFile))) errors.push(`Cloudflare control file must not be published: ${controlFile}`);
+}
 
 if (fs.existsSync(manifestPath)) {
   const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
@@ -41,11 +44,6 @@ if (fs.existsSync(searchPath)) {
   if (search.length !== 49 || search.some((entry) => !entry.text || !entry.href)) errors.push("Search index is incomplete");
 }
 
-const worker = fs.existsSync(path.join(dist, "_worker.js")) ? fs.readFileSync(path.join(dist, "_worker.js"), "utf8") : "";
-for (const token of ["app.feather.markets", "feather.markets", "env.ASSETS.fetch", "308"]) {
-  if (!worker.includes(token)) errors.push(`_worker.js missing ${token}`);
-}
-
 const searchable = fs.readdirSync(path.join(dist, "assets")).filter((file) => file.endsWith(".js")).map((file) => fs.readFileSync(path.join(dist, "assets", file), "utf8")).join("\n");
 if (!searchable.includes("feather-docs-theme")) errors.push("Docs runtime chunk is missing");
 
@@ -53,5 +51,5 @@ if (errors.length > 0) {
   errors.forEach((error) => console.error(error));
   process.exitCode = 1;
 } else {
-  console.log("Validated prerendered docs, search index, metadata, and host routing worker.");
+  console.log("Validated provider-neutral prerendered docs, search index, and metadata.");
 }

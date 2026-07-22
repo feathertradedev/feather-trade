@@ -41,13 +41,17 @@ const requiredScripts = [
   "web:build",
   "web:fixture:public",
   "web:test:public-config",
+  "web:validate:public-runtime",
+  "web:test:public-runtime",
   "web:validate:public-config",
   "web:check:public-artifact",
   "web:check:hosted-release",
   "web:test:hosted-release",
-  "web:write:public-headers",
   "web:build:public:testnet",
   "web:build:public:mainnet",
+  "vps:validate",
+  "vps:test",
+  "analytics:custody:build",
   "indexer:generate:robinhood",
   "indexer:build:robinhood:testnet",
   "indexer:build:robinhood:mainnet",
@@ -131,6 +135,8 @@ const requiredDocs = [
 
 const requiredFiles = [
   "pnpm-workspace.yaml",
+  "infra/vps/Caddyfile",
+  "infra/vps/compose.yml",
   "infra/graph-node/.env.example",
   "infra/graph-node/docker-compose.robinhood.example.yml",
   "infra/graph-node/README.md",
@@ -146,6 +152,10 @@ const requiredFiles = [
   "scripts/robinhood/redact-command-output.cjs",
   "scripts/robinhood/test-deploy-wrapper.cjs",
   "scripts/release/test-check-launch-health.cjs",
+  "scripts/release/validate-vps-deployment.cjs",
+  "scripts/release/test-validate-vps-deployment.cjs",
+  "scripts/release/build-analytics-runtime-custody.cjs",
+  "scripts/release/test-build-analytics-runtime-custody.cjs",
   "scripts/release/check-self-hosted-graph-node.cjs",
   "scripts/release/check-static-analysis-triage.cjs",
   "scripts/release/validate-audit-readiness.cjs",
@@ -207,10 +217,9 @@ const requiredFiles = [
   "apps/web/e2e/localnet/fixtures/unlocked-rpc-wallet.ts",
   "scripts/web/create-public-config-fixture.cjs",
   "scripts/web/test-public-config.cjs",
+  "scripts/web/validate-public-runtime.cjs",
+  "scripts/web/test-public-runtime.cjs",
   "scripts/web/check-public-artifact.cjs",
-  "scripts/web/write-public-headers.cjs",
-  "apps/web/public/_headers",
-  "apps/web/public/_redirects",
   "contracts/joe-v2/script/rehearse-robinhood-multibin-remove.s.sol",
   "contracts/joe-v2/script/rehearse-robinhood-pagination.s.sol",
   paginationEvidencePath,
@@ -227,6 +236,12 @@ const removedZapFiles = [
   "packages/sdk/examples/localnet-zap-out.ts",
   "indexer/subgraph/abis/LBZap.json",
   "indexer/subgraph/src/zap.ts"
+];
+
+const retiredCloudflareControlFiles = [
+  "apps/web/public/_headers",
+  "apps/web/public/_redirects",
+  "apps/web/public/_worker.js"
 ];
 
 const gates = [
@@ -258,6 +273,7 @@ const gates = [
   ["self-hosted-graph-node", "#37/#47/#61", "PR-blocking fallback shape, launch-blocking if selected", "indexer", "pnpm graph-node:validate"],
   ["public-web-testnet", "#43/#46/#53/#99/#110", "manual launch-blocking", "web", "VITE_ROBINHOOD_TESTNET_MANIFEST_PATH=... pnpm web:build:public:testnet && pnpm web:check:public-artifact -- --environment robinhoodTestnet --manifest ... --dist apps/web/dist"],
   ["public-web-mainnet", "#43/#46/#53/#99/#110", "manual launch-blocking", "web", "VITE_ROBINHOOD_MANIFEST_PATH=... pnpm web:build:public:mainnet && pnpm web:check:public-artifact -- --environment robinhood --manifest ... --dist apps/web/dist"],
+  ["vps-hosting", "#43/#55/#61", "PR-blocking deployment shape, manual production rollout", "web", "pnpm vps:validate && pnpm vps:test"],
   ["protected-web-promotion", "#43/#55/#61", "PR-blocking workflow shape, manual provider deployment", "web", "pnpm release:web-promotion:test"],
   ["hosted-web-smoke", "#43/#55/#61", "PR-blocking helper, manual launch evidence", "web", "pnpm web:test:hosted-release && pnpm web:check:hosted-release -- <https-url>"],
   [
@@ -510,6 +526,10 @@ function validate() {
     if (exists(removedFile)) errors.push(`removed on-chain Zap file must be absent: ${removedFile}`);
   }
 
+  for (const retiredFile of retiredCloudflareControlFiles) {
+    if (exists(retiredFile)) errors.push(`provider-neutral web artifacts must not include Cloudflare control file: ${retiredFile}`);
+  }
+
   for (const [issueId, gateIds] of Object.entries(reviewIssueCoverage)) {
     if (gateIds.length === 0) {
       errors.push(`release gate inventory missing verified review issue coverage: ${issueId}`);
@@ -604,8 +624,19 @@ function validate() {
     errors.push("package.json web:check:public-artifact must run scripts/web/check-public-artifact.cjs");
   }
 
-  if (scripts["web:write:public-headers"] !== "node scripts/web/write-public-headers.cjs") {
-    errors.push("package.json web:write:public-headers must run scripts/web/write-public-headers.cjs");
+  if (scripts["web:write:public-headers"] !== undefined) {
+    errors.push("package.json must not expose the retired Cloudflare web:write:public-headers script");
+  }
+
+  if (scripts["vps:validate"] !== "node scripts/release/validate-vps-deployment.cjs") {
+    errors.push("package.json vps:validate must run scripts/release/validate-vps-deployment.cjs");
+  }
+
+  if (
+    scripts["vps:test"] !==
+    "node scripts/release/test-build-analytics-runtime-custody.cjs && node scripts/release/test-validate-vps-deployment.cjs"
+  ) {
+    errors.push("package.json vps:test must run the custody-builder and VPS validator adversarial suites");
   }
 
   if (scripts["web:test:e2e"] !== "pnpm --filter @robinhood-lb/web test:e2e") {
@@ -660,20 +691,24 @@ function validate() {
     scripts["web:build:public:testnet"] &&
     (!scripts["web:build:public:testnet"].includes("pnpm web:validate:public-config") ||
       !scripts["web:build:public:testnet"].includes("--environment robinhoodTestnet") ||
+      !scripts["web:build:public:testnet"].includes("pnpm web:validate:public-runtime") ||
       !scripts["web:build:public:testnet"].includes("VITE_PUBLIC_RELEASE_ENV=robinhoodTestnet") ||
-      !scripts["web:build:public:testnet"].includes("pnpm web:write:public-headers"))
+      !scripts["web:build:public:testnet"].includes("pnpm web:build") ||
+      scripts["web:build:public:testnet"].includes("web:write:public-headers"))
   ) {
-    errors.push("package.json web:build:public:testnet must validate, set VITE_PUBLIC_RELEASE_ENV, build, and write public headers");
+    errors.push("package.json web:build:public:testnet must validate, set VITE_PUBLIC_RELEASE_ENV, and emit a provider-neutral web build");
   }
 
   if (
     scripts["web:build:public:mainnet"] &&
     (!scripts["web:build:public:mainnet"].includes("pnpm web:validate:public-config") ||
       !scripts["web:build:public:mainnet"].includes("--environment robinhood") ||
+      !scripts["web:build:public:mainnet"].includes("pnpm web:validate:public-runtime") ||
       !scripts["web:build:public:mainnet"].includes("VITE_PUBLIC_RELEASE_ENV=robinhood") ||
-      !scripts["web:build:public:mainnet"].includes("pnpm web:write:public-headers"))
+      !scripts["web:build:public:mainnet"].includes("pnpm web:build") ||
+      scripts["web:build:public:mainnet"].includes("web:write:public-headers"))
   ) {
-    errors.push("package.json web:build:public:mainnet must validate, set VITE_PUBLIC_RELEASE_ENV, build, and write public headers");
+    errors.push("package.json web:build:public:mainnet must validate, set VITE_PUBLIC_RELEASE_ENV, and emit a provider-neutral web build");
   }
 
   if (
@@ -1014,8 +1049,11 @@ function validate() {
     for (const token of [
       "pnpm web:test:public-config",
       "pnpm web:check:public-artifact",
-      "apps/web/public/_headers",
-      "apps/web/public/_redirects",
+      "infra/vps/Caddyfile",
+      "infra/vps/compose.yml",
+      "pnpm vps:validate",
+      "pnpm vps:test",
+      "provider-neutral",
       "secret canary"
     ]) {
       if (!publicEnvironmentConfig.includes(token)) {
@@ -1100,7 +1138,9 @@ function validate() {
       "oracle",
       "batch-transfer",
       "MEV",
-      "Privileged owner"
+      "Privileged owner",
+      "infra/vps/Caddyfile",
+      "pnpm vps:validate"
     ]) {
       if (!threatModel.includes(token)) {
         errors.push(`threat-model.md missing required #41 evidence: ${token}`);

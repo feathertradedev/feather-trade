@@ -4,6 +4,8 @@
 .env
 .env.*
 !.env.example
+infra/vps/*.env
+!infra/vps/*.env.example
 
 # JavaScript/TypeScript workspaces
 node_modules/

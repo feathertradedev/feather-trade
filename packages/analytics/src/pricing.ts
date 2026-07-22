@@ -9,6 +9,7 @@ export interface PriceResult {
 export class TrustedPriceBook {
   readonly #policies = new Map<string, PricePolicy>();
   readonly #samples = new Map<string, PriceSample[]>();
+  readonly #sampleSequences = new Map<string, Set<bigint>>();
 
   constructor(policies: readonly PricePolicy[]) {
     for (const policy of policies) {
@@ -33,10 +34,14 @@ export class TrustedPriceBook {
     if (sample.priceUsdE18 <= 0n || sample.confidenceUsdE18 < 0n || sample.observedAt > blockTimestamp + 30) return;
 
     const samples = this.#samples.get(token) ?? [];
-    if (samples.some((current) => current.sequence === sample.sequence)) return;
-    samples.push({ ...sample, token });
-    samples.sort((a, b) => a.observedAt - b.observedAt || (a.sequence < b.sequence ? -1 : a.sequence > b.sequence ? 1 : 0));
+    const sequences = this.#sampleSequences.get(token) ?? new Set<bigint>();
+    if (sequences.has(sample.sequence)) return;
+    const normalized = { ...sample, token };
+    const insertionIndex = upperBoundSample(samples, normalized);
+    samples.splice(insertionIndex, 0, normalized);
+    sequences.add(sample.sequence);
     this.#samples.set(token, samples);
+    this.#sampleSequences.set(token, sequences);
   }
 
   get(tokenValue: string, atTimestamp: number): PriceResult {
@@ -64,11 +69,29 @@ export class TrustedPriceBook {
 
   #sampleAt(token: string, atTimestamp: number): PriceSample | null {
     const samples = this.#samples.get(token) ?? [];
-    for (let index = samples.length - 1; index >= 0; index -= 1) {
-      if (samples[index].observedAt <= atTimestamp) return samples[index];
+    let low = 0;
+    let high = samples.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (samples[middle]!.observedAt <= atTimestamp) low = middle + 1;
+      else high = middle;
     }
-    return null;
+    return low === 0 ? null : samples[low - 1]!;
   }
+}
+
+function upperBoundSample(samples: readonly PriceSample[], sample: PriceSample): number {
+  let low = 0;
+  let high = samples.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    const current = samples[middle]!;
+    const orderedBeforeOrEqual = current.observedAt < sample.observedAt ||
+      (current.observedAt === sample.observedAt && current.sequence <= sample.sequence);
+    if (orderedBeforeOrEqual) low = middle + 1;
+    else high = middle;
+  }
+  return low;
 }
 
 function normalize(value: string): string {

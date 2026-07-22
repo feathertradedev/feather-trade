@@ -76,6 +76,13 @@ interface FlowRow {
   missingPriceTokens: Set<string>;
 }
 
+interface PairSnapshotIndexEntry {
+  state: PairState;
+  canonicalOrdinal: number;
+  prefixBest: PairState;
+  prefixBestOrdinal: number;
+}
+
 interface MutableCandle {
   pair: string;
   interval: CandleInterval;
@@ -138,6 +145,16 @@ export interface AnalyticsEngineOptions {
   assumeCompleteHistory?: boolean;
   maxHeadLagSeconds?: number;
   maxPositionSnapshotAgeSeconds?: number;
+  /** Optional read-path probes used by deterministic scale tests and diagnostics. */
+  queryInstrumentation?: AnalyticsQueryInstrumentation;
+}
+
+export interface AnalyticsQueryInstrumentation {
+  onPairKeyRead?(pair: string): void;
+  onPairStateRead?(pair: string): void;
+  onFlowRowRead?(pair: string): void;
+  onWalletPositionMaterialized?(owner: string, pair: string): void;
+  onPoolBinLookup?(pair: string, binId: string): void;
 }
 
 export interface BackfillStateUpdate {
@@ -174,12 +191,18 @@ export class AnalyticsEngine {
   readonly #blocks: BlockEnvelope[] = [];
   #priceBook: TrustedPriceBook;
   #pairs = new Map<string, PairState>();
-  #pairSnapshots: PairState[] = [];
-  #flows: FlowRow[] = [];
+  #sortedPairKeys: string[] = [];
+  #minimumPairTimestamps = new Map<string, number>();
+  #pairSnapshotsByPair = new Map<string, PairSnapshotIndexEntry[]>();
+  #nextPairSnapshotOrdinal = 0;
+  #maximumPairTimestamp = Number.NEGATIVE_INFINITY;
+  #flowsByPair = new Map<string, FlowRow[]>();
   #candles = new Map<string, MutableCandle>();
   #positions = new Map<string, MutableWalletPairPosition>();
+  #positionPairsByOwner = new Map<string, string[]>();
   #poolStates = new Map<string, PoolState>();
   #poolBins = new Map<string, Map<string, PoolBinState>>();
+  #poolBinsByNumericId = new Map<string, Map<bigint, Map<string, PoolBinState>>>();
   #lastChangedPoolUpdates: PoolStateUpdate[] = [];
   #canonicalChainId: number | null = null;
   #canonicalEventFingerprints = new Map<string, string>();
@@ -195,6 +218,7 @@ export class AnalyticsEngine {
   #coverageThroughTimestamp: number | null = null;
   readonly #maxHeadLagSeconds: number;
   readonly #maxPositionSnapshotAgeSeconds: number;
+  readonly #queryInstrumentation: AnalyticsQueryInstrumentation | null;
 
   constructor(policies: readonly PricePolicy[], options: AnalyticsEngineOptions = {}) {
     this.#policies = policies.map((policy) => ({ ...policy, token: normalize(policy.token) }));
@@ -204,6 +228,7 @@ export class AnalyticsEngine {
       options.maxPositionSnapshotAgeSeconds ?? 300,
       "maxPositionSnapshotAgeSeconds"
     );
+    this.#queryInstrumentation = options.queryInstrumentation ?? null;
     this.#backfillStatus = options.assumeCompleteHistory ? "complete" : "unavailable";
     this.#coverageStartTimestamp = options.assumeCompleteHistory ? FULL_HISTORY_START_TIMESTAMP : null;
   }
@@ -434,12 +459,28 @@ export class AnalyticsEngine {
   queryPoolMetrics(input: { first: number; after?: string | null; asOfTimestamp?: number }): Connection<PoolMetrics> {
     const head = this.#blocks.at(-1);
     const asOfTimestamp = input.asOfTimestamp ?? head?.timestamp ?? 0;
-    const rows = [...this.#pairs.keys()]
-      .map((pairId) => this.#pairStateAt(pairId, asOfTimestamp))
-      .filter((pair): pair is PairState => pair !== null)
-      .sort((a, b) => a.pair.localeCompare(b.pair))
-      .map((pair) => this.#poolMetrics(pair, asOfTimestamp));
-    return paginate(rows, input.first, input.after, head?.hash ?? "empty", !this.#historyCovers(asOfTimestamp - DAY_SECONDS, asOfTimestamp));
+    const snapshotId = head?.hash ?? "empty";
+    validatePaginationInput(input.first, input.after, snapshotId);
+    const pairKeys = asOfTimestamp >= this.#maximumPairTimestamp
+      ? this.#sortedPairKeys
+      : this.#sortedPairKeys.filter(
+          (pair) => {
+            this.#queryInstrumentation?.onPairKeyRead?.(pair);
+            return (this.#minimumPairTimestamps.get(pair) ?? Number.POSITIVE_INFINITY) <= asOfTimestamp;
+          }
+        );
+    return paginateKeys(
+      pairKeys,
+      input.first,
+      input.after,
+      snapshotId,
+      !this.#historyCovers(asOfTimestamp - DAY_SECONDS, asOfTimestamp),
+      (pairId) => {
+        const pair = this.#pairStateAt(pairId, asOfTimestamp);
+        if (pair === null) throw new Error(`Indexed pair ${pairId} has no state at ${asOfTimestamp}`);
+        return this.#poolMetrics(pair, asOfTimestamp);
+      }
+    );
   }
 
   queryCandles(input: {
@@ -509,12 +550,16 @@ export class AnalyticsEngine {
     if (state === undefined) return null;
     const minimumBinId = BigInt(state.activeId - input.radius);
     const maximumBinId = BigInt(state.activeId + input.radius);
+    const numericBins = this.#poolBinsByNumericId.get(pair);
+    const bins: PoolBinState[] = [];
+    for (let binId = minimumBinId; binId <= maximumBinId; binId += 1n) {
+      this.#queryInstrumentation?.onPoolBinLookup?.(pair, binId.toString());
+      const matches = numericBins?.get(binId);
+      if (matches !== undefined) bins.push(...matches.values());
+    }
     return structuredClone({
       state,
-      bins: sortedPoolBins(this.#poolBins.get(pair)).filter((bin) => {
-        const binId = BigInt(bin.binId);
-        return binId >= minimumBinId && binId <= maximumBinId;
-      })
+      bins: bins.sort(comparePoolBins)
     });
   }
 
@@ -537,30 +582,104 @@ export class AnalyticsEngine {
   queryWalletPositions(input: { owner: string; first: number; after?: string | null }): Connection<WalletPairPosition> {
     const owner = normalize(input.owner);
     const head = this.#blocks.at(-1) ?? null;
-    const rows = [...this.#positions.values()]
-      .filter((position) => position.owner === owner)
-      .sort((a, b) => a.pair.localeCompare(b.pair))
-      .map((position) =>
-        finalizePosition(
+    return paginateKeys(
+      this.#positionPairsByOwner.get(owner) ?? [],
+      input.first,
+      input.after,
+      head?.hash ?? "empty",
+      this.#backfillStatus !== "complete",
+      (pair) => {
+        const position = this.#positions.get(`${owner}:${pair}`);
+        if (position === undefined) throw new Error(`Indexed wallet position ${owner}:${pair} is missing`);
+        this.#queryInstrumentation?.onWalletPositionMaterialized?.(owner, pair);
+        return finalizePosition(
           position,
           this.#priceBook,
           head?.number ?? null,
           head?.timestamp ?? null,
           this.#maxPositionSnapshotAgeSeconds
-        )
-      );
-    return paginate(rows, input.first, input.after, head?.hash ?? "empty", this.#backfillStatus !== "complete");
+        );
+      }
+    );
+  }
+
+  /**
+   * Applies provider snapshots to an isolated owner view. Public reads must not
+   * rewrite the retained canonical head or cause checkpoint persistence.
+   */
+  queryWalletPositionsWithSnapshots(
+    expectedHead: CanonicalHead,
+    snapshots: readonly PositionSnapshotEvent[],
+    input: { owner: string; first: number; after?: string | null }
+  ): Connection<WalletPairPosition> {
+    const head = this.#blocks.at(-1);
+    if (!head || head.number !== expectedHead.number || !sameHash(head.hash, expectedHead.hash)) {
+      throw new CanonicalHeadChangedError("Canonical head changed while loading wallet positions");
+    }
+    const owner = normalize(input.owner);
+    const snapshotsByPair = new Map<string, PositionSnapshotEvent[]>();
+    for (const snapshot of snapshots) {
+      if (normalize(snapshot.owner) !== owner) {
+        throw new Error("Position snapshot provider returned a different owner");
+      }
+      const pair = normalize(snapshot.pair);
+      const entries = snapshotsByPair.get(pair) ?? [];
+      entries.push(snapshot);
+      snapshotsByPair.set(pair, entries);
+    }
+    const pairKeys = mergeSortedUnique(
+      this.#positionPairsByOwner.get(owner) ?? [],
+      [...snapshotsByPair.keys()].sort((left, right) => left.localeCompare(right))
+    );
+    return paginateKeys(
+      pairKeys,
+      input.first,
+      input.after,
+      head.hash,
+      this.#backfillStatus !== "complete",
+      (pair) => {
+        const canonical = this.#positions.get(`${owner}:${pair}`);
+        const positions = new Map<string, MutableWalletPairPosition>();
+        if (canonical !== undefined) positions.set(`${owner}:${pair}`, cloneMutableWalletPairPosition(canonical));
+        for (const snapshot of snapshotsByPair.get(pair) ?? []) {
+          applyPositionSnapshotToPositions(
+            positions,
+            snapshot,
+            head.number,
+            head.timestamp,
+            this.#priceBook,
+            () => undefined
+          );
+        }
+        const position = positions.get(`${owner}:${pair}`);
+        if (position === undefined) throw new Error(`Indexed wallet position ${owner}:${pair} is missing`);
+        this.#queryInstrumentation?.onWalletPositionMaterialized?.(owner, pair);
+        return finalizePosition(
+          position,
+          this.#priceBook,
+          head.number,
+          head.timestamp,
+          this.#maxPositionSnapshotAgeSeconds
+        );
+      }
+    );
   }
 
   #rebuild(): void {
     this.#priceBook = new TrustedPriceBook(this.#policies);
     this.#pairs = new Map();
-    this.#pairSnapshots = [];
-    this.#flows = [];
+    this.#sortedPairKeys = [];
+    this.#minimumPairTimestamps = new Map();
+    this.#pairSnapshotsByPair = new Map();
+    this.#nextPairSnapshotOrdinal = 0;
+    this.#maximumPairTimestamp = Number.NEGATIVE_INFINITY;
+    this.#flowsByPair = new Map();
     this.#candles = new Map();
     this.#positions = new Map();
+    this.#positionPairsByOwner = new Map();
     this.#poolStates = new Map();
     this.#poolBins = new Map();
+    this.#poolBinsByNumericId = new Map();
     this.#lastChangedPoolUpdates = [];
     this.#partialEventCount = 0;
     this.#missingPriceTokens = new Set();
@@ -693,8 +812,13 @@ export class AnalyticsEngine {
       updatedAtBlockHash: blockHash,
       updatedAtTimestamp: timestamp
     };
+    if (current === undefined) insertSortedUnique(this.#sortedPairKeys, identity.pair);
+    this.#minimumPairTimestamps.set(
+      identity.pair,
+      Math.min(this.#minimumPairTimestamps.get(identity.pair) ?? timestamp, timestamp)
+    );
     this.#pairs.set(identity.pair, pair);
-    this.#pairSnapshots.push(pair);
+    this.#indexPairState(pair);
     this.#recordPartial(pair.missingPriceTokens);
     return pair;
   }
@@ -742,13 +866,19 @@ export class AnalyticsEngine {
 
     const previousBins = this.#poolBins.get(pair.pair) ?? new Map<string, PoolBinState>();
     const bins = observation.replaceBinWindow ? new Map<string, PoolBinState>() : previousBins;
+    const previousNumericBins = this.#poolBinsByNumericId.get(pair.pair) ?? new Map<bigint, Map<string, PoolBinState>>();
+    const numericBins = observation.replaceBinWindow
+      ? new Map<bigint, Map<string, PoolBinState>>()
+      : previousNumericBins;
     this.#poolBins.set(pair.pair, bins);
+    this.#poolBinsByNumericId.set(pair.pair, numericBins);
     const binReplacements: PoolBinState[] = [];
     for (const snapshot of observation.binUpdates) {
       const current = previousBins.get(snapshot.binId);
       if (current !== undefined && samePoolBinSnapshot(current, snapshot)) {
         if (observation.replaceBinWindow) {
           bins.set(current.binId, current);
+          indexPoolBin(numericBins, current);
           binReplacements.push(current);
         }
         continue;
@@ -763,6 +893,7 @@ export class AnalyticsEngine {
         revision: (current?.revision ?? 0) + 1
       };
       bins.set(replacement.binId, replacement);
+      indexPoolBin(numericBins, replacement);
       binReplacements.push(replacement);
     }
 
@@ -800,7 +931,8 @@ export class AnalyticsEngine {
       lpNetSwapFees?.missingPriceTokens ?? new Set(),
       pair.missingPriceTokens
     );
-    this.#flows.push({
+    const flows = this.#flowsByPair.get(pair.pair) ?? [];
+    insertFlowSorted(flows, {
       pair: pair.pair,
       timestamp,
       volumeUsdE18: volume.totalUsdE18,
@@ -810,6 +942,7 @@ export class AnalyticsEngine {
       feeBreakdownComplete,
       missingPriceTokens: missing
     });
+    this.#flowsByPair.set(pair.pair, flows);
     this.#recordPartial(missing, !feeBreakdownComplete);
 
     const candle = this.#getCandle(pair, "minute", blockNumber, blockHash, timestamp);
@@ -946,6 +1079,7 @@ export class AnalyticsEngine {
     if (!position) {
       position = { owner, ...normalizePair(event), bins: new Map() };
       this.#positions.set(key, position);
+      this.#indexPosition(owner, pair);
     }
 
     for (const change of event.bins) {
@@ -983,48 +1117,16 @@ export class AnalyticsEngine {
   #applyPositionSnapshot(event: PositionSnapshotEvent, blockNumber: bigint, timestamp: number): void {
     const owner = normalize(event.owner);
     const pair = normalize(event.pair);
-    const key = `${owner}:${pair}`;
-    let position = this.#positions.get(key);
-    if (!position) {
-      position = { owner, ...normalizePair(event), bins: new Map() };
-      this.#positions.set(key, position);
-    }
-
-    const seen = new Set<string>();
-    for (const snapshot of event.bins) {
-      seen.add(snapshot.binId);
-      const hasIndexedHistory = position.bins.has(snapshot.binId);
-      const bin = getOrCreatePositionBin(position, snapshot.binId, null);
-      const value = valueAmounts(event, snapshot.amountX, snapshot.amountY, this.#priceBook, timestamp);
-      if (hasIndexedHistory && bin.liquidity !== snapshot.liquidity) {
-        bin.costBasisUsdE18 = null;
-        this.#recordPartial(new Set(), true);
-      }
-      bin.liquidity = snapshot.liquidity;
-      bin.currentValueUsdE18 = value.totalUsdE18;
-      bin.currentMissingPriceTokens = new Set(value.missingPriceTokens);
-      bin.amountX = snapshot.amountX;
-      bin.amountY = snapshot.amountY;
-      bin.snapshotBlock = blockNumber;
-      bin.snapshotTimestamp = timestamp;
-      this.#recordPartial(value.missingPriceTokens);
-      if (!hasIndexedHistory) this.#recordPartial(new Set(), true);
-    }
-
-    for (const bin of position.bins.values()) {
-      if (!seen.has(bin.binId)) {
-        if (bin.liquidity > 0n) {
-          bin.costBasisUsdE18 = null;
-          this.#recordPartial(new Set(), true);
-        }
-        bin.liquidity = 0n;
-        bin.currentValueUsdE18 = 0n;
-        bin.amountX = 0n;
-        bin.amountY = 0n;
-        bin.snapshotBlock = blockNumber;
-        bin.snapshotTimestamp = timestamp;
-      }
-    }
+    const existed = this.#positions.has(`${owner}:${pair}`);
+    applyPositionSnapshotToPositions(
+      this.#positions,
+      event,
+      blockNumber,
+      timestamp,
+      this.#priceBook,
+      (missing, force) => this.#recordPartial(missing, force)
+    );
+    if (!existed) this.#indexPosition(owner, pair);
   }
 
   #applyPositionTransfer(event: PositionTransferEvent): void {
@@ -1061,11 +1163,20 @@ export class AnalyticsEngine {
       addAll(toBin.historyMissingPriceTokens, fromBin.historyMissingPriceTokens);
       if (transferredBasis === null) this.#recordPartial(new Set(), true);
     }
+    this.#indexPosition(from, identity.pair);
+    this.#indexPosition(to, identity.pair);
   }
 
   #poolMetrics(pair: PairState, asOfTimestamp: number): PoolMetrics {
     const cutoff = asOfTimestamp - DAY_SECONDS;
-    const flows = this.#flows.filter((flow) => flow.pair === pair.pair && flow.timestamp > cutoff && flow.timestamp <= asOfTimestamp);
+    const pairFlows = this.#flowsByPair.get(pair.pair) ?? [];
+    const firstFlow = upperBoundFlowTimestamp(pairFlows, cutoff);
+    const afterLastFlow = upperBoundFlowTimestamp(pairFlows, asOfTimestamp);
+    const flows: FlowRow[] = [];
+    for (let index = firstFlow; index < afterLastFlow; index += 1) {
+      this.#queryInstrumentation?.onFlowRowRead?.(pair.pair);
+      flows.push(pairFlows[index]!);
+    }
     const valuation = valueAmounts(pair, pair.reserveX, pair.reserveY, this.#priceBook, asOfTimestamp);
     const price = this.#priceBook.get(pair.tokenX, asOfTimestamp);
     const missing = union(
@@ -1126,11 +1237,48 @@ export class AnalyticsEngine {
   }
 
   #pairStateAt(pairId: string, timestamp: number): PairState | null {
-    for (let index = this.#pairSnapshots.length - 1; index >= 0; index -= 1) {
-      const snapshot = this.#pairSnapshots[index];
-      if (snapshot.pair === pairId && snapshot.updatedAtTimestamp <= timestamp) return snapshot;
+    const snapshots = this.#pairSnapshotsByPair.get(pairId) ?? [];
+    let low = 0;
+    let high = snapshots.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      this.#queryInstrumentation?.onPairStateRead?.(pairId);
+      if (snapshots[middle]!.state.updatedAtTimestamp <= timestamp) low = middle + 1;
+      else high = middle;
     }
-    return null;
+    return low === 0 ? null : snapshots[low - 1]!.prefixBest;
+  }
+
+  #indexPairState(state: PairState): void {
+    const snapshots = this.#pairSnapshotsByPair.get(state.pair) ?? [];
+    const canonicalOrdinal = this.#nextPairSnapshotOrdinal;
+    this.#nextPairSnapshotOrdinal += 1;
+    const insertionIndex = upperBoundPairSnapshotTimestamp(snapshots, state.updatedAtTimestamp);
+    snapshots.splice(insertionIndex, 0, {
+      state,
+      canonicalOrdinal,
+      prefixBest: state,
+      prefixBestOrdinal: canonicalOrdinal
+    });
+    for (let index = insertionIndex; index < snapshots.length; index += 1) {
+      const entry = snapshots[index]!;
+      const previous = snapshots[index - 1];
+      if (previous !== undefined && previous.prefixBestOrdinal > entry.canonicalOrdinal) {
+        entry.prefixBest = previous.prefixBest;
+        entry.prefixBestOrdinal = previous.prefixBestOrdinal;
+      } else {
+        entry.prefixBest = entry.state;
+        entry.prefixBestOrdinal = entry.canonicalOrdinal;
+      }
+    }
+    this.#pairSnapshotsByPair.set(state.pair, snapshots);
+    this.#maximumPairTimestamp = Math.max(this.#maximumPairTimestamp, state.updatedAtTimestamp);
+  }
+
+  #indexPosition(owner: string, pair: string): void {
+    const pairs = this.#positionPairsByOwner.get(owner) ?? [];
+    insertSortedUnique(pairs, pair);
+    this.#positionPairsByOwner.set(owner, pairs);
   }
 
   #recordPartial(tokens: Set<string>, force = false): void {
@@ -1198,6 +1346,50 @@ function sortedPoolBins(bins: Map<string, PoolBinState> | undefined): PoolBinSta
   return bins === undefined ? [] : [...bins.values()].sort(comparePoolBins);
 }
 
+function indexPoolBin(
+  bins: Map<bigint, Map<string, PoolBinState>>,
+  bin: PoolBinState
+): void {
+  const id = BigInt(bin.binId);
+  const matches = bins.get(id) ?? new Map<string, PoolBinState>();
+  matches.set(bin.binId, bin);
+  bins.set(id, matches);
+}
+
+function upperBoundPairSnapshotTimestamp(
+  snapshots: readonly PairSnapshotIndexEntry[],
+  timestamp: number
+): number {
+  let low = 0;
+  let high = snapshots.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (snapshots[middle]!.state.updatedAtTimestamp <= timestamp) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function upperBoundFlowTimestamp(flows: readonly FlowRow[], timestamp: number): number {
+  let low = 0;
+  let high = flows.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (flows[middle]!.timestamp <= timestamp) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function insertFlowSorted(flows: FlowRow[], flow: FlowRow): void {
+  const last = flows.at(-1);
+  if (last === undefined || last.timestamp <= flow.timestamp) {
+    flows.push(flow);
+    return;
+  }
+  flows.splice(upperBoundFlowTimestamp(flows, flow.timestamp), 0, flow);
+}
+
 function comparePoolBins(left: PoolBinSnapshot, right: PoolBinSnapshot): number {
   const leftId = BigInt(left.binId);
   const rightId = BigInt(right.binId);
@@ -1237,6 +1429,76 @@ function getOrCreateWalletPairPosition(
     positions.set(key, position);
   }
   return position;
+}
+
+function cloneMutableWalletPairPosition(position: MutableWalletPairPosition): MutableWalletPairPosition {
+  return {
+    ...position,
+    bins: new Map(
+      [...position.bins].map(([binId, bin]) => [
+        binId,
+        {
+          ...bin,
+          historyMissingPriceTokens: new Set(bin.historyMissingPriceTokens),
+          currentMissingPriceTokens: new Set(bin.currentMissingPriceTokens)
+        }
+      ])
+    )
+  };
+}
+
+function applyPositionSnapshotToPositions(
+  positions: Map<string, MutableWalletPairPosition>,
+  event: PositionSnapshotEvent,
+  blockNumber: bigint,
+  timestamp: number,
+  prices: TrustedPriceBook,
+  recordPartial: (missingPriceTokens: Set<string>, force?: boolean) => void
+): void {
+  const owner = normalize(event.owner);
+  const pair = normalize(event.pair);
+  const key = `${owner}:${pair}`;
+  let position = positions.get(key);
+  if (!position) {
+    position = { owner, ...normalizePair(event), bins: new Map() };
+    positions.set(key, position);
+  }
+
+  const seen = new Set<string>();
+  for (const snapshot of event.bins) {
+    seen.add(snapshot.binId);
+    const hasIndexedHistory = position.bins.has(snapshot.binId);
+    const bin = getOrCreatePositionBin(position, snapshot.binId, null);
+    const value = valueAmounts(event, snapshot.amountX, snapshot.amountY, prices, timestamp);
+    if (hasIndexedHistory && bin.liquidity !== snapshot.liquidity) {
+      bin.costBasisUsdE18 = null;
+      recordPartial(new Set(), true);
+    }
+    bin.liquidity = snapshot.liquidity;
+    bin.currentValueUsdE18 = value.totalUsdE18;
+    bin.currentMissingPriceTokens = new Set(value.missingPriceTokens);
+    bin.amountX = snapshot.amountX;
+    bin.amountY = snapshot.amountY;
+    bin.snapshotBlock = blockNumber;
+    bin.snapshotTimestamp = timestamp;
+    recordPartial(value.missingPriceTokens);
+    if (!hasIndexedHistory) recordPartial(new Set(), true);
+  }
+
+  for (const bin of position.bins.values()) {
+    if (!seen.has(bin.binId)) {
+      if (bin.liquidity > 0n) {
+        bin.costBasisUsdE18 = null;
+        recordPartial(new Set(), true);
+      }
+      bin.liquidity = 0n;
+      bin.currentValueUsdE18 = 0n;
+      bin.amountX = 0n;
+      bin.amountY = 0n;
+      bin.snapshotBlock = blockNumber;
+      bin.snapshotTimestamp = timestamp;
+    }
+  }
 }
 
 function getOrCreatePositionBin(
@@ -1498,10 +1760,7 @@ function paginate<T>(
   snapshotId: string,
   partial: boolean
 ): Connection<T> {
-  if (!Number.isSafeInteger(first) || first <= 0 || first > MAX_PAGE_SIZE) {
-    throw new Error(`first must be between 1 and ${MAX_PAGE_SIZE}`);
-  }
-  const offset = decodeCursor(after, snapshotId);
+  const offset = validatePaginationInput(first, after, snapshotId);
   const nodes = rows.slice(offset, offset + first);
   const endOffset = offset + nodes.length;
   return {
@@ -1512,6 +1771,72 @@ function paginate<T>(
       partial
     }
   };
+}
+
+function paginateKeys<T>(
+  keys: readonly string[],
+  first: number,
+  after: string | null | undefined,
+  snapshotId: string,
+  partial: boolean,
+  materialize: (key: string) => T
+): Connection<T> {
+  const offset = validatePaginationInput(first, after, snapshotId);
+  const selectedKeys = keys.slice(offset, offset + first);
+  const nodes = selectedKeys.map(materialize);
+  const endOffset = offset + nodes.length;
+  return {
+    nodes,
+    pageInfo: {
+      endCursor: nodes.length === 0 ? null : encodeCursor(endOffset, snapshotId),
+      hasNextPage: endOffset < keys.length,
+      partial
+    }
+  };
+}
+
+function validatePaginationInput(
+  first: number,
+  after: string | null | undefined,
+  snapshotId: string
+): number {
+  if (!Number.isSafeInteger(first) || first <= 0 || first > MAX_PAGE_SIZE) {
+    throw new Error(`first must be between 1 and ${MAX_PAGE_SIZE}`);
+  }
+  return decodeCursor(after, snapshotId);
+}
+
+function insertSortedUnique(values: string[], value: string): void {
+  let low = 0;
+  let high = values.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (values[middle]!.localeCompare(value) < 0) low = middle + 1;
+    else high = middle;
+  }
+  if (values[low] !== value) values.splice(low, 0, value);
+}
+
+function mergeSortedUnique(left: readonly string[], right: readonly string[]): string[] {
+  const result: string[] = [];
+  let leftIndex = 0;
+  let rightIndex = 0;
+  while (leftIndex < left.length || rightIndex < right.length) {
+    const leftValue = left[leftIndex];
+    const rightValue = right[rightIndex];
+    if (rightValue === undefined || (leftValue !== undefined && leftValue.localeCompare(rightValue) < 0)) {
+      result.push(leftValue!);
+      leftIndex += 1;
+    } else if (leftValue === undefined || rightValue.localeCompare(leftValue) < 0) {
+      result.push(rightValue);
+      rightIndex += 1;
+    } else {
+      result.push(leftValue);
+      leftIndex += 1;
+      rightIndex += 1;
+    }
+  }
+  return result;
 }
 
 function encodeCursor(offset: number, snapshotId: string): string {

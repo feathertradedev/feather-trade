@@ -51,6 +51,13 @@ test("serves GraphQL CORS only to exact configured browser origins", async () =>
     assert.equal(disallowed.status, 403);
     assert.equal(disallowed.headers.get("access-control-allow-origin"), null);
 
+    const disallowedPost = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://evil.example.com" },
+      body: JSON.stringify({ query: "{ analyticsHealth { status } }" })
+    });
+    assert.equal(disallowedPost.status, 403, "a forbidden Origin must be rejected, not merely denied ACAO");
+
     const query = await fetch(endpoint, {
       method: "POST",
       headers: { "content-type": "application/json", origin: "https://app.testnet.example.com" },
@@ -58,6 +65,153 @@ test("serves GraphQL CORS only to exact configured browser origins", async () =>
     });
     assert.equal(query.status, 200);
     assert.equal(query.headers.get("access-control-allow-origin"), "https://app.testnet.example.com");
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("rejects abusive GraphQL envelopes before resolver or provider work", async () => {
+  let providerCalls = 0;
+  const service = await AnalyticsApiService.create({
+    engine: new AnalyticsEngine(policies),
+    positionSnapshotProvider: {
+      load: async () => {
+        providerCalls += 1;
+        return [];
+      }
+    }
+  });
+  const server = await startAnalyticsHttpServer({ service, host: "127.0.0.1", port: 0 });
+  try {
+    const address = server.address();
+    assert(address && typeof address === "object");
+    const endpoint = `http://127.0.0.1:${address.port}/graphql`;
+    const wrongType = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body: JSON.stringify({ query: "{ analyticsHealth { status } }" })
+    });
+    assert.equal(wrongType.status, 415);
+
+    const oversized = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ query: `${"#".repeat(66_000)}\n{ analyticsHealth { status } }` })
+    });
+    assert.equal(oversized.status, 413);
+
+    const aliases = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        query: `query Positions($owner: ID!) {
+          ...FirstPositions
+          ...SecondPositions
+        }
+        fragment FirstPositions on Query {
+          first: walletPositions(owner: $owner, first: 1) { nodes { owner } }
+        }
+        fragment SecondPositions on Query {
+          second: walletPositions(owner: $owner, first: 1) { nodes { owner } }
+        }`,
+        variables: { owner: OWNER }
+      })
+    });
+    assert.equal(aliases.status, 400);
+    assert.match(await aliases.text(), /walletPositions may be selected only once/);
+
+    const invalidWallet = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        query: "query($owner: ID!) { walletPositions(owner: $owner, first: 1) { nodes { owner } } }",
+        variables: { owner: "not-an-address" }
+      })
+    });
+    assert.equal(invalidWallet.status, 400);
+    assert.match(await invalidWallet.text(), /canonical EVM address/);
+    assert.equal(providerCalls, 0);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("rate-limits one GraphQL client without starving others or growing an IP-churn table", async () => {
+  const service = await AnalyticsApiService.create({ engine: new AnalyticsEngine(policies) });
+  const server = await startAnalyticsHttpServer({
+    service,
+    host: "127.0.0.1",
+    port: 0,
+    trustProxy: true,
+    graphqlRequestsPerMinute: 2,
+    graphqlRateLimitClients: 2
+  });
+  try {
+    const address = server.address();
+    assert(address && typeof address === "object");
+    const endpoint = `http://127.0.0.1:${address.port}/graphql`;
+    const request = (client: string) => fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-forwarded-for": client },
+      body: JSON.stringify({ query: "{ analyticsHealth { status } }" })
+    });
+
+    assert.equal((await request("198.51.100.1")).status, 200);
+    assert.equal((await request("198.51.100.1")).status, 200);
+    const limited = await request("198.51.100.1");
+    assert.equal(limited.status, 429);
+    const retryAfter = Number(limited.headers.get("retry-after"));
+    assert(Number.isSafeInteger(retryAfter) && retryAfter >= 1 && retryAfter <= 30);
+    assert.equal((await request("198.51.100.2")).status, 200, "another client retains its own fair bucket");
+
+    assert.equal((await request("198.51.100.3")).status, 200);
+    assert.equal((await request("198.51.100.4")).status, 200);
+    assert.equal(
+      (await request("198.51.100.5")).status,
+      429,
+      "clients beyond the bounded identity table share a rate-limited overflow bucket"
+    );
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("serves infrastructure liveness and readiness independently of analytics health", async () => {
+  const service = await AnalyticsApiService.create({ engine: new AnalyticsEngine(policies) });
+  let live = true;
+  let ready = false;
+  const server = await startAnalyticsHttpServer({
+    service,
+    host: "127.0.0.1",
+    port: 0,
+    livenessProbe: () => live,
+    readinessProbe: async () => ready
+  });
+  try {
+    const address = server.address();
+    assert(address && typeof address === "object");
+    const base = `http://127.0.0.1:${address.port}`;
+
+    const initialLive = await fetch(`${base}/livez`);
+    assert.equal(initialLive.status, 200);
+    assert.deepEqual(await initialLive.json(), { status: "live" });
+    const initialReady = await fetch(`${base}/readyz`);
+    assert.equal(initialReady.status, 503);
+    assert.deepEqual(await initialReady.json(), { status: "unavailable" });
+
+    ready = true;
+    const recovered = await fetch(`${base}/readyz`);
+    assert.equal(recovered.status, 200);
+    assert.deepEqual(await recovered.json(), { status: "ready" });
+
+    live = false;
+    const failedLive = await fetch(`${base}/livez`);
+    assert.equal(failedLive.status, 503);
+    assert.deepEqual(await failedLive.json(), { status: "unavailable" });
+
+    const invalidMethod = await fetch(`${base}/readyz`, { method: "POST" });
+    assert.equal(invalidMethod.status, 405);
+    assert.deepEqual(await invalidMethod.json(), { status: "unavailable" });
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
@@ -139,7 +293,7 @@ test("GraphQL/SSE emits multiple open 1m revisions then finalizes and opens acro
 const PAIR = "0xpair";
 const TOKEN_X = "0xtokenx";
 const TOKEN_Y = "0xtokeny";
-const OWNER = "0xowner";
+const OWNER = "0x0000000000000000000000000000000000000a11";
 const UNIT = 10n ** 18n;
 
 const policies: PricePolicy[] = [
@@ -578,6 +732,49 @@ test("materializes canonical pool state with bounded bins and sparse absolute re
   assert.throws(() => engine.queryPoolState({ pair: PAIR, radius: 101 }), /between 0 and 100/);
 });
 
+test("looks up only the bounded pool-bin radius instead of sorting the retained bin set", () => {
+  const lookups: string[] = [];
+  const engine = new AnalyticsEngine(policies, {
+    assumeCompleteHistory: true,
+    queryInstrumentation: {
+      onPoolBinLookup: (_pair, binId) => lookups.push(binId)
+    }
+  });
+  const activeId = 8_388_608;
+  const bins = Array.from({ length: 4_001 }, (_, offset) =>
+    poolBin(activeId - 2_000 + offset, BigInt(offset), 0n, BigInt(offset + 1))
+  );
+  engine.ingestBlock({
+    ...block(1n, "0xce", "0x00", 1_000, [poolObservation({
+      sourceId: "snapshot:scale",
+      sourceEventIds: ["snapshot:scale"],
+      activeId,
+      marketPriceQuoteE18: USD_SCALE,
+      bins,
+      replaceBinWindow: true
+    })], [
+      price(TOKEN_X, "x-usd", USD_SCALE, 1_000, 1n),
+      price(TOKEN_Y, "y-usd", USD_SCALE, 1_000, 1n)
+    ]),
+    chainId: 31_337
+  });
+
+  const center = engine.queryPoolState({ pair: PAIR, radius: 0 });
+  assert.deepEqual(center?.bins.map((bin) => bin.binId), [String(activeId)]);
+  assert.deepEqual(lookups, [String(activeId)], "radius zero performs exactly one indexed lookup");
+
+  lookups.length = 0;
+  const window = engine.queryPoolState({ pair: PAIR, radius: 2 });
+  assert.deepEqual(window?.bins.map((bin) => bin.binId), [
+    String(activeId - 2),
+    String(activeId - 1),
+    String(activeId),
+    String(activeId + 1),
+    String(activeId + 2)
+  ]);
+  assert.equal(lookups.length, 5, "work is bounded by the requested radius, not retained history");
+});
+
 test("deduplicates canonical event sources and rejects source or block payload conflicts", () => {
   const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
   const sourcedSwap = {
@@ -885,6 +1082,144 @@ test("uses stable cursors and enforces the 100-row query limit", () => {
   );
 });
 
+test("paginates stable pool keys before reading pair histories and flows", () => {
+  const pairKeyReads: string[] = [];
+  const pairStateReads: string[] = [];
+  const flowReads: string[] = [];
+  const engine = new AnalyticsEngine(policies, {
+    assumeCompleteHistory: true,
+    queryInstrumentation: {
+      onPairKeyRead: (pair) => pairKeyReads.push(pair),
+      onPairStateRead: (pair) => pairStateReads.push(pair),
+      onFlowRowRead: (pair) => flowReads.push(pair)
+    }
+  });
+  const pairs = Array.from({ length: 128 }, (_, index) => `0xscale${index.toString().padStart(3, "0")}`);
+  for (let height = 1; height <= 4; height += 1) {
+    const parentHash = height === 1 ? "0x00" : `0x${(height - 1).toString(16).padStart(2, "0")}`;
+    const hash = `0x${height.toString(16).padStart(2, "0")}` as `0x${string}`;
+    engine.ingestBlock(block(
+      BigInt(height),
+      hash,
+      parentHash as `0x${string}`,
+      10_000 + height,
+      pairs.map((pair) => ({ ...swap(UNIT, 0n, 0n, 0n), pair })),
+      height === 1
+        ? [
+            price(TOKEN_X, "x-usd", USD_SCALE, 10_001, 1n),
+            price(TOKEN_Y, "y-usd", USD_SCALE, 10_001, 1n)
+          ]
+        : []
+    ));
+  }
+
+  assert.throws(
+    () => engine.queryPoolMetrics({ first: 0, asOfTimestamp: 0 }),
+    /first must be between 1 and 100/
+  );
+  assert.deepEqual(pairKeyReads, [], "invalid pagination is rejected before pair-index work");
+  assert.deepEqual(pairStateReads, []);
+  assert.deepEqual(flowReads, []);
+
+  const first = engine.queryPoolMetrics({ first: 1 });
+  assert.deepEqual(first.nodes.map((node) => node.pair), [pairs[0]]);
+  assert.equal(first.pageInfo.hasNextPage, true);
+  assert.deepEqual(pairKeyReads, [], "normal head queries use the already sorted complete key index");
+  assert.deepEqual(new Set(pairStateReads), new Set([pairs[0]]), "unrelated pair histories are not read");
+  assert.deepEqual(new Set(flowReads), new Set([pairs[0]]), "unrelated flow histories are not read");
+  assert.equal(flowReads.length, 4, "only the selected pair's flow rows are aggregated");
+
+  pairStateReads.length = 0;
+  flowReads.length = 0;
+  const second = engine.queryPoolMetrics({ first: 1, after: first.pageInfo.endCursor });
+  assert.deepEqual(second.nodes.map((node) => node.pair), [pairs[1]]);
+  assert.deepEqual(new Set(pairStateReads), new Set([pairs[1]]));
+  assert.deepEqual(new Set(flowReads), new Set([pairs[1]]));
+});
+
+test("indexes positions by owner and materializes only the requested page", () => {
+  const materialized: Array<[string, string]> = [];
+  const engine = new AnalyticsEngine(policies, {
+    assumeCompleteHistory: true,
+    queryInstrumentation: {
+      onWalletPositionMaterialized: (owner, pair) => materialized.push([owner, pair])
+    }
+  });
+  const unrelated = Array.from({ length: 512 }, (_, index) => ({
+    ...liquidity("deposit", [{ binId: "1", liquidityDelta: 1n, amountX: UNIT, amountY: 0n }]),
+    owner: `0x${(index + 1).toString(16).padStart(40, "0")}`,
+    pair: `0xunrelated${index.toString().padStart(3, "0")}`
+  }));
+  const ownerPairs = ["0xowned002", "0xowned000", "0xowned001"];
+  engine.ingestBlock(block(
+    1n,
+    "0xe1",
+    "0x00",
+    20_000,
+    [
+      ...unrelated,
+      ...ownerPairs.map((pair) => ({
+        ...liquidity("deposit", [{ binId: "1", liquidityDelta: 1n, amountX: UNIT, amountY: 0n }]),
+        owner: OWNER,
+        pair
+      }))
+    ],
+    [
+      price(TOKEN_X, "x-usd", USD_SCALE, 20_000, 1n),
+      price(TOKEN_Y, "y-usd", USD_SCALE, 20_000, 1n)
+    ]
+  ));
+
+  const result = engine.queryWalletPositions({ owner: OWNER, first: 1 });
+  assert.deepEqual(result.nodes.map((position) => position.pair), ["0xowned000"]);
+  assert.equal(result.pageInfo.hasNextPage, true);
+  assert.deepEqual(materialized, [[OWNER, "0xowned000"]]);
+});
+
+test("binary-indexes a busy pair's old flows and historical state", () => {
+  let pairStateReads = 0;
+  let flowReads = 0;
+  const engine = new AnalyticsEngine(policies, {
+    assumeCompleteHistory: true,
+    queryInstrumentation: {
+      onPairStateRead: () => { pairStateReads += 1; },
+      onFlowRowRead: () => { flowReads += 1; }
+    }
+  });
+  const oldTimestamp = 1_000;
+  const headTimestamp = oldTimestamp + 24 * 60 * 60 + 100;
+  engine.ingestBlock(block(
+    1n,
+    "0xea",
+    "0x00",
+    oldTimestamp,
+    Array.from({ length: 4_096 }, () => swap(UNIT, 0n, 0n, 0n)),
+    [
+      price(TOKEN_X, "x-usd", USD_SCALE, oldTimestamp, 1n),
+      price(TOKEN_Y, "y-usd", USD_SCALE, oldTimestamp, 1n)
+    ]
+  ));
+  engine.ingestBlock(block(
+    2n,
+    "0xeb",
+    "0xea",
+    headTimestamp,
+    [swap(2n * UNIT, 0n, 0n, 0n), swap(3n * UNIT, 0n, 0n, 0n)],
+    [
+      price(TOKEN_X, "x-usd", USD_SCALE, headTimestamp, 2n),
+      price(TOKEN_Y, "y-usd", USD_SCALE, headTimestamp, 2n)
+    ]
+  ));
+
+  const metrics = engine.queryPoolMetrics({ first: 1 }).nodes[0];
+  assert.equal(metrics.volume24hUsdE18, 5n * USD_SCALE);
+  assert.equal(flowReads, 2, "binary bounds skip the entire out-of-window flow prefix");
+  assert(
+    pairStateReads <= 14,
+    `historical state lookup should be logarithmic, observed ${pairStateReads} probes`
+  );
+});
+
 test("reports partial and capped backfills with resumable cursors", async () => {
   const partialEngine = new AnalyticsEngine(policies);
   const partial = await runBackfill({
@@ -1101,7 +1436,141 @@ test("serves and restores the bounded GraphQL query surface", async () => {
   }
 });
 
-test("retries deferred position snapshots at the new head and serializes checkpoint writes", async () => {
+test("collapses and caches concurrent head-exact position loads without mutating canonical state", async () => {
+  const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  engine.ingestBlock(
+    block(
+      1n,
+      "0x79",
+      "0x00",
+      4_500,
+      [
+        liquidity("deposit", [{ binId: "1", liquidityDelta: 1n, amountX: 10n * UNIT, amountY: 0n }]),
+        { ...identity(), kind: "position-snapshot", owner: OWNER, bins: [{ binId: "1", liquidity: 1n, amountX: 10n * UNIT, amountY: 0n }] }
+      ],
+      [price(TOKEN_X, "x-usd", 2n * USD_SCALE, 4_500, 1n), price(TOKEN_Y, "y-usd", USD_SCALE, 4_500, 1n)]
+    )
+  );
+  let providerCalls = 0;
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const service = await AnalyticsApiService.create({
+    engine,
+    positionSnapshotProvider: {
+      load: async (owner) => {
+        providerCalls += 1;
+        await blocked;
+        return [{
+          ...identity(),
+          kind: "position-snapshot",
+          owner,
+          bins: [{ binId: "1", liquidity: 1n, amountX: 12n * UNIT, amountY: 0n }]
+        }];
+      }
+    }
+  });
+  const before = engine.exportCheckpoint();
+  const first = service.queryWalletPositions({ owner: OWNER.toUpperCase().replace("0X", "0x"), first: 10 });
+  const second = service.queryWalletPositions({ owner: OWNER, first: 10 });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(providerCalls, 1, "identical owner/head requests share one provider load");
+  release();
+  const results = await Promise.all([first, second]);
+  assert.equal(results[0].nodes[0]?.currentValueUsdE18, 24n * USD_SCALE);
+  assert.equal(results[1].nodes[0]?.currentValueUsdE18, 24n * USD_SCALE);
+
+  const cached = await service.queryWalletPositions({ owner: OWNER, first: 10 });
+  assert.equal(cached.nodes[0]?.currentValueUsdE18, 24n * USD_SCALE);
+  assert.equal(providerCalls, 1, "the short head-exact cache avoids polling amplification");
+  assert.deepEqual(engine.exportCheckpoint(), before, "a public read cannot rewrite the canonical head");
+});
+
+test("times out hung wallet views without detaching provider work or starving health queries", async () => {
+  const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  engine.ingestBlock(
+    block(
+      1n,
+      "0x7a",
+      "0x00",
+      4_600,
+      [pairSnapshot(10n * UNIT, 10n * UNIT)],
+      [price(TOKEN_X, "x-usd", 2n * USD_SCALE, 4_600, 1n), price(TOKEN_Y, "y-usd", USD_SCALE, 4_600, 1n)]
+    )
+  );
+  let providerCalls = 0;
+  const service = await AnalyticsApiService.create({
+    engine,
+    positionSnapshotTimeoutMs: 20,
+    positionSnapshotProvider: {
+      load: async () => {
+        providerCalls += 1;
+        return new Promise<PositionSnapshotEvent[]>(() => undefined);
+      }
+    }
+  });
+  const query = "query($owner: ID!) { walletPositions(owner: $owner, first: 1) { nodes { owner } } }";
+  const walletRequests = Array.from({ length: 40 }, (_, index) =>
+    service.execute(query, {
+      owner: `0x${(index + 100).toString(16).padStart(40, "0")}`
+    })
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(providerCalls, 8, "hung calls retain and cannot exceed the provider executor's active bound");
+
+  const healthStarted = Date.now();
+  const health = await service.execute("{ analyticsHealth { status } }");
+  assert.equal(health.errors, undefined);
+  assert(Date.now() - healthStarted < 500, "wallet response deadlines must release GraphQL execution capacity");
+
+  const walletResults = await Promise.all(walletRequests);
+  assert(walletResults.every((result) =>
+    result.errors?.some((error) => error.message === "Wallet positions are temporarily unavailable")
+  ));
+  assert.equal(providerCalls, 8, "timed-out responses cannot detach and replace hung provider work");
+});
+
+test("redacts provider and RPC failures from public wallet GraphQL errors", async () => {
+  const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  engine.ingestBlock(
+    block(
+      1n,
+      "0x7b",
+      "0x00",
+      4_700,
+      [pairSnapshot(10n * UNIT, 10n * UNIT)],
+      [price(TOKEN_X, "x-usd", 2n * USD_SCALE, 4_700, 1n), price(TOKEN_Y, "y-usd", USD_SCALE, 4_700, 1n)]
+    )
+  );
+  const service = await AnalyticsApiService.create({
+    engine,
+    positionSnapshotProvider: {
+      load: async () => {
+        throw new Error("RPC https://alice:super-secret@rpc.example/?apiKey=credential-value failed");
+      }
+    }
+  });
+  const server = await startAnalyticsHttpServer({ service, host: "127.0.0.1", port: 0 });
+  try {
+    const address = server.address();
+    assert(address && typeof address === "object");
+    const response = await fetch(`http://127.0.0.1:${address.port}/graphql`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        query: "query($owner: ID!) { walletPositions(owner: $owner, first: 1) { nodes { owner } } }",
+        variables: { owner: OWNER }
+      })
+    });
+    assert.equal(response.status, 400);
+    const body = await response.text();
+    assert.match(body, /Wallet positions are temporarily unavailable/);
+    assert.doesNotMatch(body, /alice|super-secret|rpc\.example|apiKey|credential-value/);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("retries deferred position snapshots at the new head without persisting the read-only view", async () => {
   const directory = await mkdtemp(join(tmpdir(), "feather-analytics-race-"));
   try {
     const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
@@ -1170,8 +1639,8 @@ test("retries deferred position snapshots at the new head and serializes checkpo
     const restored = await AnalyticsApiService.create({ engine: new AnalyticsEngine(policies), store, priceVerifier: verifier });
     const restoredPosition = (await restored.queryWalletPositions({ owner: OWNER, first: 10 })).nodes[0];
     assert.equal(restored.getHealth(5_001).headBlock, 2n);
-    assert.equal(restoredPosition.asOfBlock, 2n);
-    assert.equal(restoredPosition.currentValueUsdE18, 24n * USD_SCALE);
+    assert.equal(restoredPosition.asOfBlock, 1n);
+    assert.equal(restoredPosition.currentValueUsdE18, null);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

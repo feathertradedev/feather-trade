@@ -81,6 +81,47 @@ jobs:
       - name: Test protected web promotion workflow
         run: pnpm release:web-promotion:test
 
+      - name: Test VPS deployment validator
+        run: pnpm vps:test
+
+      - name: Validate operator runbooks
+        run: pnpm release:runbooks:validate
+
+      - name: Test operator runbook validator
+        run: pnpm release:runbooks:test
+
+      - name: Test public wallet runtime validation
+        run: pnpm web:test:public-runtime
+
+      - name: Test public artifact security policy
+        run: pnpm web:test:public-artifact
+
+      - name: Validate VPS deployment topology
+        run: pnpm vps:validate
+
+      - name: Parse the pinned Caddy configuration
+        run: |
+          docker run --rm \
+            --env FEATHER_APP_DOMAIN=app.example.invalid \
+            --env FEATHER_DOCS_DOMAIN=docs.example.invalid \
+            --env "FEATHER_APP_CONNECT_SRC='self' https://rpc.example.invalid" \
+            --volume "$PWD/infra/vps/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
+      - name: Resolve the VPS Compose topology
+        env:
+          FEATHER_ANALYTICS_ADAPTERS_DIR: ${{ github.workspace }}/infra/vps
+          FEATHER_ANALYTICS_CONFIG_DIR: ${{ github.workspace }}/infra/vps
+          FEATHER_ANALYTICS_ENV_FILE: ${{ github.workspace }}/infra/vps/analytics.env.example
+          FEATHER_ANALYTICS_IMAGE_DIGEST: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          FEATHER_ANALYTICS_IMAGE_REPOSITORY: ghcr.io/feathertradedev/feather-analytics
+          FEATHER_APP_CONNECT_SRC: "'self' https://rpc.example.invalid"
+          FEATHER_APP_DOMAIN: app.example.invalid
+          FEATHER_DOCS_DOMAIN: docs.example.invalid
+          FEATHER_RELEASES_DIR: ${{ github.workspace }}
+        run: docker compose --file infra/vps/compose.yml config --quiet
+
       - name: Validate token asset references
         run: |
           node <<'NODE'
@@ -201,6 +242,9 @@ jobs:
           ANALYTICS_TEST_DATABASE_URL: postgres://analytics:analytics@127.0.0.1:5432/analytics
         run: pnpm analytics:test
 
+      - name: Build production analytics image
+        run: docker build --file packages/analytics/Dockerfile --tag feather-analytics-ci:${{ github.sha }} .
+
       - name: Typecheck web app
         run: pnpm web:typecheck
 
@@ -252,6 +296,7 @@ jobs:
           ROBINHOOD_TESTNET_ARCHIVE_RPC_URL: public-canary-robinhood-testnet-archive-rpc
           ROBINHOOD_TESTNET_FALLBACK_RPC_URL: public-canary-robinhood-testnet-fallback-rpc
           ROBINHOOD_TESTNET_RPC_URL: public-canary-robinhood-testnet-rpc
+          VITE_REOWN_PROJECT_ID: public_wallet_project_0123456789
         run: |
           mkdir -p .local/public-web
           pnpm web:fixture:public -- --environment robinhoodTestnet --out .local/public-web/robinhood-testnet.latest.json
@@ -274,6 +319,7 @@ jobs:
           ROBINHOOD_TESTNET_ARCHIVE_RPC_URL: public-canary-robinhood-testnet-archive-rpc
           ROBINHOOD_TESTNET_FALLBACK_RPC_URL: public-canary-robinhood-testnet-fallback-rpc
           ROBINHOOD_TESTNET_RPC_URL: public-canary-robinhood-testnet-rpc
+          VITE_REOWN_PROJECT_ID: public_wallet_project_0123456789
         run: |
           mkdir -p .local/public-web
           pnpm web:fixture:public -- --environment robinhood --out .local/public-web/robinhood-mainnet.latest.json

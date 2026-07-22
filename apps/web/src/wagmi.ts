@@ -15,11 +15,15 @@ const walletNetworks = (
       : [localnetChain, robinhoodTestnetChain, robinhoodChain]
 ) as [typeof localnetChain | typeof robinhoodTestnetChain | typeof robinhoodChain, ...Array<typeof localnetChain | typeof robinhoodTestnetChain | typeof robinhoodChain>];
 
-const walletTransports = {
-  [localnetChain.id]: http(registries.localnet.endpoints.rpcUrl),
-  [robinhoodTestnetChain.id]: http(registries.robinhoodTestnet.endpoints.rpcUrl),
-  [robinhoodChain.id]: http(registries.robinhood.endpoints.rpcUrl)
-};
+const walletTransports: Record<number, ReturnType<typeof http>> = publicReleaseEnvironment === "robinhoodTestnet"
+  ? { [robinhoodTestnetChain.id]: http(registries.robinhoodTestnet.endpoints.rpcUrl) }
+  : publicReleaseEnvironment === "robinhood"
+    ? { [robinhoodChain.id]: http(registries.robinhood.endpoints.rpcUrl) }
+    : {
+        [localnetChain.id]: http(registries.localnet.endpoints.rpcUrl),
+        [robinhoodTestnetChain.id]: http(registries.robinhoodTestnet.endpoints.rpcUrl),
+        [robinhoodChain.id]: http(registries.robinhood.endpoints.rpcUrl)
+      };
 
 const wagmiAdapter = reownProjectId
   ? new WagmiAdapter({

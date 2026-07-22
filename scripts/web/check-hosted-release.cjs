@@ -36,17 +36,20 @@ async function main() {
   const timeoutMs = parsePositiveInteger(options.timeoutMs ?? String(DEFAULT_TIMEOUT_MS), "--timeout-ms");
   const errors = [];
   const fetchedText = [];
+  const expectedConnectOrigins = options.manifest
+    ? connectOriginsFromManifest(options.manifest, baseUrl.origin, errors)
+    : [];
 
   const root = await inspectUrl(baseUrl, { allowHttp: options.allowHttp, timeoutMs }, errors);
   if (!root) return finish(errors);
-  validateDocument("root document", root, baseUrl, errors);
+  validateDocument("root document", root, baseUrl, errors, expectedConnectOrigins);
   validateArtifactDigest("root document", root, path.join(dist, "index.html"), errors);
   if (isTextResponse(root)) fetchedText.push([root.url.href, root.body]);
 
   const routeUrl = new URL(`__release-smoke-${crypto.randomBytes(6).toString("hex")}`, baseUrl);
   const route = await inspectUrl(routeUrl, { allowHttp: options.allowHttp, timeoutMs }, errors);
   if (route) {
-    validateDocument("SPA route", route, baseUrl, errors);
+    validateDocument("SPA route", route, baseUrl, errors, expectedConnectOrigins);
     if (isTextResponse(route)) fetchedText.push([route.url.href, route.body]);
     if (root.response.ok && route.response.ok && documentFingerprint(root.body) !== documentFingerprint(route.body)) {
       errors.push("SPA route did not return the deployed index document");
@@ -163,16 +166,16 @@ async function inspectUrl(url, options, errors) {
   return null;
 }
 
-function validateDocument(label, result, baseUrl, errors) {
+function validateDocument(label, result, baseUrl, errors, expectedConnectOrigins = []) {
   if (!result.response.ok) errors.push(`${label} returned HTTP ${result.response.status}`);
   if (result.url.origin !== baseUrl.origin) errors.push(`${label} resolved outside the release origin`);
   const contentType = result.response.headers.get("content-type") ?? "";
   if (!/text\/html/i.test(contentType)) errors.push(`${label} must return text/html, got ${contentType || "<missing>"}`);
-  validateSecurityHeaders(label, result.response.headers, errors);
+  validateSecurityHeaders(label, result.response.headers, errors, expectedConnectOrigins);
   validateDocumentCache(label, result.response.headers, errors);
 }
 
-function validateSecurityHeaders(label, headers, errors) {
+function validateSecurityHeaders(label, headers, errors, expectedConnectOrigins) {
   if ((headers.get("x-content-type-options") ?? "").toLowerCase() !== "nosniff") {
     errors.push(`${label} is missing X-Content-Type-Options: nosniff`);
   }
@@ -197,12 +200,42 @@ function validateSecurityHeaders(label, headers, errors) {
     errors.push(`${label} CSP base-uri must be restricted to 'self' or 'none'`);
   }
   const connectSrc = csp.match(/(?:^|;)\s*connect-src\s+([^;]+)/i)?.[1] ?? "";
-  for (const source of connectSrc.split(/\s+/)) {
+  const connectSources = connectSrc.split(/\s+/).filter(Boolean);
+  for (const source of connectSources) {
     if (["http:", "https:", "ws:", "wss:", "*"].includes(source)) {
       errors.push(`${label} CSP connect-src contains broad source ${source}`);
     }
   }
+  for (const origin of expectedConnectOrigins) {
+    if (!connectSources.includes(origin)) {
+      errors.push(`${label} CSP connect-src does not allow sealed manifest origin ${origin}`);
+    }
+  }
   scanForLeakage(`${label} CSP`, csp, errors);
+}
+
+function connectOriginsFromManifest(value, appOrigin, errors) {
+  const manifestPath = path.resolve(value);
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  } catch (error) {
+    errors.push(`sealed manifest could not be read: ${error.message}`);
+    return [];
+  }
+  const origins = new Set();
+  for (const field of ["rpcUrl", "indexerUrl", "apiUrl", "tokenListUrl"]) {
+    const endpoint = manifest?.endpoints?.[field];
+    if (endpoint === null || endpoint === undefined || endpoint === "") continue;
+    try {
+      const url = new URL(endpoint);
+      if (url.protocol !== "https:") throw new Error("must use HTTPS");
+      if (url.origin !== appOrigin) origins.add(url.origin);
+    } catch (error) {
+      errors.push(`sealed manifest endpoints.${field} is invalid: ${error.message}`);
+    }
+  }
+  return [...origins].sort();
 }
 
 function validateCspSources(label, csp, directive, allowed, errors) {
@@ -323,9 +356,9 @@ function parseArgs(args) {
     if (arg === "--") continue;
     if (arg === "--help" || arg === "-h") options.help = true;
     else if (arg === "--allow-http") options.allowHttp = true;
-    else if (arg === "--url" || arg === "--docs-url" || arg === "--timeout-ms" || arg === "--dist") {
+    else if (arg === "--url" || arg === "--docs-url" || arg === "--timeout-ms" || arg === "--dist" || arg === "--manifest") {
       if (!args[index + 1] || args[index + 1].startsWith("--")) throw new Error(`Missing value for ${arg}`);
-      options[arg === "--url" ? "url" : arg === "--docs-url" ? "docsUrl" : arg === "--dist" ? "dist" : "timeoutMs"] = args[++index];
+      options[arg === "--url" ? "url" : arg === "--docs-url" ? "docsUrl" : arg === "--dist" ? "dist" : arg === "--manifest" ? "manifest" : "timeoutMs"] = args[++index];
     } else throw new Error(`Unexpected argument ${arg}`);
   }
   return options;
@@ -339,5 +372,5 @@ function finish(errors, success) {
 }
 
 function printHelp() {
-  console.log(`Usage: node scripts/web/check-hosted-release.cjs --url <https://release.example/> --dist <apps/web/dist> [--docs-url <https://example/docs>] [--timeout-ms 10000]\n\nChecks URL/TLS policy, redirects, SPA fallback, security and cache headers, local artifact digests, same-origin assets, docs routes, and local/dry-run leakage.\n--allow-http is intended only for local fixture tests.`);
+  console.log(`Usage: node scripts/web/check-hosted-release.cjs --url <https://release.example/> --dist <apps/web/dist> [--manifest <manifest.json>] [--docs-url <https://example/docs>] [--timeout-ms 10000]\n\nChecks URL/TLS policy, redirects, SPA fallback, security and cache headers, sealed-manifest CSP origins, local artifact digests, same-origin assets, docs routes, and local/dry-run leakage.\n--allow-http is intended only for local fixture tests.`);
 }

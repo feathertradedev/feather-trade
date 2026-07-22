@@ -100,13 +100,19 @@ jobs:
       - name: Build public artifact once
         shell: bash
         env:
+          DEPLOYED_ORIGIN: ${{ needs.trusted-preflight.outputs.deployed_origin }}
           TARGET_ENVIRONMENT: ${{ inputs.environment }}
           SELECTED_MANIFEST: ${{ inputs.manifest }}
+          VITE_REOWN_PROJECT_ID: ${{ vars.WEB_REOWN_PROJECT_ID }}
         run: |
+          [[ "$VITE_REOWN_PROJECT_ID" =~ ^[A-Za-z0-9_-]{16,128}$ ]] || {
+            echo "::error::repository variable WEB_REOWN_PROJECT_ID is required for the public wallet modal"
+            exit 1
+          }
           if [[ "$TARGET_ENVIRONMENT" == testnet ]]; then
-            VITE_ROBINHOOD_TESTNET_MANIFEST_PATH="$SELECTED_MANIFEST" pnpm web:build:public:testnet
+            VITE_ANALYTICS_ROBINHOOD_TESTNET_URL="$DEPLOYED_ORIGIN/graphql" VITE_ROBINHOOD_TESTNET_MANIFEST_PATH="$SELECTED_MANIFEST" pnpm web:build:public:testnet
           else
-            VITE_ROBINHOOD_MANIFEST_PATH="$SELECTED_MANIFEST" pnpm web:build:public:mainnet
+            VITE_ANALYTICS_ROBINHOOD_URL="$DEPLOYED_ORIGIN/graphql" VITE_ROBINHOOD_MANIFEST_PATH="$SELECTED_MANIFEST" pnpm web:build:public:mainnet
           fi
 
       - name: Validate and seal artifact custody
@@ -172,26 +178,25 @@ jobs:
           IMMUTABLE_COMMIT: ${{ inputs.immutable_commit }}
         run: node scripts/release/web-promotion-custody.cjs verify --environment "$TARGET_ENVIRONMENT" --commit "$IMMUTABLE_COMMIT" --bundle .local/web-promotion/bundle --output .local/web-promotion/verified
 
-      - name: Invoke provider adapter
+      - name: Invoke provider adapter and smoke hosted app/docs
         if: ${{ needs.build.result == 'success' }}
         env:
+          WEB_PROMOTION_ENVIRONMENT: ${{ inputs.environment }}
+          WEB_PROMOTION_COMMIT: ${{ inputs.immutable_commit }}
           WEB_PROMOTION_ARTIFACT: .local/web-promotion/verified/dist
           WEB_PROMOTION_MANIFEST: .local/web-promotion/verified/manifest.json
+          WEB_PROMOTION_ARCHIVE: .local/web-promotion/bundle/web-promotion.tar.gz
+          WEB_PROMOTION_CUSTODY: .local/web-promotion/bundle/custody.json
           WEB_PROMOTION_DEPLOYED_URL: ${{ needs.trusted-preflight.outputs.deployed_origin }}
+          WEB_VPS_DEPLOYED_ORIGIN: ${{ secrets.WEB_VPS_DEPLOYED_ORIGIN }}
+          WEB_VPS_DOCS_ORIGIN: ${{ secrets.WEB_VPS_DOCS_ORIGIN }}
+          WEB_VPS_RELEASE_ROOT: ${{ secrets.WEB_VPS_RELEASE_ROOT }}
+          WEB_VPS_SSH_HOST: ${{ secrets.WEB_VPS_SSH_HOST }}
+          WEB_VPS_SSH_KNOWN_HOSTS: ${{ secrets.WEB_VPS_SSH_KNOWN_HOSTS }}
+          WEB_VPS_SSH_PORT: ${{ secrets.WEB_VPS_SSH_PORT }}
+          WEB_VPS_SSH_PRIVATE_KEY: ${{ secrets.WEB_VPS_SSH_PRIVATE_KEY }}
+          WEB_VPS_SSH_USER: ${{ secrets.WEB_VPS_SSH_USER }}
         run: bash scripts/release/promote-web-provider.sh
-
-      - name: Smoke hosted release against sealed artifact
-        if: ${{ needs.build.result == 'success' }}
-        shell: bash
-        env:
-          DEPLOYED_URL: ${{ needs.trusted-preflight.outputs.deployed_origin }}
-          TARGET_ENVIRONMENT: ${{ inputs.environment }}
-        run: |
-          args=(--url "$DEPLOYED_URL" --dist .local/web-promotion/verified/dist)
-          if [[ "$TARGET_ENVIRONMENT" == mainnet ]]; then
-            args+=(--docs-url https://feather.markets/docs)
-          fi
-          node scripts/web/check-hosted-release.cjs "${args[@]}"
 
       - name: Write sanitized promotion and rollback-readiness evidence
         if: always()

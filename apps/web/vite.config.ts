@@ -8,7 +8,7 @@ import rehypeSlug from "rehype-slug";
 import remarkFrontmatter from "remark-frontmatter";
 import remarkGfm from "remark-gfm";
 import remarkMdxFrontmatter from "remark-mdx-frontmatter";
-import { defineConfig, loadEnv } from "vite";
+import { defineConfig, loadEnv, type Plugin } from "vite";
 
 const rootDir = dirname(fileURLToPath(import.meta.url));
 const sdkSrc = resolve(rootDir, "../../packages/sdk/src");
@@ -66,6 +66,7 @@ export default defineConfig(({ mode }) => {
 
   return {
     plugins: [
+      walletVendorBoundaryPlugin(),
       mdx({
         providerImportSource: "@mdx-js/react",
         rehypePlugins: [rehypeSlug],
@@ -108,10 +109,56 @@ export default defineConfig(({ mode }) => {
       strictPort: false
     },
     build: {
-      chunkSizeWarningLimit: 700
+      chunkSizeWarningLimit: 700,
+      rolldownOptions: {
+        output: {
+          codeSplitting: {
+            groups: [
+              {
+                // Keep wallet libraries auditable as vendor code. Some of these
+                // libraries ship inert localhost chain definitions and origin
+                // patterns even when the app is configured for a public chain.
+                name: "wallet-vendor",
+                includeDependenciesRecursively: false,
+                priority: 100,
+                test: isWalletVendorLocalDefaultModule
+              }
+            ]
+          }
+        }
+      }
     }
   };
 });
+
+function isWalletVendorLocalDefaultModule(moduleId: string): boolean {
+  const normalized = moduleId.replaceAll("\\", "/");
+  return (
+    /\/node_modules\/viem\/_esm\/chains\/definitions\//.test(normalized) ||
+    /\/node_modules\/@reown\/appkit-common\/dist\/esm\/src\/utils\/ConstantsUtil\.js$/.test(normalized)
+  );
+}
+
+function walletVendorBoundaryPlugin(): Plugin {
+  return {
+    name: "feather-wallet-vendor-boundary",
+    generateBundle(_outputOptions, bundle) {
+      const walletChunks = Object.values(bundle).filter(
+        (output) => output.type === "chunk" && output.name === "wallet-vendor"
+      );
+      if (walletChunks.length !== 1) {
+        this.error(`Expected exactly one wallet-vendor chunk, received ${walletChunks.length}`);
+      }
+
+      const unexpectedModules = Object.keys(walletChunks[0].modules).filter(
+        (moduleId) => !isWalletVendorLocalDefaultModule(moduleId)
+      );
+      if (unexpectedModules.length > 0) {
+        this.error(`wallet-vendor chunk contains non-approved modules:\n${unexpectedModules.join("\n")}`);
+      }
+    }
+  };
+}
 
 function localnetManifestDefine(path: string | undefined): string {
   if (path === undefined || path.length === 0) return "undefined";
