@@ -10,7 +10,7 @@ import { getAddress, type Address } from "viem";
 
 import type { PoolRow } from "./data";
 
-export type SelectedPoolSource = "localnet-seeded" | "indexed";
+export type SelectedPoolSource = "analytics" | "localnet-seeded" | "indexed";
 export type SelectedPoolTokenSide = "x" | "y";
 
 export type SelectedPoolMessageCode =
@@ -79,7 +79,7 @@ export interface IndexedPoolSelectionInput {
   pool: IndexedPoolSelectionRow | null | undefined;
   registry?: Pick<DexRegistry, "tokens"> | null;
   runtime?: SelectedPoolRuntimeFlags;
-  source: "indexed";
+  source: "analytics" | "indexed";
 }
 
 export type SelectedPoolSelectionInput = LocalnetSeededPoolSelectionInput | IndexedPoolSelectionInput;
@@ -119,7 +119,7 @@ export function buildSelectedPoolDescriptor(input: SelectedPoolSelectionInput): 
   const pool = normalizePoolInput(input, blockers);
 
   appendRuntimeBlockers(input.runtime, blockers);
-  appendIndexerBlockers(input.indexer, blockers);
+  if (input.source === "indexed") appendIndexerBlockers(input.indexer, blockers);
 
   if (pool === null) {
     blockers.push({

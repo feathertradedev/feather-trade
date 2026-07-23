@@ -154,6 +154,21 @@ try {
   assertMessage(missingIndexer.blockers, "missing-indexer");
   assertMessage(missingIndexer.blockers, "missing-pool");
 
+  const analyticsWithoutLegacyIndexer = buildSelectedPoolDescriptor({
+    action: "add-liquidity",
+    indexer: {
+      unavailable: true,
+      unavailableMessage: "Indexer endpoint is not configured for this environment yet."
+    },
+    pool: indexedPool,
+    registry: robinhoodRegistry,
+    runtime: { actualChainId: 4_663, expectedChainId: 4_663, status: "ready" },
+    source: "analytics"
+  });
+  assert.equal(analyticsWithoutLegacyIndexer.ready, true);
+  assert.equal(analyticsWithoutLegacyIndexer.source, "analytics");
+  assert.deepEqual(analyticsWithoutLegacyIndexer.blockers, []);
+
   const emptyIndexedPools = buildSelectedPoolDescriptor({
     indexer: {
       empty: true,
@@ -350,7 +365,7 @@ try {
   assertMessage(liquidityBlocked.blockers, "unsupported-token-action", { action: "add-liquidity", side: "x" });
 
   console.log(
-    "Pool selection fixture passed: explicit localnet seeded descriptor, indexed Robinhood-style descriptor, missing pool/indexer states, metadata warning/blocker behavior, stale/partial indexer blockers, and action-specific token blockers."
+    "Pool selection fixture passed: explicit localnet seeded descriptor, analytics and indexed descriptors, missing pool/indexer states, metadata warning/blocker behavior, stale/partial indexer blockers, and action-specific token blockers."
   );
 } finally {
   await server.close();

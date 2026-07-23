@@ -3480,6 +3480,10 @@ function buildPoolDescriptor({
 }: BuildPoolDescriptorInput): SelectedPoolDescriptor {
   const indexerStatus = snapshot?.indexer.status;
   const runtime = selectedPoolRuntimeFlags(snapshot, registry.chainId);
+  const poolSource =
+    registry.endpoints.indexerUrl === null && analyticsEndpointForRegistry(registry) !== null
+      ? "analytics"
+      : "indexed";
   const indexer = {
     empty: indexerStatus === "empty" && (snapshot?.indexer.pools.length ?? 0) === 0,
     emptyMessage: snapshot?.indexer.message ?? "No indexed pools are available yet",
@@ -3500,7 +3504,7 @@ function buildPoolDescriptor({
       pool,
       registry,
       runtime,
-      source: "indexed"
+      source: poolSource
     });
   }
 
@@ -3520,7 +3524,7 @@ function buildPoolDescriptor({
     pool: null,
     registry,
     runtime,
-    source: "indexed"
+    source: poolSource
   });
 }
 
