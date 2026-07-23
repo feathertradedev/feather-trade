@@ -14,6 +14,8 @@ import type {
   LiquidityAnalyticsEvent,
   PairIdentity,
   PairSnapshotEvent,
+  PoolActivityConnection,
+  PoolActivityEvent,
   PoolBinSnapshot,
   PoolBinState,
   PoolDiscoveryPool,
@@ -28,6 +30,7 @@ import type {
   PositionTransferEvent,
   PricePolicy,
   SwapAnalyticsEvent,
+  TrustedPairPrice,
   WalletPairPosition
 } from "./types.js";
 
@@ -203,6 +206,7 @@ export class AnalyticsEngine {
   #candles = new Map<string, MutableCandle>();
   #positions = new Map<string, MutableWalletPairPosition>();
   #positionPairsByOwner = new Map<string, string[]>();
+  #poolActivityByPair = new Map<string, PoolActivityEvent[]>();
   #poolStates = new Map<string, PoolState>();
   #poolBins = new Map<string, Map<string, PoolBinState>>();
   #poolBinsByNumericId = new Map<string, Map<bigint, Map<string, PoolBinState>>>();
@@ -459,6 +463,34 @@ export class AnalyticsEngine {
     };
   }
 
+  queryTrustedPairPrice(
+    input: { baseToken: string; quoteToken: string },
+    nowTimestamp = Math.floor(Date.now() / 1_000)
+  ): TrustedPairPrice {
+    const baseToken = canonicalEvmAddress(input.baseToken, "Trusted-price base token");
+    const quoteToken = canonicalEvmAddress(input.quoteToken, "Trusted-price quote token");
+    if (baseToken === quoteToken) throw new Error("Trusted-price tokens must be distinct");
+    const head = this.#blocks.at(-1) ?? null;
+    const base = this.#priceBook.inspect(baseToken, nowTimestamp);
+    const quote = this.#priceBook.inspect(quoteToken, nowTimestamp);
+    const ready = head !== null && base.priceUsdE18 !== null && quote.priceUsdE18 !== null;
+    return {
+      baseToken,
+      quoteToken,
+      quotePerBaseE18: ready ? (base.priceUsdE18! * USD_SCALE) / quote.priceUsdE18! : null,
+      status: ready ? "ready" : head === null ? "unavailable" : "partial",
+      baseSource: base.sample?.source ?? null,
+      quoteSource: quote.sample?.source ?? null,
+      baseObservedAt: base.sample?.observedAt ?? null,
+      quoteObservedAt: quote.sample?.observedAt ?? null,
+      baseAgeSeconds: base.sample === null ? null : Math.max(0, nowTimestamp - base.sample.observedAt),
+      quoteAgeSeconds: quote.sample === null ? null : Math.max(0, nowTimestamp - quote.sample.observedAt),
+      asOfBlock: head?.number ?? null,
+      asOfBlockHash: head?.hash ?? null,
+      asOfTimestamp: head?.timestamp ?? null
+    };
+  }
+
   queryPoolMetrics(input: { first: number; after?: string | null; asOfTimestamp?: number }): Connection<PoolMetrics> {
     const head = this.#blocks.at(-1);
     const asOfTimestamp = input.asOfTimestamp ?? head?.timestamp ?? 0;
@@ -662,6 +694,46 @@ export class AnalyticsEngine {
     });
   }
 
+  queryPoolCatalog(input: { first: number; after?: string | null }): Connection<PoolState> {
+    const head = this.#blocks.at(-1);
+    const keys = this.#sortedPairKeys.filter((pair) => this.#poolStates.has(pair));
+    return paginateKeys(
+      keys,
+      input.first,
+      input.after,
+      head?.hash ?? "empty",
+      this.#backfillStatus !== "complete",
+      (pair) => structuredClone(this.#poolStates.get(pair)!)
+    );
+  }
+
+  queryPoolActivity(input: {
+    pair: string;
+    owner?: string | null;
+    first: number;
+    after?: string | null;
+  }): PoolActivityConnection {
+    const pair = canonicalEvmAddress(input.pair, "Pool activity pair");
+    const owner = input.owner === undefined || input.owner === null
+      ? null
+      : canonicalEvmAddress(input.owner, "Pool activity owner");
+    const head = this.#blocks.at(-1) ?? null;
+    const rows = [...(this.#poolActivityByPair.get(pair) ?? [])]
+      .reverse()
+      .filter((event) => owner === null || event.owner === owner || event.from === owner || event.to === owner);
+    return {
+      ...paginate(
+        rows,
+        input.first,
+        input.after,
+        head?.hash ?? "empty",
+        this.#backfillStatus !== "complete"
+      ),
+      asOfBlock: head?.number ?? null,
+      asOfBlockHash: head?.hash ?? null
+    };
+  }
+
   listPoolStates(): PoolStateSnapshot[] {
     return [...this.#poolStates.values()]
       .sort((left, right) => left.chainId - right.chainId || left.pair.localeCompare(right.pair))
@@ -776,6 +848,7 @@ export class AnalyticsEngine {
     this.#candles = new Map();
     this.#positions = new Map();
     this.#positionPairsByOwner = new Map();
+    this.#poolActivityByPair = new Map();
     this.#poolStates = new Map();
     this.#poolBins = new Map();
     this.#poolBinsByNumericId = new Map();
@@ -843,9 +916,56 @@ export class AnalyticsEngine {
   #applyCanonicalBlock(block: BlockEnvelope): void {
     this.#lastChangedPoolUpdates = [];
     for (const sample of block.prices) this.#priceBook.apply(sample, block.timestamp);
-    for (const event of block.events) {
+    for (const [eventIndex, event] of block.events.entries()) {
+      this.#indexPoolActivity(event, block.number, block.hash, block.timestamp, eventIndex);
       this.#applyEvent(event, block.chainId ?? null, block.number, block.hash, block.timestamp);
     }
+  }
+
+  #indexPoolActivity(
+    event: AnalyticsEvent,
+    blockNumber: bigint,
+    blockHash: Hex,
+    timestamp: number,
+    eventIndex: number
+  ): void {
+    if (event.kind === "pair-snapshot" || event.kind === "position-snapshot") return;
+    const pair = normalize(event.pair);
+    const source = event.source;
+    const binIds = event.kind === "swap"
+      ? []
+      : event.bins.map((bin) => bin.binId);
+    const amountX = event.kind === "swap"
+      ? event.amountInX
+      : event.kind === "position-transfer"
+        ? null
+        : event.bins.reduce((total, bin) => total + bin.amountX, 0n);
+    const amountY = event.kind === "swap"
+      ? event.amountInY
+      : event.kind === "position-transfer"
+        ? null
+        : event.bins.reduce((total, bin) => total + bin.amountY, 0n);
+    const row: PoolActivityEvent = {
+      id: `${blockHash.toLowerCase()}:${source?.eventId ?? eventIndex}`,
+      pair,
+      kind: event.kind,
+      owner: event.kind === "deposit" || event.kind === "withdraw" ? normalize(event.owner) : null,
+      from: event.kind === "position-transfer" ? normalize(event.from) : null,
+      to: event.kind === "position-transfer" ? normalize(event.to) : null,
+      amountX,
+      amountY,
+      binIds,
+      blockNumber,
+      blockHash,
+      transactionHash: source?.transactionHash ?? null,
+      logIndex: source?.logIndex ?? null,
+      sequence: source?.sequence ?? eventIndex,
+      timestamp,
+      revision: 1
+    };
+    const rows = this.#poolActivityByPair.get(pair);
+    if (rows === undefined) this.#poolActivityByPair.set(pair, [row]);
+    else rows.push(row);
   }
 
   #applyEvent(
@@ -942,10 +1062,15 @@ export class AnalyticsEngine {
     const state: PoolState = {
       chainId,
       pair: pair.pair,
+      factoryAddress: pair.factoryAddress ?? null,
       tokenX: pair.tokenX,
       tokenY: pair.tokenY,
       decimalsX: pair.decimalsX,
       decimalsY: pair.decimalsY,
+      createdAtBlock: pair.createdAtBlock ?? null,
+      createdAtBlockHash: pair.createdAtBlockHash ?? null,
+      creationTransactionHash: pair.creationTransactionHash ?? null,
+      creationLogIndex: pair.creationLogIndex ?? null,
       reserveX: pair.reserveX,
       reserveY: pair.reserveY,
       activeId: pair.activeId,
@@ -1508,12 +1633,32 @@ function normalizePair(pair: PairIdentity): PairIdentity {
     tokenX: normalize(pair.tokenX),
     tokenY: normalize(pair.tokenY),
     decimalsX: pair.decimalsX,
-    decimalsY: pair.decimalsY
+    decimalsY: pair.decimalsY,
+    factoryAddress: pair.factoryAddress === undefined || pair.factoryAddress === null
+      ? null
+      : normalize(pair.factoryAddress),
+    createdAtBlock: pair.createdAtBlock ?? null,
+    createdAtBlockHash: pair.createdAtBlockHash ?? null,
+    creationTransactionHash: pair.creationTransactionHash ?? null,
+    creationLogIndex: pair.creationLogIndex ?? null
   };
 }
 
 function samePairIdentity(a: PairIdentity, b: PairIdentity): boolean {
-  return a.pair === b.pair && a.tokenX === b.tokenX && a.tokenY === b.tokenY && a.decimalsX === b.decimalsX && a.decimalsY === b.decimalsY;
+  return a.pair === b.pair &&
+    a.tokenX === b.tokenX &&
+    a.tokenY === b.tokenY &&
+    a.decimalsX === b.decimalsX &&
+    a.decimalsY === b.decimalsY &&
+    compatibleOptionalIdentity(a.factoryAddress, b.factoryAddress) &&
+    compatibleOptionalIdentity(a.createdAtBlock, b.createdAtBlock) &&
+    compatibleOptionalIdentity(a.createdAtBlockHash, b.createdAtBlockHash) &&
+    compatibleOptionalIdentity(a.creationTransactionHash, b.creationTransactionHash) &&
+    compatibleOptionalIdentity(a.creationLogIndex, b.creationLogIndex);
+}
+
+function compatibleOptionalIdentity<T>(left: T | null | undefined, right: T | null | undefined): boolean {
+  return left === null || left === undefined || right === null || right === undefined || left === right;
 }
 
 function getOrCreateWalletPairPosition(

@@ -3,9 +3,14 @@ import { getAddress, isAddressEqual, type Address } from "viem";
 import localnetTokenListJson from "./token-lists/localnet.json" with { type: "json" };
 import robinhoodTokenListJson from "./token-lists/robinhood.json" with { type: "json" };
 import robinhoodTestnetTokenListJson from "./token-lists/robinhood-testnet.json" with { type: "json" };
-import type { LocalnetDeploymentManifest, RobinhoodDeploymentManifest } from "./manifest.js";
+import sepoliaTokenListJson from "./token-lists/sepolia.json" with { type: "json" };
+import type {
+  LocalnetDeploymentManifest,
+  RobinhoodDeploymentManifest,
+  SepoliaDeploymentManifest
+} from "./manifest.js";
 
-export type TokenListEnvironment = "localnet" | "robinhood" | "robinhoodTestnet";
+export type TokenListEnvironment = "localnet" | "robinhood" | "robinhoodTestnet" | "sepolia";
 
 export type TokenTag =
   | "canonical"
@@ -75,6 +80,7 @@ export interface TokenListMapOptions {
 export const localnetTokenListDefinition = localnetTokenListJson as unknown as TokenListDefinition;
 export const robinhoodTokenListDefinition = robinhoodTokenListJson as unknown as TokenListDefinition;
 export const robinhoodTestnetTokenListDefinition = robinhoodTestnetTokenListJson as unknown as TokenListDefinition;
+export const sepoliaTokenListDefinition = sepoliaTokenListJson as unknown as TokenListDefinition;
 
 export const defaultTokenRiskPolicy: TokenRiskPolicy = {
   disabledActions: [],
@@ -84,6 +90,7 @@ export const defaultTokenRiskPolicy: TokenRiskPolicy = {
 
 export const robinhoodTokenList = tokenListToMetadataMap(robinhoodTokenListDefinition);
 export const robinhoodTestnetTokenList = tokenListToMetadataMap(robinhoodTestnetTokenListDefinition);
+export const sepoliaTokenList = tokenListToMetadataMap(sepoliaTokenListDefinition);
 
 export function localnetTokenListFromManifest(manifest: LocalnetDeploymentManifest): TokenMetadataMap {
   return tokenListToMetadataMap(localnetTokenListDefinition, {
@@ -99,6 +106,42 @@ export function robinhoodTokenListFromManifest(manifest: RobinhoodDeploymentMani
   );
 
   return tokenListToMetadataMap({ ...definition, chainId: manifest.chainId, tokens });
+}
+
+export function sepoliaTokenListFromManifest(manifest: SepoliaDeploymentManifest): TokenMetadataMap {
+  const listedWrappedNative = sepoliaTokenListDefinition.tokens.find(isWrappedNativeEntry);
+  if (
+    listedWrappedNative?.address === undefined ||
+    !isAddressEqual(listedWrappedNative.address, manifest.tokens.wrappedNative)
+  ) {
+    throw new Error("Sepolia manifest wrapped native token does not match the canonical WETH allowlist entry");
+  }
+  for (const entry of sepoliaTokenListDefinition.tokens) {
+    if (entry.risk === undefined) {
+      throw new Error(`Sepolia public token ${entry.symbol} requires explicit token-risk policy metadata`);
+    }
+  }
+
+  const tokens = sepoliaTokenListDefinition.tokens.map((entry) =>
+    isWrappedNativeEntry(entry) ? { ...entry, address: manifest.tokens.wrappedNative } : entry
+  );
+  const metadata = tokenListToMetadataMap({ ...sepoliaTokenListDefinition, chainId: manifest.chainId, tokens });
+  const quoteAssets = new Set(
+    Object.values(manifest.quoteAssets)
+      .filter((address) => !isAddressEqual(address, "0x0000000000000000000000000000000000000000"))
+      .map((address) => address.toLowerCase())
+  );
+
+  for (const token of Object.values(metadata)) {
+    if (token.tags.includes("mock")) {
+      throw new Error(`Sepolia public token ${token.symbol} must not be a mock asset`);
+    }
+    if (token.tags.includes("quote") && !quoteAssets.has(token.address.toLowerCase())) {
+      throw new Error(`Sepolia quote token ${token.symbol} is not declared by the deployment manifest`);
+    }
+  }
+
+  return metadata;
 }
 
 export function tokenListToMetadataMap(tokenList: TokenListDefinition, options: TokenListMapOptions = {}): TokenMetadataMap {

@@ -33,6 +33,7 @@ try {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = mockFetch;
   const { loadPaginatedPositionsForOwner } = await server.ssrLoadModule("/src/data.ts");
+  const { deprecatedPoolAddresses, isDeprecatedPool } = await server.ssrLoadModule("/src/pool-release-policy.ts");
   const {
     actionHref,
     buildOwnerLiquidityIndex,
@@ -50,6 +51,10 @@ try {
   } = await server.ssrLoadModule("/src/pool-discovery.ts");
 
   const parsed = parsePoolDiscoveryState("#/pools?q= USDC%20%2F%20WETH &category=stables&sort=updated&direction=asc&minTvl=001&minVolume=10.5000&minFees=0.25&page=3&mine=1&ignored=yes");
+  const deprecatedSepoliaPool = "0x3136C5F3b48fe486c696bEDC031B9cB9D3e9EA62";
+  assert.equal(isDeprecatedPool({ environment: "sepolia", chainId: 11155111 }, deprecatedSepoliaPool), true);
+  assert.deepEqual(deprecatedPoolAddresses({ environment: "sepolia", chainId: 11155111 }), [deprecatedSepoliaPool]);
+  assert.equal(isDeprecatedPool({ environment: "localnet", chainId: 31337 }, deprecatedSepoliaPool), false);
   assert.deepEqual(parsed, {
     query: "USDC / WETH",
     category: "stables",

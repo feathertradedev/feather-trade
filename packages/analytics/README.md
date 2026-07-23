@@ -65,7 +65,7 @@ That checkpoint example is local-development configuration. Outside localnet,
 the CLI requires managed PostgreSQL with exactly `sslmode=verify-full` plus an
 `ANALYTICS_DEPLOYMENT_IDENTITY`, canonical `ANALYTICS_RUNTIME_CUSTODY` inventory,
 and its `ANALYTICS_RUNTIME_CUSTODY_SHA256`. Generate the inventory from the four
-reviewed policy/adapter files with `pnpm analytics:custody:build -- ...` as shown
+reviewed policy/adapter files with `pnpm analytics:custody:build ...` as shown
 in [`infra/vps/README.md`](../../infra/vps/README.md). Production startup verifies
 regular non-symlink files and imports the held, hash-verified module bytes.
 
@@ -117,12 +117,15 @@ required at startup; authenticated `/internal/blocks` is only an additional
 ingestion path.
 
 `ANALYTICS_PRICE_VERIFIER_MODULE` exports `createPriceVerifier()`, returning a
-`PriceSampleVerifier`. The verifier receives the signed Chainlink report and
-must authenticate/decode it with the current Chainlink verifier/SDK; only the
-trusted sample it returns reaches the engine. The service rejects missing,
-forged, or mismatched reports and cannot be bypassed with a caller-provided
-boolean. `fixed-test` pricing is disabled by default. Source/feed/freshness/
-confidence checks are independently enforced inside the replay core.
+`PriceSampleVerifier`. The factory receives the custody-verified price policies.
+For Chainlink Data Streams, the verifier authenticates and decodes the signed
+report. For on-chain Chainlink Data Feeds, the submission carries no signed
+report: the verifier independently reads `latestRoundData()` at the submitted
+canonical block hash and reconstructs the sample. Only the trusted sample it
+returns reaches the engine. The service rejects missing, forged, or mismatched
+evidence and cannot be bypassed with a caller-provided boolean. `fixed-test`
+pricing is disabled by default. Source/feed/freshness/confidence checks are
+independently enforced inside the replay core.
 
 `ANALYTICS_POSITION_SNAPSHOT_MODULE` exports
 `createPositionSnapshotProvider()`. The provider performs a bounded owner query
@@ -131,3 +134,26 @@ service applies those snapshots to an isolated, head-checked response view
 before resolving `walletPositions`; a public read cannot mutate or persist the
 canonical engine state. The provider never enumerates every holder on every
 block.
+
+## Pool workspace data ownership
+
+The VPS deployment has one explicit source of truth per pool-workspace
+dataset. It does not treat the analytics endpoint as a legacy Graph schema:
+
+- `poolCatalog`, `poolState`, `pairCandles`, and `poolActivity` are derived
+  only from retained canonical block envelopes persisted in PostgreSQL.
+- `walletPositions` combines canonical position accounting with a bounded
+  head-exact RPC snapshot in an isolated response view. Current wallet claims
+  never become canonical merely because a browser requested them.
+- `poolActivity(pair, owner, first, after)` returns swaps, liquidity changes,
+  and ERC-1155 position transfers from the retained canonical chain. Each row
+  includes its block hash, transaction/log identity, timestamp, and immutable
+  row revision. Owner filtering matches only the canonical liquidity owner or
+  transfer endpoints; swaps are omitted from owner-filtered results because
+  the indexed Swap event does not identify the initiating wallet.
+- Activity cursors are bound to the canonical head hash. A reorg expires an
+  old cursor and the client refetches the replacement history. The pool
+  workspace polls this bounded connection for live updates; no separate raw
+  indexer is required for activity or position history.
+- DEX Screener enrichment remains presentation-only and is never a source for
+  positions, activity, pricing, TVL, or transaction decisions.

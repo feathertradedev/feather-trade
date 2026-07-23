@@ -14,6 +14,12 @@ const POLICIES: Record<EnvironmentKey, FullExitBatchPolicy> = {
     maxCandidateBins: 48,
     maxProbeCount: 128
   },
+  sepolia: {
+    maxBlockGasBps: 4_000n,
+    maxCalldataBytes: 20_000,
+    maxCandidateBins: 32,
+    maxProbeCount: 128
+  },
   robinhoodTestnet: {
     maxBlockGasBps: 4_000n,
     maxCalldataBytes: 20_000,

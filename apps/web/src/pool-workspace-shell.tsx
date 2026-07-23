@@ -195,12 +195,7 @@ function PoolBinStepSelector({ pool, pools }: { pool: PoolRow; pools: PoolRow[] 
 
 function PoolWorkspaceRail({ mobileWorkspaceNavigation }: { mobileWorkspaceNavigation: boolean }) {
   const workspace = usePoolWorkspace();
-  const marketIdentityAvailable = workspace.liveMarket.value !== null || workspace.economics.value !== null;
-  const metricTiles = workspaceMetricTiles(workspace.analytics.row.metric).map((tile) => !marketIdentityAvailable
-    ? workspace.economics.state === "loading" || workspace.liveMarket.state === "connecting"
-      ? { ...tile, status: "PARTIAL" as const, value: "Loading…" }
-      : { ...tile, status: "UNAVAILABLE" as const, value: "Unavailable" }
-    : tile);
+  const metricTiles = workspaceMetricTiles(workspace.analytics.row.metric);
   const tvl = metricTiles.find((tile) => tile.key === "tvl")!;
   const volume = metricTiles.find((tile) => tile.key === "volume24h")!;
   const fees = metricTiles.find((tile) => tile.key === "lpFees24h")!;
@@ -311,7 +306,7 @@ function PoolWorkspaceRail({ mobileWorkspaceNavigation }: { mobileWorkspaceNavig
         <dl aria-label="Pool analytics">
           <div data-analytics-status={volume.status}><dt>24h volume</dt><dd>{volume.value}</dd></div>
           <div data-analytics-status={fees.status}><dt>24h LP fees</dt><dd>{fees.value}</dd></div>
-          <div data-analytics-status={feeToTvl.status}><dt>24h LP fees / TVL</dt><dd>{feeToTvl.value}</dd></div>
+          <div data-analytics-status={feeToTvl.status} title={feeToTvl.detail ?? undefined}><dt>24h LP fees / TVL</dt><dd>{feeToTvl.value}</dd></div>
         </dl>
         <small className="pool-rail-data-source">Analytics · {metricSourceLabel(workspace.analytics.row.metric)}</small>
       </section>

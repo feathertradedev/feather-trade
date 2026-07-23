@@ -1,4 +1,8 @@
-import type { LocalnetDeploymentManifest, RobinhoodDeploymentManifest } from "@robinhood-lb/sdk/manifest";
+import type {
+  LocalnetDeploymentManifest,
+  RobinhoodDeploymentManifest,
+  SepoliaDeploymentManifest
+} from "@robinhood-lb/sdk/manifest";
 
 export const localnetDefaultManifest = {
   chainId: 31_337,
@@ -211,3 +215,75 @@ export const robinhoodDefaultManifest = {
     routerWNative: "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"
   }
 } as const satisfies RobinhoodDeploymentManifest;
+
+export const sepoliaDefaultManifest = {
+  chainId: 11_155_111,
+  deployer: "0xC1A4747D52CDBAac26294495c6f0be49a0f0DDAA",
+  environment: "sepolia",
+  schemaVersion: "lb.evm.v1",
+  sourceCommit: "8a56eeb49d5413fd7b51d32cdd0b9fc82ffde83d",
+  sourceTreeDirty: true,
+  startBlock: 11_330_230,
+  endpoints: {
+    rpcUrl: "https://ethereum-sepolia-rpc.publicnode.com",
+    indexerUrl: null,
+    apiUrl: null,
+    tokenListUrl: null
+  },
+  chain: {
+    explorerUrl: "https://sepolia.etherscan.io",
+    name: "Ethereum Sepolia",
+    nativeCurrency: "ETH",
+    rpcEnvVar: "SEPOLIA_RPC_URL",
+    verifierUrl: "https://api-sepolia.etherscan.io/api"
+  },
+  contracts: {
+    lbFactory: "0xe521A00F81A60b77Eb39EC2097F94aF532DFb811",
+    lbPairImplementation: "0x82200929c2FFa1b591d01f63d7edD87321202624",
+    lbQuoter: "0x3e347eC5BFe056550BB6956631f6D9617BB8dc4e",
+    lbRouter: "0xF65e2408F167fF6a56F1392bB0bb0DaA06E2E9d6"
+  },
+  ownership: {
+    feeRecipient: "0xC1A4747D52CDBAac26294495c6f0be49a0f0DDAA",
+    initialOwner: "0xC1A4747D52CDBAac26294495c6f0be49a0f0DDAA",
+    lbFactoryOwner: "0xC1A4747D52CDBAac26294495c6f0be49a0f0DDAA"
+  },
+  tokens: {
+    wrappedNative: "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9"
+  },
+  quoteAssets: {
+    extra0: "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+    extra1: "0x0000000000000000000000000000000000000000",
+    extra2: "0x0000000000000000000000000000000000000000",
+    extra3: "0x0000000000000000000000000000000000000000",
+    wrappedNative: "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9"
+  },
+  factoryPreset: {
+    baseFactor: 10_000,
+    binStep: 10,
+    decayPeriod: 600,
+    filterPeriod: 30,
+    maxVolatilityAccumulator: 350_000,
+    open: true,
+    protocolShare: 0,
+    reductionFactor: 5_000,
+    variableFeeControl: 40_000
+  },
+  constructorArgs: {
+    feeRecipient: "0xC1A4747D52CDBAac26294495c6f0be49a0f0DDAA",
+    flashLoanFee: 5_000_000_000_000,
+    initialOwner: "0xC1A4747D52CDBAac26294495c6f0be49a0f0DDAA",
+    quoterFactoryV1: "0x0000000000000000000000000000000000000000",
+    quoterFactoryV2_1: "0x0000000000000000000000000000000000000000",
+    quoterFactoryV2_2: "0xe521A00F81A60b77Eb39EC2097F94aF532DFb811",
+    quoterLegacyFactoryV2: "0x0000000000000000000000000000000000000000",
+    quoterLegacyRouterV2: "0x0000000000000000000000000000000000000000",
+    quoterRouterV2_1: "0x0000000000000000000000000000000000000000",
+    quoterRouterV2_2: "0xF65e2408F167fF6a56F1392bB0bb0DaA06E2E9d6",
+    routerFactoryV1: "0x0000000000000000000000000000000000000000",
+    routerFactoryV2_1: "0x0000000000000000000000000000000000000000",
+    routerLegacyFactoryV2: "0x0000000000000000000000000000000000000000",
+    routerLegacyRouterV2: "0x0000000000000000000000000000000000000000",
+    routerWNative: "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9"
+  }
+} as const satisfies SepoliaDeploymentManifest;

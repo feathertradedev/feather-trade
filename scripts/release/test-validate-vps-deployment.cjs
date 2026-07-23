@@ -15,6 +15,9 @@ const fixtureFiles = [
   "infra/vps/compose.yml",
   "infra/vps/Caddyfile",
   "infra/vps/host.env.example",
+  "infra/vps/compose.web.yml",
+  "infra/vps/Caddyfile.web",
+  "infra/vps/host.web.env.example",
   "infra/vps/analytics.env.example",
   "infra/vps/README.md",
   "scripts/release/build-analytics-runtime-custody.cjs"
@@ -105,6 +108,56 @@ try {
   ));
   expectFailure(temp, /public analytics matcher must contain only/);
   restore(temp, "infra/vps/Caddyfile");
+
+  mutate(temp, "infra/vps/compose.web.yml", (source) => source.replace(/@sha256:[0-9a-f]{64}/i, ":latest"));
+  expectFailure(temp, /web-only Caddy image must use an immutable sha256 digest/);
+  restore(temp, "infra/vps/compose.web.yml");
+
+  mutate(temp, "infra/vps/compose.web.yml", (source) => source.replace(
+    '      - "443:443/udp"',
+    '      - "443:443/udp"\n      - "8787:8787/tcp"'
+  ));
+  expectFailure(temp, /web-only Caddy must publish only/);
+  restore(temp, "infra/vps/compose.web.yml");
+
+  mutate(temp, "infra/vps/compose.web.yml", (source) => source.replace(
+    "  caddy:\n",
+    "  analytics:\n    image: example.invalid/analytics:latest\n\n  caddy:\n"
+  ));
+  expectFailure(temp, /web-only compose services must be exactly caddy/);
+  restore(temp, "infra/vps/compose.web.yml");
+
+  mutate(temp, "infra/vps/compose.web.yml", (source) => source.replace(
+    "        target: /srv/feather/releases\n        read_only: true",
+    "        target: /srv/feather/releases\n        read_only: false"
+  ));
+  expectFailure(temp, /immutable release bind mounts must be read-only/);
+  restore(temp, "infra/vps/compose.web.yml");
+
+  mutate(temp, "infra/vps/Caddyfile.web", (source) => source.replace(
+    "\t\trespond @private 404\n",
+    "\t\treverse_proxy @private analytics:8787\n",
+    ));
+  expectFailure(temp, /must not proxy analytics or any other upstream/);
+  restore(temp, "infra/vps/Caddyfile.web");
+
+  mutate(temp, "infra/vps/Caddyfile.web", (source) => source.replaceAll(" /graphql/*", ""));
+  expectFailure(temp, /reject the complete analytics and private path set/);
+  restore(temp, "infra/vps/Caddyfile.web");
+
+  mutate(temp, "infra/vps/host.web.env.example", (source) => source.replace(
+    "https://ethereum-sepolia-rpc.publicnode.com",
+    "https:"
+  ));
+  expectFailure(temp, /allow only self and the reviewed Sepolia public RPC origin/);
+  restore(temp, "infra/vps/host.web.env.example");
+
+  mutate(temp, "infra/vps/host.web.env.example", (source) => source.replace(
+    "/srv/feather/web/sepolia",
+    "/srv/feather/web/mainnet"
+  ));
+  expectFailure(temp, /web-only release root must be \/srv\/feather\/web\/sepolia/);
+  restore(temp, "infra/vps/host.web.env.example");
 
   mutate(temp, "infra/vps/analytics.env.example", (source) => `${source}\nANALYTICS_STATE_PATH=/var/lib/feather/checkpoint.json\n`);
   expectFailure(temp, /must not enable local checkpoint state/);

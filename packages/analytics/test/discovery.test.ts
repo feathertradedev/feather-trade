@@ -52,6 +52,92 @@ test("pool discovery is bounded, validates canonical unique requests, and omits 
   assert.deepEqual(engine.queryPoolDiscovery({ pools: [{ pair: OTHER_PAIR }] }), []);
 });
 
+test("pool catalog enumerates canonical pool state with factory creation provenance", () => {
+  const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
+  const factory = "0x00000000000000000000000000000000000000f1";
+  const blockHash = `0x${"01".padStart(64, "0")}` as `0x${string}`;
+  const transactionHash = `0x${"ab".repeat(32)}` as `0x${string}`;
+  engine.ingestBlock({
+    chainId: 4663,
+    number: 7n,
+    hash: blockHash,
+    parentHash: "0x00",
+    timestamp: 100,
+    prices: [
+      fixedPrice(TOKEN_X, "x-usd", 2_000n * USD_SCALE, 100, 1n),
+      fixedPrice(TOKEN_Y, "y-usd", USD_SCALE, 100, 1n)
+    ],
+    events: [{
+      ...identity(),
+      factoryAddress: factory,
+      createdAtBlock: 7n,
+      createdAtBlockHash: blockHash,
+      creationTransactionHash: transactionHash,
+      creationLogIndex: 3,
+      kind: "pair-snapshot",
+      source: {
+        eventId: `${blockHash}:pool`,
+        transactionHash: null,
+        logIndex: null,
+        sequence: 0,
+        kind: "block-snapshot"
+      },
+      reserveX: 0n,
+      reserveY: 0n,
+      activeId: 8_388_608,
+      binStep: 10,
+      marketPriceQuoteE18: 2_000n * USD_SCALE,
+      poolState: {
+        feeState: {
+          static: {
+            baseFactor: 1n,
+            filterPeriod: 1n,
+            decayPeriod: 1n,
+            reductionFactor: 1n,
+            variableFeeControl: 1n,
+            protocolShare: 1n,
+            maxVolatilityAccumulator: 1n
+          },
+          variable: {
+            volatilityAccumulator: 0n,
+            volatilityReference: 0n,
+            idReference: 8_388_608n,
+            timeOfLastUpdate: 100n
+          }
+        },
+        binUpdates: [],
+        sourceEventIds: ["created"],
+        replaceBinWindow: true
+      }
+    }]
+  });
+
+  const catalog = engine.queryPoolCatalog({ first: 10 });
+  assert.equal(catalog.nodes.length, 1);
+  assert.equal(catalog.nodes[0]?.factoryAddress, factory);
+  assert.equal(catalog.nodes[0]?.createdAtBlock, 7n);
+  assert.equal(catalog.nodes[0]?.createdAtBlockHash, blockHash);
+  assert.equal(catalog.nodes[0]?.creationTransactionHash, transactionHash);
+  assert.equal(catalog.nodes[0]?.creationLogIndex, 3);
+  assert.equal(catalog.nodes[0]?.tvlUsdE18, 0n);
+  assert.equal(catalog.pageInfo.hasNextPage, false);
+});
+
+test("trusted pair price uses only current trusted token samples and exposes head identity", () => {
+  const engine = seededEngine();
+  const price = engine.queryTrustedPairPrice({ baseToken: TOKEN_X, quoteToken: TOKEN_Y }, 25 * 3_600 + 60);
+  assert.equal(price.status, "ready");
+  assert.equal(price.quotePerBaseE18, 125n * USD_SCALE);
+  assert.equal(price.baseSource, "fixed-test");
+  assert.equal(price.quoteSource, "fixed-test");
+  assert.equal(price.asOfBlock, 25n);
+  assert.equal(price.asOfBlockHash, `0x${"19".padStart(64, "0")}`);
+
+  const stale = engine.queryTrustedPairPrice({ baseToken: TOKEN_X, quoteToken: TOKEN_Y }, 1_000_000);
+  assert.equal(stale.status, "partial");
+  assert.equal(stale.quotePerBaseE18, null);
+});
+
 test("pool discovery uses canonical 24-hour closes, candle orientation, signed change, and metrics", () => {
   const engine = seededEngine();
   const [row] = engine.queryPoolDiscovery({ pools: [{ pair: PAIR, preferredQuoteToken: TOKEN_X }] });

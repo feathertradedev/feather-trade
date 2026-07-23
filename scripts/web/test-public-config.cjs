@@ -63,9 +63,11 @@ function expectFail(name, environment, manifestPath, pattern) {
 }
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "public-web-config-test-"));
+const sepoliaManifestPath = writeFixture(dir, "sepolia");
 const testnetManifestPath = writeFixture(dir, "robinhoodTestnet");
 const mainnetManifestPath = writeFixture(dir, "robinhood");
 
+expectPass("synthetic public Sepolia manifest without an indexer", "sepolia", sepoliaManifestPath);
 expectPass("synthetic public testnet manifest", "robinhoodTestnet", testnetManifestPath);
 expectPass("synthetic public mainnet manifest", "robinhood", mainnetManifestPath);
 
@@ -82,6 +84,20 @@ writeJson(localEndpointPath, {
   }
 });
 expectFail("local RPC endpoint", "robinhoodTestnet", localEndpointPath, /public endpoints must use https|local hosts/i);
+
+const missingSepoliaRpcPath = path.join(dir, "sepolia-missing-rpc.latest.json");
+writeJson(missingSepoliaRpcPath, {
+  ...readJson(sepoliaManifestPath),
+  endpoints: {
+    ...readJson(sepoliaManifestPath).endpoints,
+    rpcUrl: null
+  }
+});
+expectFail("missing Sepolia RPC endpoint", "sepolia", missingSepoliaRpcPath, /rpcUrl.*required for public builds/i);
+
+const wrongSepoliaChainPath = path.join(dir, "sepolia-wrong-chain.latest.json");
+writeJson(wrongSepoliaChainPath, { ...readJson(sepoliaManifestPath), chainId: 1 });
+expectFail("wrong Sepolia chain", "sepolia", wrongSepoliaChainPath, /chainId.*11155111/i);
 
 const anvilOwnerPath = path.join(dir, "anvil-owner.latest.json");
 writeJson(anvilOwnerPath, {
@@ -158,5 +174,13 @@ for (const [name, mutate] of [
   writeJson(retiredZapPath, mutate(readJson(mainnetManifestPath)));
   expectFail(name, "robinhood", retiredZapPath, /on-chain Zap (?:was removed|constructor fields)/i);
 }
+
+const rootPackage = readJson(path.join(repoRoot, "package.json"));
+assert(
+  rootPackage.scripts["web:build:public:sepolia"].includes(
+    'node scripts/evm/validate-manifest.cjs "$VITE_SEPOLIA_MANIFEST_PATH" sepolia 11155111'
+  ),
+  "Sepolia public builds must run the complete generic EVM manifest validator before Vite"
+);
 
 console.log("public web config fixture tests passed");

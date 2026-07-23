@@ -12,17 +12,35 @@ const disabledLegacyRoutingConstructorArgs = [
   "routerLegacyRouterV2"
 ];
 const environmentConfig = {
+  sepolia: {
+    chainId: 11_155_111,
+    manifestEnvironment: "sepolia",
+    manifestEnvVar: "VITE_SEPOLIA_MANIFEST_PATH",
+    requireCanonicalStableQuote: true,
+    requireIndexer: false,
+    schemaVersion: "lb.evm.v1",
+    tokenList: "packages/sdk/src/token-lists/sepolia.json",
+    tokenListEnvironment: "sepolia"
+  },
   robinhoodTestnet: {
     chainId: 46_630,
     manifestEnvironment: "testnet",
     manifestEnvVar: "VITE_ROBINHOOD_TESTNET_MANIFEST_PATH",
-    tokenList: "packages/sdk/src/token-lists/robinhood-testnet.json"
+    requireCanonicalStableQuote: false,
+    requireIndexer: true,
+    schemaVersion: "lb.robinhood.v1",
+    tokenList: "packages/sdk/src/token-lists/robinhood-testnet.json",
+    tokenListEnvironment: "robinhoodTestnet"
   },
   robinhood: {
     chainId: 4_663,
     manifestEnvironment: "mainnet",
     manifestEnvVar: "VITE_ROBINHOOD_MANIFEST_PATH",
-    tokenList: "packages/sdk/src/token-lists/robinhood.json"
+    requireCanonicalStableQuote: true,
+    requireIndexer: true,
+    schemaVersion: "lb.robinhood.v1",
+    tokenList: "packages/sdk/src/token-lists/robinhood.json",
+    tokenListEnvironment: "robinhood"
   }
 };
 const anvilAddresses = new Set([
@@ -92,13 +110,13 @@ function validateManifest(manifest, manifestPath, config, options, errors) {
     errors.push(`${path}: public builds must use a broadcast latest.json or promoted immutable manifest, not dry-run.json`);
   }
 
-  expectEqual(manifest.schemaVersion, "lb.robinhood.v1", `${path}.schemaVersion`, errors);
+  expectEqual(manifest.schemaVersion, config.schemaVersion, `${path}.schemaVersion`, errors);
   expectEqual(manifest.environment, config.manifestEnvironment, `${path}.environment`, errors);
   expectEqual(manifest.chainId, config.chainId, `${path}.chainId`, errors);
   expectInteger(manifest.startBlock, `${path}.startBlock`, errors, { min: 1 });
   for (const field of ["seededPools", "smoke"]) {
     if (Object.prototype.hasOwnProperty.call(manifest, field)) {
-      errors.push(`${path}.${field}: public Robinhood manifests must not include localnet-only ${field}`);
+      errors.push(`${path}.${field}: public manifests must not include localnet-only ${field}`);
     }
   }
   expectAddress(manifest.deployer, `${path}.deployer`, errors, { allowAnvil: false });
@@ -121,7 +139,9 @@ function validateManifest(manifest, manifestPath, config, options, errors) {
   validateDisabledLegacyRouting(manifest.constructorArgs, `${path}.constructorArgs`, errors);
 
   validateEndpoint(manifest.endpoints?.rpcUrl, `${path}.endpoints.rpcUrl`, errors, { required: true });
-  validateEndpoint(manifest.endpoints?.indexerUrl, `${path}.endpoints.indexerUrl`, errors, { required: true });
+  validateEndpoint(manifest.endpoints?.indexerUrl, `${path}.endpoints.indexerUrl`, errors, {
+    required: config.requireIndexer
+  });
   validateEndpoint(manifest.endpoints?.apiUrl, `${path}.endpoints.apiUrl`, errors, { required: false });
 
   const tokenListSource = options.tokenListSource ?? "bundled";
@@ -156,7 +176,7 @@ function validateTokenList(tokenList, tokenListPath, config, errors) {
 
   expectEqual(tokenList.schemaVersion, "lb.token-list.v1", `${path}.schemaVersion`, errors);
   expectEqual(tokenList.chainId, config.chainId, `${path}.chainId`, errors);
-  expectEqual(tokenList.environment, config.chainId === 4_663 ? "robinhood" : "robinhoodTestnet", `${path}.environment`, errors);
+  expectEqual(tokenList.environment, config.tokenListEnvironment, `${path}.environment`, errors);
 
   if (!Array.isArray(tokenList.tokens) || tokenList.tokens.length === 0) {
     errors.push(`${path}.tokens: expected a non-empty token array`);
@@ -187,8 +207,16 @@ function validateTokenList(tokenList, tokenListPath, config, errors) {
     }
   }
 
-  if (config.chainId === 4_663 && quoteTokens.length !== 1) {
-    errors.push(`${path}.tokens: expected exactly one Robinhood mainnet quote token, got ${quoteTokens.length}`);
+  if (config.requireCanonicalStableQuote && quoteTokens.length !== 1) {
+    errors.push(`${path}.tokens: expected exactly one canonical stablecoin quote token, got ${quoteTokens.length}`);
+  }
+
+  if (config.requireCanonicalStableQuote) {
+    for (const token of quoteTokens) {
+      if (!token.tags.includes("canonical") || !token.tags.includes("stablecoin")) {
+        errors.push(`${path}.tokens: quote token ${token.symbol ?? token.id ?? "<unknown>"} must be canonical and stablecoin`);
+      }
+    }
   }
 }
 
@@ -278,7 +306,7 @@ function validateOptions(options) {
   const errors = [];
 
   if (!Object.hasOwn(environmentConfig, options.environment)) {
-    errors.push("--environment must be robinhoodTestnet or robinhood");
+    errors.push("--environment must be sepolia, robinhoodTestnet, or robinhood");
   }
 
   if (typeof options.manifest !== "string" || options.manifest.length === 0) {
@@ -376,9 +404,10 @@ function printErrors(errors) {
 }
 
 function printHelp() {
-  console.log(`Usage: pnpm web:validate:public-config -- --environment <robinhoodTestnet|robinhood> --manifest <path> [--token-list <path>] [--token-list-source bundled|hosted]
+  console.log(`Usage: pnpm web:validate:public-config -- --environment <sepolia|robinhoodTestnet|robinhood> --manifest <path> [--token-list <path>] [--token-list-source bundled|hosted]
 
 Validates a promoted public web configuration before building with the matching Vite manifest path env var:
+  sepolia          -> VITE_SEPOLIA_MANIFEST_PATH
   robinhoodTestnet -> VITE_ROBINHOOD_TESTNET_MANIFEST_PATH
   robinhood        -> VITE_ROBINHOOD_MANIFEST_PATH`);
 }

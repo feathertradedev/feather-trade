@@ -26,7 +26,9 @@ try {
     isCandleStreamStale,
     isPoolStreamStale,
     loadAnalyticsHealth,
+    loadCanonicalPoolActivity,
     loadPairCandles,
+    loadPoolCatalog,
     loadPoolDiscovery,
     loadPoolDiscoveryBatches,
     loadPoolMetrics,
@@ -61,6 +63,48 @@ try {
   assert.equal(metrics.rows[1].totalSwapFees24hUsdE18, "0");
   assert.equal(metrics.rows[1].protocolSwapFees24hUsdE18, "0");
   assert.equal(metrics.rows[1].feeBreakdownComplete, true);
+
+  mode = "zero-tvl-ready";
+  const zeroTvl = await loadPoolMetrics(endpoint, [pairA]);
+  assert.equal(zeroTvl.status, "READY");
+  assert.equal(zeroTvl.rows[0].tvlUsdE18, "0");
+  assert.equal(zeroTvl.rows[0].feeToTvlE18, null);
+  mode = "zero-tvl-ratio";
+  const invalidZeroTvlRatio = await loadPoolMetrics(endpoint, [pairA]);
+  assert.equal(invalidZeroTvlRatio.status, "UNAVAILABLE");
+  assert.match(invalidZeroTvlRatio.error, /invalid LP fee \/ TVL ratio/);
+  mode = "nonzero-null-ratio";
+  const invalidNonzeroRatio = await loadPoolMetrics(endpoint, [pairA]);
+  assert.equal(invalidNonzeroRatio.status, "UNAVAILABLE");
+  assert.match(invalidNonzeroRatio.error, /invalid LP fee \/ TVL ratio/);
+  mode = "normal";
+
+  const catalog = await loadPoolCatalog(endpoint, { pageSize: 1 });
+  assert.equal(catalog.status, "READY");
+  assert.equal(catalog.pageInfo.pagesLoaded, 2);
+  assert.deepEqual(catalog.rows.map((row) => row.pair), [pairA, pairB]);
+  assert.equal(catalog.rows[0].factoryAddress, "0x00000000000000000000000000000000000000f1");
+  assert.equal(catalog.rows[0].createdAtBlock, "80");
+  assert.equal(catalog.rows[0].creationLogIndex, 4);
+
+  const activity = await loadCanonicalPoolActivity(endpoint, pairA, tokenX, { pageSize: 1, maxPages: 2 });
+  assert.equal(activity.status, "READY");
+  assert.equal(activity.asOfBlock, "101");
+  assert.equal(activity.asOfBlockHash, `0x${"b".repeat(64)}`);
+  assert.deepEqual(activity.rows.map((row) => row.kind), ["DEPOSIT", "POSITION_TRANSFER"]);
+  assert(activity.rows.every((row) => row.owner === tokenX || row.from === tokenX || row.to === tokenX));
+  assert.equal(activity.rows[0].amountX, "10");
+  assert.deepEqual(activity.rows[0].binIds, ["8388608"]);
+
+  mode = "foreign-activity";
+  const foreignActivity = await loadCanonicalPoolActivity(endpoint, pairA, tokenX);
+  assert.equal(foreignActivity.status, "UNAVAILABLE");
+  assert.match(foreignActivity.error, /foreign pair/);
+  mode = "owner-leak-activity";
+  const ownerLeak = await loadCanonicalPoolActivity(endpoint, pairA, tokenX);
+  assert.equal(ownerLeak.status, "UNAVAILABLE");
+  assert.match(ownerLeak.error, /unrelated to owner/);
+  mode = "normal";
 
   const capped = await loadPoolMetrics(endpoint, [pairA, pairB], undefined, { pageSize: 1, maxPages: 1 });
   assert.equal(capped.status, "PARTIAL");
@@ -260,10 +304,52 @@ async function mockFetch(url, init) {
   const variables = body.variables ?? {};
 
   if (query.includes("WebPoolMetrics")) {
+    if (mode === "zero-tvl-ready" || mode === "zero-tvl-ratio" || mode === "nonzero-null-ratio") {
+      const row = metric(pairA, "READY");
+      if (mode === "zero-tvl-ready" || mode === "zero-tvl-ratio") row.tvlUsdE18 = "0";
+      if (mode === "zero-tvl-ready" || mode === "nonzero-null-ratio") row.lpNetSwapFeeToTvlE18 = null;
+      return response({ data: { poolMetrics: connection([row], "metrics-zero", false, false) } });
+    }
     if (mode === "duplicate") return response({ data: { poolMetrics: connection([metric(pairA, "READY"), metric(pairA, "READY")], null, false, false) } });
     const after = variables.after ?? null;
     const nodes = after === null ? [metric(pairA, "READY")] : [metric(pairB, "PARTIAL")];
     return response({ data: { poolMetrics: connection(nodes, after === null ? "metrics-1" : "metrics-2", after === null, after !== null) } });
+  }
+
+  if (query.includes("WebPoolCatalog")) {
+    const after = variables.after ?? null;
+    const nodes = after === null ? [catalogEntry(pairA)] : [catalogEntry(pairB)];
+    return response({
+      data: {
+        poolCatalog: {
+          ...connection(nodes, after === null ? "catalog-1" : "catalog-2", after === null, false),
+          streamCursor: "11"
+        }
+      }
+    });
+  }
+
+  if (query.includes("WebPoolActivity")) {
+    const after = variables.after ?? null;
+    let row = after === null
+      ? activityRow("DEPOSIT", 101, 9, { owner: tokenX, amountX: "10", amountY: "20" })
+      : activityRow("POSITION_TRANSFER", 100, 8, { from: tokenX, to: tokenY });
+    if (mode === "foreign-activity") row = { ...row, pair: pairB };
+    if (mode === "owner-leak-activity") row = {
+      ...row,
+      owner: tokenY,
+      from: null,
+      to: null
+    };
+    return response({
+      data: {
+        poolActivity: {
+          ...connection([row], after === null ? "activity-1" : "activity-2", after === null && mode === "normal", false),
+          asOfBlock: "101",
+          asOfBlockHash: `0x${"b".repeat(64)}`
+        }
+      }
+    });
   }
 
   if (query.includes("WebPairCandles")) {
@@ -391,6 +477,40 @@ function discoveryRow(pairAddress = pairA) {
 
 function address(value) {
   return `0x${value.toString(16).padStart(40, "0")}`;
+}
+
+function catalogEntry(pairAddress) {
+  return {
+    ...poolState({ pair: pairAddress }),
+    factoryAddress: "0x00000000000000000000000000000000000000f1",
+    createdAtBlock: "80",
+    createdAtBlockHash: `0x${"8".repeat(64)}`,
+    creationTransactionHash: `0x${"7".repeat(64)}`,
+    creationLogIndex: 4
+  };
+}
+
+function activityRow(kind, blockNumber, sequence, overrides = {}) {
+  const positionTransfer = kind === "POSITION_TRANSFER";
+  return {
+    id: `activity-${blockNumber}-${sequence}`,
+    pair: pairA,
+    kind,
+    owner: positionTransfer ? null : tokenX,
+    from: positionTransfer ? tokenX : null,
+    to: positionTransfer ? tokenY : null,
+    amountX: positionTransfer ? null : "1",
+    amountY: positionTransfer ? null : "2",
+    binIds: ["8388608"],
+    blockNumber: String(blockNumber),
+    blockHash: `0x${(blockNumber === 101 ? "b" : "a").repeat(64)}`,
+    transactionHash: `0x${(blockNumber === 101 ? "d" : "c").repeat(64)}`,
+    logIndex: sequence,
+    sequence,
+    timestamp: 9_000 + blockNumber,
+    revision: 1,
+    ...overrides
+  };
 }
 
 function poolState(overrides = {}) {

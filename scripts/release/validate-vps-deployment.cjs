@@ -15,6 +15,9 @@ function main() {
     compose: readRequired(root, "infra/vps/compose.yml", errors),
     caddy: readRequired(root, "infra/vps/Caddyfile", errors),
     hostEnv: readRequired(root, "infra/vps/host.env.example", errors),
+    webCompose: readRequired(root, "infra/vps/compose.web.yml", errors),
+    webCaddy: readRequired(root, "infra/vps/Caddyfile.web", errors),
+    webHostEnv: readRequired(root, "infra/vps/host.web.env.example", errors),
     analyticsEnv: readRequired(root, "infra/vps/analytics.env.example", errors),
     readme: readRequired(root, "infra/vps/README.md", errors),
     custodyBuilder: readRequired(root, "scripts/release/build-analytics-runtime-custody.cjs", errors)
@@ -25,6 +28,9 @@ function main() {
   if (files.compose !== null) validateCompose(files.compose, errors);
   if (files.caddy !== null) validateCaddy(files.caddy, errors);
   if (files.hostEnv !== null) validateHostEnvironment(files.hostEnv, errors);
+  if (files.webCompose !== null) validateWebCompose(files.webCompose, files.compose, errors);
+  if (files.webCaddy !== null) validateWebCaddy(files.webCaddy, files.caddy, errors);
+  if (files.webHostEnv !== null) validateWebHostEnvironment(files.webHostEnv, errors);
   if (files.analyticsEnv !== null) validateAnalyticsEnvironment(files.analyticsEnv, errors);
   if (files.readme !== null) validateRunbook(files.readme, errors);
   if (files.custodyBuilder !== null) validateCustodyBuilder(files.custodyBuilder, errors);
@@ -310,6 +316,151 @@ function validateHostEnvironment(source, errors) {
   }
 }
 
+function validateWebCompose(source, fullComposeSource, errors) {
+  const services = serviceNames(source);
+  if (services.join(",") !== "caddy") {
+    errors.push(`web-only compose services must be exactly caddy, found ${services.join(",") || "none"}`);
+  }
+  const caddy = serviceBlock(source, "caddy");
+  if (caddy === null) {
+    errors.push("web-only compose must define a Caddy service block");
+    return;
+  }
+
+  requireTokens(caddy, "web-only Caddy service", [
+    "caddy:2.10.2-alpine@sha256:",
+    "FEATHER_APP_DOMAIN: ${FEATHER_APP_DOMAIN:?set FEATHER_APP_DOMAIN}",
+    "FEATHER_DOCS_DOMAIN: ${FEATHER_DOCS_DOMAIN:?set FEATHER_DOCS_DOMAIN}",
+    "FEATHER_APP_CONNECT_SRC: ${FEATHER_APP_CONNECT_SRC:?set FEATHER_APP_CONNECT_SRC}",
+    "source: ./Caddyfile.web",
+    "source: ${FEATHER_RELEASES_DIR:?set FEATHER_RELEASES_DIR}",
+    "target: /srv/feather/releases",
+    "read_only: true",
+    "no-new-privileges:true",
+    "cap_drop:",
+    "cap_add:",
+    "NET_BIND_SERVICE",
+    "pids_limit: 128",
+    "cpus: \"${FEATHER_CADDY_CPUS:-1.0}\"",
+    "mem_limit: ${FEATHER_CADDY_MEMORY_LIMIT:-512m}",
+    "logging: *bounded-logging"
+  ], errors);
+
+  const caddyImage = caddy.match(/^\s{4}image:\s*(\S+)\s*$/m)?.[1];
+  const fullCaddyImage = fullComposeSource === null
+    ? undefined
+    : serviceBlock(fullComposeSource, "caddy")?.match(/^\s{4}image:\s*(\S+)\s*$/m)?.[1];
+  if (!caddyImage || !/@sha256:[0-9a-f]{64}$/i.test(caddyImage)) {
+    errors.push("web-only Caddy image must use an immutable sha256 digest");
+  }
+  if (fullCaddyImage !== undefined && caddyImage !== fullCaddyImage) {
+    errors.push("web-only Caddy image must equal the reviewed full-stack Caddy image digest");
+  }
+
+  const portsBlock = caddy.match(/^\s{4}ports:\s*$([\s\S]*?)(?=^\s{4}\S)/m)?.[1] ?? "";
+  const ports = [...portsBlock.matchAll(/^\s{6}-\s*["']?([^"'\s]+)["']?\s*$/gm)].map((match) => match[1]);
+  const expectedPorts = ["80:80/tcp", "443:443/tcp", "443:443/udp"];
+  if (ports.join(",") !== expectedPorts.join(",")) {
+    errors.push(`web-only Caddy must publish only ${expectedPorts.join(", ")}`);
+  }
+  if ((source.match(/^\s{4}ports:/gm) ?? []).length !== 1) {
+    errors.push("only web-only Caddy may publish ports");
+  }
+  if ((source.match(/^\s{8}read_only:\s*true\s*$/gm) ?? []).length < 2) {
+    errors.push("web-only Caddyfile and immutable release bind mounts must be read-only");
+  }
+  if (!/^\s{2}edge:\s*\{\}\s*$/m.test(source)) {
+    errors.push("web-only compose must define only its edge network");
+  }
+  if (/^\s{2}(?:backend|egress):/m.test(source)) {
+    errors.push("web-only compose must not attach backend or egress networks");
+  }
+  for (const forbidden of [
+    "/var/run/docker.sock",
+    "privileged: true",
+    "network_mode: host",
+    "depends_on:",
+    "image: postgres",
+    "image: mysql",
+    "image: mariadb"
+  ]) {
+    if (source.toLowerCase().includes(forbidden.toLowerCase())) {
+      errors.push(`web-only compose contains forbidden deployment capability: ${forbidden}`);
+    }
+  }
+}
+
+function validateWebCaddy(source, fullCaddySource, errors) {
+  requireTokens(source, "web-only Caddyfile", [
+    "admin off",
+    "read_header 10s",
+    "read_body 15s",
+    "idle 2m",
+    "max_header_size 64KB",
+    "output stdout",
+    "format json",
+    "Strict-Transport-Security \"max-age=31536000; includeSubDomains\"",
+    "Cross-Origin-Opener-Policy \"same-origin-allow-popups\"",
+    "{$FEATHER_APP_DOMAIN}",
+    "{$FEATHER_DOCS_DOMAIN}",
+    "https://{$FEATHER_DOCS_DOMAIN}{uri} 308",
+    "https://{$FEATHER_APP_DOMAIN}{uri} 308",
+    "connect-src {$FEATHER_APP_CONNECT_SRC}",
+    "wss://relay.walletconnect.com",
+    "https://verify.walletconnect.com",
+    "https://fonts.reown.com",
+    "@private path /graphql /graphql/* /events /events/* /token-images /token-images/* /livez /readyz /metrics /internal /internal/* /_headers /_redirects /_worker.js",
+    "respond @private 404",
+    "/srv/feather/releases/current",
+    "public, max-age=31536000, immutable",
+    "Cache-Control \"no-store\"",
+    "connect-src 'none'"
+  ], errors);
+
+  if (/\breverse_proxy\b/.test(source)) {
+    errors.push("web-only Caddyfile must not proxy analytics or any other upstream");
+  }
+  const privateMatchers = source.match(/^\s*@private path .*$/gm) ?? [];
+  const expectedPrivateMatcher = "@private path /graphql /graphql/* /events /events/* /token-images /token-images/* /livez /readyz /metrics /internal /internal/* /_headers /_redirects /_worker.js";
+  if (privateMatchers.length !== 2 || privateMatchers.some((line) => line.trim() !== expectedPrivateMatcher)) {
+    errors.push("web-only app and docs hosts must reject the complete analytics and private path set");
+  }
+  if ((source.match(/\brespond @private 404\b/g) ?? []).length !== 2) {
+    errors.push("web-only app and docs hosts must each return 404 for analytics and private paths");
+  }
+
+  const webAppCsp = source.match(/^\s*Content-Security-Policy \"default-src 'self';.*Cross-Origin-Opener-Policy|^\s*Content-Security-Policy \"default-src 'self';.*$/m)?.[0]?.trim();
+  const fullAppCsp = fullCaddySource === null
+    ? undefined
+    : fullCaddySource.match(/^\s*Content-Security-Policy \"default-src 'self';.*$/m)?.[0]?.trim();
+  if (fullAppCsp !== undefined && webAppCsp !== fullAppCsp) {
+    errors.push("web-only app CSP must equal the reviewed full-stack Reown CSP");
+  }
+}
+
+function validateWebHostEnvironment(source, errors) {
+  requireTokens(source, "host.web.env.example", [
+    "COMPOSE_PROJECT_NAME=feather-sepolia-web",
+    "FEATHER_CADDY_CPUS=1.0",
+    "FEATHER_CADDY_MEMORY_LIMIT=512m",
+    "FEATHER_APP_DOMAIN=app.example.invalid",
+    "FEATHER_DOCS_DOMAIN=docs.example.invalid",
+    "FEATHER_APP_CONNECT_SRC=\"'self' https://ethereum-sepolia-rpc.publicnode.com\"",
+    "FEATHER_RELEASES_DIR=/srv/feather/web/sepolia"
+  ], errors);
+  if (/^FEATHER_(?:ANALYTICS|DATABASE)_/m.test(source)) {
+    errors.push("web-only host environment must not configure analytics or a database");
+  }
+  const connectSource = source.match(/^FEATHER_APP_CONNECT_SRC=(.+)$/m)?.[1];
+  if (connectSource !== "\"'self' https://ethereum-sepolia-rpc.publicnode.com\"") {
+    errors.push("web-only browser CSP must allow only self and the reviewed Sepolia public RPC origin");
+  }
+  const releaseRoot = source.match(/^FEATHER_RELEASES_DIR=(.+)$/m)?.[1];
+  if (releaseRoot !== "/srv/feather/web/sepolia") {
+    errors.push("web-only release root must be /srv/feather/web/sepolia");
+  }
+}
+
 function validateAnalyticsEnvironment(source, errors) {
   requireTokens(source, "analytics.env.example", [
     "ANALYTICS_DATABASE_URL=postgresql://",
@@ -353,6 +504,12 @@ function validateRunbook(source, errors) {
     "feather-deploy",
     "WEB_REOWN_PROJECT_ID",
     "current -> releases/<commit>/dist",
+    "## Sepolia web-only stage",
+    "compose.web.yml",
+    "Caddyfile.web",
+    "host.web.env.example",
+    "/srv/feather/web/sepolia",
+    "does not start or proxy analytics",
     "## Roll back",
     "/readyz"
   ], errors);
@@ -401,4 +558,12 @@ function requireTokens(source, label, tokens, errors) {
 
 if (require.main === module) main();
 
-module.exports = { validateCaddy, validateCompose, validateDockerfile, validateDockerignore };
+module.exports = {
+  validateCaddy,
+  validateCompose,
+  validateDockerfile,
+  validateDockerignore,
+  validateWebCaddy,
+  validateWebCompose,
+  validateWebHostEnvironment
+};

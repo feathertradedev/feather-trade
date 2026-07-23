@@ -152,10 +152,15 @@ type PoolFeeState {
 type PoolState {
   chainId: Int!
   pair: ID!
+  factoryAddress: ID
   tokenX: ID!
   tokenY: ID!
   decimalsX: Int!
   decimalsY: Int!
+  createdAtBlock: BigInt
+  createdAtBlockHash: String
+  creationTransactionHash: String
+  creationLogIndex: Int
   reserveX: BigInt!
   reserveY: BigInt!
   activeId: Int!
@@ -189,6 +194,45 @@ type PoolStateSnapshot {
   state: PoolState!
   bins: [PoolBinState!]!
   streamCursor: String!
+}
+
+type PoolCatalogConnection {
+  nodes: [PoolState!]!
+  pageInfo: PageInfo!
+  streamCursor: String!
+}
+
+enum PoolActivityKind {
+  SWAP
+  DEPOSIT
+  WITHDRAW
+  POSITION_TRANSFER
+}
+
+type PoolActivityEvent {
+  id: ID!
+  pair: ID!
+  kind: PoolActivityKind!
+  owner: ID
+  from: ID
+  to: ID
+  amountX: BigInt
+  amountY: BigInt
+  binIds: [BigInt!]!
+  blockNumber: BigInt!
+  blockHash: String!
+  transactionHash: String
+  logIndex: Int
+  sequence: Int!
+  timestamp: Int!
+  revision: Int!
+}
+
+type PoolActivityConnection {
+  nodes: [PoolActivityEvent!]!
+  pageInfo: PageInfo!
+  asOfBlock: BigInt
+  asOfBlockHash: String
 }
 
 type PositionBinAccounting {
@@ -254,11 +298,30 @@ type PriceHealth {
   ageSeconds: Int
 }
 
+type TrustedPairPrice {
+  baseToken: ID!
+  quoteToken: ID!
+  quotePerBaseE18: BigInt
+  status: AnalyticsStatus!
+  baseSource: String
+  quoteSource: String
+  baseObservedAt: Int
+  quoteObservedAt: Int
+  baseAgeSeconds: Int
+  quoteAgeSeconds: Int
+  asOfBlock: BigInt
+  asOfBlockHash: String
+  asOfTimestamp: Int
+}
+
 type Query {
   poolMetrics(first: Int!, after: String, asOfTimestamp: Int): PoolMetricsConnection!
+  poolCatalog(first: Int!, after: String): PoolCatalogConnection!
   poolDiscovery(pools: [PoolDiscoveryRequest!]!, asOfTimestamp: Int): [PoolDiscoveryPool!]!
+  poolActivity(pair: ID!, owner: ID, first: Int!, after: String): PoolActivityConnection!
   poolState(pair: ID!, radius: Int!): PoolStateSnapshot
   pairCandles(pair: ID!, interval: CandleInterval!, fromTimestamp: Int!, toTimestamp: Int!, first: Int!, after: String): CandleConnection!
   walletPositions(owner: ID!, first: Int!, after: String): WalletPairPositionConnection!
+  trustedPairPrice(baseToken: ID!, quoteToken: ID!): TrustedPairPrice!
   analyticsHealth: AnalyticsHealth!
 }

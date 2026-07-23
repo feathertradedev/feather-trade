@@ -4255,6 +4255,66 @@ a {
   overflow-wrap: anywhere;
 }
 
+.pool-creation-price-source {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  background: color-mix(in srgb, var(--card) 84%, transparent);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+}
+
+.pool-creation-price-source.ready {
+  border-color: color-mix(in srgb, var(--green) 46%, var(--hairline));
+}
+
+.pool-creation-price-source > div {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.pool-creation-price-source strong,
+.pool-creation-price-source span {
+  font-size: 0.82rem;
+}
+
+.pool-creation-price-source span,
+.pool-creation-price-source p {
+  color: var(--ink-60);
+}
+
+.pool-creation-price-source p {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin: 0;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.7rem;
+}
+
+.pool-creation-price-source .secondary-button {
+  justify-self: start;
+}
+
+.pool-creation-prerequisite {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 0;
+  padding: 10px 12px;
+  color: var(--ink-60);
+  background: var(--card);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+}
+
+.pool-creation-prerequisite.warning {
+  color: #805c11;
+  border-color: #a77b23;
+}
+
 .pool-creation-token-summary {
   display: grid;
   gap: 4px;
@@ -4316,6 +4376,161 @@ a {
   background: #fff4d6;
   border: 1px solid #f1cf7a;
   border-radius: 8px;
+}
+
+.pool-creation-result {
+  --progress-accent: var(--green);
+}
+
+.pool-creation-result.warning {
+  --progress-accent: #d2a43f;
+}
+
+.pool-creation-result.error {
+  --progress-accent: #df6b62;
+}
+
+.pool-creation-result-heading {
+  display: flex;
+  gap: 16px;
+  align-items: start;
+  justify-content: space-between;
+}
+
+.pool-creation-result-heading > div {
+  display: grid;
+  gap: 5px;
+}
+
+.pool-creation-result-heading strong {
+  font-size: 1.08rem;
+}
+
+.pool-creation-elapsed {
+  flex: 0 0 auto;
+  padding: 4px 7px;
+  color: var(--ink-60);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.72rem;
+  border: 1px solid var(--hairline);
+  border-radius: 3px;
+}
+
+.pool-creation-progress-track {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 0;
+  margin: 6px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.pool-creation-progress-track li {
+  position: relative;
+  display: grid;
+  gap: 7px;
+  justify-items: center;
+  min-width: 0;
+  color: var(--ink-60);
+  text-align: center;
+}
+
+.pool-creation-progress-track li::before {
+  position: absolute;
+  top: 11px;
+  right: 50%;
+  left: -50%;
+  height: 1px;
+  background: var(--hairline);
+  content: "";
+}
+
+.pool-creation-progress-track li:first-child::before {
+  display: none;
+}
+
+.pool-creation-progress-track li > span {
+  z-index: 1;
+  display: grid;
+  width: 23px;
+  height: 23px;
+  place-items: center;
+  background: var(--panel);
+  border: 1px solid var(--hairline);
+  border-radius: 50%;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.68rem;
+}
+
+.pool-creation-progress-track li.verified::before,
+.pool-creation-progress-track li.verified > span {
+  color: var(--panel);
+  background: var(--progress-accent);
+  border-color: var(--progress-accent);
+}
+
+.pool-creation-progress-track li.current {
+  color: var(--ink);
+}
+
+.pool-creation-progress-track li.current > span {
+  color: var(--progress-accent);
+  border-color: var(--progress-accent);
+}
+
+.pool-creation-progress-track small {
+  overflow-wrap: anywhere;
+  font-size: 0.66rem;
+}
+
+.pool-creation-transaction {
+  display: grid;
+  gap: 1px;
+  margin: 0;
+  background: var(--hairline);
+  border: 1px solid var(--hairline);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.pool-creation-transaction > div {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.3fr) minmax(0, 1fr);
+  gap: 12px;
+  padding: 10px 12px;
+  background: var(--card);
+}
+
+.pool-creation-transaction dt {
+  color: var(--ink-60);
+  font-size: 0.7rem;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+
+.pool-creation-transaction dd {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  margin: 0;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.74rem;
+}
+
+.pool-creation-transaction code {
+  overflow-wrap: anywhere;
+  color: var(--ink-60);
+  font-size: 0.66rem;
+}
+
+.pool-creation-hashless {
+  margin: 0;
+  color: var(--ink-60);
+  font-size: 0.8rem;
+}
+
+.pool-creation-result-actions {
+  padding-top: 2px;
 }
 
 @keyframes spin {
@@ -4499,6 +4714,42 @@ a {
   .pool-creation-preview,
   .review-grid {
     grid-template-columns: 1fr;
+  }
+
+  .pool-creation-price-source > div,
+  .pool-creation-result-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .pool-creation-progress-track {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+
+  .pool-creation-progress-track li {
+    grid-template-columns: 24px minmax(0, 1fr);
+    gap: 9px;
+    justify-items: start;
+    text-align: left;
+  }
+
+  .pool-creation-progress-track li::before {
+    top: -7px;
+    right: auto;
+    bottom: 23px;
+    left: 11px;
+    width: 1px;
+    height: auto;
+  }
+
+  .pool-creation-progress-track small {
+    align-self: center;
+  }
+
+  .pool-creation-transaction > div {
+    grid-template-columns: 1fr;
+    gap: 5px;
   }
 }
 }

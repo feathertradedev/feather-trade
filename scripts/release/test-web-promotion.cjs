@@ -42,6 +42,22 @@ try {
     assert.equal(readiness[executedField], undefined, `readiness must not imply executed rollback via ${executedField}`);
   }
 
+  const sepoliaManifest = path.join(temp, "sepolia-manifest.json");
+  fs.writeFileSync(sepoliaManifest, '{"environment":"sepolia","chainId":11155111}\n');
+  const sepoliaBundle = path.join(temp, "sepolia-bundle");
+  run(custody, ["create", "--environment", "sepolia", "--commit", commit, "--manifest", relative(sepoliaManifest), "--dist", relative(dist), "--output", relative(sepoliaBundle)]);
+  const sepoliaExtracted = path.join(temp, "sepolia-extracted");
+  run(custody, ["verify", "--environment", "sepolia", "--commit", commit, "--bundle", relative(sepoliaBundle), "--output", relative(sepoliaExtracted)]);
+  const sepoliaCustody = JSON.parse(fs.readFileSync(path.join(sepoliaBundle, "custody.json"), "utf8"));
+  assert.equal(sepoliaCustody.environment, "sepolia");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(sepoliaExtracted, "manifest.json"), "utf8")).chainId, 11155111);
+
+  const sepoliaEvidenceDir = path.join(temp, "sepolia-evidence");
+  run(evidence, ["--environment", "sepolia", "--commit", commit, "--custody", path.join(sepoliaBundle, "custody.json"), "--deployed-url", "https://release.example", "--output", sepoliaEvidenceDir, "--outcome", "promoted"]);
+  const sepoliaPromotion = JSON.parse(fs.readFileSync(path.join(sepoliaEvidenceDir, "promotion.json"), "utf8"));
+  assert.equal(sepoliaPromotion.environment, "sepolia");
+  assert.equal(sepoliaPromotion.custodyStatus, "available");
+
   const missingCustodyDir = path.join(temp, "missing-custody-evidence");
   run(evidence, ["--environment", "testnet", "--commit", commit, "--custody", path.join(temp, "absent.json"), "--deployed-url", "https://release.example", "--output", missingCustodyDir, "--outcome", "blocked"]);
   const blocked = JSON.parse(fs.readFileSync(path.join(missingCustodyDir, "promotion.json"), "utf8"));
@@ -63,7 +79,7 @@ try {
   }
 
   testAdversarialArchives(bundle, extracted);
-  testVpsPromotionAdapter({ bundle, extracted });
+  testVpsPromotionAdapter({ bundle: sepoliaBundle, extracted: sepoliaExtracted, environment: "sepolia" });
 
   fs.appendFileSync(path.join(bundle, "web-promotion.tar.gz"), "tampered");
   assert.notEqual(run(custody, ["verify", "--environment", "testnet", "--commit", commit, "--bundle", relative(bundle), "--output", relative(extracted)], false).status, 0);
@@ -81,11 +97,22 @@ function validateWorkflowContract() {
   for (const input of ["environment", "immutable_commit", "manifest", "deployed_url"]) {
     assert.match(workflow, new RegExp(`^      ${input}:`, "m"));
   }
+  assert.match(workflow, /options: \[sepolia, testnet, mainnet\]/);
   assert.match(workflow, /environment:\n      name: web-\$\{\{ inputs\.environment \}\}\n      url: \$\{\{ needs\.trusted-preflight\.outputs\.deployed_origin \}\}/);
-  assert.equal((workflow.match(/pnpm web:build:public:/g) || []).length, 2, "only the environment branches may contain build commands");
+  assert.equal((workflow.match(/pnpm web:build:public:/g) || []).length, 3, "only the environment branches may contain build commands");
   assert.match(workflow, /DEPLOYED_ORIGIN: \$\{\{ needs\.trusted-preflight\.outputs\.deployed_origin \}\}/);
+  assert.match(workflow, /VITE_ANALYTICS_SEPOLIA_URL="\$DEPLOYED_ORIGIN\/graphql" VITE_SEPOLIA_MANIFEST_PATH="\$SELECTED_MANIFEST" pnpm web:build:public:sepolia/);
   assert.match(workflow, /VITE_ANALYTICS_ROBINHOOD_TESTNET_URL="\$DEPLOYED_ORIGIN\/graphql"/);
   assert.match(workflow, /VITE_ANALYTICS_ROBINHOOD_URL="\$DEPLOYED_ORIGIN\/graphql"/);
+  const sepoliaBuildBranch = workflow.slice(
+    workflow.indexOf('if [[ "$TARGET_ENVIRONMENT" == sepolia ]]'),
+    workflow.indexOf('elif [[ "$TARGET_ENVIRONMENT" == testnet ]]')
+  );
+  assert.match(sepoliaBuildBranch, /web:build:public:sepolia/);
+  assert.match(sepoliaBuildBranch, /VITE_ANALYTICS_SEPOLIA_URL="\$DEPLOYED_ORIGIN\/graphql"/,
+    "Sepolia promotion must bind the same-origin analytics endpoint");
+  assert.match(workflow, /node scripts\/web\/check-hosted-analytics\.cjs --origin "\$DEPLOYED_ORIGIN"/);
+  assert.match(workflow, /sepolia\) public_environment=sepolia ;;/);
   const approvalBoundary = workflow.indexOf("  promote:");
   const verify = workflow.indexOf("Verify custody without rebuilding");
   const adapter = workflow.indexOf("Invoke provider adapter and smoke hosted app/docs");
@@ -152,7 +179,7 @@ function validateWorkflowContract() {
   }
 }
 
-function testVpsPromotionAdapter({ bundle, extracted }) {
+function testVpsPromotionAdapter({ bundle, extracted, environment }) {
   const transportDir = path.join(temp, "fake-transport");
   const transportLog = path.join(temp, "fake-transport.jsonl");
   const smokeLog = path.join(temp, "fake-smoke.jsonl");
@@ -257,14 +284,15 @@ if (process.env.FAKE_SMOKE_REPOINT_TARGET) {
   fs.unlinkSync(current);
   fs.symlinkSync(process.env.FAKE_SMOKE_REPOINT_TARGET, current);
 }
-if (process.env.FAKE_SMOKE_FAIL === "1") process.exit(72);
+if (process.env.FAKE_SMOKE_FAIL === "1" && args.includes("--url")) process.exit(72);
+if (process.env.FAKE_ANALYTICS_SMOKE_FAIL === "1" && args.includes("--origin")) process.exit(73);
 `);
 
-  const vpsRoot = path.join(temp, "vps-testnet");
+  const vpsRoot = path.join(temp, `vps-${environment}`);
   const oldCommit = "1".repeat(40);
   const oldTarget = `releases/${oldCommit}/dist`;
   const oldRelease = path.join(vpsRoot, "releases", oldCommit);
-  installReleaseFixture(oldRelease, { commit: oldCommit, environment: "testnet", index: "old release\n" });
+  installReleaseFixture(oldRelease, { commit: oldCommit, environment, index: "old release\n" });
   fs.symlinkSync(oldTarget, path.join(vpsRoot, "current"));
 
   const privateKey = "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-private-key\n-----END OPENSSH PRIVATE KEY-----";
@@ -280,9 +308,10 @@ if (process.env.FAKE_SMOKE_FAIL === "1") process.exit(72);
     WEB_PROMOTION_COMMIT: commit,
     WEB_PROMOTION_CUSTODY: path.join(bundle, "custody.json"),
     WEB_PROMOTION_DEPLOYED_URL: "https://release.example",
-    WEB_PROMOTION_ENVIRONMENT: "testnet",
+    WEB_PROMOTION_ENVIRONMENT: environment,
     WEB_PROMOTION_MANIFEST: path.join(extracted, "manifest.json"),
     WEB_PROMOTION_SCP_BIN: fakeScp,
+    WEB_PROMOTION_ANALYTICS_SMOKE_BIN: fakeSmoke,
     WEB_PROMOTION_SMOKE_BIN: fakeSmoke,
     WEB_PROMOTION_SSH_BIN: fakeSsh,
     WEB_PROMOTION_TEST_MODE: "1",
@@ -313,7 +342,7 @@ if (process.env.FAKE_SMOKE_FAIL === "1") process.exit(72);
   const custodyEnvelope = JSON.parse(fs.readFileSync(path.join(bundle, "custody.json"), "utf8"));
   assert.equal(fs.readFileSync(path.join(releaseDir, ".archive-sha256"), "utf8").trim(), custodyEnvelope.archiveSha256);
   assert.match(fs.readFileSync(path.join(releaseDir, ".payload-sha256"), "utf8").trim(), /^[0-9a-f]{64}$/);
-  assert.equal(fs.readFileSync(path.join(releaseDir, ".release-identity"), "utf8").trim(), `testnet ${commit}`);
+  assert.equal(fs.readFileSync(path.join(releaseDir, ".release-identity"), "utf8").trim(), `${environment} ${commit}`);
   assert.equal(fs.statSync(path.join(releaseDir, "dist", "index.html")).mode & 0o222, 0, "immutable release files must not be writable");
   assert.deepEqual(fs.readdirSync(path.join(vpsRoot, ".incoming")), []);
   const firstSmoke = JSON.parse(fs.readFileSync(smokeLog, "utf8").trim().split("\n")[0]);
@@ -350,7 +379,7 @@ if (process.env.FAKE_SMOKE_FAIL === "1") process.exit(72);
 
   const pendingIntentRoot = path.join(temp, "vps-pending-intent-race");
   const pendingIntentState = path.join(temp, "vps-pending-intent-race.pid");
-  installReleaseFixture(path.join(pendingIntentRoot, "releases", oldCommit), { commit: oldCommit, environment: "testnet", index: "old release\n" });
+  installReleaseFixture(path.join(pendingIntentRoot, "releases", oldCommit), { commit: oldCommit, environment, index: "old release\n" });
   fs.symlinkSync(oldTarget, path.join(pendingIntentRoot, "current"));
   const pendingIntent = runAdapter({
     ...baseEnv,
@@ -390,7 +419,7 @@ if (process.env.FAKE_SMOKE_FAIL === "1") process.exit(72);
   assert(!fs.existsSync(path.join(invalidPreviousRoot, "previous")));
 
   const lockedRoot = path.join(temp, "vps-locked-activation");
-  installReleaseFixture(path.join(lockedRoot, "releases", oldCommit), { commit: oldCommit, environment: "testnet", index: "old release\n" });
+  installReleaseFixture(path.join(lockedRoot, "releases", oldCommit), { commit: oldCommit, environment, index: "old release\n" });
   fs.symlinkSync(oldTarget, path.join(lockedRoot, "current"));
   fs.mkdirSync(path.join(lockedRoot, ".promotion.lock"));
   const locked = runAdapter({
@@ -405,7 +434,7 @@ if (process.env.FAKE_SMOKE_FAIL === "1") process.exit(72);
   assert(fs.existsSync(path.join(lockedRoot, ".promotion.lock")), "a contender must not remove another activation's lock");
 
   const rollbackRoot = path.join(temp, "vps-smoke-rollback");
-  installReleaseFixture(path.join(rollbackRoot, "releases", oldCommit), { commit: oldCommit, environment: "testnet", index: "old release\n" });
+  installReleaseFixture(path.join(rollbackRoot, "releases", oldCommit), { commit: oldCommit, environment, index: "old release\n" });
   fs.symlinkSync(oldTarget, path.join(rollbackRoot, "current"));
   const failedSmoke = runAdapter({
     ...baseEnv,
@@ -418,11 +447,28 @@ if (process.env.FAKE_SMOKE_FAIL === "1") process.exit(72);
   assert.equal(fs.readlinkSync(path.join(rollbackRoot, "current")), oldTarget, "failed smoke must restore the verified prior release");
   assert(fs.existsSync(path.join(rollbackRoot, "releases", commit)), "rollback retains the failed immutable release for investigation");
 
+  const analyticsRollbackRoot = path.join(temp, "vps-analytics-smoke-rollback");
+  installReleaseFixture(path.join(analyticsRollbackRoot, "releases", oldCommit), { commit: oldCommit, environment, index: "old release\n" });
+  fs.symlinkSync(oldTarget, path.join(analyticsRollbackRoot, "current"));
+  const failedAnalyticsSmoke = runAdapter({
+    ...baseEnv,
+    FAKE_ANALYTICS_SMOKE_FAIL: "1",
+    FAKE_VPS_ROOT: analyticsRollbackRoot,
+    WEB_VPS_RELEASE_ROOT: analyticsRollbackRoot
+  }, false);
+  assert.notEqual(failedAnalyticsSmoke.status, 0, "a failed hosted analytics smoke must fail promotion");
+  assert.match(`${failedAnalyticsSmoke.stdout}\n${failedAnalyticsSmoke.stderr}`, /hosted analytics smoke failed.*prior verified release was restored/i);
+  assert.equal(
+    fs.readlinkSync(path.join(analyticsRollbackRoot, "current")),
+    oldTarget,
+    "failed analytics smoke must restore the verified prior release before activation is confirmed"
+  );
+
   const guardedRoot = path.join(temp, "vps-guarded-rollback");
   const concurrentCommit = "2".repeat(40);
   const concurrentTarget = `releases/${concurrentCommit}/dist`;
-  installReleaseFixture(path.join(guardedRoot, "releases", oldCommit), { commit: oldCommit, environment: "testnet", index: "old release\n" });
-  installReleaseFixture(path.join(guardedRoot, "releases", concurrentCommit), { commit: concurrentCommit, environment: "testnet", index: "newer concurrent release\n" });
+  installReleaseFixture(path.join(guardedRoot, "releases", oldCommit), { commit: oldCommit, environment, index: "old release\n" });
+  installReleaseFixture(path.join(guardedRoot, "releases", concurrentCommit), { commit: concurrentCommit, environment, index: "newer concurrent release\n" });
   fs.symlinkSync(oldTarget, path.join(guardedRoot, "current"));
   const guarded = runAdapter({
     ...baseEnv,
@@ -436,7 +482,7 @@ if (process.env.FAKE_SMOKE_FAIL === "1") process.exit(72);
   assert.equal(fs.readlinkSync(path.join(guardedRoot, "current")), concurrentTarget, "rollback must never clobber a newer current target");
 
   const disconnectedRoot = path.join(temp, "vps-disconnected-activation-result");
-  installReleaseFixture(path.join(disconnectedRoot, "releases", oldCommit), { commit: oldCommit, environment: "testnet", index: "old release\n" });
+  installReleaseFixture(path.join(disconnectedRoot, "releases", oldCommit), { commit: oldCommit, environment, index: "old release\n" });
   fs.symlinkSync(oldTarget, path.join(disconnectedRoot, "current"));
   const disconnected = runAdapter({
     ...baseEnv,
@@ -450,7 +496,7 @@ if (process.env.FAKE_SMOKE_FAIL === "1") process.exit(72);
     "reconciled activation must be explicitly confirmed after smoke");
 
   const malformedRoot = path.join(temp, "vps-malformed-activation-result");
-  installReleaseFixture(path.join(malformedRoot, "releases", oldCommit), { commit: oldCommit, environment: "testnet", index: "old release\n" });
+  installReleaseFixture(path.join(malformedRoot, "releases", oldCommit), { commit: oldCommit, environment, index: "old release\n" });
   fs.symlinkSync(oldTarget, path.join(malformedRoot, "current"));
   const malformed = runAdapter({
     ...baseEnv,
@@ -463,7 +509,7 @@ if (process.env.FAKE_SMOKE_FAIL === "1") process.exit(72);
 
   const abandonedRoot = path.join(temp, "vps-abandoned-activation");
   const abandonedState = path.join(temp, "vps-abandoned-activation.ssh-state");
-  installReleaseFixture(path.join(abandonedRoot, "releases", oldCommit), { commit: oldCommit, environment: "testnet", index: "old release\n" });
+  installReleaseFixture(path.join(abandonedRoot, "releases", oldCommit), { commit: oldCommit, environment, index: "old release\n" });
   fs.symlinkSync(oldTarget, path.join(abandonedRoot, "current"));
   const abandoned = runAdapter({
     ...baseEnv,
@@ -494,7 +540,7 @@ if (process.env.FAKE_SMOKE_FAIL === "1") process.exit(72);
 
   const supersededSameCommitRoot = path.join(temp, "vps-superseded-same-commit");
   const supersededSameCommitState = path.join(temp, "vps-superseded-same-commit.ssh-state");
-  installReleaseFixture(path.join(supersededSameCommitRoot, "releases", oldCommit), { commit: oldCommit, environment: "testnet", index: "old release\n" });
+  installReleaseFixture(path.join(supersededSameCommitRoot, "releases", oldCommit), { commit: oldCommit, environment, index: "old release\n" });
   fs.symlinkSync(oldTarget, path.join(supersededSameCommitRoot, "current"));
   const supersededSameCommit = runAdapter({
     ...baseEnv,
@@ -531,7 +577,7 @@ if (process.env.FAKE_SMOKE_FAIL === "1") process.exit(72);
 
   const conflictRoot = path.join(temp, "vps-conflicting-release");
   const conflictRelease = path.join(conflictRoot, "releases", commit);
-  installReleaseFixture(conflictRelease, { commit, environment: "testnet", index: "conflict\n" });
+  installReleaseFixture(conflictRelease, { commit, environment, index: "conflict\n" });
   fs.writeFileSync(path.join(conflictRelease, ".archive-sha256"), `${"0".repeat(64)}\n`);
   fs.writeFileSync(path.join(conflictRelease, ".payload-sha256"), `${releasePayloadDigest(conflictRelease)}\n`);
   const conflict = runAdapter({ ...baseEnv, WEB_VPS_RELEASE_ROOT: conflictRoot }, false);

@@ -16,7 +16,7 @@ try {
   for (const name of ["environment", "commit", "deployed-url", "output", "outcome"]) {
     if (!options[name]) throw new Error(`--${name} is required`);
   }
-  if (!["testnet", "mainnet"].includes(options.environment)) throw new Error("invalid environment");
+  if (!["sepolia", "testnet", "mainnet"].includes(options.environment)) throw new Error("invalid environment");
   if (!/^[0-9a-f]{40}$/.test(options.commit)) throw new Error("invalid immutable commit");
   if (!["promoted", "failed", "blocked"].includes(options.outcome)) throw new Error("invalid outcome");
   const custody = readCustody(options.custody, options.commit, options.environment);

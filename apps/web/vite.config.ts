@@ -1,4 +1,5 @@
-import { existsSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -12,6 +13,8 @@ import { defineConfig, loadEnv, type Plugin } from "vite";
 
 const rootDir = dirname(fileURLToPath(import.meta.url));
 const sdkSrc = resolve(rootDir, "../../packages/sdk/src");
+const walletVendorAuditFile = "wallet-vendor-audit.json";
+const walletVendorAuditSchema = "feather.wallet-vendor-audit.v1";
 const zeroAddress = "0x0000000000000000000000000000000000000000";
 const disabledLegacyRoutingConstructorArgs = [
   "routerFactoryV1",
@@ -61,32 +64,44 @@ interface PublicTokenListShape {
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, rootDir, "");
-  const publicReleaseEnvironment = env.VITE_PUBLIC_RELEASE_ENV;
+  const publicReleaseEnvironment = env.VITE_PUBLIC_RELEASE_ENV?.trim() || undefined;
   validatePublicReleaseEnvironment(publicReleaseEnvironment, env);
 
   return {
     plugins: [
-      walletVendorBoundaryPlugin(),
       mdx({
         providerImportSource: "@mdx-js/react",
         rehypePlugins: [rehypeSlug],
         remarkPlugins: [remarkGfm, remarkFrontmatter, [remarkMdxFrontmatter, { name: "frontmatter" }]]
       }),
-      react()
+      react(),
+      walletVendorBoundaryPlugin()
     ],
     define: {
       __LOCALNET_MANIFEST__: localnetManifestDefine(env.VITE_LOCALNET_MANIFEST_PATH),
       __PUBLIC_RELEASE_ENV__: publicReleaseEnvironment === undefined ? "undefined" : JSON.stringify(publicReleaseEnvironment),
+      __SEPOLIA_MANIFEST__: manifestDefine(env.VITE_SEPOLIA_MANIFEST_PATH, {
+        chainId: 11_155_111,
+        environment: "sepolia",
+        requireIndexer: false,
+        releaseEnvironmentKey: "sepolia",
+        schemaVersion: "lb.evm.v1",
+        publicReleaseEnvironment
+      }),
       __ROBINHOOD_TESTNET_MANIFEST__: manifestDefine(env.VITE_ROBINHOOD_TESTNET_MANIFEST_PATH, {
         chainId: 46_630,
         environment: "testnet",
+        requireIndexer: true,
         releaseEnvironmentKey: "robinhoodTestnet",
+        schemaVersion: "lb.robinhood.v1",
         publicReleaseEnvironment
       }),
       __ROBINHOOD_MANIFEST__: manifestDefine(env.VITE_ROBINHOOD_MANIFEST_PATH, {
         chainId: 4_663,
         environment: "mainnet",
+        requireIndexer: true,
         releaseEnvironmentKey: "robinhood",
+        schemaVersion: "lb.robinhood.v1",
         publicReleaseEnvironment
       })
     },
@@ -112,18 +127,14 @@ export default defineConfig(({ mode }) => {
       chunkSizeWarningLimit: 700,
       rolldownOptions: {
         output: {
-          codeSplitting: {
-            groups: [
-              {
-                // Keep wallet libraries auditable as vendor code. Some of these
-                // libraries ship inert localhost chain definitions and origin
-                // patterns even when the app is configured for a public chain.
-                name: "wallet-vendor",
-                includeDependenciesRecursively: false,
-                priority: 100,
-                test: isWalletVendorLocalDefaultModule
-              }
-            ]
+          // Name naturally generated, dependency-only chunks that contain the
+          // reviewed wallet defaults. Naming does not change the module graph;
+          // the public artifact checker uses this boundary to distinguish inert
+          // Viem/AppKit localhost constants from application configuration.
+          chunkFileNames(chunkInfo) {
+            return isWalletVendorDependencyChunk(chunkInfo.moduleIds)
+              ? "assets/wallet-vendor-[name]-[hash].js"
+              : "assets/[name]-[hash].js";
           }
         }
       }
@@ -131,31 +142,71 @@ export default defineConfig(({ mode }) => {
   };
 });
 
-function isWalletVendorLocalDefaultModule(moduleId: string): boolean {
-  const normalized = moduleId.replaceAll("\\", "/");
+function normalizeModuleId(moduleId: string): string {
+  return moduleId.replaceAll("\\", "/");
+}
+
+function isNodeModule(moduleId: string): boolean {
+  return normalizeModuleId(moduleId).includes("/node_modules/");
+}
+
+function isReviewedWalletVendorModule(moduleId: string): boolean {
+  const normalized = normalizeModuleId(moduleId);
   return (
     /\/node_modules\/viem\/_esm\/chains\/definitions\//.test(normalized) ||
     /\/node_modules\/@reown\/appkit-common\/dist\/esm\/src\/utils\/ConstantsUtil\.js$/.test(normalized)
   );
 }
 
+function isWalletVendorDependencyChunk(moduleIds: readonly string[]): boolean {
+  return moduleIds.length > 0 && moduleIds.every(isNodeModule) && moduleIds.some(isReviewedWalletVendorModule);
+}
+
+function isWalletVendorChunkFile(fileName: string): boolean {
+  return /^assets\/wallet-vendor-.+\.js$/i.test(fileName.replaceAll("\\", "/"));
+}
+
 function walletVendorBoundaryPlugin(): Plugin {
+  let auditedChunkFiles: string[] = [];
+
   return {
+    enforce: "post",
     name: "feather-wallet-vendor-boundary",
     generateBundle(_outputOptions, bundle) {
-      const walletChunks = Object.values(bundle).filter(
-        (output) => output.type === "chunk" && output.name === "wallet-vendor"
-      );
-      if (walletChunks.length !== 1) {
-        this.error(`Expected exactly one wallet-vendor chunk, received ${walletChunks.length}`);
-      }
+      auditedChunkFiles = [];
 
-      const unexpectedModules = Object.keys(walletChunks[0].modules).filter(
-        (moduleId) => !isWalletVendorLocalDefaultModule(moduleId)
-      );
-      if (unexpectedModules.length > 0) {
-        this.error(`wallet-vendor chunk contains non-approved modules:\n${unexpectedModules.join("\n")}`);
+      for (const output of Object.values(bundle)) {
+        if (output.type !== "chunk") continue;
+
+        const moduleIds = Object.keys(output.modules);
+        const shouldBeVendorChunk = isWalletVendorDependencyChunk(moduleIds);
+        const isNamedVendorChunk = isWalletVendorChunkFile(output.fileName);
+
+        if (shouldBeVendorChunk !== isNamedVendorChunk) {
+          this.error(
+            `${output.fileName}: wallet-vendor audit boundary does not match its dependency provenance`
+          );
+        }
+
+        if (isNamedVendorChunk) {
+          auditedChunkFiles.push(output.fileName);
+        }
       }
+    },
+    writeBundle(outputOptions) {
+      if (typeof outputOptions.dir !== "string") {
+        this.error("wallet-vendor audit requires a directory build output");
+      }
+      const artifacts = auditedChunkFiles
+        .sort((left, right) => left.localeCompare(right))
+        .map((file) => ({
+          file,
+          sha256: createHash("sha256").update(readFileSync(resolve(outputOptions.dir, file))).digest("hex")
+        }));
+      writeFileSync(
+        resolve(outputOptions.dir, walletVendorAuditFile),
+        `${JSON.stringify({ schemaVersion: walletVendorAuditSchema, artifacts }, null, 2)}\n`
+      );
     }
   };
 }
@@ -180,9 +231,11 @@ function manifestDefine(
   path: string | undefined,
   options: {
     chainId: number;
-    environment: "testnet" | "mainnet";
+    environment: "sepolia" | "testnet" | "mainnet";
     publicReleaseEnvironment?: string;
-    releaseEnvironmentKey: "robinhoodTestnet" | "robinhood";
+    releaseEnvironmentKey: "sepolia" | "robinhoodTestnet" | "robinhood";
+    requireIndexer: boolean;
+    schemaVersion: "lb.evm.v1" | "lb.robinhood.v1";
   }
 ): string {
   if (path === undefined || path.length === 0) {
@@ -200,8 +253,8 @@ function manifestDefine(
 
   const manifest = JSON.parse(readFileSync(absolutePath, "utf8")) as PublicManifestShape;
 
-  if (manifest.schemaVersion !== "lb.robinhood.v1") {
-    throw new Error(`Public web manifest override must use lb.robinhood.v1: ${path}`);
+  if (manifest.schemaVersion !== options.schemaVersion) {
+    throw new Error(`Public web manifest override must use ${options.schemaVersion}: ${path}`);
   }
 
   if (manifest.environment !== options.environment || manifest.chainId !== options.chainId) {
@@ -209,7 +262,7 @@ function manifestDefine(
   }
 
   if (options.publicReleaseEnvironment === options.releaseEnvironmentKey) {
-    validatePublicManifest(path, manifest);
+    validatePublicManifest(path, manifest, options.requireIndexer);
     validatePublicTokenPolicy(path, manifest, options);
   }
 
@@ -219,6 +272,17 @@ function manifestDefine(
 function validatePublicReleaseEnvironment(environment: string | undefined, env: Record<string, string>): void {
   if (environment === undefined || environment.length === 0) {
     return;
+  }
+
+  if (environment === "sepolia" && !env.VITE_SEPOLIA_MANIFEST_PATH) {
+    throw new Error("VITE_PUBLIC_RELEASE_ENV=sepolia requires VITE_SEPOLIA_MANIFEST_PATH");
+  }
+
+  if (environment === "sepolia") {
+    if (!env.VITE_ANALYTICS_SEPOLIA_URL) {
+      throw new Error("VITE_PUBLIC_RELEASE_ENV=sepolia requires VITE_ANALYTICS_SEPOLIA_URL");
+    }
+    assertPublicEndpoint("build environment", "VITE_ANALYTICS_SEPOLIA_URL", env.VITE_ANALYTICS_SEPOLIA_URL, true);
   }
 
   if (environment === "robinhoodTestnet" && !env.VITE_ROBINHOOD_TESTNET_MANIFEST_PATH) {
@@ -237,15 +301,15 @@ function validatePublicReleaseEnvironment(environment: string | undefined, env: 
     assertPublicEndpoint("build environment", "VITE_ANALYTICS_ROBINHOOD_URL", env.VITE_ANALYTICS_ROBINHOOD_URL, true);
   }
 
-  if (environment !== "robinhoodTestnet" && environment !== "robinhood") {
-    throw new Error("VITE_PUBLIC_RELEASE_ENV must be robinhoodTestnet or robinhood");
+  if (environment !== "sepolia" && environment !== "robinhoodTestnet" && environment !== "robinhood") {
+    throw new Error("VITE_PUBLIC_RELEASE_ENV must be sepolia, robinhoodTestnet, or robinhood");
   }
 }
 
-function validatePublicManifest(path: string, manifest: PublicManifestShape): void {
+function validatePublicManifest(path: string, manifest: PublicManifestShape, requireIndexer: boolean): void {
   assertNoLocalnetManifestFields(path, manifest);
   assertPublicEndpoint(path, "endpoints.rpcUrl", manifest.endpoints?.rpcUrl, true);
-  assertPublicEndpoint(path, "endpoints.indexerUrl", manifest.endpoints?.indexerUrl, true);
+  assertPublicEndpoint(path, "endpoints.indexerUrl", manifest.endpoints?.indexerUrl, requireIndexer);
   assertPublicEndpoint(path, "endpoints.apiUrl", manifest.endpoints?.apiUrl, false);
   assertPublicEndpoint(path, "endpoints.tokenListUrl", manifest.endpoints?.tokenListUrl, false);
 
@@ -323,12 +387,16 @@ function assertPublicAddress(path: string, field: string, value: unknown): void 
 function validatePublicTokenPolicy(
   manifestPath: string,
   manifest: PublicManifestShape,
-  options: { chainId: number; releaseEnvironmentKey: "robinhoodTestnet" | "robinhood" }
+  options: { chainId: number; releaseEnvironmentKey: "sepolia" | "robinhoodTestnet" | "robinhood" }
 ): void {
   const tokenListPath = resolve(
     rootDir,
     "../../packages/sdk/src/token-lists",
-    options.releaseEnvironmentKey === "robinhood" ? "robinhood.json" : "robinhood-testnet.json"
+    options.releaseEnvironmentKey === "sepolia"
+      ? "sepolia.json"
+      : options.releaseEnvironmentKey === "robinhood"
+        ? "robinhood.json"
+        : "robinhood-testnet.json"
   );
   const tokenList = JSON.parse(readFileSync(tokenListPath, "utf8")) as PublicTokenListShape;
 
@@ -394,14 +462,14 @@ function validatePublicTokenPolicy(
     }
   }
 
-  if (options.releaseEnvironmentKey === "robinhood") {
+  if (options.releaseEnvironmentKey === "robinhood" || options.releaseEnvironmentKey === "sepolia") {
     if (quoteTokens.length !== 1) {
-      throw new Error(`${tokenListPath}: expected exactly one Robinhood mainnet quote token, got ${quoteTokens.length}`);
+      throw new Error(`${tokenListPath}: expected exactly one canonical stablecoin quote token, got ${quoteTokens.length}`);
     }
 
     const [quoteToken] = quoteTokens;
     if (!quoteToken.tags.includes("canonical") || !quoteToken.tags.includes("stablecoin")) {
-      throw new Error(`${tokenListPath}: Robinhood mainnet quote token must be canonical and stablecoin`);
+      throw new Error(`${tokenListPath}: quote token must be canonical and stablecoin`);
     }
   }
 }

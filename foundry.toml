@@ -22,6 +22,7 @@ avalanche = "${AVALANCHE_RPC_URL}"
 fuji = "${FUJI_RPC_URL}"
 robinhood = "${ROBINHOOD_RPC_URL}"
 robinhood_testnet = "${ROBINHOOD_TESTNET_RPC_URL}"
+sepolia = "${SEPOLIA_RPC_URL}"
 local = "http://127.0.0.1:8545"
 
 # Blockscout-style verification is expected for Robinhood Chain.

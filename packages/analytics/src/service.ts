@@ -43,12 +43,14 @@ import type {
   PriceSample,
   PriceSubmission,
   PositionSnapshotEvent,
+  PoolActivityConnection,
   PoolBinState,
   PoolDiscoveryPool,
   PoolDiscoveryRequest,
   PoolState,
   PoolStateSnapshot,
   PoolStateUpdate,
+  TrustedPairPrice,
   WalletPairPosition,
   Connection
 } from "./types.js";
@@ -732,6 +734,12 @@ export class AnalyticsApiService {
       rootValue: {
         poolMetrics: (args: { first: number; after?: string | null; asOfTimestamp?: number }) =>
           this.#readCommitted(() => mapConnection(this.#engine.queryPoolMetrics(args), mapPoolMetrics)),
+        poolCatalog: (args: { first: number; after?: string | null }) => this.#readCommitted(() => ({
+          ...mapConnection(this.#engine.queryPoolCatalog(args), mapPoolState),
+          streamCursor: this.#stream.cursor
+        })),
+        poolActivity: (args: { pair: string; owner?: string | null; first: number; after?: string | null }) =>
+          this.#readCommitted(() => mapPoolActivityConnection(this.#engine.queryPoolActivity(args))),
         poolDiscovery: (args: { pools: PoolDiscoveryRequest[]; asOfTimestamp?: number }) =>
           this.queryPoolDiscovery(args).then((rows) => rows.map(mapPoolDiscovery)),
         pairCandles: (args: {
@@ -757,6 +765,8 @@ export class AnalyticsApiService {
         }),
         walletPositions: async (args: { owner: string; first: number; after?: string | null }) =>
           mapConnection(await this.queryWalletPositions(args), mapWalletPosition),
+        trustedPairPrice: (args: { baseToken: string; quoteToken: string }) =>
+          this.#readCommitted(() => mapTrustedPairPrice(this.#engine.queryTrustedPairPrice(args))),
         analyticsHealth: () => this.#readCommitted(() => mapHealth(this.#engine.getHealth()))
       }
     }));
@@ -1036,7 +1046,8 @@ export class AnalyticsApiService {
         prices.push({ ...omitSignedReport(price), verifiedBy: "fixed-test" });
         continue;
       }
-      if (price.signedReport === null || price.signedReport.trim() === "") {
+      if (price.source === "chainlink-data-streams" &&
+        (price.signedReport === null || price.signedReport.trim() === "")) {
         throw new Error(`Signed Chainlink report is required for ${price.token}`);
       }
       if (this.#priceVerifier === null) {
@@ -1594,6 +1605,29 @@ function mapPoolDiscovery(value: PoolDiscoveryPool) {
   return { ...value, status: value.status.toUpperCase() };
 }
 
+function mapTrustedPairPrice(value: TrustedPairPrice) {
+  return {
+    ...value,
+    quotePerBaseE18: nullableBigIntString(value.quotePerBaseE18),
+    status: value.status.toUpperCase(),
+    asOfBlock: nullableBigIntString(value.asOfBlock)
+  };
+}
+
+function mapPoolActivityConnection(value: PoolActivityConnection) {
+  return {
+    ...mapConnection(value, (event) => ({
+      ...event,
+      kind: event.kind === "position-transfer" ? "POSITION_TRANSFER" : event.kind.toUpperCase(),
+      amountX: nullableBigIntString(event.amountX),
+      amountY: nullableBigIntString(event.amountY),
+      blockNumber: event.blockNumber.toString()
+    })),
+    asOfBlock: nullableBigIntString(value.asOfBlock),
+    asOfBlockHash: value.asOfBlockHash
+  };
+}
+
 function mapCandle(value: Candle) {
   return {
     ...value,
@@ -1625,6 +1659,11 @@ function mapPoolStateSnapshot(value: PoolStateSnapshot, streamCursor: string) {
 function mapPoolState(value: PoolState) {
   return {
     ...value,
+    factoryAddress: value.factoryAddress ?? null,
+    createdAtBlock: nullableBigIntString(value.createdAtBlock ?? null),
+    createdAtBlockHash: value.createdAtBlockHash ?? null,
+    creationTransactionHash: value.creationTransactionHash ?? null,
+    creationLogIndex: value.creationLogIndex ?? null,
     reserveX: value.reserveX.toString(),
     reserveY: value.reserveY.toString(),
     marketPriceQuoteE18: value.marketPriceQuoteE18.toString(),
@@ -1826,6 +1865,7 @@ function rootFieldComplexity(field: FieldNode, variables: Record<string, unknown
   switch (field.name.value) {
     case "poolMetrics":
     case "pairCandles":
+    case "poolActivity":
       return 5 + boundedIntegerArgument(field, "first", variables, 100);
     case "poolState":
       return 5 + boundedIntegerArgument(field, "radius", variables, 100) * 2;

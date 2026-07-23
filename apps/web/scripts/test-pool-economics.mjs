@@ -57,7 +57,7 @@ try {
   assert.equal(economics.blockNumber, 55n);
   assert.equal(economics.activeId, BigInt(seeded.activeId));
   assert.equal(economics.binStep, BigInt(seeded.binStep));
-  assert.equal(economics.source, "rpc-at-indexer-block");
+  assert.equal(economics.source, "rpc-at-canonical-analytics-block");
   assert.equal(economics.feeRates.totalFeeRate, economics.feeRates.baseFeeRate + economics.feeRates.variableFeeRate);
   assert.equal(economics.feeRates.totalFeeRate, economics.feeRates.protocolFeeRate + economics.feeRates.lpNetFeeRate);
   assert(calls.every((call) => call.blockNumber === 55n), "every economics contract read is pinned to one block");
@@ -72,7 +72,7 @@ try {
   await assert.rejects(() => loadPinnedPoolEconomics(wrongDecimalsY.client, registry, pool, anchor), /token Y decimals/);
   await assert.rejects(
     () => loadPinnedPoolEconomics(client, registry, pool, { ...anchor, activeId: anchor.activeId + 1n }),
-    /active ID differs from the indexer snapshot/
+    /active ID differs from the canonical analytics anchor/
   );
   await assert.rejects(
     () => loadPinnedPoolEconomics(client, registry, { ...pool, tokenXAddress: "0x00000000000000000000000000000000000000ee" }, anchor),

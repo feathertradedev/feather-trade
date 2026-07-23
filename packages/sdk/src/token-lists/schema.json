@@ -10,10 +10,10 @@
       "const": "lb.token-list.v1"
     },
     "environment": {
-      "enum": ["localnet", "robinhoodTestnet", "robinhood"]
+      "enum": ["localnet", "robinhoodTestnet", "robinhood", "sepolia"]
     },
     "chainId": {
-      "enum": [31337, 46630, 4663]
+      "enum": [31337, 46630, 4663, 11155111]
     },
     "name": {
       "type": "string",

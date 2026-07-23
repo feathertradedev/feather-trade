@@ -122,7 +122,8 @@ networks:
   edge: {}
   backend:
     internal: true
-  egress: {}
+  egress:
+    enable_ipv6: true
 
 volumes:
   caddy_data: {}

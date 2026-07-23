@@ -1,5 +1,5 @@
 import { WagmiAdapter } from "@reown/appkit-adapter-wagmi";
-import { localnetChain, robinhoodChain, robinhoodTestnetChain } from "@robinhood-lb/sdk/chains";
+import { localnetChain, robinhoodChain, robinhoodTestnetChain, sepoliaChain } from "@robinhood-lb/sdk/chains";
 import { createConfig, http } from "wagmi";
 
 import { publicReleaseEnvironment, registries } from "./config";
@@ -8,22 +8,30 @@ const reownProjectId = import.meta.env.VITE_REOWN_PROJECT_ID?.trim() ?? "";
 const appOrigin = typeof window === "undefined" ? "https://feather.trade" : window.location.origin;
 
 const walletNetworks = (
-  publicReleaseEnvironment === "robinhoodTestnet"
-    ? [robinhoodTestnetChain]
-    : publicReleaseEnvironment === "robinhood"
-      ? [robinhoodChain]
-      : [localnetChain, robinhoodTestnetChain, robinhoodChain]
-) as [typeof localnetChain | typeof robinhoodTestnetChain | typeof robinhoodChain, ...Array<typeof localnetChain | typeof robinhoodTestnetChain | typeof robinhoodChain>];
+  publicReleaseEnvironment === "sepolia"
+    ? [sepoliaChain]
+    : publicReleaseEnvironment === "robinhoodTestnet"
+      ? [robinhoodTestnetChain]
+      : publicReleaseEnvironment === "robinhood"
+        ? [robinhoodChain]
+        : [localnetChain, sepoliaChain, robinhoodTestnetChain, robinhoodChain]
+) as [
+  typeof localnetChain | typeof sepoliaChain | typeof robinhoodTestnetChain | typeof robinhoodChain,
+  ...Array<typeof localnetChain | typeof sepoliaChain | typeof robinhoodTestnetChain | typeof robinhoodChain>
+];
 
-const walletTransports: Record<number, ReturnType<typeof http>> = publicReleaseEnvironment === "robinhoodTestnet"
-  ? { [robinhoodTestnetChain.id]: http(registries.robinhoodTestnet.endpoints.rpcUrl) }
-  : publicReleaseEnvironment === "robinhood"
-    ? { [robinhoodChain.id]: http(registries.robinhood.endpoints.rpcUrl) }
-    : {
-        [localnetChain.id]: http(registries.localnet.endpoints.rpcUrl),
-        [robinhoodTestnetChain.id]: http(registries.robinhoodTestnet.endpoints.rpcUrl),
-        [robinhoodChain.id]: http(registries.robinhood.endpoints.rpcUrl)
-      };
+const walletTransports: Record<number, ReturnType<typeof http>> = publicReleaseEnvironment === "sepolia"
+  ? { [sepoliaChain.id]: http(registries.sepolia.endpoints.rpcUrl) }
+  : publicReleaseEnvironment === "robinhoodTestnet"
+    ? { [robinhoodTestnetChain.id]: http(registries.robinhoodTestnet.endpoints.rpcUrl) }
+    : publicReleaseEnvironment === "robinhood"
+      ? { [robinhoodChain.id]: http(registries.robinhood.endpoints.rpcUrl) }
+      : {
+          [localnetChain.id]: http(registries.localnet.endpoints.rpcUrl),
+          [sepoliaChain.id]: http(registries.sepolia.endpoints.rpcUrl),
+          [robinhoodTestnetChain.id]: http(registries.robinhoodTestnet.endpoints.rpcUrl),
+          [robinhoodChain.id]: http(registries.robinhood.endpoints.rpcUrl)
+        };
 
 const wagmiAdapter = reownProjectId
   ? new WagmiAdapter({
@@ -72,7 +80,7 @@ async function loadAppKit() {
         swaps: false
       },
       metadata: {
-        description: "Liquidity Book trading on Robinhood Chain.",
+        description: "Liquidity Book trading with Feather Trade.",
         icons: [`${appOrigin}/feather/feather-mark-128.png`],
         name: "Feather Trade",
         url: appOrigin
@@ -92,13 +100,48 @@ async function loadAppKit() {
 }
 
 let appKitPromise: ReturnType<typeof loadAppKit> | null = null;
+let walletModalOpen = false;
+let walletModalSubscriptionAttached = false;
+const walletModalSubscribers = new Set<(open: boolean) => void>();
 
 export const walletModalConfigured = wagmiAdapter !== null;
+
+export function walletModalIsOpen(): boolean {
+  return walletModalOpen;
+}
+
+export function subscribeWalletModalOpen(listener: (open: boolean) => void): () => void {
+  walletModalSubscribers.add(listener);
+  listener(walletModalOpen);
+  return () => walletModalSubscribers.delete(listener);
+}
+
+function observeWalletModal(appKit: Awaited<ReturnType<typeof loadAppKit>>): void {
+  if (walletModalSubscriptionAttached) return;
+  walletModalSubscriptionAttached = true;
+  const publish = (open: boolean) => {
+    if (walletModalOpen === open) return;
+    walletModalOpen = open;
+    for (const listener of walletModalSubscribers) listener(open);
+  };
+  publish(appKit.getState().open);
+  appKit.subscribeState((state) => publish(state.open));
+}
+
+function publishWalletModalOpen(open: boolean): void {
+  if (walletModalOpen === open) return;
+  walletModalOpen = open;
+  for (const listener of walletModalSubscribers) listener(open);
+}
 
 export async function openWalletModal(): Promise<void> {
   if (!walletModalConfigured) {
     throw new Error("Wallet modal is not configured");
   }
   const appKit = await (appKitPromise ??= loadAppKit());
+  observeWalletModal(appKit);
+  // Mark ownership before AppKit mounts its portal. This closes the small gap
+  // in which an immediate Escape could otherwise reach the underlying wizard.
+  publishWalletModalOpen(true);
   await appKit.open({ view: "Connect" });
 }

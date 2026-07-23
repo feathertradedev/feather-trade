@@ -23,6 +23,7 @@ export interface WorkspaceMetricTile {
   label: string;
   value: string;
   status: AnalyticsStatus;
+  detail?: string | null;
 }
 
 export interface WorkspaceAnalyticsState {
@@ -137,11 +138,23 @@ export function sortPoolWorkspaceRows<T extends PoolRow>(
 }
 
 export function workspaceMetricTiles(metric: PoolAnalyticsMetric | null): WorkspaceMetricTile[] {
+  const zeroTvlRatio = metric?.status === "READY" &&
+    metric.tvlUsdE18 !== null &&
+    BigInt(metric.tvlUsdE18) === 0n &&
+    metric.feeToTvlE18 === null;
   return [
     metricTile("tvl", "TVL", metric?.tvlUsdE18 ?? null, metric?.status ?? "UNAVAILABLE", formatUsdE18),
     metricTile("volume24h", "24h volume", metric?.volume24hUsdE18 ?? null, metric?.status ?? "UNAVAILABLE", formatUsdE18),
     metricTile("lpFees24h", "24h LP fees", metric?.lpFees24hUsdE18 ?? null, metric?.status ?? "UNAVAILABLE", formatUsdE18),
-    metricTile("feeToTvl", "24h LP fee / TVL", metric?.feeToTvlE18 ?? null, metric?.status ?? "UNAVAILABLE", formatRatioPercentE18),
+    zeroTvlRatio
+      ? {
+          key: "feeToTvl",
+          label: "24h LP fee / TVL",
+          value: "—",
+          status: "READY",
+          detail: "Undefined because TVL is $0."
+        }
+      : metricTile("feeToTvl", "24h LP fee / TVL", metric?.feeToTvlE18 ?? null, metric?.status ?? "UNAVAILABLE", formatRatioPercentE18),
     metricTile("price", "Indexed price", metric?.priceUsdE18 ?? null, metric?.status ?? "UNAVAILABLE", formatUsdE18)
   ];
 }

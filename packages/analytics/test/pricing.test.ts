@@ -32,6 +32,49 @@ test("indexes out-of-order trusted samples while preserving sequence and timesta
   assert.equal(book.get(TOKEN, 300).priceUsdE18, 30n * USD_SCALE);
 });
 
+test("uses zero confidence as the explicit Data Feed convention and enforces freshness boundaries", () => {
+  const token = "0x00000000000000000000000000000000000000f1";
+  const feedId = "0x00000000000000000000000000000000000000f2";
+  const book = new TrustedPriceBook([{
+    token,
+    source: "chainlink-data-feeds",
+    feedId: feedId.toUpperCase().replace("0X", "0x"),
+    maxAgeSeconds: 60,
+    maxConfidenceBps: 0,
+    feedDecimals: 8,
+    feedDescription: "TEST / USD"
+  }]);
+  book.apply({
+    token,
+    source: "chainlink-data-feeds",
+    feedId,
+    priceUsdE18: 3n * USD_SCALE,
+    confidenceUsdE18: 0n,
+    observedAt: 100,
+    sequence: 9n,
+    verifiedBy: "canonical-data-feed"
+  }, 100);
+
+  assert.equal(book.get(token, 160).priceUsdE18, 3n * USD_SCALE);
+  assert.equal(book.get(token, 161).reason, "stale");
+});
+
+test("rejects malformed Data Feed policies at startup", () => {
+  const base = {
+    token: "0x00000000000000000000000000000000000000f1",
+    source: "chainlink-data-feeds" as const,
+    feedId: "0x00000000000000000000000000000000000000f2",
+    maxAgeSeconds: 60,
+    maxConfidenceBps: 0,
+    feedDecimals: 8,
+    feedDescription: "TEST / USD"
+  };
+  assert.throws(() => new TrustedPriceBook([{ ...base, feedId: "not-an-address" }]), /Data Feed address/);
+  assert.throws(() => new TrustedPriceBook([{ ...base, feedDecimals: undefined }]), /feedDecimals/);
+  assert.throws(() => new TrustedPriceBook([{ ...base, feedDescription: "" }]), /feedDescription/);
+  assert.throws(() => new TrustedPriceBook([{ ...base, maxConfidenceBps: 1 }]), /maxConfidenceBps 0/);
+});
+
 function sample(observedAt: number, sequence: bigint, priceUsdE18: bigint): PriceSample {
   return {
     token: TOKEN,

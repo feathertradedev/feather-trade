@@ -17,6 +17,78 @@ absent, but adapter availability alone is not approval to expose analytics on
 mainnet. Do not substitute the localnet adapter, fixed prices, browser fixtures,
 or fabricated candles in staging or production.
 
+## Sepolia web-only stage
+
+The current Sepolia stage serves only the sealed application and documentation
+artifact. Use `compose.web.yml`, `Caddyfile.web`, and
+`host.web.env.example`; this path does not start or proxy analytics, a database,
+or any chain indexer. The existing `compose.yml` full-stack path remains the
+separate, fail-closed analytics deployment and is unchanged.
+
+The web-only Caddy listener publishes only TCP 80/443 and UDP 443, mounts the
+release tree read-only, retains the reviewed Reown CSP, and permits the browser
+to connect to the exact Sepolia public RPC origin in `host.web.env.example`.
+`FEATHER_APP_DOMAIN` and `FEATHER_DOCS_DOMAIN` are exact virtual hosts; there is
+no catch-all host. Replace the reserved `.invalid` examples before starting
+Caddy. Analytics and private paths, including `/graphql`,
+`/events/*`, `/token-images/*`, `/readyz`, `/metrics`, and `/internal/*`, return
+404 rather than falling through to the SPA.
+
+Provision the release root and operator environment without creating any
+analytics directories or secrets:
+
+```sh
+sudo install -d -m 0755 /etc/feather
+sudo install -d -o feather-deploy -g feather-deploy -m 0755 /srv/feather/web/sepolia
+sudo install -d -o feather-deploy -g feather-deploy -m 0755 /srv/feather/web/sepolia/releases
+sudo cp infra/vps/host.web.env.example /etc/feather/host.web.env
+```
+
+Configure the protected Sepolia promotion environment with
+`WEB_VPS_RELEASE_ROOT=/srv/feather/web/sepolia`. Install only sealed artifacts
+at `releases/<commit>/dist`, remove their write bits, and atomically update the
+relative `current` pointer exactly as described in the sealed-release section
+below. The public RPC is intentionally not a deployment key or private provider
+credential; if it changes, update the sealed web manifest and the exact CSP
+origin together.
+
+Validate and start the web-only stage from the repository checkout:
+
+```sh
+node scripts/release/validate-vps-deployment.cjs
+docker compose --env-file /etc/feather/host.web.env \
+  --file infra/vps/compose.web.yml config --quiet
+docker run --rm \
+  --env FEATHER_APP_DOMAIN=app.example.invalid \
+  --env FEATHER_DOCS_DOMAIN=docs.example.invalid \
+  --env "FEATHER_APP_CONNECT_SRC='self' https://ethereum-sepolia-rpc.publicnode.com" \
+  --volume "$PWD/infra/vps/Caddyfile.web:/etc/caddy/Caddyfile:ro" \
+  caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d \
+  caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+docker compose --env-file /etc/feather/host.web.env \
+  --file infra/vps/compose.web.yml pull
+docker compose --env-file /etc/feather/host.web.env \
+  --file infra/vps/compose.web.yml up --detach
+```
+
+After DNS points both exact names at the VPS, verify the app, docs, and the
+deliberately absent analytics surface:
+
+```sh
+curl --fail --silent --show-error "https://${FEATHER_APP_DOMAIN}/"
+curl --fail --silent --show-error "https://${FEATHER_DOCS_DOMAIN}/docs"
+test "$(curl --silent --output /dev/null --write-out '%{http_code}' https://${FEATHER_APP_DOMAIN}/graphql)" = 404
+test "$(curl --silent --output /dev/null --write-out '%{http_code}' https://${FEATHER_APP_DOMAIN}/events/candles)" = 404
+test "$(curl --silent --output /dev/null --write-out '%{http_code}' https://${FEATHER_APP_DOMAIN}/readyz)" = 404
+```
+
+Stop this stage with the same explicit file and environment selections:
+
+```sh
+docker compose --env-file /etc/feather/host.web.env \
+  --file infra/vps/compose.web.yml down --remove-orphans
+```
+
 ## Host layout
 
 Keep mutable operator configuration outside the checkout:
@@ -34,7 +106,26 @@ Keep mutable operator configuration outside the checkout:
 Managed PostgreSQL is deliberately absent from `compose.yml`. Caddy's named
 volumes retain ACME account and certificate material; losing them does not lose
 application data, but repeated loss can trigger certificate-authority rate
-limits.
+limits. The analytics egress network enables IPv6 because managed PostgreSQL
+providers may expose direct database hosts without an IPv4 address.
+
+## Sepolia Chainlink pricing
+
+The reviewed Sepolia analytics path uses public on-chain Chainlink Data Feeds,
+not credentialed Chainlink Data Streams. Copy
+`config/price-policies.sepolia.json` to the custody filename
+`price-policies.json`, and copy `adapters/chainlink-verifier.sepolia.mjs` to
+`chainlink-verifier.mjs` before building the runtime custody inventory.
+
+The policies bind the exact allowlisted Sepolia WETH and Circle USDC addresses
+to the official ETH/USD and USDC/USD proxy feeds. The canonical source reads
+`latestRoundData()` through an EIP-1898 canonical block-hash reference. The
+independent verifier repeats that exact read, validates the chain, proxy code,
+description, decimals, round ordering, answer, and timestamps, and reconstructs
+the sample instead of trusting submitted values. Stale but authentic rounds
+degrade USD metrics to partial; malformed or future rounds stop ingestion.
+Neither active-bin prices nor any other DEX-derived value can enter this trusted
+TVL price path.
 
 ## Provision once
 
@@ -88,7 +179,7 @@ limits.
    Generate the canonical four-file inventory and its deployment-bound digest:
 
    ```sh
-   pnpm analytics:custody:build -- \
+   pnpm analytics:custody:build \
      --environment mainnet \
      --deployment-identity "mainnet:<approved-adapter-release>" \
      --config-dir /etc/feather/analytics/config \

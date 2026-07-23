@@ -13,6 +13,14 @@ export class TrustedPriceBook {
 
   constructor(policies: readonly PricePolicy[]) {
     for (const policy of policies) {
+      if (policy === null || typeof policy !== "object") throw new Error("Price policy must be an object");
+      if (!["chainlink-data-feeds", "chainlink-data-streams", "fixed-test"].includes(policy.source)) {
+        throw new Error(`Invalid price source for ${String(policy.token)}`);
+      }
+      if (typeof policy.token !== "string" || policy.token.trim() === "") throw new Error("Price policy token is required");
+      if (typeof policy.feedId !== "string" || policy.feedId.trim() === "") {
+        throw new Error(`Price policy feedId is required for ${policy.token}`);
+      }
       const token = normalize(policy.token);
       if (this.#policies.has(token)) throw new Error(`Duplicate price policy for ${policy.token}`);
       if (!Number.isSafeInteger(policy.maxAgeSeconds) || policy.maxAgeSeconds <= 0) {
@@ -21,7 +29,22 @@ export class TrustedPriceBook {
       if (!Number.isSafeInteger(policy.maxConfidenceBps) || policy.maxConfidenceBps < 0 || policy.maxConfidenceBps > 10_000) {
         throw new Error(`Invalid maxConfidenceBps for ${policy.token}`);
       }
-      this.#policies.set(token, { ...policy, token });
+      if (policy.source === "chainlink-data-feeds") {
+        if (!/^0x[0-9a-fA-F]{40}$/.test(policy.feedId)) {
+          throw new Error(`Invalid Chainlink Data Feed address for ${policy.token}`);
+        }
+        if (!Number.isSafeInteger(policy.feedDecimals) || policy.feedDecimals! < 0 || policy.feedDecimals! > 36) {
+          throw new Error(`Invalid feedDecimals for ${policy.token}`);
+        }
+        if (typeof policy.feedDescription !== "string" || policy.feedDescription.trim() === "") {
+          throw new Error(`Invalid feedDescription for ${policy.token}`);
+        }
+        if (policy.maxConfidenceBps !== 0) {
+          throw new Error(`Chainlink Data Feeds policy for ${policy.token} must use maxConfidenceBps 0`);
+        }
+      }
+      const feedId = policy.source === "chainlink-data-feeds" ? policy.feedId.toLowerCase() : policy.feedId;
+      this.#policies.set(token, { ...policy, token, feedId });
     }
   }
 
@@ -29,14 +52,15 @@ export class TrustedPriceBook {
     const token = normalize(sample.token);
     const policy = this.#policies.get(token);
     if (!policy) return;
-    if (sample.source !== policy.source || sample.feedId !== policy.feedId) return;
-    if (sample.source === "chainlink-data-streams" && sample.verifiedBy.trim() === "") return;
+    const feedId = sample.source === "chainlink-data-feeds" ? sample.feedId.toLowerCase() : sample.feedId;
+    if (sample.source !== policy.source || feedId !== policy.feedId) return;
+    if (sample.source !== "fixed-test" && sample.verifiedBy.trim() === "") return;
     if (sample.priceUsdE18 <= 0n || sample.confidenceUsdE18 < 0n || sample.observedAt > blockTimestamp + 30) return;
 
     const samples = this.#samples.get(token) ?? [];
     const sequences = this.#sampleSequences.get(token) ?? new Set<bigint>();
     if (sequences.has(sample.sequence)) return;
-    const normalized = { ...sample, token };
+    const normalized = { ...sample, token, feedId };
     const insertionIndex = upperBoundSample(samples, normalized);
     samples.splice(insertionIndex, 0, normalized);
     sequences.add(sample.sequence);

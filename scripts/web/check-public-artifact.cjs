@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 
 const fs = require("node:fs");
+const crypto = require("node:crypto");
 const path = require("node:path");
 
 const repoRoot = path.resolve(__dirname, "../..");
+const walletVendorAuditFile = "wallet-vendor-audit.json";
+const walletVendorAuditSchema = "feather.wallet-vendor-audit.v1";
 const anvilAddresses = [
   "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
   "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
@@ -29,6 +32,10 @@ const localnetManifestAddresses = [
   "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
 ];
 const environmentConfig = {
+  sepolia: {
+    chainId: 11_155_111,
+    tokenList: "packages/sdk/src/token-lists/sepolia.json"
+  },
   robinhoodTestnet: {
     chainId: 46_630,
     tokenList: "packages/sdk/src/token-lists/robinhood-testnet.json"
@@ -39,6 +46,9 @@ const environmentConfig = {
   }
 };
 const secretCanaryEnvVars = [
+  "EVM_DEPLOYER_PRIVATE_KEY",
+  "EVM_DEPLOY_RPC_URL",
+  "SEPOLIA_RPC_URL",
   "ROBINHOOD_DEPLOYER_PRIVATE_KEY",
   "DEPLOYER_PRIVATE_KEY",
   "GOLDSKY_API_KEY",
@@ -118,7 +128,7 @@ function main() {
 
   const errors = [];
   const config = environmentConfig[options.environment];
-  if (config === undefined) errors.push("--environment must be robinhoodTestnet or robinhood");
+  if (config === undefined) errors.push("--environment must be sepolia, robinhoodTestnet, or robinhood");
   if (typeof options.manifest !== "string") errors.push("--manifest is required");
   if (typeof options.dist !== "string") errors.push("--dist is required");
   if (errors.length > 0) return finish(errors);
@@ -162,22 +172,22 @@ function main() {
     text: fs.readFileSync(file, "utf8").toLowerCase()
   }));
   const haystack = searchableArtifacts.map((artifact) => artifact.text).join("\n");
-  const walletVendorArtifacts = searchableArtifacts.filter((artifact) => isWalletVendorArtifact(artifact.relativePath));
-  if (walletVendorArtifacts.length !== 1) {
-    errors.push(`dist artifact must contain exactly one hashed wallet-vendor JavaScript chunk; found ${walletVendorArtifacts.length}`);
-  }
+  const auditedWalletVendorArtifacts = validateWalletVendorAudit(distPath, searchableArtifacts, errors);
   if (haystack.includes("sourcemappingurl")) {
     errors.push("dist artifact must not include sourceMappingURL comments");
   }
-  const selectedStrings = [
+  const selectedStrings = [...new Set([
     String(config.chainId),
     manifest.endpoints.rpcUrl,
     manifest.endpoints.indexerUrl,
     manifest.contracts.lbFactory,
+    manifest.contracts.lbPairImplementation,
     manifest.contracts.lbRouter,
     manifest.contracts.lbQuoter,
-    manifest.tokens.wrappedNative
-  ].filter((value) => typeof value === "string" && value.length > 0);
+    ...Object.values(manifest.tokens ?? {}),
+    ...Object.values(manifest.quoteAssets ?? {}),
+    ...(Array.isArray(tokenList.tokens) ? tokenList.tokens.map((token) => token.address) : [])
+  ].filter((value) => typeof value === "string" && value.length > 0))];
 
   for (const value of selectedStrings) {
     if (!haystack.includes(value.toLowerCase())) {
@@ -185,7 +195,7 @@ function main() {
     }
   }
 
-  scanForForbiddenPublicValues(searchableArtifacts, errors);
+  scanForForbiddenPublicValues(searchableArtifacts, errors, auditedWalletVendorArtifacts);
   scanForSecretCanaries(searchableArtifacts, process.env, errors);
 
   validateTokenAssets(distPath, tokenList, errors);
@@ -236,12 +246,12 @@ function isSearchableArtifactFile(file) {
   return /\.(css|html|js|json|svg|txt|webmanifest)$/i.test(file);
 }
 
-function scanForForbiddenPublicValues(artifacts, errors) {
+function scanForForbiddenPublicValues(artifacts, errors, auditedWalletVendorArtifacts = new Set()) {
   for (const forbidden of forbiddenPublicBuildValues) {
     const normalized = forbidden.toLowerCase();
     for (const artifact of artifacts) {
       if (!artifact.text.includes(normalized)) continue;
-      if (isWalletVendorArtifact(artifact.relativePath) && walletVendorAllowedForbiddenValues.has(normalized)) {
+      if (auditedWalletVendorArtifacts.has(artifact.relativePath) && walletVendorAllowedForbiddenValues.has(normalized)) {
         continue;
       }
       errors.push(`${artifact.relativePath}: contains forbidden public-build value: ${forbidden}`);
@@ -249,11 +259,66 @@ function scanForForbiddenPublicValues(artifacts, errors) {
   }
 
   for (const artifact of artifacts) {
-    const allowedUrls = isWalletVendorArtifact(artifact.relativePath)
+    const allowedUrls = auditedWalletVendorArtifacts.has(artifact.relativePath)
       ? walletVendorAllowedLocalEndpointUrls
       : undefined;
     scanForLocalEndpointUrls(artifact.text, artifact.relativePath, errors, allowedUrls);
   }
+}
+
+function validateWalletVendorAudit(distPath, artifacts, errors) {
+  const audited = new Set();
+  const auditPath = path.join(distPath, walletVendorAuditFile);
+  const audit = readJson(auditPath, errors);
+  if (audit.schemaVersion !== walletVendorAuditSchema) {
+    errors.push(`${display(auditPath)}: expected schemaVersion ${walletVendorAuditSchema}`);
+    return audited;
+  }
+  if (!Array.isArray(audit.artifacts)) {
+    errors.push(`${display(auditPath)}: artifacts must be an array`);
+    return audited;
+  }
+
+  const artifactByPath = new Map(artifacts.map((artifact) => [artifact.relativePath, artifact]));
+  for (const entry of audit.artifacts) {
+    if (entry === null || typeof entry !== "object" || typeof entry.file !== "string" || typeof entry.sha256 !== "string") {
+      errors.push(`${display(auditPath)}: each artifact requires file and sha256 strings`);
+      continue;
+    }
+    const relativePath = entry.file.replaceAll("\\", "/");
+    if (!isWalletVendorArtifact(relativePath)) {
+      errors.push(`${display(auditPath)}: invalid wallet-vendor artifact path ${entry.file}`);
+      continue;
+    }
+    if (!/^[a-f0-9]{64}$/.test(entry.sha256)) {
+      errors.push(`${display(auditPath)}: invalid sha256 for ${relativePath}`);
+      continue;
+    }
+    if (audited.has(relativePath)) {
+      errors.push(`${display(auditPath)}: duplicate artifact ${relativePath}`);
+      continue;
+    }
+
+    const artifact = artifactByPath.get(relativePath);
+    if (artifact === undefined) {
+      errors.push(`${display(auditPath)}: audited artifact is missing: ${relativePath}`);
+      continue;
+    }
+    const filePath = path.join(distPath, ...relativePath.split("/"));
+    const sha256 = crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+    if (sha256 !== entry.sha256) {
+      errors.push(`${relativePath}: wallet-vendor audit digest mismatch`);
+      continue;
+    }
+    audited.add(relativePath);
+  }
+
+  for (const artifact of artifacts) {
+    if (isWalletVendorArtifact(artifact.relativePath) && !audited.has(artifact.relativePath)) {
+      errors.push(`${artifact.relativePath}: wallet-vendor artifact is not present in the build audit inventory`);
+    }
+  }
+  return audited;
 }
 
 function scanForSecretCanaries(artifacts, env, errors) {
@@ -270,7 +335,7 @@ function scanForSecretCanaries(artifacts, env, errors) {
 }
 
 function isWalletVendorArtifact(relativePath) {
-  return /^assets\/wallet-vendor-[a-z0-9_-]{8}\.js$/i.test(relativePath.replaceAll("\\", "/"));
+  return /^assets\/wallet-vendor-.+-[a-z0-9_-]{8}\.js$/i.test(relativePath.replaceAll("\\", "/"));
 }
 
 function scanForLocalEndpointUrls(text, label, errors, allowedUrls = undefined) {
@@ -389,7 +454,7 @@ function finish(errors, successMessage) {
 }
 
 function printHelp() {
-  console.log("Usage: node scripts/web/check-public-artifact.cjs --environment <robinhoodTestnet|robinhood> --manifest <path> --dist <apps/web/dist> [--token-list <path>]");
+  console.log("Usage: node scripts/web/check-public-artifact.cjs --environment <sepolia|robinhoodTestnet|robinhood> --manifest <path> --dist <apps/web/dist> [--token-list <path>]");
 }
 
 if (require.main === module) {
@@ -405,5 +470,6 @@ module.exports = {
   isWalletVendorArtifact,
   scanForForbiddenPublicValues,
   scanForLocalEndpointUrls,
-  scanForSecretCanaries
+  scanForSecretCanaries,
+  validateWalletVendorAudit
 };

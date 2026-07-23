@@ -38,6 +38,7 @@ export interface TransactionJournalApi {
   begin(reviewed: ReviewedTransactionIntent): Promise<TransactionIntentHandle>;
   fail(handle: TransactionIntentHandle, error: unknown): Promise<void>;
   records: TransactionJournalRecord[];
+  recheck(recordId: string): Promise<void>;
   retryBlocked(reviewed: ReviewedTransactionIntent): boolean;
   submitted(handle: TransactionIntentHandle, hash: Address): Promise<void>;
 }
@@ -140,6 +141,29 @@ export function TransactionJournalProvider({ children }: { children: ReactNode }
   const retryBlocked = useCallback((reviewed: ReviewedTransactionIntent) =>
     !ready || transactionRetryBlocked(stateRef.current, reviewed) || transactionFamilyRetryBlocked(stateRef.current, reviewed), [ready]);
 
+  const recheck = useCallback(async (recordId: string): Promise<void> => {
+    await ensureInitialized();
+    const record = stateRef.current.records.find((candidate) => candidate.id === recordId);
+    if (!record) throw new Error("Transaction journal record is no longer available");
+    const registry = registries[record.reviewed.environment as EnvironmentKey];
+    if (!registry || record.reviewed.chainId !== registry.chainId || record.reviewed.deploymentEpoch !== registryDeploymentEpoch(registry)) {
+      throw new Error("Transaction status cannot be checked against a stale deployment");
+    }
+    const client = createDexPublicClient(registry.chain, registry.endpoints.rpcUrl);
+    const observation = await observeRecord(client, record, await client.getBlockNumber());
+    await commit((current) => {
+      const currentRecord = current.records.find((candidate) => candidate.id === record.id);
+      if (!currentRecord || currentRecord.lifecycleRevision !== record.lifecycleRevision) return current;
+      return {
+        ...current,
+        records: current.records.map((candidate) => candidate.id === record.id
+          ? applyTransactionObservation(candidate, observation, TRANSACTION_JOURNAL_CONFIRMATIONS)
+          : candidate),
+        revision: current.revision + 1
+      };
+    });
+  }, [commit, ensureInitialized]);
+
   useEffect(() => {
     const mergeFromStorage = (event: StorageEvent) => {
       if (event.key !== TRANSACTION_JOURNAL_STORAGE_KEY) return;
@@ -222,7 +246,10 @@ export function TransactionJournalProvider({ children }: { children: ReactNode }
     };
   }, [commit, ensureInitialized]);
 
-  const api = useMemo<TransactionJournalApi>(() => ({ abort, begin, fail, records: state.records, retryBlocked, submitted }), [abort, begin, fail, retryBlocked, state.records, submitted]);
+  const api = useMemo<TransactionJournalApi>(
+    () => ({ abort, begin, fail, records: state.records, recheck, retryBlocked, submitted }),
+    [abort, begin, fail, recheck, retryBlocked, state.records, submitted]
+  );
   return <TransactionJournalContext.Provider value={api}>{children}</TransactionJournalContext.Provider>;
 }
 

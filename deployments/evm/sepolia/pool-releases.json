@@ -1,0 +1,26 @@
+{
+  "schemaVersion": "feather.pool-release-policy.v1",
+  "environment": "sepolia",
+  "chainId": 11155111,
+  "factory": "0xe521A00F81A60b77Eb39EC2097F94aF532DFb811",
+  "epochs": [
+    {
+      "id": "sepolia-weth-usdc-mispriced-empty-2026-07-23",
+      "pair": "0x3136C5F3b48fe486c696bEDC031B9cB9D3e9EA62",
+      "status": "deprecated-do-not-fund",
+      "canonical": false,
+      "reason": "Initial WETH/USDC price was entered with the wrong orientation. The pool is empty and must remain unfunded."
+    }
+  ],
+  "canonicalPools": [],
+  "replacement": {
+    "status": "pending-user-creation",
+    "pair": null,
+    "requirements": [
+      "Created through the reviewed Sepolia UI with the corrected wallet and chain gate.",
+      "Initial price is explicitly confirmed as USDC per WETH using a current trusted oracle suggestion.",
+      "Identity is reconciled against the live factory before the pool is promoted.",
+      "Liquidity is supplied by the user only after the replacement address is recorded here."
+    ]
+  }
+}

@@ -13,6 +13,7 @@ import {
   isCandleStreamStale,
   isPoolStreamStale,
   loadAnalyticsHealth,
+  loadCanonicalPoolActivity,
   loadPairCandles,
   loadPoolMetrics,
   loadPoolState,
@@ -28,9 +29,6 @@ import {
 } from "./analytics-data";
 import { analyticsEndpointForRegistry, registries, type EnvironmentKey } from "./config";
 import {
-  loadPoolActivity,
-  loadPaginatedPositionsForOwnerPair,
-  loadPositionHistory,
   loadPoolBinWindow,
   loadPoolIndexerSnapshot,
   loadWalletPortfolio,
@@ -51,7 +49,16 @@ import {
   type PoolWorkspaceRow,
   type WorkspaceAnalyticsState
 } from "./pool-workspace";
-import { loadPinnedPoolEconomics, type PinnedPoolEconomics } from "./pool-economics";
+import {
+  canonicalActivityRows,
+  canonicalPositionHistoryRows,
+  portfolioPositionRows
+} from "./pool-workspace-activity";
+import {
+  loadPinnedPoolEconomics,
+  type PinnedPoolEconomics,
+  type PoolEconomicsAnchor
+} from "./pool-economics";
 
 const WORKSPACE_REFRESH_INTERVAL_MS = 10_000;
 export type CandleStreamState = "connecting" | "live" | "stale" | "unavailable";
@@ -345,8 +352,23 @@ export function PoolWorkspaceProvider({
     retry: false
   });
   const indexerSnapshot = indexerSnapshotQuery.isError ? undefined : indexerSnapshotQuery.data;
-  const indexerSnapshotBlockNumber = indexerSnapshot?.blockNumber.toString() ?? null;
-  const indexerSnapshotBlockHash = indexerSnapshot?.blockHash ?? null;
+  const livePoolBootstrap = livePoolQuery.data?.value ?? null;
+  const analyticsHealth = healthQuery.data?.value ?? null;
+  const analyticsEconomicsAnchor: PoolEconomicsAnchor | null =
+    livePoolBootstrap !== null &&
+    analyticsHealth?.headBlock !== null &&
+    analyticsHealth?.headBlock !== undefined &&
+    analyticsHealth.headHash !== null
+      ? {
+          activeId: BigInt(livePoolBootstrap.state.activeId),
+          binStep: BigInt(livePoolBootstrap.state.binStep),
+          blockHash: analyticsHealth.headHash as `0x${string}`,
+          blockNumber: BigInt(analyticsHealth.headBlock),
+          factory: pool.factoryAddress,
+          tokenX: livePoolBootstrap.state.tokenX,
+          tokenY: livePoolBootstrap.state.tokenY
+        }
+      : null;
   const economicsQuery = useQuery({
     queryKey: [
       "canonicalPoolEconomics",
@@ -356,22 +378,21 @@ export function PoolWorkspaceProvider({
       pool.tokenXAddress,
       pool.tokenYAddress,
       pool.binStep,
-      indexerSnapshotBlockNumber,
-      indexerSnapshotBlockHash,
-      indexerSnapshot?.activeId.toString() ?? null
+      analyticsEconomicsAnchor?.blockNumber.toString() ?? null,
+      analyticsEconomicsAnchor?.blockHash ?? null,
+      analyticsEconomicsAnchor?.activeId.toString() ?? null
     ],
     queryFn: () => {
-      const snapshot = indexerSnapshot;
-      if (snapshot === undefined) throw new Error("Pool indexer snapshot is unavailable");
-      return loadPinnedPoolEconomics(publicClient, registry, pool, snapshot);
+      if (analyticsEconomicsAnchor === null) throw new Error("Canonical analytics market anchor is unavailable");
+      return loadPinnedPoolEconomics(publicClient, registry, pool, analyticsEconomicsAnchor);
     },
-    enabled: indexerSnapshot !== undefined,
-    refetchInterval: indexerSnapshot !== undefined ? WORKSPACE_REFRESH_INTERVAL_MS : false,
+    enabled: analyticsEconomicsAnchor !== null,
+    refetchInterval: analyticsEconomicsAnchor !== null ? WORKSPACE_REFRESH_INTERVAL_MS : false,
     refetchOnWindowFocus: "always",
     retry: false
   });
-  const economicsValue = indexerSnapshot !== undefined && !economicsQuery.isError && economicsQuery.data !== undefined &&
-    economicsMatchesIndexerSnapshot(economicsQuery.data, indexerSnapshot)
+  const economicsValue = analyticsEconomicsAnchor !== null && !economicsQuery.isError && economicsQuery.data !== undefined &&
+    economicsMatchesAnalyticsAnchor(economicsQuery.data, analyticsEconomicsAnchor)
     ? economicsQuery.data
     : undefined;
   const currentActiveId = economicsValue?.activeId.toString() ?? null;
@@ -405,25 +426,16 @@ export function PoolWorkspaceProvider({
     refetchOnWindowFocus: "always",
     retry: false
   });
-  const positionsQuery = useQuery({
-    queryKey: ["canonicalPoolPositions", environmentKey, walletAddress, pool.address, registry.endpoints.indexerUrl],
-    queryFn: () => {
-      if (walletAddress === null) throw new Error("Wallet pool positions are unavailable");
-      return loadPaginatedPositionsForOwnerPair(registry, walletAddress, pool.address);
-    },
-    enabled: walletAddress !== null && registry.endpoints.indexerUrl !== null,
-    refetchInterval: walletAddress !== null && registry.endpoints.indexerUrl !== null ? WORKSPACE_REFRESH_INTERVAL_MS : false,
-    refetchOnWindowFocus: "always",
-    retry: false
-  });
   const historyQuery = useQuery({
-    queryKey: ["canonicalPoolHistory", environmentKey, walletAddress, pool.address, registry.endpoints.indexerUrl],
+    queryKey: ["canonicalPoolHistory", environmentKey, analyticsEndpoint, walletAddress, pool.address],
     queryFn: () => {
-      if (walletAddress === null) throw new Error("Wallet pool history is unavailable");
-      return loadPositionHistory(registry, walletAddress, pool.address);
+      if (walletAddress === null || analyticsEndpoint === null) {
+        throw new Error("Wallet pool history is unavailable");
+      }
+      return loadCanonicalPoolActivity(analyticsEndpoint, pool.address, walletAddress);
     },
-    enabled: walletAddress !== null && registry.endpoints.indexerUrl !== null,
-    refetchInterval: walletAddress !== null && registry.endpoints.indexerUrl !== null ? WORKSPACE_REFRESH_INTERVAL_MS : false,
+    enabled: walletAddress !== null && analyticsEndpoint !== null,
+    refetchInterval: walletAddress !== null && analyticsEndpoint !== null ? WORKSPACE_REFRESH_INTERVAL_MS : false,
     refetchOnWindowFocus: "always",
     retry: false
   });
@@ -449,13 +461,13 @@ export function PoolWorkspaceProvider({
     queryKey: [
       "canonicalPoolActivity",
       environmentKey,
-      registry.endpoints.indexerUrl,
+      analyticsEndpoint,
       pool.address,
       activityOwner
     ],
-    queryFn: () => loadPoolActivity(registry, pool.address, activityOwner),
-    enabled: registry.endpoints.indexerUrl !== null,
-    refetchInterval: registry.endpoints.indexerUrl !== null ? WORKSPACE_REFRESH_INTERVAL_MS : false,
+    queryFn: () => loadCanonicalPoolActivity(analyticsEndpoint, pool.address, activityOwner, { maxPages: 1 }),
+    enabled: analyticsEndpoint !== null,
+    refetchInterval: analyticsEndpoint !== null ? WORKSPACE_REFRESH_INTERVAL_MS : false,
     refetchOnWindowFocus: "always",
     retry: false
   });
@@ -487,10 +499,6 @@ export function PoolWorkspaceProvider({
     totalSupply: bin.totalSupply,
     updatedAtBlock: bin.updatedAtBlock
   })) ?? [];
-  const positions = positionsQuery.data?.rows ?? [];
-  const positionsPartial = Boolean(positionsQuery.data?.pageInfo.capped || positionsQuery.data?.pageInfo.failed);
-  const history = historyQuery.data?.rows ?? [];
-  const historyPartial = Boolean(historyQuery.data?.pageInfo.capped || historyQuery.data?.pageInfo.failed);
   const portfolioPosition = portfolioQuery.data?.position ?? null;
   const portfolioPage = portfolioQuery.data?.page;
   const portfolioHeadPinned = portfolioPosition !== null &&
@@ -500,54 +508,52 @@ export function PoolWorkspaceProvider({
     portfolioPage.health.headHash !== null &&
     portfolioPosition.asOfBlock !== null &&
     portfolioPosition.asOfBlock === portfolioPage.health.headBlock &&
-    indexerSnapshot !== undefined &&
-    portfolioPosition.asOfBlock === indexerSnapshot.blockNumber.toString() &&
-    portfolioPage.health.headHash.toLowerCase() === indexerSnapshot.blockHash.toLowerCase() &&
     economicsValue !== undefined &&
-    economicsValue.blockNumber === indexerSnapshot.blockNumber &&
-    economicsValue.blockHash.toLowerCase() === indexerSnapshot.blockHash.toLowerCase();
+    portfolioPosition.asOfBlock === economicsValue.blockNumber.toString() &&
+    portfolioPage.health.headHash.toLowerCase() === economicsValue.blockHash.toLowerCase();
   const portfolioPartial = Boolean(
     portfolioPage?.pageInfo.partial ||
     portfolioPage?.pageInfo.hasNextPage ||
     (portfolioPage !== undefined && (portfolioPage.health.status !== "READY" || !portfolioPage.health.fresh)) ||
     (portfolioPosition !== null && (portfolioPosition.status !== "READY" || !portfolioHeadPinned))
   );
-  const activity = activityQuery.data?.rows ?? [];
-  const activityPartial = Boolean(
-    activityQuery.data?.pageInfo.capped || activityQuery.data?.pageInfo.failed
+  const positions = portfolioPositionRows(portfolioPosition, walletAddress, pool.address);
+  const positionsPartial = portfolioPartial;
+  const history = canonicalPositionHistoryRows(historyQuery.data?.rows ?? [], walletAddress);
+  const historyPartial = Boolean(
+    historyQuery.data?.status === "PARTIAL" || historyQuery.data?.pageInfo.hasNextPage
   );
-  const economicsPending = indexerSnapshotQuery.isLoading || economicsQuery.isLoading || indexerSnapshotQuery.isFetching || economicsQuery.isFetching;
-  const binsState: LoadState = registry.endpoints.indexerUrl === null
-    ? "unavailable"
-    : currentActiveId === null
-      ? indexerSnapshotQuery.isError || economicsQuery.isError
-        ? "error"
-        : economicsPending
-          ? "loading"
-          : "unavailable"
-    : binsQuery.isError
-      ? "error"
-      : binsQuery.isLoading
+  const activity = canonicalActivityRows(activityQuery.data?.rows ?? []);
+  const activityPartial = Boolean(
+    activityQuery.data?.status === "PARTIAL" || activityQuery.data?.pageInfo.hasNextPage
+  );
+  const economicsPending = livePoolQuery.isLoading || healthQuery.isLoading || economicsQuery.isLoading ||
+    livePoolQuery.isFetching || healthQuery.isFetching || economicsQuery.isFetching;
+  const binsState: LoadState = livePoolAttestationError !== null
+    ? economicsPending ? "loading" : "error"
+    : livePoolSnapshot !== null
+      ? "ready"
+      : livePoolQuery.isLoading
         ? "loading"
-        : binsQuery.data
-          ? "ready"
-          : "empty";
+        : livePoolQuery.isError
+          ? "error"
+          : "unavailable";
   const positionsState: LoadState = walletAddress === null
     ? "unavailable"
-    : registry.endpoints.indexerUrl === null
+    : analyticsEndpoint === null
       ? "unavailable"
-      : positionsQuery.isError
+      : portfolioQuery.isError
         ? "error"
         : positionsPartial
           ? "partial"
-          : positionsQuery.isLoading
+          : portfolioQuery.isLoading
             ? "loading"
             : positions.length > 0
               ? "ready"
               : "empty";
   const historyState: LoadState = walletAddress === null
     ? "unavailable"
-    : registry.endpoints.indexerUrl === null
+    : analyticsEndpoint === null
       ? "unavailable"
       : historyQuery.isError
         ? "error"
@@ -569,7 +575,7 @@ export function PoolWorkspaceProvider({
           : portfolioPosition === null
             ? "empty"
             : "ready";
-  const activityState: LoadState = registry.endpoints.indexerUrl === null
+  const activityState: LoadState = analyticsEndpoint === null
     ? "unavailable"
     : activityQuery.isError
       ? "error"
@@ -580,7 +586,7 @@ export function PoolWorkspaceProvider({
           : activity.length > 0
             ? "ready"
             : "empty";
-  const economicsState: LoadState = indexerSnapshotQuery.isError || economicsQuery.isError
+  const economicsState: LoadState = livePoolQuery.isError || healthQuery.isError || economicsQuery.isError
     ? "error"
     : economicsValue !== undefined
       ? "ready"
@@ -606,12 +612,12 @@ export function PoolWorkspaceProvider({
 
   const value = useMemo<PoolWorkspaceContextValue>(() => ({
     activity: {
-      error: errorMessage(activityQuery.error) ?? activityQuery.data?.pageInfo.error ?? null,
+      error: errorMessage(activityQuery.error) ?? activityQuery.data?.error ?? null,
       rows: activity,
       setWalletOnly: setPoolActivityWalletOnly,
       state: activityState,
       walletOnly: walletAddress !== null && poolActivityWalletOnly,
-      windowed: activityQuery.data?.pageInfo.windowed === true
+      windowed: activityQuery.data?.pageInfo.hasNextPage === true
     },
     analytics: {
       candles,
@@ -624,18 +630,18 @@ export function PoolWorkspaceProvider({
       state: analyticsState,
       stateVisible: analyticsStateVisible
     },
-    bins: binsQuery.data ?? [],
-    binsError: errorMessage(binsQuery.error),
+    bins: livePoolSnapshot !== null ? livePoolBins : binsQuery.data ?? [],
+    binsError: livePoolAttestationError ?? errorMessage(livePoolQuery.error) ?? errorMessage(binsQuery.error),
     binsState,
     draftValues,
     economics: {
-      error: errorMessage(indexerSnapshotQuery.error) ?? errorMessage(economicsQuery.error),
+      error: errorMessage(livePoolQuery.error) ?? errorMessage(healthQuery.error) ?? errorMessage(economicsQuery.error),
       state: economicsState,
       value: economicsValue ?? null
     },
     environmentKey,
     history,
-    historyError: errorMessage(historyQuery.error) ?? historyQuery.data?.pageInfo.error ?? null,
+    historyError: errorMessage(historyQuery.error) ?? historyQuery.data?.error ?? null,
     historyPartial,
     historyState,
     indexerSnapshot: {
@@ -658,7 +664,7 @@ export function PoolWorkspaceProvider({
       state: portfolioState
     },
     positions,
-    positionsError: errorMessage(positionsQuery.error) ?? positionsQuery.data?.pageInfo.error ?? null,
+    positionsError: errorMessage(portfolioQuery.error),
     positionsPartial,
     positionsState,
     registry,
@@ -666,8 +672,8 @@ export function PoolWorkspaceProvider({
     walletAddress
   }), [
     activity,
-    activityQuery.data?.pageInfo.error,
-    activityQuery.data?.pageInfo.windowed,
+    activityQuery.data?.error,
+    activityQuery.data?.pageInfo.hasNextPage,
     activityQuery.error,
     activityState,
     analyticsState,
@@ -687,9 +693,10 @@ export function PoolWorkspaceProvider({
     environmentKey,
     history,
     historyPartial,
-    historyQuery.data?.pageInfo.error,
+    historyQuery.data?.error,
     historyQuery.error,
     historyState,
+    healthQuery.error,
     indexerSnapshotQuery.error,
     indexerSnapshot,
     indexerSnapshotState,
@@ -709,8 +716,6 @@ export function PoolWorkspaceProvider({
     portfolioState,
     positions,
     positionsPartial,
-    positionsQuery.data?.pageInfo.error,
-    positionsQuery.error,
     positionsState,
     registry,
     row,
@@ -747,14 +752,14 @@ export function usePoolDraftState<T>(key: string, initialValue: T): [T, Dispatch
   return [workspace === null ? localValue : workspaceValue, setValue];
 }
 
-function economicsMatchesIndexerSnapshot(economics: PinnedPoolEconomics, snapshot: PoolIndexerSnapshot): boolean {
-  return economics.blockNumber === snapshot.blockNumber &&
-    economics.blockHash.toLowerCase() === snapshot.blockHash.toLowerCase() &&
-    economics.activeId === snapshot.activeId &&
-    economics.binStep === snapshot.binStep &&
-    economics.factory.toLowerCase() === snapshot.factory.toLowerCase() &&
-    economics.tokenX.toLowerCase() === snapshot.tokenX.toLowerCase() &&
-    economics.tokenY.toLowerCase() === snapshot.tokenY.toLowerCase();
+function economicsMatchesAnalyticsAnchor(economics: PinnedPoolEconomics, anchor: PoolEconomicsAnchor): boolean {
+  return economics.blockNumber === anchor.blockNumber &&
+    economics.blockHash.toLowerCase() === anchor.blockHash.toLowerCase() &&
+    economics.activeId === anchor.activeId &&
+    economics.binStep === anchor.binStep &&
+    economics.factory.toLowerCase() === anchor.factory.toLowerCase() &&
+    economics.tokenX.toLowerCase() === anchor.tokenX.toLowerCase() &&
+    economics.tokenY.toLowerCase() === anchor.tokenY.toLowerCase();
 }
 
 function attestLivePoolSnapshot(
@@ -781,7 +786,7 @@ function attestLivePoolSnapshot(
     return "Live pool bin step differs from pinned RPC state";
   }
   const liveBlock = BigInt(state.asOfBlock);
-  if (liveBlock < economics.blockNumber) return "Live pool state is older than pinned RPC state";
+  if (liveBlock > economics.blockNumber) return "Live pool state is newer than the canonical RPC anchor";
   if (liveBlock === economics.blockNumber && state.asOfBlockHash.toLowerCase() !== economics.blockHash.toLowerCase()) {
     return "Live pool state canonical hash differs from pinned RPC state";
   }

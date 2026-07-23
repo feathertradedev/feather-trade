@@ -69,6 +69,12 @@ jobs:
       - name: Test Robinhood deploy wrapper
         run: pnpm robinhood:deploy:test
 
+      - name: Test generic EVM deploy wrapper
+        run: pnpm evm:deploy:test
+
+      - name: Validate tracked Sepolia public deployment
+        run: node scripts/evm/validate-manifest.cjs deployments/evm/sepolia/public.json sepolia 11155111
+
       - name: Test launch health helper
         run: pnpm launch:health:test
 
@@ -106,6 +112,16 @@ jobs:
             caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d \
             caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 
+      - name: Parse the pinned Sepolia web-only Caddy configuration
+        run: |
+          docker run --rm \
+            --env FEATHER_APP_DOMAIN=app.example.invalid \
+            --env FEATHER_DOCS_DOMAIN=docs.example.invalid \
+            --env "FEATHER_APP_CONNECT_SRC='self' https://ethereum-sepolia-rpc.publicnode.com" \
+            --volume "$PWD/infra/vps/Caddyfile.web:/etc/caddy/Caddyfile:ro" \
+            caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
       - name: Resolve the VPS Compose topology
         env:
           FEATHER_ANALYTICS_ADAPTERS_DIR: ${{ github.workspace }}/infra/vps
@@ -118,6 +134,14 @@ jobs:
           FEATHER_DOCS_DOMAIN: docs.example.invalid
           FEATHER_RELEASES_DIR: ${{ github.workspace }}
         run: docker compose --file infra/vps/compose.yml config --quiet
+
+      - name: Resolve the Sepolia web-only VPS topology
+        env:
+          FEATHER_APP_CONNECT_SRC: "'self' https://ethereum-sepolia-rpc.publicnode.com"
+          FEATHER_APP_DOMAIN: app.example.invalid
+          FEATHER_DOCS_DOMAIN: docs.example.invalid
+          FEATHER_RELEASES_DIR: ${{ github.workspace }}
+        run: docker compose --file infra/vps/compose.web.yml config --quiet
 
       - name: Validate token asset references
         run: |
@@ -177,6 +201,9 @@ jobs:
 
       - name: Forge core tests
         run: pnpm contracts:test:core
+
+      - name: Test generic EVM deploy script
+        run: forge test --match-contract GenericEvmDeployScriptTest
 
   packages:
     name: SDK, Analytics, and Web
@@ -254,6 +281,12 @@ jobs:
       - name: Test web pool selection
         run: pnpm web:test:pool-selection
 
+      - name: Test web pool creation defaults
+        run: pnpm web:test:pool-creation-defaults
+
+      - name: Test web pool creation safety and recovery
+        run: pnpm web:test:pool-creation-safety
+
       - name: Test web position burn planning
         run: pnpm web:test:positions
 
@@ -279,6 +312,18 @@ jobs:
 
       - name: Test web public config fixtures
         run: pnpm web:test:public-config
+
+      - name: Build and check synthetic public Sepolia web artifact
+        env:
+          EVM_DEPLOYER_PRIVATE_KEY: public-canary-evm-deployer-key
+          EVM_DEPLOY_RPC_URL: public-canary-evm-deploy-rpc
+          SEPOLIA_RPC_URL: public-canary-sepolia-rpc
+          VITE_REOWN_PROJECT_ID: public_wallet_project_0123456789
+        run: |
+          mkdir -p .local/public-web
+          pnpm web:fixture:public -- --environment sepolia --out .local/public-web/sepolia.latest.json
+          VITE_SEPOLIA_MANIFEST_PATH=.local/public-web/sepolia.latest.json pnpm web:build:public:sepolia
+          pnpm web:check:public-artifact -- --environment sepolia --manifest .local/public-web/sepolia.latest.json --dist apps/web/dist
 
       - name: Build and check synthetic public testnet web artifact
         env:

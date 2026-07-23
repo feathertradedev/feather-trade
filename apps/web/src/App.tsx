@@ -173,7 +173,7 @@ import {
   type NativeSwapSubmissionBinding,
   type SwapExecutionContext
 } from "./transaction-safety";
-import { openWalletModal, wagmiConfig, walletModalConfigured } from "./wagmi";
+import { openWalletModal, wagmiConfig, walletModalConfigured, walletModalIsOpen } from "./wagmi";
 import { SUPPORTED_WALLET_RDNS, walletFailure, walletSessionIdentity, type WalletFailure } from "./wallet-lifecycle";
 import { TransactionJournalProvider, useTransactionJournal, type TransactionJournalApi } from "./transaction-journal-react";
 import {
@@ -224,6 +224,30 @@ import {
   type PoolCreationMode
 } from "./pool-creation";
 import {
+  POOL_CREATION_PROGRESS_STEPS,
+  formatPoolCreationElapsed,
+  poolCreationProgress
+} from "./pool-creation-progress";
+import {
+  TRUSTED_POOL_CREATION_PRICE_CLIENT_TTL_MS,
+  loadTrustedPoolCreationPrice,
+  trustedPoolCreationPriceIsLocallyFresh,
+  trustedPoolCreationPriceLocalAgeSeconds,
+  trustedPriceDeviationBps
+} from "./pool-creation-price";
+import {
+  loadPoolCreationReview,
+  persistPoolCreationReview
+} from "./pool-creation-review-storage";
+import {
+  loadPoolCreationDraft,
+  persistPoolCreationDraft,
+  poolCreationWasOpen,
+  setPoolCreationOpen
+} from "./pool-creation-draft";
+import { selectPoolCreationTokenDefaults } from "./pool-creation-defaults";
+import { isDeprecatedPool } from "./pool-release-policy";
+import {
   DEFAULT_POOL_DISCOVERY_STATE,
   actionHref,
   buildOwnerLiquidityIndex,
@@ -240,11 +264,13 @@ import {
   CANDLE_LOOKBACK_SECONDS,
   candleBoundary,
   loadPairCandles,
+  loadPoolCatalog,
   loadPoolDiscoveryBatches,
   type AnalyticsPage,
   type AnalyticsStatus,
   type CandleInterval,
-  type PairCandle
+  type PairCandle,
+  type PoolCatalogEntry
 } from "./analytics-data";
 import {
   buildCenteredBinDistribution,
@@ -654,6 +680,7 @@ function DexShell() {
   });
   const walletPanelKey = account.status === "connected" ? walletSessionKey : `${environmentKey}:disconnected`;
   const previousWalletSessionKey = useRef(walletSessionKey);
+  const [confirmedPoolOverlay, setConfirmedPoolOverlay] = useState<ConfirmedPoolOverlay | null>(null);
   const snapshotQuery = useQuery({
     queryKey: [
       "dashboard",
@@ -751,7 +778,7 @@ function DexShell() {
           </button>
         </header>
 
-        {snapshot?.indexer.message ? (
+        {snapshot?.indexer.message && snapshot.indexer.status !== "unavailable" ? (
           <p
             className={`snapshot-message ${snapshot.indexer.status}`}
             data-testid="indexer-status-message"
@@ -762,7 +789,10 @@ function DexShell() {
         ) : null}
 
           <ContentView
-            key={walletSessionKey}
+            key={routeKey === "pools" && poolDetailId === null
+              ? `pool-discovery:${environmentKey}`
+              : walletSessionKey}
+            confirmedPoolOverlay={confirmedPoolOverlay}
             environmentKey={environmentKey}
             actionPoolId={actionPoolId}
             liquiditySection={liquiditySection}
@@ -773,6 +803,7 @@ function DexShell() {
             snapshot={snapshot}
             snapshotState={snapshotQuery.isLoading ? "loading" : snapshotQuery.isError ? "error" : snapshot?.indexer.status ?? "loading"}
             workspaceTask={workspaceTask}
+            setConfirmedPoolOverlay={setConfirmedPoolOverlay}
             onRefresh={() => snapshotQuery.refetch()}
           />
       </section>
@@ -1178,6 +1209,7 @@ function WalletPanel({ activeChain }: { activeChain: Chain }) {
 
 function ContentView({
   actionPoolId,
+  confirmedPoolOverlay,
   environmentKey,
   liquiditySection,
   poolDetailId,
@@ -1186,10 +1218,12 @@ function ContentView({
   routeKey,
   snapshot,
   snapshotState,
+  setConfirmedPoolOverlay,
   workspaceTask,
   onRefresh
 }: {
   actionPoolId: string | null;
+  confirmedPoolOverlay: ConfirmedPoolOverlay | null;
   environmentKey: EnvironmentKey;
   liquiditySection: "add" | "withdraw" | null;
   poolDetailId: string | null;
@@ -1198,20 +1232,59 @@ function ContentView({
   routeKey: RouteKey;
   snapshot: AppSnapshot | undefined;
   snapshotState: LoadState;
+  setConfirmedPoolOverlay: (overlay: ConfirmedPoolOverlay | null) => void;
   workspaceTask: PoolWorkspaceTask | null;
   onRefresh: SnapshotRefetch;
 }) {
+  const activeRegistry = registries[environmentKey];
+  const analyticsEndpoint = analyticsEndpointForRegistry(activeRegistry);
   const indexedPools = snapshot?.indexer.pools ?? [];
-  const [confirmedPoolOverlay, setConfirmedPoolOverlay] = useState<ConfirmedPoolOverlay | null>(null);
-  const overlayIndexed = confirmedPoolOverlay !== null && indexedPools.some((pool) =>
+  const poolCatalogQuery = useQuery({
+    queryKey: ["poolCatalog", environmentKey, analyticsEndpoint],
+    queryFn: () => loadPoolCatalog(analyticsEndpoint),
+    enabled: analyticsEndpoint !== null,
+    refetchInterval: SNAPSHOT_REFRESH_INTERVAL_MS,
+    refetchOnWindowFocus: "always",
+    retry: false
+  });
+  const catalogPools = useMemo(
+    () => poolRowsFromCatalog(activeRegistry, poolCatalogQuery.data?.rows ?? [], indexedPools),
+    [activeRegistry, indexedPools, poolCatalogQuery.data?.rows]
+  );
+  const setSafeConfirmedPoolOverlay = (overlay: ConfirmedPoolOverlay | null) => {
+    if (overlay !== null && isDeprecatedPool(activeRegistry, overlay.row.address)) {
+      setConfirmedPoolOverlay(null);
+      return;
+    }
+    setConfirmedPoolOverlay(overlay);
+  };
+  const overlayIndexed = confirmedPoolOverlay !== null && catalogPools.some((pool) =>
     isAddressEqual(pool.address, confirmedPoolOverlay.row.address)
   );
-  const pools = confirmedPoolOverlay !== null
-    ? [confirmedPoolOverlay.row, ...indexedPools.filter((pool) => !isAddressEqual(pool.address, confirmedPoolOverlay.row.address))]
-    : indexedPools;
+  useEffect(() => {
+    if (overlayIndexed) setConfirmedPoolOverlay(null);
+  }, [overlayIndexed, setConfirmedPoolOverlay]);
+  const pools = confirmedPoolOverlay !== null && !overlayIndexed
+    ? [confirmedPoolOverlay.row, ...catalogPools.filter((pool) => !isAddressEqual(pool.address, confirmedPoolOverlay.row.address))]
+    : catalogPools;
+  const refreshPoolCatalog = useCallback(async () => {
+    if (analyticsEndpoint === null) return;
+    const result = await poolCatalogQuery.refetch();
+    if (result.isError) throw result.error;
+  }, [analyticsEndpoint, poolCatalogQuery.refetch]);
   const [selectedPoolId, setSelectedPoolId] = useState("");
   const poolIdsKey = pools.map((pool) => pool.id).join("|");
-  const activeRegistry = registries[environmentKey];
+  const poolCatalogState: LoadState = analyticsEndpoint === null
+    ? snapshotState
+    : poolCatalogQuery.isPending
+      ? "loading"
+      : poolCatalogQuery.isError || poolCatalogQuery.data?.status === "UNAVAILABLE"
+        ? "unavailable"
+        : catalogPools.length === 0
+          ? "empty"
+          : poolCatalogQuery.data?.status === "PARTIAL"
+            ? "partial"
+            : "ready";
   const preferredPoolAddress = isLocalnetRegistry(activeRegistry)
     ? activeRegistry.seededPools.wethUsdc.pair
     : null;
@@ -1224,14 +1297,22 @@ function ContentView({
             pool.id.toLowerCase() === actionPoolId.toLowerCase() ||
             pool.address.toLowerCase() === actionPoolId.toLowerCase()
         ) ?? null;
+  const actionPoolIsDeprecated =
+    actionPoolId !== null &&
+    isAddress(actionPoolId, { strict: false }) &&
+    isDeprecatedPool(activeRegistry, actionPoolId as Address);
   const directActionPoolQuery = useQuery({
     queryKey: ["actionPoolById", environmentKey, actionPoolId, registries[environmentKey].endpoints.indexerUrl],
     queryFn: () => {
       if (actionPoolId === null) throw new Error("Action pool ID is unavailable");
+      if (actionPoolIsDeprecated) throw new Error("This test pool is deprecated and must remain unfunded");
       return loadPoolById(registries[environmentKey], actionPoolId);
     },
     enabled:
-      actionPoolId !== null && dashboardActionPool === null && registries[environmentKey].endpoints.indexerUrl !== null,
+      actionPoolId !== null &&
+      !actionPoolIsDeprecated &&
+      dashboardActionPool === null &&
+      registries[environmentKey].endpoints.indexerUrl !== null,
     refetchInterval:
       actionPoolId !== null && dashboardActionPool === null && registries[environmentKey].endpoints.indexerUrl !== null
         ? SNAPSHOT_REFRESH_INTERVAL_MS
@@ -1251,15 +1332,21 @@ function ContentView({
       : pools.find(
           (pool) => pool.id.toLowerCase() === poolDetailId.toLowerCase() || pool.address.toLowerCase() === poolDetailId.toLowerCase()
         ) ?? null;
+  const detailPoolIsDeprecated =
+    poolDetailId !== null &&
+    isAddress(poolDetailId, { strict: false }) &&
+    isDeprecatedPool(activeRegistry, poolDetailId as Address);
   const directPoolQuery = useQuery({
     queryKey: ["poolById", environmentKey, poolDetailId, registries[environmentKey].endpoints.indexerUrl],
     queryFn: () => {
       if (poolDetailId === null) throw new Error("Pool ID is unavailable");
+      if (detailPoolIsDeprecated) throw new Error("This test pool is deprecated and must remain unfunded");
       return loadPoolById(registries[environmentKey], poolDetailId);
     },
     enabled:
       routeKey === "pools" &&
       poolDetailId !== null &&
+      !detailPoolIsDeprecated &&
       dashboardDetailPool === null &&
       registries[environmentKey].endpoints.indexerUrl !== null,
     refetchInterval:
@@ -1309,17 +1396,18 @@ function ContentView({
   };
 
   if ((routeKey === "swap" || routeKey === "liquidity") && actionPoolId !== null && actionPool === null) {
-    const actionPoolState: LoadState = registries[environmentKey].endpoints.indexerUrl === null
-      ? "unavailable"
-      : directActionPoolQuery.isError
+    const actionPoolState: LoadState = actionPoolIsDeprecated
+        ? "empty"
+        : poolCatalogQuery.isError || directActionPoolQuery.isError
         ? "error"
-        : directActionPoolQuery.isLoading
+        : poolCatalogQuery.isLoading || directActionPoolQuery.isLoading
           ? "loading"
           : "empty";
     return (
       <RequestedPoolState
         error={directActionPoolQuery.error}
         poolId={actionPoolId}
+        reason={actionPoolIsDeprecated ? "This Sepolia pool is deprecated and must remain unfunded." : null}
         state={actionPoolState}
       />
     );
@@ -1345,11 +1433,13 @@ function ContentView({
   if (routeKey === "pools") {
     if (poolDetailId !== null) {
       const detailPool = dashboardDetailPool ?? directPoolQuery.data ?? null;
-      const detailState: LoadState = detailPool !== null
-        ? snapshotState
-        : directPoolQuery.isLoading
+      const detailState: LoadState = detailPoolIsDeprecated
+        ? "empty"
+        : detailPool !== null
+        ? poolCatalogState
+        : poolCatalogQuery.isLoading || directPoolQuery.isLoading
           ? "loading"
-          : directPoolQuery.isError
+          : poolCatalogQuery.isError || directPoolQuery.isError
             ? "error"
             : directPoolQuery.data === null
               ? "empty"
@@ -1393,19 +1483,26 @@ function ContentView({
       }
 
       return (
-        <RequestedPoolState error={directPoolQuery.error} poolId={poolDetailId} state={detailState} />
+        <RequestedPoolState
+          error={directPoolQuery.error}
+          poolId={poolDetailId}
+          reason={detailPoolIsDeprecated ? "This Sepolia pool is deprecated and must remain unfunded." : null}
+          state={detailState}
+        />
       );
     }
 
     return (
       <PoolsView
+        catalogPools={catalogPools}
         environmentKey={environmentKey}
-        onConfirmedPool={setConfirmedPoolOverlay}
+        onConfirmedPool={setSafeConfirmedPoolOverlay}
+        onCatalogRefresh={refreshPoolCatalog}
         onRefresh={onRefresh}
         pools={pools}
         rpcOverlay={confirmedPoolOverlay !== null && !overlayIndexed ? confirmedPoolOverlay : null}
         snapshot={snapshot}
-        snapshotState={snapshotState}
+        snapshotState={poolCatalogState}
       />
     );
   }
@@ -1443,7 +1540,17 @@ function ActionReturnLink() {
   return <a className="back-link action-return-link" data-testid="pool-action-back" href={returnHref}>← Back to pool workspace</a>;
 }
 
-function RequestedPoolState({ error, poolId, state }: { error: Error | null; poolId: string; state: LoadState }) {
+function RequestedPoolState({
+  error,
+  poolId,
+  reason,
+  state
+}: {
+  error: Error | null;
+  poolId: string;
+  reason?: string | null;
+  state: LoadState;
+}) {
   return (
     <div className="view-grid">
       <section className="table-panel" data-testid="requested-pool-state">
@@ -1453,7 +1560,7 @@ function RequestedPoolState({ error, poolId, state }: { error: Error | null; poo
         </div>
         <EmptyState state={state} />
         {error ? <p className="inline-error">{getWriteError(error) ?? "Requested pool lookup failed"}</p> : null}
-        {state === "empty" ? <p className="inline-error">The requested pool was not found.</p> : null}
+        {state === "empty" ? <p className="inline-error">{reason ?? "The requested pool was not found."}</p> : null}
       </section>
     </div>
   );
@@ -1470,6 +1577,68 @@ function selectDefaultIndexedPool(pools: PoolRow[], preferredPoolAddress: Addres
     pools.at(0) ??
     null
   );
+}
+
+function poolRowsFromCatalog(
+  registry: DexRegistry,
+  catalog: readonly PoolCatalogEntry[],
+  legacyPools: readonly PoolRow[]
+): PoolRow[] {
+  const legacyByAddress = new Map(legacyPools.map((pool) => [pool.address.toLowerCase(), pool]));
+  const rows = catalog.flatMap((entry) => {
+    if (entry.chainId !== registry.chainId) return [];
+    if (isDeprecatedPool(registry, entry.pair)) return [];
+    const completeCreationProvenance =
+      entry.factoryAddress !== null &&
+      entry.createdAtBlock !== null &&
+      entry.createdAtBlockHash !== null &&
+      entry.creationTransactionHash !== null &&
+      entry.creationLogIndex !== null;
+    if (!isLocalnetRegistry(registry) && !completeCreationProvenance) return [];
+    if (entry.factoryAddress !== null && !isAddressEqual(entry.factoryAddress, registry.contracts.lbFactory)) return [];
+    const legacy = legacyByAddress.get(entry.pair.toLowerCase());
+    if (legacy !== undefined && (
+      !isAddressEqual(legacy.tokenXAddress, entry.tokenX) ||
+      !isAddressEqual(legacy.tokenYAddress, entry.tokenY) ||
+      legacy.binStep !== String(entry.binStep)
+    )) return [];
+    const tokenX = registry.tokens[entry.tokenX.toLowerCase()] ?? null;
+    const tokenY = registry.tokens[entry.tokenY.toLowerCase()] ?? null;
+    return [{
+      ...(legacy ?? {
+        id: entry.pair,
+        address: entry.pair,
+        tokenXAddress: entry.tokenX,
+        tokenYAddress: entry.tokenY,
+        tokenX,
+        tokenY,
+        volumeX: "0",
+        volumeY: "0",
+        feesX: "0",
+        feesY: "0",
+        factoryAddress: entry.factoryAddress ?? registry.contracts.lbFactory,
+        hooksParameters: null,
+        ignoredForRouting: false,
+        swapCount: "0",
+        depositCount: "0"
+      }),
+      activeId: String(entry.activeId),
+      binStep: String(entry.binStep),
+      reserveX: entry.reserveX,
+      reserveY: entry.reserveY,
+      updatedAtBlock: entry.asOfBlock
+    }];
+  });
+  const catalogAddresses = new Set(rows.map((pool) => pool.address.toLowerCase()));
+  return [
+    ...rows,
+    ...(isLocalnetRegistry(registry)
+      ? legacyPools.filter((pool) =>
+          !catalogAddresses.has(pool.address.toLowerCase()) &&
+          !isDeprecatedPool(registry, pool.address)
+        )
+      : [])
+  ];
 }
 
 function poolSupportsCoreActions(pool: PoolRow): boolean {
@@ -1793,7 +1962,12 @@ function SwapView({
       binSteps: exactQuote.binSteps,
       pairs: exactQuote.pairs,
       pools: poolOptions,
-      resolvePool: (pair) => loadPoolById(registry, pair),
+      resolvePool: (pair) => {
+        if (isDeprecatedPool(registry, pair)) {
+          throw new PairAttestationError("pair-mismatch", "The quoted route includes a deprecated pool that must remain unfunded");
+        }
+        return loadPoolById(registry, pair);
+      },
       route: exactQuote.route,
       versions: exactQuote.versions
     });
@@ -4120,16 +4294,20 @@ function PairAttestationReview({
 }
 
 function PoolsView({
+  catalogPools,
   environmentKey,
   onConfirmedPool,
+  onCatalogRefresh,
   onRefresh,
   pools,
   rpcOverlay,
   snapshot,
   snapshotState
 }: {
+  catalogPools: PoolRow[];
   environmentKey: EnvironmentKey;
   onConfirmedPool: (overlay: ConfirmedPoolOverlay | null) => void;
+  onCatalogRefresh: () => Promise<void>;
   onRefresh: SnapshotRefetch;
   pools: PoolRow[];
   rpcOverlay: ConfirmedPoolOverlay | null;
@@ -4141,7 +4319,9 @@ function PoolsView({
   const [discoveryState, setDiscoveryState] = useState<PoolDiscoveryState>(() =>
     typeof window === "undefined" ? { ...DEFAULT_POOL_DISCOVERY_STATE } : parsePoolDiscoveryState(window.location.hash)
   );
-  const [creationOpen, setCreationOpen] = useState(false);
+  const [creationOpen, setCreationOpen] = useState(() =>
+    typeof window !== "undefined" && poolCreationWasOpen(window.sessionStorage, environmentKey)
+  );
   const creationLaunchRef = useRef<HTMLButtonElement>(null);
   const pageSize = 10;
   const analyticsEndpoint = analyticsEndpointForRegistry(registry);
@@ -4211,9 +4391,10 @@ function PoolsView({
   const ownerFilterLoading = discoveryState.hasLiquidity && account.address !== undefined && analyticsEndpoint !== null &&
     (ownerPortfolioQuery.isPending || ownerPortfolioQuery.isFetching);
   const closeCreation = useCallback(() => {
+    setPoolCreationOpen(window.sessionStorage, environmentKey, false);
     setCreationOpen(false);
     requestAnimationFrame(() => creationLaunchRef.current?.focus());
-  }, []);
+  }, [environmentKey]);
   const sortPools = (sort: PoolDiscoveryState["sort"]) => {
     updateDiscovery({
       sort,
@@ -4232,10 +4413,12 @@ function PoolsView({
     <div className="view-grid">
       {creationOpen ? (
         <PoolCreationWizard
+          analyticsState={snapshotState}
           environmentKey={environmentKey}
-          indexedPools={pools}
+          indexedPools={catalogPools}
           onClose={closeCreation}
           onConfirmedPool={onConfirmedPool}
+          onCatalogRefresh={onCatalogRefresh}
           onRefresh={onRefresh}
           snapshot={snapshot}
         />
@@ -4249,7 +4432,18 @@ function PoolsView({
             </span>
           </div>
           <div className="pool-heading-actions">
-            <button className="primary-button" data-testid="pool-create-launch" onClick={() => setCreationOpen(true)} ref={creationLaunchRef} type="button">Create pool</button>
+            <button
+              className="primary-button"
+              data-testid="pool-create-launch"
+              onClick={() => {
+                setPoolCreationOpen(window.sessionStorage, environmentKey, true);
+                setCreationOpen(true);
+              }}
+              ref={creationLaunchRef}
+              type="button"
+            >
+              Create pool
+            </button>
           </div>
         </header>
         {rpcOverlay ? (
@@ -4424,6 +4618,16 @@ function PoolsView({
               <button disabled={filteredPage.page + 1 >= filteredPage.pageCount} onClick={() => updateDiscovery({ page: Math.min(filteredPage.pageCount - 1, filteredPage.page + 1) }, false)} type="button">Next</button>
             </div>
           </>
+        ) : snapshotState === "unavailable" ? (
+          <div className="empty-state" data-testid="pool-discovery-rpc-only" role="status">
+            <Server size={22} />
+            <span>Pool analytics are temporarily unavailable. Try again in a moment.</span>
+          </div>
+        ) : snapshotState === "empty" ? (
+          <div className="empty-state" data-testid="pool-discovery-empty" role="status">
+            <Server size={22} />
+            <span>No pools have been created in this deployment yet.</span>
+          </div>
         ) : (
           <EmptyState state={snapshotState} />
         )}
@@ -4616,35 +4820,48 @@ function PoolSortableHeader({
 type PoolCreationStep = "tokens" | "configure" | "review" | "create";
 
 function PoolCreationWizard({
+  analyticsState,
   environmentKey,
   indexedPools,
   onClose,
   onConfirmedPool,
+  onCatalogRefresh,
   onRefresh,
   snapshot
 }: {
+  analyticsState: LoadState;
   environmentKey: EnvironmentKey;
   indexedPools: PoolRow[];
   onClose: () => void;
   onConfirmedPool: (overlay: ConfirmedPoolOverlay | null) => void;
+  onCatalogRefresh: () => Promise<void>;
   onRefresh: SnapshotRefetch;
   snapshot: AppSnapshot | undefined;
 }) {
   const registry = registries[environmentKey];
   const account = useAccount();
   const walletChainId = useChainId();
+  const {
+    error: poolCreationSwitchError,
+    isPending: poolCreationSwitchPending,
+    reset: resetPoolCreationSwitch,
+    switchChain: switchPoolCreationChain
+  } = useSwitchChain();
   const transactionJournal = useTransactionJournal();
   const createWrite = useSendTransaction();
   const publicClient = useMemo(() => createDexPublicClient(registry.chain, registry.endpoints.rpcUrl), [registry]);
+  const draftAtMount = useRef(
+    typeof window === "undefined" ? null : loadPoolCreationDraft(window.sessionStorage, environmentKey)
+  );
   const [step, setStep] = useState<PoolCreationStep>("tokens");
-  const [tokenXInput, setTokenXInput] = useState("");
-  const [tokenYAddress, setTokenYAddress] = useState("");
+  const [tokenXInput, setTokenXInput] = useState(draftAtMount.current?.tokenXInput ?? "");
+  const [tokenYAddress, setTokenYAddress] = useState(draftAtMount.current?.tokenYAddress ?? "");
   const [tokenX, setTokenX] = useState<PoolCreationTokenChoice | null>(null);
   const [tokenY, setTokenY] = useState<PoolCreationTokenChoice | null>(null);
-  const [binStepInput, setBinStepInput] = useState("");
-  const [priceInput, setPriceInput] = useState("1");
-  const [mode, setMode] = useState<PoolCreationMode>("create-only");
-  const [riskAcknowledged, setRiskAcknowledged] = useState(false);
+  const [binStepInput, setBinStepInput] = useState(draftAtMount.current?.binStepInput ?? "");
+  const [priceInput, setPriceInput] = useState(draftAtMount.current?.priceInput ?? "");
+  const [mode, setMode] = useState<PoolCreationMode>(draftAtMount.current?.mode ?? "create-only");
+  const [riskAcknowledged, setRiskAcknowledged] = useState(draftAtMount.current?.riskAcknowledged ?? false);
   const [prepared, setPrepared] = useState<PoolCreationPreparedReview | null>(null);
   const [gasReview, setGasReview] = useState<ExactGasReview | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -4653,9 +4870,12 @@ function PoolCreationWizard({
   const [recovery, setRecovery] = useState<PoolCreationRecoveryState | null>(null);
   const [submittedFingerprint, setSubmittedFingerprint] = useState<string | null>(null);
   const [canonicalRetryNonce, setCanonicalRetryNonce] = useState(0);
+  const [progressNow, setProgressNow] = useState(() => Date.now());
   const handledCanonicalHash = useRef<Hex | null>(null);
   const canonicalReconciliationHash = useRef<Hex | null>(null);
   const handledRevertedHash = useRef<Hex | null>(null);
+  const restoringReviewFingerprint = useRef<string | null>(null);
+  const restoringDraft = useRef(false);
   const submitInFlight = useRef(false);
   const tokenXInputRef = useRef<HTMLInputElement>(null);
 
@@ -4663,16 +4883,26 @@ function PoolCreationWizard({
     tokenXInputRef.current?.focus();
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
+      const modalOwnsEscape = event.composedPath().some((target) =>
+        target instanceof Element &&
+        (target.tagName.startsWith("W3M-") || target.getAttribute("role") === "alertdialog")
+      );
+      if (modalOwnsEscape || walletModalIsOpen() || document.querySelector("dialog[open]") !== null) return;
       event.preventDefault();
       onClose();
     };
-    window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
+    // Capture before AppKit handles Escape and flips its public `open` state.
+    // The wallet chooser owns that keypress; a later bubbling listener would
+    // otherwise see the modal as closed and dismiss this wizard too.
+    window.addEventListener("keydown", closeOnEscape, true);
+    return () => window.removeEventListener("keydown", closeOnEscape, true);
   }, [onClose]);
   const operationGeneration = useRef(0);
-  const contextIdentity = [
+  const deploymentContextIdentity = [
     environmentKey,
-    deploymentEpoch(registry),
+    deploymentEpoch(registry)
+  ].join("|");
+  const walletAuthorityIdentity = [
     account.address?.toLowerCase() ?? "disconnected",
     walletChainId,
     snapshot?.runtime.chainId ?? "rpc-unavailable"
@@ -4697,9 +4927,47 @@ function PoolCreationWizard({
     staleTime: 0
   });
   const discovery = discoveryQuery.data?.discovery ?? null;
+  const trustedPriceQuery = useQuery({
+    queryKey: [
+      "poolCreationTrustedPrice",
+      environmentKey,
+      deploymentEpoch(registry),
+      tokenX?.address.toLowerCase() ?? null,
+      tokenY?.address.toLowerCase() ?? null
+    ],
+    queryFn: () => loadTrustedPoolCreationPrice(
+      analyticsEndpointForRegistry(registry),
+      tokenX!.address,
+      tokenY!.address
+    ),
+    enabled: tokenX !== null && tokenY !== null,
+    refetchInterval: 20_000,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: true,
+    retry: false,
+    staleTime: 15_000
+  });
+  const trustedPriceResponse = trustedPriceQuery.data?.price ?? null;
+  const trustedPriceLocallyFresh = trustedPriceResponse !== null && trustedPoolCreationPriceIsLocallyFresh(
+    trustedPriceQuery.dataUpdatedAt,
+    progressNow,
+    TRUSTED_POOL_CREATION_PRICE_CLIENT_TTL_MS
+  );
+  const trustedPrice = trustedPriceLocallyFresh ? trustedPriceResponse : null;
+  const trustedPriceExpired = trustedPriceResponse !== null && !trustedPriceLocallyFresh;
+  const trustedPriceAgeSeconds = trustedPrice === null
+    ? null
+    : trustedPoolCreationPriceLocalAgeSeconds(trustedPrice, trustedPriceQuery.dataUpdatedAt, progressNow);
+  const trustedSuggestedInput = trustedPrice === null
+    ? null
+    : formatUnits(BigInt(trustedPrice.quotePerBaseE18), 18);
+  const trustedDeviation = trustedPrice === null
+    ? null
+    : trustedPriceDeviationBps(priceInput, trustedPrice.quotePerBaseE18);
 
   useEffect(() => {
     operationGeneration.current += 1;
+    restoringReviewFingerprint.current = null;
     setPrepared(null);
     setGasReview(null);
     setRecovery(null);
@@ -4707,7 +4975,34 @@ function PoolCreationWizard({
     setError(null);
     setNotice(null);
     setStep("tokens");
-  }, [contextIdentity]);
+  }, [deploymentContextIdentity]);
+
+  useEffect(() => {
+    operationGeneration.current += 1;
+    if (submittedFingerprint === null) {
+      setPrepared(null);
+      setGasReview(null);
+      setError(null);
+      if (step === "review") setStep("configure");
+    }
+  }, [walletAuthorityIdentity]);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => setProgressNow(Date.now()), 1_000);
+    return () => window.clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    persistPoolCreationDraft(window.sessionStorage, environmentKey, {
+      tokenXInput,
+      tokenYAddress,
+      binStepInput,
+      priceInput,
+      mode,
+      riskAcknowledged,
+      configured: step !== "tokens" || draftAtMount.current?.configured === true
+    });
+  }, [binStepInput, environmentKey, mode, priceInput, riskAcknowledged, step, tokenXInput, tokenYAddress]);
 
   useEffect(() => () => {
     operationGeneration.current += 1;
@@ -4716,16 +5011,53 @@ function PoolCreationWizard({
 
   useEffect(() => {
     if (!discovery) return;
-    const firstQuote = discovery.quoteAssets[0];
-    if (tokenYAddress === "" && firstQuote) setTokenYAddress(firstQuote);
+    const defaults = selectPoolCreationTokenDefaults(Object.values(registry.tokens), discovery.quoteAssets);
+    if (tokenYAddress === "" && defaults.tokenY) setTokenYAddress(defaults.tokenY);
     if (binStepInput === "" && discovery.openBinSteps[0] !== undefined) setBinStepInput(discovery.openBinSteps[0].toString());
-    if (tokenXInput === "") {
-      const candidate = Object.values(registry.tokens).find((token) =>
-        !discovery.quoteAssets.some((quote) => isAddressEqual(quote, token.address)) && token.risk.reviewStatus !== "blocked"
-      ) ?? Object.values(registry.tokens)[0];
-      if (candidate) setTokenXInput(candidate.address);
-    }
+    if (tokenXInput === "" && defaults.tokenX) setTokenXInput(defaults.tokenX);
   }, [binStepInput, discovery, registry.tokens, tokenXInput, tokenYAddress]);
+
+  useEffect(() => {
+    const draft = draftAtMount.current;
+    if (
+      !draft?.configured ||
+      restoringDraft.current ||
+      tokenX !== null ||
+      tokenY !== null ||
+      !discoveryQuery.data ||
+      !isAddress(tokenXInput) ||
+      !isAddress(tokenYAddress)
+    ) return;
+    restoringDraft.current = true;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const selectedY = tokenYAddress as Address;
+        if (!discoveryQuery.data.discovery.quoteAssets.some((asset) => isAddressEqual(asset, selectedY))) {
+          throw new Error("Saved quote asset is no longer enabled by the factory");
+        }
+        const [restoredTokenX, restoredTokenY] = await Promise.all([
+          readPoolCreationToken(publicClient, registry, tokenXInput as Address, discoveryQuery.data.blockNumber),
+          readPoolCreationToken(publicClient, registry, selectedY, discoveryQuery.data.blockNumber)
+        ]);
+        if (isAddressEqual(restoredTokenX.address, restoredTokenY.address)) throw new Error("Saved pool tokens must be distinct");
+        if (cancelled) return;
+        setTokenX(restoredTokenX);
+        setTokenY(restoredTokenY);
+        if (!restoredTokenX.listed || !restoredTokenY.listed) setMode("create-only");
+        setStep("configure");
+        draftAtMount.current = null;
+      } catch (draftError) {
+        if (!cancelled) {
+          draftAtMount.current = null;
+          setError(`Saved pool configuration needs review: ${getWriteError(draftError) ?? "token validation failed"}`);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [discoveryQuery.data, publicClient, registry, tokenX, tokenXInput, tokenY, tokenYAddress]);
 
   const pricePreview = useMemo(() => {
     if (!tokenX || !tokenY || !/^\d+$/.test(binStepInput)) return null;
@@ -4762,11 +5094,122 @@ function PoolCreationWizard({
     }
   }, [binStepInput, priceInput, tokenX, tokenY]);
 
-  const journalRecord = submittedFingerprint === null ? null : transactionJournal.records.find((record) =>
-    record.reviewed.intent === "create-pool" &&
-    record.reviewed.executionFingerprint === submittedFingerprint &&
-    record.reviewed.account.toLowerCase() === account.address?.toLowerCase()
-  ) ?? null;
+  const resumableJournalRecord = useMemo(() => {
+    const accountAddress = account.address?.toLowerCase() ?? null;
+    return transactionJournal.records
+      .filter((record) =>
+        record.reviewed.intent === "create-pool" &&
+        record.reviewed.environment === environmentKey &&
+        record.reviewed.deploymentEpoch === deploymentEpoch(registry) &&
+        record.reviewed.chainId === registry.chainId &&
+        record.reviewed.target.toLowerCase() === registry.contracts.lbRouter.toLowerCase() &&
+        (accountAddress === null || record.reviewed.account.toLowerCase() === accountAddress) &&
+        ["awaiting-wallet", "unknown-submission", "reconciling", "submitted", "confirming", "canonical", "orphaned", "timed-out", "reverted"].includes(record.status)
+      )
+      .sort((left, right) => right.updatedAt - left.updatedAt)[0] ?? null;
+  }, [account.address, environmentKey, registry, transactionJournal.records]);
+  const journalRecord = submittedFingerprint === null
+    ? resumableJournalRecord
+    : transactionJournal.records.find((record) =>
+      record.reviewed.intent === "create-pool" &&
+      record.reviewed.executionFingerprint === submittedFingerprint
+    ) ?? resumableJournalRecord;
+
+  useEffect(() => {
+    if (submittedFingerprint !== null || resumableJournalRecord === null) return;
+    setSubmittedFingerprint(resumableJournalRecord.reviewed.executionFingerprint);
+    setStep("create");
+  }, [resumableJournalRecord?.id, submittedFingerprint]);
+
+  useEffect(() => {
+    if (
+      journalRecord === null ||
+      prepared !== null ||
+      restoringReviewFingerprint.current === journalRecord.reviewed.executionFingerprint
+    ) return;
+    const restored = loadPoolCreationReview(window.localStorage, journalRecord.reviewed.executionFingerprint);
+    if (
+      restored === null ||
+      restored.binding.environment !== environmentKey ||
+      restored.binding.deploymentEpoch !== deploymentEpoch(registry) ||
+      restored.binding.chainId !== registry.chainId ||
+      restored.binding.account.toLowerCase() !== journalRecord.reviewed.account.toLowerCase() ||
+      restored.binding.router.toLowerCase() !== registry.contracts.lbRouter.toLowerCase() ||
+      restored.binding.factory.toLowerCase() !== registry.contracts.lbFactory.toLowerCase() ||
+      keccak256(restored.binding.transaction.data).toLowerCase() !== journalRecord.reviewed.calldataFingerprint.toLowerCase()
+    ) return;
+
+    restoringReviewFingerprint.current = restored.fingerprint;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const block = await publicClient.getBlock({ blockTag: "latest" });
+        if (block.hash === null) throw new Error("Current canonical head is unavailable");
+        const [restoredTokenX, restoredTokenY] = await Promise.all([
+          readPoolCreationToken(publicClient, registry, restored.binding.tokenX, block.number),
+          readPoolCreationToken(publicClient, registry, restored.binding.tokenY, block.number)
+        ]);
+        if (
+          restoredTokenX.decimals !== restored.binding.tokenXDecimals ||
+          restoredTokenY.decimals !== restored.binding.tokenYDecimals
+        ) {
+          throw new Error("Stored pool-creation token decimals no longer match live metadata");
+        }
+        const requestedPriceQ128 = decimalPriceToQ128(restored.binding.requestedQuotePerBase, {
+          baseDecimals: restored.binding.tokenXDecimals,
+          quoteDecimals: restored.binding.tokenYDecimals
+        });
+        const delta = restored.binding.representablePriceQ128 > requestedPriceQ128
+          ? restored.binding.representablePriceQ128 - requestedPriceQ128
+          : requestedPriceQ128 - restored.binding.representablePriceQ128;
+        const inverseBasePerQuote = formatExactPriceFraction(normalizeQ128Price(
+          restored.binding.representablePriceQ128,
+          {
+            baseDecimals: restored.binding.tokenXDecimals,
+            quoteDecimals: restored.binding.tokenYDecimals,
+            inverse: true
+          }
+        ), 36);
+        const restoredPrepared: PoolCreationPreparedReview = {
+          review: restored,
+          preflight: {
+            kind: "creatable",
+            blockNumber: restored.binding.pinnedHead.number,
+            selection: {
+              tokenX: restored.binding.tokenX,
+              tokenY: restored.binding.tokenY,
+              binStep: restored.binding.binStep
+            }
+          },
+          transaction: restored.binding.transaction,
+          preset: restored.binding.preset,
+          requestedPriceQ128,
+          representedPriceQ128: restored.binding.representablePriceQ128,
+          representedQuotePerBase: restored.binding.representableQuotePerBase,
+          inverseBasePerQuote,
+          deviationBps: delta * 10_000n / requestedPriceQ128,
+          tokenX: restoredTokenX,
+          tokenY: restoredTokenY
+        };
+        if (cancelled) return;
+        setTokenX(restoredTokenX);
+        setTokenY(restoredTokenY);
+        setTokenXInput(restoredTokenX.address);
+        setTokenYAddress(restoredTokenY.address);
+        setBinStepInput(restored.binding.binStep.toString());
+        setPriceInput(restored.binding.requestedQuotePerBase);
+        setMode(restored.binding.mode);
+        setRiskAcknowledged(true);
+        setPrepared(restoredPrepared);
+        setStep("create");
+      } catch (restoreError) {
+        if (!cancelled) setError(`Saved creation status could not restore its exact review: ${getWriteError(restoreError) ?? "invalid saved review"}`);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [environmentKey, journalRecord?.id, journalRecord?.reviewed.executionFingerprint, prepared, publicClient, registry]);
 
   const reviewIsCurrent = (review: PoolCreationReview): boolean => poolCreationReviewIsCurrent(review, {
     ...review.binding,
@@ -4819,6 +5262,13 @@ function PoolCreationWizard({
       blockNumber,
       blockHash
     );
+    if (isDeprecatedPool(registry, observation.pool.pair)) {
+      onConfirmedPool(null);
+      throw new Error(
+        "The matching Sepolia pool is deprecated because it was initialized at an unsafe price. " +
+        "It must remain unfunded; choose the approved replacement preset."
+      );
+    }
     const duplicate = recordDuplicatePool(review, observation.pool, source);
     setRecovery(duplicate);
     setPrepared(null);
@@ -4833,12 +5283,10 @@ function PoolCreationWizard({
   };
 
   const buildCurrentReview = async (): Promise<PoolCreationPreparedReview | null> => {
-    if (!account.address || !tokenX || !tokenY || !pricePreview || "error" in pricePreview) {
-      throw new Error("Complete a valid connected pool configuration first");
-    }
-    if (walletChainId !== registry.chainId || snapshot?.runtime.chainId !== registry.chainId) {
-      throw new Error("Wallet and RPC must match the selected pool-creation chain");
-    }
+    if (!tokenX || !tokenY || !pricePreview || "error" in pricePreview) throw new Error("Enter and verify the token pair, bin step, and initial price");
+    if (!account.address) throw new Error("Connect a wallet before preparing the exact creation review");
+    if (walletChainId !== registry.chainId) throw new Error(`Switch the wallet to ${registry.chain.name} (${registry.chainId}) before review`);
+    if (snapshot?.runtime.chainId !== registry.chainId) throw new Error("The application RPC does not match this deployment; pool creation is unavailable");
     if (!riskAcknowledged) throw new Error("Acknowledge the initial-price arbitrage and loss risk before review");
     const capturedGeneration = operationGeneration.current;
     const [rpcChainId, block] = await Promise.all([publicClient.getChainId(), publicClient.getBlock({ blockTag: "latest" })]);
@@ -4998,6 +5446,24 @@ function PoolCreationWizard({
     setError(null);
     setNotice(null);
     try {
+      const displayedTrustedPrice = trustedPrice;
+      const refreshedTrustedPrice = (await trustedPriceQuery.refetch({ cancelRefetch: true })).data?.price ?? null;
+      if (displayedTrustedPrice === null && refreshedTrustedPrice !== null) {
+        setNotice("A current trusted oracle suggestion is now available. Feather did not alter your input; inspect the suggestion and deviation, then review again.");
+        return;
+      }
+      if (displayedTrustedPrice !== null && refreshedTrustedPrice === null) {
+        setNotice("The trusted oracle suggestion became unavailable before review. Feather kept your value as explicit input; verify it independently, then review again.");
+        return;
+      }
+      if (
+        displayedTrustedPrice !== null &&
+        refreshedTrustedPrice !== null &&
+        displayedTrustedPrice.quotePerBaseE18 !== refreshedTrustedPrice.quotePerBaseE18
+      ) {
+        setNotice("The trusted oracle suggestion changed before review. Feather did not alter your input; inspect the updated deviation, then review again.");
+        return;
+      }
       const next = await buildCurrentReview();
       if (next) {
         setPrepared(next);
@@ -5108,6 +5574,7 @@ function PoolCreationWizard({
           prepared.review.binding.binStep.toString()
         ].join("|")
       });
+      persistPoolCreationReview(window.localStorage, prepared.review);
       setSubmittedFingerprint(prepared.review.fingerprint);
       setStep("create");
       const hash = await submitJournaledTransaction({
@@ -5133,7 +5600,7 @@ function PoolCreationWizard({
         },
         send: () => createWrite.sendTransactionAsync(prepared.transaction)
       });
-      if (hash) setNotice(`Creation submitted as ${formatCompactAddress(hash)}. Canonical receipt and live factory identity must reconcile before the pool appears.`);
+      if (hash) setNotice(`Transaction ${formatCompactAddress(hash)} was submitted. Feather is tracking confirmation, pool identity, and discovery without sending another transaction.`);
     } catch (submitError) {
       if (isUserRejectedSubmission(submitError)) {
         setRecovery(recordCreateWalletRejection(prepared.review));
@@ -5247,6 +5714,10 @@ function PoolCreationWizard({
         if (postReadCanonicalBlock.hash?.toLowerCase() !== receipt.blockHash.toLowerCase()) {
           throw new Error("Pool-creation receipt block reorganized during live reconciliation");
         }
+        if (isDeprecatedPool(registry, reconciled.pair)) {
+          onConfirmedPool(null);
+          throw new Error("The reconciled pool is a deprecated Sepolia release and cannot be promoted or funded.");
+        }
         const empty = recordCreatedPoolEmpty(confirmation, livePool, true);
         const indexed = indexedPools.some((pool) => isAddressEqual(pool.address, reconciled.pair));
         const indexerHead = snapshot?.indexer.blockNumber === null || snapshot?.indexer.blockNumber === undefined
@@ -5272,7 +5743,7 @@ function PoolCreationWizard({
         } else {
           setNotice(indexed ? "Pool creation is canonical and indexed." : "Pool creation is canonical by RPC. The empty-pool workspace is available while indexing catches up; swaps remain disabled.");
         }
-        void onRefresh().catch((refreshError) => {
+        void Promise.all([onRefresh(), onCatalogRefresh()]).catch((refreshError) => {
           if (!cancelled) {
             setNotice(`Pool creation remains canonically reconciled. Indexed-data refresh failed and can be retried from the pool list: ${getWriteError(refreshError) ?? "unknown refresh error"}`);
           }
@@ -5290,9 +5761,53 @@ function PoolCreationWizard({
         canonicalReconciliationHash.current = null;
       }
     };
-  }, [canonicalRetryNonce, journalRecord?.activeHash, journalRecord?.canonicalReceipt?.hash, journalRecord?.id, journalRecord?.status, prepared?.review.fingerprint]);
+  }, [
+    canonicalRetryNonce,
+    journalRecord?.activeHash,
+    journalRecord?.canonicalReceipt?.hash,
+    journalRecord?.id,
+    journalRecord?.status,
+    onCatalogRefresh,
+    onRefresh,
+    prepared?.review.fingerprint
+  ]);
 
   const configured = tokenX !== null && tokenY !== null && pricePreview !== null && !("error" in pricePreview) && riskAcknowledged;
+  const walletConnected = account.address !== undefined;
+  const walletOnCreationChain = walletConnected && walletChainId === registry.chainId;
+  const rpcOnCreationChain = snapshot?.runtime.chainId === registry.chainId;
+  const reviewActionLabel = !walletConnected
+    ? "Connect wallet to review"
+    : !walletOnCreationChain
+      ? `Switch to ${registry.chain.name}`
+      : !rpcOnCreationChain
+        ? "Creation RPC unavailable"
+        : trustedPriceQuery.isFetching
+          ? "Refreshing trusted price…"
+        : busy
+          ? "Pinning review…"
+          : "Review exact creation";
+  const handleReviewAction = () => {
+    setError(null);
+    if (!walletConnected) {
+      if (!walletModalConfigured) {
+        setError("Use Connect wallet in the application header before reviewing pool creation.");
+        return;
+      }
+      void openWalletModal().catch(() => setError("The wallet chooser could not open. Reload the page and try again."));
+      return;
+    }
+    if (!walletOnCreationChain) {
+      resetPoolCreationSwitch();
+      switchPoolCreationChain({ chainId: registry.chainId });
+      return;
+    }
+    if (!rpcOnCreationChain) {
+      setError("The application RPC does not match this deployment. Pool creation is disabled until the deployment configuration is corrected.");
+      return;
+    }
+    void handlePrepareReview();
+  };
   const existingPool = recovery?.kind === "duplicate" ? recovery.pool : null;
   const confirmedPool = recovery && ["canonical-confirmation", "indexing-lag", "created-empty"].includes(recovery.kind)
     ? (recovery as Extract<PoolCreationRecoveryState, { kind: "canonical-confirmation" | "indexing-lag" | "created-empty" }>).pool
@@ -5304,6 +5819,62 @@ function PoolCreationWizard({
   const existingLiveTokenY = existingPool && tokenX && tokenY
     ? (isAddressEqual(existingPool.tokenY, tokenY.address) ? tokenY : tokenX)
     : tokenY;
+  const resultPool = confirmedPool ?? existingPool;
+  const resultPoolDiscovered = resultPool !== null && indexedPools.some((pool) => isAddressEqual(pool.address, resultPool.pair));
+  const baseCreationProgress = poolCreationProgress(journalRecord, recovery, resultPoolDiscovered);
+  const progressHash = journalRecord?.activeHash ??
+    (recovery?.kind === "ambiguous-submission" ? recovery.transactionHash : null) ??
+    (recovery?.kind === "mined-revert" || recovery?.kind === "canonical-confirmation" ? recovery.transactionHash : null);
+  const explorerTransactionUrl = progressHash && registry.chain.blockExplorers?.default.url
+    ? `${registry.chain.blockExplorers.default.url.replace(/\/+$/, "")}/tx/${progressHash}`
+    : null;
+  const progressStartedAt = journalRecord?.submittedAt ?? journalRecord?.createdAt ?? null;
+  const discoveryWaitMs = progressStartedAt === null ? 0 : Math.max(0, progressNow - progressStartedAt);
+  const pendingDiscoveryProgress = resultPool !== null && !resultPoolDiscovered
+    ? {
+        ...baseCreationProgress,
+        verifiedStep: baseCreationProgress.verifiedStep === 6 ? 5 as const : baseCreationProgress.verifiedStep,
+        terminal: false,
+        canCheckStatus: true
+      }
+    : baseCreationProgress;
+  const creationProgress = resultPool !== null && !resultPoolDiscovered &&
+    (analyticsState === "error" || analyticsState === "unavailable")
+    ? {
+        ...pendingDiscoveryProgress,
+        title: `${baseCreationProgress.title} · analytics temporarily unavailable`,
+        detail: `${baseCreationProgress.detail} Feather cannot verify durable discovery right now and will not resubmit creation; retry the status check when analytics recovers.`,
+        tone: "warning" as const,
+      }
+    : resultPool !== null && !resultPoolDiscovered && discoveryWaitMs >= 120_000
+      ? {
+          ...pendingDiscoveryProgress,
+          title: `${baseCreationProgress.title} · discovery is taking longer than usual`,
+          detail: `${baseCreationProgress.detail} The pool is still absent from the durable catalog. Check status safely; Feather will never resubmit creation automatically.`,
+          tone: "warning" as const,
+        }
+      : pendingDiscoveryProgress;
+  const handleProgressCheck = async () => {
+    setError(null);
+    setNotice("Checking the existing transaction and discovery state. No new transaction will be submitted.");
+    try {
+      if (journalRecord) await transactionJournal.recheck(journalRecord.id);
+      setCanonicalRetryNonce((value) => value + 1);
+      await Promise.all([onRefresh(), onCatalogRefresh()]);
+      setNotice("Status refreshed from the current chain and application data.");
+    } catch (statusError) {
+      setError(getWriteError(statusError) ?? "Status check failed. The existing transaction remains unchanged.");
+    }
+  };
+  const startFreshCreationReview = () => {
+    setPrepared(null);
+    setGasReview(null);
+    setRecovery(null);
+    setError(null);
+    setNotice(null);
+    setRiskAcknowledged(false);
+    setStep(tokenX && tokenY ? "configure" : "tokens");
+  };
 
   return (
     <section className="pool-creation-panel" data-testid="pool-creation-wizard" aria-label="Create permissionless LB pool">
@@ -5336,7 +5907,62 @@ function PoolCreationWizard({
           <label><span className="field-label">Open bin-step preset</span><select data-testid="pool-create-bin-step" value={binStepInput} onChange={(event) => { setBinStepInput(event.target.value); setPrepared(null); }}>
             {(discovery?.openBinSteps ?? []).map((value) => <option key={value.toString()} value={value.toString()}>{value.toString()} bps step</option>)}
           </select></label>
-          <label><span className="field-label">Initial price · {tokenY.symbol} per {tokenX.symbol}</span><input data-testid="pool-create-price" value={priceInput} onChange={(event) => { setPriceInput(event.target.value); setPrepared(null); }} inputMode="decimal" /></label>
+          <label>
+            <span className="field-label">Initial price · {tokenY.symbol} per {tokenX.symbol}</span>
+            <input
+              aria-describedby="pool-create-price-guidance"
+              data-testid="pool-create-price"
+              inputMode="decimal"
+              placeholder={`Enter ${tokenY.symbol} per ${tokenX.symbol}`}
+              value={priceInput}
+              onChange={(event) => {
+                setPriceInput(event.target.value);
+                setPrepared(null);
+                setGasReview(null);
+              }}
+            />
+          </label>
+          <div className={`pool-creation-price-source ${trustedPrice ? "ready" : "unavailable"}`} id="pool-create-price-guidance" data-testid="pool-create-trusted-price">
+            {trustedPrice && trustedSuggestedInput ? (
+              <>
+                <div>
+                  <strong>Trusted oracle suggestion</strong>
+                  <span>{trustedSuggestedInput} {tokenY.symbol} per {tokenX.symbol}</span>
+                </div>
+                <p>
+                  {poolCreationPriceSourceLabel(trustedPrice.baseSource, trustedPrice.quoteSource)}
+                  {" · "}
+                  samples {formatPoolCreationPriceAge(trustedPriceAgeSeconds ?? Math.max(trustedPrice.baseAgeSeconds, trustedPrice.quoteAgeSeconds))} old
+                  {" · "}
+                  analytics block {trustedPrice.asOfBlock}
+                </p>
+                <button
+                  className="secondary-button"
+                  data-testid="pool-create-use-trusted-price"
+                  onClick={() => {
+                    setPriceInput(trustedSuggestedInput);
+                    setPrepared(null);
+                    setGasReview(null);
+                  }}
+                  type="button"
+                >
+                  Use trusted price
+                </button>
+              </>
+            ) : trustedPriceQuery.isLoading || trustedPriceQuery.isFetching ? (
+              <p><LoaderCircle className="spin" size={14} /> {trustedPriceExpired ? "Refreshing an expired trusted oracle suggestion…" : "Checking trusted oracle pricing…"}</p>
+            ) : trustedPriceExpired ? (
+              <p>The prior trusted oracle suggestion expired locally. Feather will refresh it before review; enter a price explicitly if it remains unavailable.</p>
+            ) : (
+              <p>{trustedPriceQuery.data?.detail ?? "No current trusted oracle suggestion is available. Enter a price explicitly and verify it independently."}</p>
+            )}
+          </div>
+          {trustedDeviation !== null ? (
+            <p className={trustedDeviation >= 100n ? "inline-error" : "pool-creation-copy"} data-testid="pool-create-trusted-deviation">
+              Entered price differs from the trusted oracle suggestion by {formatBps(trustedDeviation)}.
+              {trustedDeviation >= 100n ? " Recheck the price orientation before review." : ""}
+            </p>
+          ) : null}
           {pricePreview && !("error" in pricePreview) ? (
             <dl className="pool-creation-preview" data-testid="pool-create-price-preview">
               <div><dt>Derived active ID</dt><dd>{pricePreview.activeId.toString()}</dd></div>
@@ -5347,7 +5973,24 @@ function PoolCreationWizard({
           ) : pricePreview && "error" in pricePreview ? <p className="inline-error">{pricePreview.error}</p> : null}
           <label className="check-row"><input checked={mode === "create-and-add"} disabled={!tokenX.listed || !tokenY.listed} onChange={(event) => setMode(event.target.checked ? "create-and-add" : "create-only")} type="checkbox" /><span>{tokenX.listed && tokenY.listed ? "After canonical creation, offer a separate fresh Create Position review" : "Create Position handoff requires both tokens in the supported Feather token registry; permissionless pool creation remains available in create-only mode"}</span></label>
           <label className="check-row risk-ack"><input data-testid="pool-create-risk-ack" checked={riskAcknowledged} onChange={(event) => setRiskAcknowledged(event.target.checked)} type="checkbox" /><span>I understand an incorrect initial price can cause immediate arbitrage and permanent loss. The representable rounded price—not my typed decimal—will initialize the pool.</span></label>
-          <div className="wizard-actions"><button className="secondary-button" onClick={() => setStep("tokens")} type="button">Back</button><button className="primary-button" disabled={!configured || busy} onClick={() => void handlePrepareReview()} type="button">{busy ? "Pinning review…" : "Review exact creation"}</button></div>
+          {!walletConnected ? (
+            <p className="pool-creation-prerequisite" role="status"><Wallet size={16} /> Connect a wallet to bind the exact review. Your pair and price will stay here while you connect.</p>
+          ) : !walletOnCreationChain ? (
+            <p className="pool-creation-prerequisite warning" role="status"><Network size={16} /> Wallet is on chain {walletChainId}. Switch to {registry.chain.name} ({registry.chainId}) before review.</p>
+          ) : null}
+          {poolCreationSwitchError ? <p className="inline-error" role="alert">{walletFailure(poolCreationSwitchError, "switch").action}</p> : null}
+          <div className="wizard-actions">
+            <button className="secondary-button" onClick={() => setStep("tokens")} type="button">Back</button>
+            <button
+              className={!walletConnected || !walletOnCreationChain ? "warn-button" : "primary-button"}
+              data-testid="pool-create-review-action"
+              disabled={!configured || busy || trustedPriceQuery.isFetching || poolCreationSwitchPending || (!rpcOnCreationChain && walletOnCreationChain)}
+              onClick={handleReviewAction}
+              type="button"
+            >
+              {poolCreationSwitchPending ? "Switching…" : reviewActionLabel}
+            </button>
+          </div>
         </div>
       ) : null}
       {step === "review" && prepared ? (
@@ -5370,18 +6013,52 @@ function PoolCreationWizard({
         </div>
       ) : null}
       {step === "create" ? (
-        <div className="pool-creation-result" data-testid="pool-create-result">
-          <strong>{poolCreationRecoveryTitle(recovery, journalRecord)}</strong>
-          <p>{poolCreationRecoveryCopy(recovery, journalRecord)}</p>
+        <div className={`pool-creation-result ${creationProgress.tone}`} data-testid="pool-create-result" aria-live="polite">
+          <div className="pool-creation-result-heading">
+            <div>
+              <span className="eyebrow">Latest verified stage</span>
+              <strong>{creationProgress.title}</strong>
+            </div>
+            {progressStartedAt !== null ? <span className="pool-creation-elapsed">{formatPoolCreationElapsed(progressStartedAt, progressNow)}</span> : null}
+          </div>
+          <p>{creationProgress.detail}</p>
+          <ol className="pool-creation-progress-track" aria-label="Pool creation transaction progress">
+            {POOL_CREATION_PROGRESS_STEPS.map((label, index) => {
+              const stepNumber = index + 1;
+              const verified = stepNumber <= creationProgress.verifiedStep;
+              const current = stepNumber === Math.min(6, creationProgress.verifiedStep + 1) && !creationProgress.terminal;
+              return (
+                <li className={verified ? "verified" : current ? "current" : ""} key={label} aria-current={current ? "step" : undefined}>
+                  <span aria-hidden="true">{verified ? "✓" : stepNumber}</span>
+                  <small>{label}</small>
+                </li>
+              );
+            })}
+          </ol>
+          {progressHash ? (
+            <dl className="pool-creation-transaction">
+              <div>
+                <dt>Transaction</dt>
+                <dd><span>{formatCompactAddress(progressHash)}</span><code>{progressHash}</code></dd>
+              </div>
+              {journalRecord?.canonicalReceipt ? (
+                <div><dt>Canonical receipt</dt><dd>block {journalRecord.canonicalReceipt.blockNumber} · {journalRecord.confirmations} confirmation{journalRecord.confirmations === 1 ? "" : "s"}</dd></div>
+              ) : null}
+            </dl>
+          ) : (
+            <p className="pool-creation-hashless">No authoritative transaction hash has been returned yet.</p>
+          )}
           {existingPool ? (
             <dl className="review-grid"><div><dt>Winning pair</dt><dd>{existingPool.pair}</dd></div><div><dt>Fresh live X/Y</dt><dd>{existingLiveTokenX?.symbol ?? existingPool.tokenX} / {existingLiveTokenY?.symbol ?? existingPool.tokenY}</dd></div><div><dt>Fresh live ID / price</dt><dd>{existingPool.activeId.toString()} / {formatExactPriceFraction(normalizeQ128Price(existingPool.priceQ128, { baseDecimals: existingLiveTokenX?.decimals ?? 18, quoteDecimals: existingLiveTokenY?.decimals ?? 18 }), 24)}</dd></div></dl>
           ) : null}
-          {(confirmedPool || existingPool) ? (
-            <div className="wizard-actions">
-              <a className="secondary-button" href={`#/pools/${encodeURIComponent((confirmedPool ?? existingPool)!.pair)}`}>Open exact pool workspace</a>
-              {mode === "create-and-add" ? <a className="primary-button" data-testid="pool-create-position" href={`#/liquidity/add/${encodeURIComponent((confirmedPool ?? existingPool)!.pair)}`}>Create Position · fresh review</a> : null}
-            </div>
-          ) : null}
+          <div className="wizard-actions pool-creation-result-actions">
+            {explorerTransactionUrl ? <a className="secondary-button" href={explorerTransactionUrl} rel="noreferrer" target="_blank">View transaction</a> : null}
+            {creationProgress.canCheckStatus ? <button className="secondary-button" data-testid="pool-create-status-retry" disabled={busy} onClick={() => void handleProgressCheck()} type="button">Check status now</button> : null}
+            {resultPool ? <a className="secondary-button" href={`#/pools/${encodeURIComponent(resultPool.pair)}`} onClick={() => setPoolCreationOpen(window.sessionStorage, environmentKey, false)}>Open confirmed pool</a> : null}
+            <button className="secondary-button" onClick={onClose} type="button">Return to pools</button>
+            {creationProgress.canStartFreshReview ? <button className="secondary-button" data-testid="pool-create-fresh-review" onClick={startFreshCreationReview} type="button">Start a fresh creation review</button> : null}
+            {resultPool && mode === "create-and-add" ? <a className="primary-button" data-testid="pool-create-position" href={`#/liquidity/add/${encodeURIComponent(resultPool.pair)}`} onClick={() => setPoolCreationOpen(window.sessionStorage, environmentKey, false)}>Create Position · fresh review</a> : null}
+          </div>
         </div>
       ) : null}
       {notice ? <p className="state-row warning" role="status">{notice}</p> : null}
@@ -5633,44 +6310,24 @@ function duplicatePoolOverlayRow(
   };
 }
 
-function poolCreationRecoveryTitle(
-  recovery: PoolCreationRecoveryState | null,
-  journal: TransactionJournalRecord | null
-): string {
-  if (recovery === null) return journal ? `Creation ${journal.status}` : "Preparing creation";
-  switch (recovery.kind) {
-    case "duplicate": return recovery.source === "race-winner" ? "Another creator won the race" : "Exact pool already exists";
-    case "wallet-rejection": return "Wallet rejected creation";
-    case "ambiguous-submission": return "Submission identity is ambiguous";
-    case "mined-revert": return "Creation reverted onchain";
-    case "canonical-confirmation": return "Pool creation confirmed";
-    case "reorg": return "Creation receipt was reorganized";
-    case "indexing-lag": return "Pool confirmed · indexing catching up";
-    case "created-empty": return "Empty pool created";
-    case "add-rejected": return "Position creation rejected · pool preserved";
-    case "add-reverted": return "Position creation reverted · pool preserved";
-    case "add-ambiguous-submission": return "Position submission ambiguous · pool preserved";
-  }
+function poolCreationPriceSourceLabel(baseSource: string, quoteSource: string): string {
+  const label = (source: string) => source === "chainlink-data-feeds"
+    ? "Chainlink Data Feeds"
+    : source === "chainlink-data-streams"
+      ? "Chainlink Data Streams"
+      : source === "fixed-test"
+        ? "Verified local test feed"
+        : source;
+  const base = label(baseSource);
+  const quote = label(quoteSource);
+  return base === quote ? base : `${base} / ${quote}`;
 }
 
-function poolCreationRecoveryCopy(
-  recovery: PoolCreationRecoveryState | null,
-  journal: TransactionJournalRecord | null
-): string {
-  if (recovery === null) return journal?.rejectionReason ?? "No transaction has been accepted as canonical yet.";
-  switch (recovery.kind) {
-    case "duplicate": return "No create transaction was sent. Live active ID and price were re-read; any position requires a new explicit add review.";
-    case "wallet-rejection": return "No transaction hash was accepted. Refresh the exact review before retrying.";
-    case "ambiguous-submission": return "Retry is blocked while the durable journal searches by sender and nonce for a broadcast.";
-    case "mined-revert": return "The canonical receipt reverted. No pool overlay or position action is enabled.";
-    case "canonical-confirmation": return "Factory event and live pair identity reconciled at the canonical receipt block.";
-    case "reorg": return "The prior receipt is no longer canonical. The RPC overlay was removed and retry requires a fresh review.";
-    case "indexing-lag": return "RPC confirms the exact empty pool. It remains visible here while the indexer is behind; swaps are disabled.";
-    case "created-empty": return "The pool exists with zero creation-block reserves. Position creation is a separate fresh review and never starts automatically.";
-    case "add-rejected":
-    case "add-reverted":
-    case "add-ambiguous-submission": return "The canonical pool remains available. Blind add retry is blocked until live state is refreshed and reviewed again.";
-  }
+function formatPoolCreationPriceAge(ageSeconds: number): string {
+  if (ageSeconds < 60) return `${ageSeconds}s`;
+  const minutes = Math.floor(ageSeconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
 
 function LiquidityView({

@@ -16,7 +16,7 @@ validate_root() {
 
 validate_environment() {
   case "$1" in
-    testnet|mainnet) ;;
+    sepolia|testnet|mainnet) ;;
     *) fail "environment is invalid" ;;
   esac
 }

@@ -3,9 +3,34 @@ import type { Address, Chain } from "viem";
 export const LOCALNET_CHAIN_ID = 31_337;
 export const ROBINHOOD_CHAIN_ID = 4_663;
 export const ROBINHOOD_TESTNET_CHAIN_ID = 46_630;
+export const SEPOLIA_CHAIN_ID = 11_155_111;
 
 export const ROBINHOOD_WETH: Address = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73";
 export const ROBINHOOD_TESTNET_WETH: Address = "0x7943e237c7F95DA44E0301572D358911207852Fa";
+export const SEPOLIA_WETH: Address = "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9";
+export const SEPOLIA_USDC: Address = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238";
+
+export const sepoliaChain = {
+  id: SEPOLIA_CHAIN_ID,
+  name: "Ethereum Sepolia",
+  nativeCurrency: {
+    decimals: 18,
+    name: "Sepolia Ether",
+    symbol: "ETH"
+  },
+  rpcUrls: {
+    default: { http: ["https://ethereum-sepolia-rpc.publicnode.com"] },
+    public: { http: ["https://ethereum-sepolia-rpc.publicnode.com"] }
+  },
+  blockExplorers: {
+    default: {
+      name: "Etherscan",
+      url: "https://sepolia.etherscan.io",
+      apiUrl: "https://api-sepolia.etherscan.io/api"
+    }
+  },
+  testnet: true
+} as const satisfies Chain;
 
 export const localnetChain = {
   id: LOCALNET_CHAIN_ID,

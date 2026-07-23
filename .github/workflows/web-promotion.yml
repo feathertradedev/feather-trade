@@ -4,10 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: "Public Robinhood environment"
+        description: "Public deployment environment"
         required: true
         type: choice
-        options: [testnet, mainnet]
+        options: [sepolia, testnet, mainnet]
       immutable_commit:
         description: "Lowercase 40-character commit SHA to build and promote"
         required: true
@@ -109,7 +109,9 @@ jobs:
             echo "::error::repository variable WEB_REOWN_PROJECT_ID is required for the public wallet modal"
             exit 1
           }
-          if [[ "$TARGET_ENVIRONMENT" == testnet ]]; then
+          if [[ "$TARGET_ENVIRONMENT" == sepolia ]]; then
+            VITE_ANALYTICS_SEPOLIA_URL="$DEPLOYED_ORIGIN/graphql" VITE_SEPOLIA_MANIFEST_PATH="$SELECTED_MANIFEST" pnpm web:build:public:sepolia
+          elif [[ "$TARGET_ENVIRONMENT" == testnet ]]; then
             VITE_ANALYTICS_ROBINHOOD_TESTNET_URL="$DEPLOYED_ORIGIN/graphql" VITE_ROBINHOOD_TESTNET_MANIFEST_PATH="$SELECTED_MANIFEST" pnpm web:build:public:testnet
           else
             VITE_ANALYTICS_ROBINHOOD_URL="$DEPLOYED_ORIGIN/graphql" VITE_ROBINHOOD_MANIFEST_PATH="$SELECTED_MANIFEST" pnpm web:build:public:mainnet
@@ -122,8 +124,12 @@ jobs:
           IMMUTABLE_COMMIT: ${{ inputs.immutable_commit }}
           SELECTED_MANIFEST: ${{ inputs.manifest }}
         run: |
-          public_environment=robinhood
-          [[ "$TARGET_ENVIRONMENT" == testnet ]] && public_environment=robinhoodTestnet
+          case "$TARGET_ENVIRONMENT" in
+            sepolia) public_environment=sepolia ;;
+            testnet) public_environment=robinhoodTestnet ;;
+            mainnet) public_environment=robinhood ;;
+            *) echo "::error::unsupported public environment"; exit 1 ;;
+          esac
           pnpm web:check:public-artifact -- --environment "$public_environment" --manifest "$SELECTED_MANIFEST" --dist apps/web/dist
           node scripts/release/web-promotion-custody.cjs create --environment "$TARGET_ENVIRONMENT" --commit "$IMMUTABLE_COMMIT" --manifest "$SELECTED_MANIFEST" --dist apps/web/dist --output .local/web-promotion/bundle
 
@@ -178,6 +184,12 @@ jobs:
           IMMUTABLE_COMMIT: ${{ inputs.immutable_commit }}
         run: node scripts/release/web-promotion-custody.cjs verify --environment "$TARGET_ENVIRONMENT" --commit "$IMMUTABLE_COMMIT" --bundle .local/web-promotion/bundle --output .local/web-promotion/verified
 
+      - name: Verify hosted analytics before activation
+        if: ${{ needs.build.result == 'success' }}
+        env:
+          DEPLOYED_ORIGIN: ${{ needs.trusted-preflight.outputs.deployed_origin }}
+        run: node scripts/web/check-hosted-analytics.cjs --origin "$DEPLOYED_ORIGIN" --manifest .local/web-promotion/verified/manifest.json
+
       - name: Invoke provider adapter and smoke hosted app/docs
         if: ${{ needs.build.result == 'success' }}
         env:
@@ -197,6 +209,12 @@ jobs:
           WEB_VPS_SSH_PRIVATE_KEY: ${{ secrets.WEB_VPS_SSH_PRIVATE_KEY }}
           WEB_VPS_SSH_USER: ${{ secrets.WEB_VPS_SSH_USER }}
         run: bash scripts/release/promote-web-provider.sh
+
+      - name: Verify hosted analytics after activation
+        if: ${{ needs.build.result == 'success' }}
+        env:
+          DEPLOYED_ORIGIN: ${{ needs.trusted-preflight.outputs.deployed_origin }}
+        run: node scripts/web/check-hosted-analytics.cjs --origin "$DEPLOYED_ORIGIN" --manifest .local/web-promotion/verified/manifest.json
 
       - name: Write sanitized promotion and rollback-readiness evidence
         if: always()

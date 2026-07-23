@@ -9,7 +9,7 @@ export type CandleInterval =
   | "day"
   | "week";
 export type CandlePriceSource = "active-bin-quote-usd" | "trusted-token-usd" | "mixed";
-export type PriceSource = "chainlink-data-streams" | "fixed-test";
+export type PriceSource = "chainlink-data-feeds" | "chainlink-data-streams" | "fixed-test";
 export type BackfillStatus = "unavailable" | "running" | "complete" | "partial" | "capped";
 
 export interface PricePolicy {
@@ -18,6 +18,10 @@ export interface PricePolicy {
   feedId: string;
   maxAgeSeconds: number;
   maxConfidenceBps: number;
+  /** Expected on-chain feed decimals. Required for Chainlink Data Feeds. */
+  feedDecimals?: number;
+  /** Expected proxy description, such as "ETH / USD". Required for Chainlink Data Feeds. */
+  feedDescription?: string;
 }
 
 export interface PriceSample {
@@ -41,6 +45,15 @@ export interface PairIdentity {
   tokenY: string;
   decimalsX: number;
   decimalsY: number;
+  /**
+   * Canonical factory provenance. Legacy checkpoints may omit these fields,
+   * but live EVM adapters attach them from the factory creation log.
+   */
+  factoryAddress?: string | null;
+  createdAtBlock?: bigint | null;
+  createdAtBlockHash?: Hex | null;
+  creationTransactionHash?: Hex | null;
+  creationLogIndex?: number | null;
 }
 
 /**
@@ -199,10 +212,15 @@ export interface PoolBinState extends PoolBinSnapshot {
 export interface PoolState {
   chainId: number;
   pair: string;
+  factoryAddress?: string | null;
   tokenX: string;
   tokenY: string;
   decimalsX: number;
   decimalsY: number;
+  createdAtBlock?: bigint | null;
+  createdAtBlockHash?: Hex | null;
+  creationTransactionHash?: Hex | null;
+  creationLogIndex?: number | null;
   reserveX: bigint;
   reserveY: bigint;
   activeId: number;
@@ -372,6 +390,37 @@ export interface WalletPairPosition {
   asOfTimestamp: number | null;
 }
 
+export type PoolActivityKind = "swap" | "deposit" | "withdraw" | "position-transfer";
+
+/**
+ * One immutable event from the retained canonical chain. The canonical block
+ * hash is part of the row identity, so a reorg replaces orphaned rows instead
+ * of silently reusing their identifiers.
+ */
+export interface PoolActivityEvent {
+  id: string;
+  pair: string;
+  kind: PoolActivityKind;
+  owner: string | null;
+  from: string | null;
+  to: string | null;
+  amountX: bigint | null;
+  amountY: bigint | null;
+  binIds: string[];
+  blockNumber: bigint;
+  blockHash: Hex;
+  transactionHash: Hex | null;
+  logIndex: number | null;
+  sequence: number;
+  timestamp: number;
+  revision: number;
+}
+
+export interface PoolActivityConnection extends Connection<PoolActivityEvent> {
+  asOfBlock: bigint | null;
+  asOfBlockHash: Hex | null;
+}
+
 export interface PageInfo {
   endCursor: string | null;
   hasNextPage: boolean;
@@ -410,4 +459,20 @@ export interface PriceHealth {
   status: "available" | "missing-policy" | "missing-sample" | "stale" | "invalid-confidence";
   observedAt: number | null;
   ageSeconds: number | null;
+}
+
+export interface TrustedPairPrice {
+  baseToken: string;
+  quoteToken: string;
+  quotePerBaseE18: bigint | null;
+  status: AnalyticsStatus;
+  baseSource: PriceSource | null;
+  quoteSource: PriceSource | null;
+  baseObservedAt: number | null;
+  quoteObservedAt: number | null;
+  baseAgeSeconds: number | null;
+  quoteAgeSeconds: number | null;
+  asOfBlock: bigint | null;
+  asOfBlockHash: Hex | null;
+  asOfTimestamp: number | null;
 }

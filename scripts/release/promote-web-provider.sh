@@ -31,7 +31,7 @@ do
   require_env "$name"
 done
 
-[[ "$WEB_PROMOTION_ENVIRONMENT" == "testnet" || "$WEB_PROMOTION_ENVIRONMENT" == "mainnet" ]] || fail "environment is invalid"
+[[ "$WEB_PROMOTION_ENVIRONMENT" == "sepolia" || "$WEB_PROMOTION_ENVIRONMENT" == "testnet" || "$WEB_PROMOTION_ENVIRONMENT" == "mainnet" ]] || fail "environment is invalid"
 [[ "$WEB_PROMOTION_COMMIT" =~ ^[0-9a-f]{40}$ ]] || fail "immutable commit is invalid"
 [[ -d "$WEB_PROMOTION_ARTIFACT" ]] || fail "verified artifact directory is unavailable"
 [[ -f "$WEB_PROMOTION_ARTIFACT/index.html" ]] || fail "verified artifact is missing index.html"
@@ -87,14 +87,17 @@ fi
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 remote_helper="$script_dir/promote-web-vps-remote.sh"
 smoke_checker="$script_dir/../web/check-hosted-release.cjs"
+analytics_smoke_checker="$script_dir/../web/check-hosted-analytics.cjs"
 [[ -f "$remote_helper" ]] || fail "remote promotion helper is unavailable"
 [[ -f "$smoke_checker" ]] || fail "hosted release smoke checker is unavailable"
+[[ -f "$analytics_smoke_checker" ]] || fail "hosted analytics smoke checker is unavailable"
 
 ssh_bin="${WEB_PROMOTION_SSH_BIN:-ssh}"
 scp_bin="${WEB_PROMOTION_SCP_BIN:-scp}"
 smoke_bin="${WEB_PROMOTION_SMOKE_BIN:-}"
+analytics_smoke_bin="${WEB_PROMOTION_ANALYTICS_SMOKE_BIN:-}"
 lease_seconds="${WEB_PROMOTION_LEASE_SECONDS:-300}"
-if [[ -n "${WEB_PROMOTION_SSH_BIN:-}${WEB_PROMOTION_SCP_BIN:-}${WEB_PROMOTION_SMOKE_BIN:-}${WEB_PROMOTION_LEASE_SECONDS:-}" && "${WEB_PROMOTION_TEST_MODE:-0}" != "1" ]]; then
+if [[ -n "${WEB_PROMOTION_SSH_BIN:-}${WEB_PROMOTION_SCP_BIN:-}${WEB_PROMOTION_SMOKE_BIN:-}${WEB_PROMOTION_ANALYTICS_SMOKE_BIN:-}${WEB_PROMOTION_LEASE_SECONDS:-}" && "${WEB_PROMOTION_TEST_MODE:-0}" != "1" ]]; then
   fail "transport and smoke binary overrides require WEB_PROMOTION_TEST_MODE=1"
 fi
 [[ "$lease_seconds" =~ ^[0-9]+$ ]] && (( lease_seconds >= 1 && lease_seconds <= 900 )) || fail "activation lease is invalid"
@@ -103,6 +106,8 @@ if [[ "${WEB_PROMOTION_TEST_MODE:-0}" != "1" ]] && (( lease_seconds < 30 )); the
 fi
 smoke_command=(node "$smoke_checker")
 [[ -z "$smoke_bin" ]] || smoke_command=("$smoke_bin")
+analytics_smoke_command=(node "$analytics_smoke_checker")
+[[ -z "$analytics_smoke_bin" ]] || analytics_smoke_command=("$analytics_smoke_bin")
 
 work_dir="$(mktemp -d)"
 chmod 700 "$work_dir"
@@ -342,6 +347,25 @@ if ! "${smoke_command[@]}" "${smoke_args[@]}"; then
     fail "hosted app/docs smoke failed; guarded rollback could not restore because this activation was no longer current"
   fi
   fail "hosted app/docs smoke failed and guarded rollback could not restore the prior release"
+fi
+
+analytics_smoke_args=(
+  --origin "$WEB_PROMOTION_DEPLOYED_URL"
+  --manifest "$WEB_PROMOTION_MANIFEST"
+)
+if ! "${analytics_smoke_command[@]}" "${analytics_smoke_args[@]}"; then
+  if [[ "$activation_mode" == "already-confirmed" ]]; then
+    fail "hosted analytics smoke failed; the previously confirmed current release was left unchanged"
+  fi
+  if attempt_guarded_rollback; then
+    activated=0
+    activation_attempted=0
+    if [[ "$rollback_outcome" == "restored" ]]; then
+      fail "hosted analytics smoke failed; the prior verified release was restored"
+    fi
+    fail "hosted analytics smoke failed; guarded rollback could not restore because this activation was no longer current"
+  fi
+  fail "hosted analytics smoke failed and guarded rollback could not restore the prior release"
 fi
 
 if [[ "$activation_mode" == "already-confirmed" ]]; then

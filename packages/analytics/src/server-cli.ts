@@ -106,7 +106,9 @@ export async function startAnalyticsRuntime(
     const policiesSource = custody === null
       ? await readFile(policyPath, "utf8")
       : custody.files.pricePolicies.contents.toString("utf8");
-    const policies = JSON.parse(policiesSource) as PricePolicy[];
+    const parsedPolicies: unknown = JSON.parse(policiesSource);
+    if (!Array.isArray(parsedPolicies)) throw new Error("ANALYTICS_PRICE_POLICIES must contain a JSON array");
+    const policies = parsedPolicies as PricePolicy[];
     const engine = new AnalyticsEngine(policies, {
       maxHeadLagSeconds: numberFromEnv(env, "ANALYTICS_MAX_HEAD_LAG_SECONDS", 120),
       maxPositionSnapshotAgeSeconds: numberFromEnv(env, "ANALYTICS_MAX_POSITION_SNAPSHOT_AGE_SECONDS", 300)
@@ -156,7 +158,8 @@ export async function startAnalyticsRuntime(
 
     const priceVerifier = await loadPriceVerifier(
       priceVerifierModule,
-      custody?.files.priceVerifierModule ?? null
+      custody?.files.priceVerifierModule ?? null,
+      policies
     );
     assertProductionPriceVerifier(priceVerifier, {
       localnet: config.localnet,
@@ -171,7 +174,8 @@ export async function startAnalyticsRuntime(
       blockSourceModule,
       custody?.files.blockSourceModule ?? null,
       abortController.signal,
-      !config.localnet
+      !config.localnet,
+      policies
     );
     if (blockSource === null) {
       throw new Error("ANALYTICS_BLOCK_SOURCE_MODULE is required for canonical startup attestation and live ingestion");
@@ -300,32 +304,38 @@ function commaSeparatedEnv(env: NodeJS.ProcessEnv, name: string): string[] {
 
 async function loadPriceVerifier(
   modulePath: string | null,
-  verifiedFile: VerifiedAnalyticsRuntimeFile | null
+  verifiedFile: VerifiedAnalyticsRuntimeFile | null,
+  policies: readonly PricePolicy[]
 ): Promise<PriceSampleVerifier | null> {
   if (modulePath === null) return null;
   const loaded = (await import(moduleSpecifier(modulePath, verifiedFile))) as {
-    createPriceVerifier?: () => PriceSampleVerifier | Promise<PriceSampleVerifier>;
+    createPriceVerifier?: (
+      options?: { pricePolicies?: readonly PricePolicy[] }
+    ) => PriceSampleVerifier | Promise<PriceSampleVerifier>;
   };
   if (typeof loaded.createPriceVerifier !== "function") {
     throw new Error("ANALYTICS_PRICE_VERIFIER_MODULE must export createPriceVerifier()");
   }
-  return loaded.createPriceVerifier();
+  return loaded.createPriceVerifier({ pricePolicies: policies });
 }
 
 async function loadBlockSource(
   modulePath: string | null,
   verifiedFile: VerifiedAnalyticsRuntimeFile | null,
   signal: AbortSignal,
-  requiresLiveSource: boolean
+  requiresLiveSource: boolean,
+  policies: readonly PricePolicy[]
 ): Promise<AnalyticsBlockSource | null> {
   if (modulePath === null) return null;
   const loaded = (await import(moduleSpecifier(modulePath, verifiedFile))) as {
-    createBlockSource?: (options?: { signal?: AbortSignal }) => AnalyticsBlockSource | Promise<AnalyticsBlockSource>;
+    createBlockSource?: (
+      options?: { signal?: AbortSignal; pricePolicies?: readonly PricePolicy[] }
+    ) => AnalyticsBlockSource | Promise<AnalyticsBlockSource>;
   };
   if (typeof loaded.createBlockSource !== "function") {
     throw new Error("ANALYTICS_BLOCK_SOURCE_MODULE must export createBlockSource()");
   }
-  const source = await loaded.createBlockSource({ signal });
+  const source = await loaded.createBlockSource({ signal, pricePolicies: policies });
   assertAnalyticsBlockSource(source, { requiresLiveSource });
   return source;
 }

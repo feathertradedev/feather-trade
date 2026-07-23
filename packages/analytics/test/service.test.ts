@@ -23,6 +23,79 @@ const policies: PricePolicy[] = [
   { token: TOKEN_Y, source: "fixed-test", feedId: "y-usd", maxAgeSeconds: 300, maxConfidenceBps: 100 }
 ];
 
+test("requires independent verification for on-chain Data Feeds without pretending they are signed reports", async () => {
+  const token = "0x00000000000000000000000000000000000000d1";
+  const feedId = "0x00000000000000000000000000000000000000e1";
+  const dataFeedPolicies: PricePolicy[] = [{
+    token,
+    source: "chainlink-data-feeds",
+    feedId,
+    maxAgeSeconds: 300,
+    maxConfidenceBps: 0,
+    feedDecimals: 8,
+    feedDescription: "TEST / USD"
+  }];
+  const submission: BlockSubmission = {
+    chainId: 11_155_111,
+    number: 1n,
+    hash: hash(1),
+    parentHash: hash(0),
+    timestamp: 100,
+    events: [],
+    prices: [{
+      token,
+      source: "chainlink-data-feeds",
+      feedId,
+      priceUsdE18: 2n * USD_SCALE,
+      confidenceUsdE18: 0n,
+      observedAt: 100,
+      sequence: 7n,
+      signedReport: null
+    }]
+  };
+  const verifier = {
+    verify: async (price: BlockSubmission["prices"][number]) => {
+      const { signedReport: _signedReport, ...sample } = price;
+      return { ...sample, verifiedBy: "canonical-chainlink-data-feed-test" };
+    }
+  };
+  const service = await AnalyticsApiService.create({
+    engine: new AnalyticsEngine(dataFeedPolicies),
+    priceVerifier: verifier
+  });
+  await service.ingestBlock(submission);
+  assert.deepEqual(service.getHealth(100).prices, [{
+    token: token.toLowerCase(),
+    source: "chainlink-data-feeds",
+    feedId: feedId.toLowerCase(),
+    status: "available",
+    observedAt: 100,
+    ageSeconds: 0
+  }]);
+
+  const missingVerifier = await AnalyticsApiService.create({ engine: new AnalyticsEngine(dataFeedPolicies) });
+  await assert.rejects(() => missingVerifier.ingestBlock(submission), /price verifier is not configured/);
+
+  const streamsPolicy: PricePolicy[] = [{
+    token,
+    source: "chainlink-data-streams",
+    feedId: "stream-id",
+    maxAgeSeconds: 300,
+    maxConfidenceBps: 100
+  }];
+  const streamsService = await AnalyticsApiService.create({
+    engine: new AnalyticsEngine(streamsPolicy),
+    priceVerifier: verifier
+  });
+  await assert.rejects(
+    () => streamsService.ingestBlock({
+      ...submission,
+      prices: [{ ...submission.prices[0]!, source: "chainlink-data-streams", feedId: "stream-id" }]
+    }),
+    /Signed Chainlink report is required/
+  );
+});
+
 test("rejects reused fragment DAGs within a deterministic traversal budget", async () => {
   const service = await AnalyticsApiService.create({ engine: new AnalyticsEngine(policies) });
   const fragments = ["fragment Chain0 on Query { analyticsHealth { status } }"];
