@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page } from "./fixtures/test";
 import { decodeFunctionData, type Hex } from "viem";
 
 import { lbRouterAbi } from "../../../packages/sdk/src/abi";

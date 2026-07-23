@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./fixtures/test";
 
 import { installMockAnalyticsStream } from "./fixtures/mock-analytics-stream";
 import { installMockRpc, LOCALNET_ANALYTICS_URL, USDC, WNATIVE } from "./fixtures/mock-rpc";

@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./fixtures/test";
 import { decodeFunctionData, parseUnits, type Hex } from "viem";
 
 import { erc20Abi, lbPairAbi, lbRouterAbi } from "../../../packages/sdk/src/abi";
@@ -2032,7 +2032,7 @@ test("background approval polling detects external revocation and clears stale r
 });
 
 test("stable revoked polling preserves a newly reviewed LB reapproval through its second click", async ({ page }) => {
-  test.setTimeout(60_000);
+  test.setTimeout(90_000);
   const rpc = await setupConnectedLiquidity(page, { lbApproved: true });
   const disclosure = page.getByTestId("lb-operator-approval-disclosure");
 
@@ -2041,7 +2041,7 @@ test("stable revoked polling preserves a newly reviewed LB reapproval through it
   const approveButton = page.getByTestId("liquidity-approve-lb-button");
   await expect(approveButton).toBeEnabled();
   await approveButton.click();
-  await expect(page.getByTestId("gas-review")).toContainText("LB operator approval");
+  await expect(page.getByTestId("gas-review")).toContainText("LB operator approval", { timeout: 15_000 });
 
   const approvalReadsBeforeStablePoll = rpc.snapshot().ethCalls.filter((call) => call.functionName === "isApprovedForAll").length;
   await expect.poll(

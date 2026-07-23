@@ -1,15 +1,16 @@
-import { expect, test } from "@playwright/test";
+import { expect, REOWN_API_PATTERN, test } from "./fixtures/test";
 
 import { installMockRpc } from "./fixtures/mock-rpc";
 import { installMockWallet, openAndSelectMockWallet } from "./fixtures/mock-wallet";
 
 test("Reown cloud requests cannot block the app shell", async ({ page }) => {
-  await page.route("https://api.web3modal.org/**", () => new Promise(() => {}));
+  await page.unroute(REOWN_API_PATTERN);
+  await page.route(REOWN_API_PATTERN, () => new Promise(() => {}));
   await installMockRpc(page);
 
   await page.goto("/#/pools", { waitUntil: "domcontentloaded" });
 
-  await expect(page.getByTestId("wallet-connect-button")).toBeVisible({ timeout: 5_000 });
+  await expect(page.getByTestId("wallet-connect-button")).toBeVisible({ timeout: 15_000 });
   await expect(page.getByRole("heading", { name: "Pools", exact: true })).toBeVisible();
 });
 

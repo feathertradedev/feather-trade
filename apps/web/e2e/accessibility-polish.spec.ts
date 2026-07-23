@@ -1,4 +1,4 @@
-import { expect, test, type Locator, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "./fixtures/test";
 
 import { installMockRpc } from "./fixtures/mock-rpc";
 import { installMockWallet, LOCALNET_CHAIN_ID, openAndSelectMockWallet, readMockWallet } from "./fixtures/mock-wallet";
