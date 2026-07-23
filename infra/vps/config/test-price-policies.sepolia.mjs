@@ -10,7 +10,7 @@ const USDC_USD = "0xa2f78ab2355fe2f984d808b5cee7fd0a93d5270e";
 test("Sepolia Chainlink policies exactly match the deployed and allowlisted WETH/USDC assets", async () => {
   const [policies, manifest, tokenList] = await Promise.all([
     json("infra/vps/config/price-policies.sepolia.json"),
-    json("deployments/evm/sepolia/latest.json"),
+    json("deployments/evm/sepolia/public.json"),
     json("packages/sdk/src/token-lists/sepolia.json")
   ]);
   assert.equal(manifest.environment, "sepolia");

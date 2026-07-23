@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 
 import { installMockAnalyticsStream } from "./fixtures/mock-analytics-stream";
 import { installMockRpc, LOCALNET_ANALYTICS_URL, USDC, WNATIVE } from "./fixtures/mock-rpc";
-import { installMockWallet, LOCALNET_CHAIN_ID, ROBINHOOD_TESTNET_CHAIN_ID } from "./fixtures/mock-wallet";
+import { installMockWallet, LOCALNET_CHAIN_ID, openAndSelectMockWallet, ROBINHOOD_TESTNET_CHAIN_ID } from "./fixtures/mock-wallet";
 
 const screenshotOptions = {
   animations: "disabled" as const,
@@ -15,7 +15,7 @@ test.beforeEach(async ({ page }) => {
 });
 
 async function connectWallet(page: Parameters<typeof installMockRpc>[0]) {
-  await page.getByTestId("wallet-connect-button").click();
+  await openAndSelectMockWallet(page);
   await expect(page.getByTestId("wallet-account-button")).toBeVisible();
 }
 
@@ -163,10 +163,7 @@ test("canonical Feather pool workspace mobile", async ({ page }, testInfo) => {
   await page.locator(".pool-pair-link").first().click();
   await expect(page).toHaveURL(/#\/pools\/.+$/);
   const views = page.getByRole("tablist", { name: "Pool workspace views" });
-  await expect(views.getByRole("tab", { name: "Trade" })).toHaveAttribute("aria-selected", "true");
-  await expect(page.getByTestId("swap-market-chart")).toBeHidden();
-  await expect(page.getByTestId("liquidity-range-editor")).toBeVisible();
-  await views.getByRole("tab", { name: "Market" }).click();
+  await expect(views.getByRole("tab", { name: "Market" })).toHaveAttribute("aria-selected", "true");
   await expect(page.getByTestId("swap-market-chart")).toBeVisible();
   await expect(page.getByTestId("pool-workspace-rail")).toBeVisible();
   await expect(page.getByTestId("liquidity-range-editor")).toBeHidden();
@@ -174,6 +171,8 @@ test("canonical Feather pool workspace mobile", async ({ page }, testInfo) => {
   await expect(page.getByTestId("pool-workspace-owner-panel")).toBeVisible();
   await expect(page.getByRole("link", { name: "Market overview" })).toHaveCount(0);
   await views.getByRole("tab", { name: "Trade" }).click();
+  await expect(page.getByTestId("swap-market-chart")).toBeHidden();
+  await expect(page.getByTestId("liquidity-range-editor")).toBeVisible();
   await expect(page).toHaveScreenshot("feather-pool-detail-mobile.png", screenshotOptions);
 });
 
@@ -303,9 +302,10 @@ test("320px wrong-chain header keeps wallet and docs reachable", async ({ page }
   test.skip(testInfo.project.name !== "chromium");
   await page.setViewportSize({ width: 320, height: 800 });
   await installMockRpc(page, { includePairs: true });
-  await installMockWallet(page, { chainId: ROBINHOOD_TESTNET_CHAIN_ID });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/swap");
   await connectWallet(page);
+  await page.evaluate((chainId) => window.__mockWalletControl.setChain(chainId), ROBINHOOD_TESTNET_CHAIN_ID);
   await expect(page.getByTestId("wallet-switch-button")).toBeVisible();
   await expect(page.getByRole("navigation", { name: "Primary" }).getByRole("link", { name: "Docs" })).toBeVisible();
   await expect(page.getByRole("link", { name: "Liquidity" })).toHaveCount(0);

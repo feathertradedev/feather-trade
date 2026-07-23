@@ -126,6 +126,9 @@ export interface MockRpcOptions {
   pairByIdDelayMs?: number;
   pairByIdMode?: "ready" | "error";
   poolActivityMode?: "ready" | "empty";
+  poolEconomicsReadDelayMs?: number;
+  poolStateAsOfBlock?: bigint;
+  poolStateAsOfBlockHash?: Hex;
   positionHistoryCount?: number;
   positionHistoryFailAtSkip?: number;
   positionOwner?: Address;
@@ -331,6 +334,26 @@ function mockAnalyticsResponse(body: GraphRequest, options: MockRpcOptions): Rec
   const query = body.query ?? "";
   const partial = options.analyticsPartialHistory === true;
   const analyticsStatus = partial ? "PARTIAL" : "READY";
+  if (query.includes("WebPoolCatalog")) {
+    const pairMetadata = allPairMetadata(options);
+    const catalogPairMetadata = [pairMetadata[0]!, pairMetadata.at(-1)!, ...pairMetadata.slice(1, -1)]
+      .slice(0, options.includePairs === true ? options.poolCount ?? 1 : 0)
+      .sort((left, right) => left.pair.toLowerCase().localeCompare(right.pair.toLowerCase()));
+    const page = paginateMockAnalyticsRows(
+      catalogPairMetadata.map((metadata, index) => mockPoolCatalogEntry(metadata, options, index, analyticsStatus)),
+      body,
+      "pool-catalog",
+      partial
+    );
+    return {
+      data: {
+        poolCatalog: {
+          ...page,
+          streamCursor: "0"
+        }
+      }
+    };
+  }
   if (query.includes("WebPoolMetrics")) {
     const pairMetadata = allPairMetadata(options);
     const dashboardPairMetadata = [pairMetadata[0]!, pairMetadata.at(-1)!, ...pairMetadata.slice(1, -1)];
@@ -359,8 +382,9 @@ function mockAnalyticsResponse(body: GraphRequest, options: MockRpcOptions): Rec
     if (metadata === undefined) return { data: { poolState: null } };
     const radius = Math.max(0, Math.min(100, body.variables?.radius ?? 40));
     const activeId = activeIdFor(options);
-    const block = String(options.analyticsAsOfBlock ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER);
-    const blockHash = options.analyticsHeadHash ?? options.blockHash ?? "0x2222222222222222222222222222222222222222222222222222222222222222";
+    const block = String(options.poolStateAsOfBlock ?? options.analyticsAsOfBlock ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER);
+    const blockHash = options.poolStateAsOfBlockHash ?? options.analyticsHeadHash ?? options.blockHash ??
+      "0x2222222222222222222222222222222222222222222222222222222222222222";
     const reserveX = String(options.pairReserveX ?? 1_000n * 10n ** 18n);
     const reserveY = String(options.pairReserveY ?? 160_000n * 10n ** 18n);
     const bins = Array.from({ length: radius * 2 + 1 }, (_, index) => {
@@ -461,7 +485,46 @@ function mockAnalyticsResponse(body: GraphRequest, options: MockRpcOptions): Rec
   if (query.includes("WebAnalyticsHealth")) {
     return { data: { analyticsHealth: mockAnalyticsHealth(options, partial) } };
   }
-  const owner = body.variables?.owner ?? DEFAULT_ACCOUNT;
+  if (query.includes("WebPoolActivity")) {
+    const requestedPair = (body.variables?.pair ?? WNATIVE_USDC_PAIR).toLowerCase();
+    const requestedOwner = body.variables?.owner?.toLowerCase() ?? null;
+    const snapshotId = `pool-activity:${requestedPair}:${requestedOwner ?? "all"}`;
+    const offset = decodeMockAnalyticsCursor(body.variables?.after, snapshotId);
+    if (
+      requestedOwner !== null &&
+      options.positionHistoryFailAtSkip !== undefined &&
+      offset >= options.positionHistoryFailAtSkip
+    ) {
+      throw new Error("Mock position history page failed");
+    }
+    const events = mockCanonicalPoolActivity(options, requestedPair, requestedOwner);
+    const page = paginateMockAnalyticsRows(events, body, snapshotId, partial);
+    const configuredBlock = options.analyticsAsOfBlock ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER;
+    const highestBlock = events.reduce(
+      (highest, event) => BigInt(String(event.blockNumber)) > highest ? BigInt(String(event.blockNumber)) : highest,
+      configuredBlock
+    );
+    const configuredBlockHash = options.analyticsHeadHash ?? options.blockHash ??
+      "0x2222222222222222222222222222222222222222222222222222222222222222";
+    const highestBlockHash = highestBlock === configuredBlock
+      ? configuredBlockHash
+      : `0x${highestBlock.toString(16).padStart(64, "0")}`;
+    return {
+      data: {
+        poolActivity: {
+          ...page,
+          asOfBlock: highestBlock.toString(),
+          asOfBlockHash: highestBlockHash
+        }
+      }
+    };
+  }
+  if (!query.includes("walletPositions")) {
+    return { errors: [{ message: "Unhandled mock analytics GraphQL query" }] };
+  }
+  const requestedOwner = body.variables?.owner ?? DEFAULT_ACCOUNT;
+  const owner = options.ownerPositionResponseOwner ?? requestedOwner;
+  const pair = options.ownerPositionResponsePair ?? WNATIVE_USDC_PAIR;
   const binId = activeIdFor(options) + (options.analyticsBinOffset ?? (options.analyticsOutOfRange === true ? 10 : 0));
   const transferred = options.analyticsTransferred === true;
   const analyticsBins = transferred
@@ -482,7 +545,7 @@ function mockAnalyticsResponse(body: GraphRequest, options: MockRpcOptions): Rec
       }));
   const position = {
     owner,
-    pair: WNATIVE_USDC_PAIR.toLowerCase(),
+    pair: pair.toLowerCase(),
     costBasisUsdE18: transferred ? "0" : partial ? null : "100000000000000000000",
     currentValueUsdE18: transferred ? "0" : "120000000000000000000",
     realizedPnlUsdE18: partial ? null : "5000000000000000000",
@@ -508,6 +571,237 @@ function mockAnalyticsResponse(body: GraphRequest, options: MockRpcOptions): Rec
       walletPositions: { nodes, pageInfo: { endCursor: null, hasNextPage: false, partial } }
     }
   };
+}
+
+function mockPoolCatalogEntry(
+  metadata: ReturnType<typeof allPairMetadata>[number],
+  options: MockRpcOptions,
+  index: number,
+  status: "READY" | "PARTIAL"
+): Record<string, unknown> {
+  const block = options.analyticsAsOfBlock ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER;
+  const blockHash = options.analyticsHeadHash ?? options.blockHash ??
+    "0x2222222222222222222222222222222222222222222222222222222222222222";
+  const createdAtBlock = block > 0n ? 1n : 0n;
+  const activeId = activeIdFor(options) + index;
+  const partial = status === "PARTIAL";
+  return {
+    chainId: options.chainId ?? LOCALNET_CHAIN_ID,
+    pair: metadata.pair.toLowerCase(),
+    factoryAddress: (options.pairFactoryAddress ?? LB_FACTORY).toLowerCase(),
+    tokenX: metadata.tokenX.toLowerCase(),
+    tokenY: metadata.tokenY.toLowerCase(),
+    decimalsX: 18,
+    decimalsY: 18,
+    createdAtBlock: createdAtBlock.toString(),
+    createdAtBlockHash: `0x${createdAtBlock.toString(16).padStart(64, "0")}`,
+    creationTransactionHash: `0x${(index + 1).toString(16).padStart(64, "0")}`,
+    creationLogIndex: index,
+    reserveX: String(options.pairReserveX ?? 1_000n * 10n ** 18n),
+    reserveY: String(options.pairReserveY ?? 160_000n * 10n ** 18n),
+    activeId,
+    binStep: metadata.binStep,
+    marketPriceQuoteE18: "160000000000000000000",
+    priceUsdE18: partial ? null : "160000000000000000000",
+    tvlUsdE18: partial ? null : "320000000000000000000000",
+    status,
+    missingPriceTokens: partial ? [metadata.tokenX.toLowerCase()] : [],
+    feeState: {
+      static: {
+        baseFactor: "20",
+        filterPeriod: "30",
+        decayPeriod: "120",
+        reductionFactor: "5000",
+        variableFeeControl: "100",
+        protocolShare: "1000",
+        maxVolatilityAccumulator: "100000"
+      },
+      variable: {
+        volatilityAccumulator: "1000",
+        volatilityReference: "500",
+        idReference: String(activeId),
+        timeOfLastUpdate: "1720000000"
+      }
+    },
+    asOfBlock: block.toString(),
+    asOfBlockHash: blockHash,
+    asOfTimestamp: 1_720_000_000,
+    revision: 1
+  };
+}
+
+function mockCanonicalPoolActivity(
+  options: MockRpcOptions,
+  pair: string,
+  owner: string | null
+): Array<Record<string, unknown>> {
+  if (options.poolActivityMode === "empty") return [];
+  const wallet = DEFAULT_ACCOUNT.toLowerCase();
+  const otherAccount = "0x0000000000000000000000000000000000000002";
+  const historyCount = options.includePositions === true ? options.positionHistoryCount ?? 2 : 0;
+  const history = Array.from({ length: historyCount }, (_, index) => {
+    const deposit = index % 2 === 0;
+    const blockNumber = 1_000 - index;
+    return {
+      id: `canonical-liquidity-history-${index}`,
+      pair,
+      kind: deposit ? "DEPOSIT" : "WITHDRAW",
+      owner: wallet,
+      from: null,
+      to: null,
+      amountX: String((10n + BigInt(index)) * 10n ** 18n),
+      amountY: String((20n + BigInt(index)) * 10n ** 18n),
+      binIds: [String(activeIdFor(options) + index)],
+      blockNumber: String(blockNumber),
+      blockHash: `0x${blockNumber.toString(16).padStart(64, "0")}`,
+      transactionHash: `0x${(0xa0 + index).toString(16).padStart(64, "0")}`,
+      logIndex: index,
+      sequence: 10_000 - index,
+      timestamp: 1_720_000_000 - index * 60,
+      revision: 1
+    };
+  });
+  const poolWideEvents: Array<Record<string, unknown>> = [
+    {
+      id: "canonical-pool-swap-0",
+      pair,
+      kind: "SWAP",
+      owner: null,
+      from: null,
+      to: null,
+      amountX: "1000000000000000000",
+      amountY: "0",
+      binIds: [],
+      blockNumber: "1002",
+      blockHash: `0x${(1002).toString(16).padStart(64, "0")}`,
+      transactionHash: `0x${"d1".padStart(64, "0")}`,
+      logIndex: 0,
+      sequence: 10_002,
+      timestamp: 1_720_000_300,
+      revision: 1
+    },
+    {
+      id: "canonical-pool-swap-1",
+      pair,
+      kind: "SWAP",
+      owner: null,
+      from: null,
+      to: null,
+      amountX: "2000000000000000000",
+      amountY: "0",
+      binIds: [],
+      blockNumber: "1001",
+      blockHash: `0x${(1001).toString(16).padStart(64, "0")}`,
+      transactionHash: `0x${"d2".padStart(64, "0")}`,
+      logIndex: 0,
+      sequence: 10_001,
+      timestamp: 1_720_000_240,
+      revision: 1
+    },
+    {
+      id: "canonical-pool-liquidity-other",
+      pair,
+      kind: "WITHDRAW",
+      owner: otherAccount,
+      from: null,
+      to: null,
+      amountX: "1000000000000000000",
+      amountY: "2500000",
+      binIds: [String(activeIdFor(options) - 1)],
+      blockNumber: "998",
+      blockHash: `0x${(998).toString(16).padStart(64, "0")}`,
+      transactionHash: `0x${"e2".padStart(64, "0")}`,
+      logIndex: 0,
+      sequence: 9_998,
+      timestamp: 1_720_000_120,
+      revision: 1
+    }
+  ];
+  const transfer = options.analyticsTransferred === true
+    ? [{
+        id: "canonical-position-transfer-out",
+        pair,
+        kind: "POSITION_TRANSFER",
+        owner: null,
+        from: wallet,
+        to: otherAccount,
+        amountX: null,
+        amountY: null,
+        binIds: [String(activeIdFor(options))],
+        blockNumber: "1003",
+        blockHash: `0x${(1003).toString(16).padStart(64, "0")}`,
+        transactionHash: `0x${"c".repeat(64)}`,
+        logIndex: 0,
+        sequence: 10_003,
+        timestamp: 1_720_000_360,
+        revision: 1
+      }]
+    : [];
+  // Canonical swap events deliberately have no owner/from/to identity, so an
+  // owner-filtered query includes liquidity and transfer events but not swaps.
+  return [...transfer, ...poolWideEvents, ...history]
+    .filter((event) => owner === null || event.owner === owner || event.from === owner || event.to === owner)
+    .sort(compareMockPoolActivity);
+}
+
+function compareMockPoolActivity(left: Record<string, unknown>, right: Record<string, unknown>): number {
+  const leftBlock = BigInt(String(left.blockNumber));
+  const rightBlock = BigInt(String(right.blockNumber));
+  if (leftBlock !== rightBlock) return leftBlock > rightBlock ? -1 : 1;
+  const leftSequence = Number(left.sequence);
+  const rightSequence = Number(right.sequence);
+  if (leftSequence !== rightSequence) return rightSequence - leftSequence;
+  return String(left.id).localeCompare(String(right.id));
+}
+
+function paginateMockAnalyticsRows<T>(
+  rows: readonly T[],
+  body: GraphRequest,
+  snapshotId: string,
+  partial: boolean
+): { nodes: T[]; pageInfo: { endCursor: string | null; hasNextPage: boolean; partial: boolean } } {
+  const first = body.variables?.first ?? 100;
+  if (!Number.isSafeInteger(first) || first <= 0 || first > 100) {
+    throw new Error("first must be between 1 and 100");
+  }
+  const offset = decodeMockAnalyticsCursor(body.variables?.after, snapshotId);
+  const nodes = rows.slice(offset, offset + first);
+  const endOffset = offset + nodes.length;
+  return {
+    nodes,
+    pageInfo: {
+      endCursor: nodes.length === 0 ? null : encodeMockAnalyticsCursor(endOffset, snapshotId),
+      hasNextPage: endOffset < rows.length,
+      partial
+    }
+  };
+}
+
+function encodeMockAnalyticsCursor(offset: number, snapshotId: string): string {
+  return Buffer.from(JSON.stringify({ version: 1, offset, snapshotId }), "utf8").toString("base64url");
+}
+
+function decodeMockAnalyticsCursor(cursor: string | null | undefined, snapshotId: string): number {
+  if (!cursor) return 0;
+  try {
+    const decoded = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as {
+      version?: unknown;
+      offset?: unknown;
+      snapshotId?: unknown;
+    };
+    if (
+      decoded.version !== 1 ||
+      !Number.isSafeInteger(decoded.offset) ||
+      Number(decoded.offset) < 0 ||
+      decoded.snapshotId !== snapshotId
+    ) {
+      throw new Error("Cursor expired or invalid");
+    }
+    return Number(decoded.offset);
+  } catch (error) {
+    if (error instanceof Error && error.message === "Cursor expired or invalid") throw error;
+    throw new Error("Cursor expired or invalid");
+  }
 }
 
 function mockAnalyticsHealth(options: MockRpcOptions, partial: boolean): Record<string, unknown> {
@@ -953,6 +1247,15 @@ async function handleEthCall(
     )
   ) {
     await delay(options.simulationDelayMs);
+  }
+
+  if (
+    options.poolEconomicsReadDelayMs !== undefined &&
+    ["getFactory", "getTokenX", "getTokenY", "decimals", "getBinStep", "getActiveId", "getStaticFeeParameters", "getVariableFeeParameters"].includes(
+      functionName
+    )
+  ) {
+    await delay(options.poolEconomicsReadDelayMs);
   }
 
   if ((functionName === "balanceOf" || functionName === "allowance" || functionName === "isApprovedForAll") && options.walletReadDelayMs !== undefined) {

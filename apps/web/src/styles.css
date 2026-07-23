@@ -6926,7 +6926,7 @@ a {
 .pools-filter-grid select {
   width: 100%;
   min-width: 0;
-  min-height: 40px;
+  min-height: 44px;
   padding: 8px 10px;
   color: var(--bone);
   font: inherit;
@@ -6957,7 +6957,7 @@ a {
 }
 
 .pools-category-tabs button {
-  min-height: 40px;
+  min-height: 44px;
   padding: 7px 11px;
   color: var(--ink-60);
   font-size: 0.78rem;
@@ -6999,7 +6999,7 @@ a {
   align-items: center;
   justify-content: space-between;
   min-width: 92px;
-  min-height: 40px;
+  min-height: 44px;
   padding: 7px 10px;
   color: var(--ink-60);
   font-size: 0.78rem;
@@ -7372,7 +7372,7 @@ a {
 }
 
 .pools-discovery .pagination-controls button {
-  min-height: 36px;
+  min-height: 44px;
   border-radius: 2px;
 }
 
@@ -7423,7 +7423,7 @@ a {
 
   .pools-discovery .primary-button {
     width: auto;
-    min-height: 40px;
+    min-height: 44px;
     padding: 8px 11px;
     font-size: 0.78rem;
   }

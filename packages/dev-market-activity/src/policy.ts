@@ -164,11 +164,16 @@ export function adaptAmount(state: AdaptiveAmountState, binsMoved: number): Adap
   };
 }
 
-export function assertNonMainnetEnvironment(environment: string): asserts environment is "localnet" | "testnet" | "robinhoodTestnet" {
+export function assertNonMainnetEnvironment(environment: string): asserts environment is "localnet" | "testnet" | "robinhoodTestnet" | "sepolia" {
   if (environment === "mainnet" || environment === "robinhood") {
     throw new Error("Development market activity rejects mainnet unconditionally");
   }
-  if (environment !== "localnet" && environment !== "testnet" && environment !== "robinhoodTestnet") {
+  if (
+    environment !== "localnet" &&
+    environment !== "testnet" &&
+    environment !== "robinhoodTestnet" &&
+    environment !== "sepolia"
+  ) {
     throw new Error(`Unsupported market activity environment ${environment}`);
   }
 }

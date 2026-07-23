@@ -10,6 +10,7 @@ import {
 import {
   installMockWallet,
   LOCALNET_CHAIN_ID,
+  openAndSelectMockWallet,
   readMockWallet
 } from "./fixtures/mock-wallet";
 
@@ -205,18 +206,15 @@ async function setupFullExit(page: Page, options: MockRpcOptions): Promise<Insta
 }
 
 async function connectWallet(page: Page): Promise<void> {
-  await page.getByTestId("wallet-connect-button").click();
+  await openAndSelectMockWallet(page);
   await expect(page.getByTestId("wallet-account-button")).toContainText("0xf39F...2266");
 }
 
 async function reconnectIfNeeded(page: Page): Promise<void> {
   const connectButton = page.getByTestId("wallet-connect-button");
   const accountButton = page.getByTestId("wallet-account-button");
-  await page.waitForTimeout(250);
-  if (!await accountButton.isVisible().catch(() => false) && await connectButton.isVisible().catch(() => false)) {
-    await expect(connectButton).toBeEnabled();
-    await connectButton.click();
-  }
+  await connectButton.or(accountButton).first().waitFor({ state: "visible" });
+  if (!await accountButton.isVisible()) await openAndSelectMockWallet(page);
   await expect(accountButton).toContainText("0xf39F...2266");
 }
 

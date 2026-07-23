@@ -10,7 +10,12 @@ import {
   USDT,
   WNATIVE
 } from "./fixtures/mock-rpc";
-import { installMockWallet, LOCALNET_CHAIN_ID, readMockWallet } from "./fixtures/mock-wallet";
+import {
+  installMockWallet,
+  LOCALNET_CHAIN_ID,
+  openAndSelectMockWallet,
+  readMockWallet
+} from "./fixtures/mock-wallet";
 
 const ACTIVE_ID = 8_388_608;
 const NO_CODE_TOKEN = "0x4444444444444444444444444444444444444401" as Address;
@@ -26,9 +31,7 @@ const creationRpc = {
 } as const;
 
 async function connectMockWallet(page: Page) {
-  await page.getByTestId("wallet-connect-button").click();
-  const appKitMockWallet = page.getByRole("button", { name: /Mock MetaMask installed/i });
-  await appKitMockWallet.waitFor({ state: "visible", timeout: 2_000 }).then(() => appKitMockWallet.click()).catch(() => undefined);
+  await openAndSelectMockWallet(page);
   await expect(page.getByTestId("wallet-account-button")).toContainText("0xf39F...2266");
 }
 

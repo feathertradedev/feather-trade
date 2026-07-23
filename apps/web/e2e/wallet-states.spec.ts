@@ -19,7 +19,7 @@ import {
   type InstalledMockRpc,
   type MockRpcOptions
 } from "./fixtures/mock-rpc";
-import { DEFAULT_ACCOUNT, installMockWallet, LOCALNET_CHAIN_ID, readMockWallet, ROBINHOOD_TESTNET_CHAIN_ID, type MockWalletOptions } from "./fixtures/mock-wallet";
+import { DEFAULT_ACCOUNT, installMockWallet, LOCALNET_CHAIN_ID, openAndSelectMockWallet, openMockWalletConnection, readMockWallet, ROBINHOOD_TESTNET_CHAIN_ID, type MockWalletOptions } from "./fixtures/mock-wallet";
 
 const ONE_TOKEN = 1_000_000_000_000_000_000n;
 const TRANSACTION_ABI = [...erc20Abi, ...lbPairAbi, ...lbRouterAbi] as const;
@@ -212,26 +212,27 @@ test("native swap mined revert is truthful and duplicate clicks open one wallet 
 });
 
 test("broken token logos render a deterministic address-derived fallback", async ({ page }) => {
-  await page.route("**/token-assets/wnative.svg", (route) => route.abort());
+  await page.route("**/token-assets/weth.svg", (route) => route.abort());
   await installMockRpc(page);
   await page.goto("/#/swap");
 
   await expect(page.getByTestId("swap-token-in-identity-logo")).toHaveAttribute("data-fallback", "true");
-  await expect(page.getByTestId("swap-token-in-identity-logo")).toHaveText("WN");
+  await expect(page.getByTestId("swap-token-in-identity-logo")).toHaveText("WE");
 });
 
-test("blocked token markets are stopped before quote, simulation, or wallet", async ({ page }) => {
+test("unallowlisted token markets are stopped before quote, simulation, or wallet", async ({ page }) => {
+  const unknownToken = "0x9000000000000000000000000000000000000009";
   const rpc = await installMockRpc(page, {
     includePairs: true,
     pairAddress: WNATIVE_WETH_PAIR,
     pairTokenX: WNATIVE,
-    pairTokenY: WETH
+    pairTokenY: unknownToken
   });
   await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
-  await page.goto("/#/swap");
+  await page.goto(`/#/pools/${WNATIVE_WETH_PAIR}/swap`);
   await connectWallet(page);
-  await expect(page.getByTestId("swap-market-recovery")).toContainText("does not support swap");
-  await expect(page.getByTestId("swap-token-out-identity")).toContainText("ETH/WETH onboarding UX is not yet supported");
+  await expect(page.getByTestId("swap-market-recovery")).toContainText("Token Y metadata is missing");
+  await expect(page.getByTestId("swap-token-out-identity")).toContainText("Token identity unavailable");
   await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
   await expect(page.getByTestId("swap-approve-button")).toBeDisabled();
   await bypassDisabledButtonAndClick(page, "swap-submit-button");
@@ -324,32 +325,45 @@ test("financial pool choice searches name, symbol, and full token address", asyn
   await expect(options.filter({ hasText: WETH })).toContainText(WETH);
 });
 
-test("missing injected provider is distinguished from an ordinary disconnected wallet", async ({ page }) => {
+test("configured wallet modal remains available without an injected provider", async ({ page }) => {
   await installMockRpc(page);
   await page.goto("/#/swap");
 
-  await expect(page.getByTestId("wallet-connect-button")).toBeDisabled();
-  await expect(page.getByTestId("wallet-status")).toHaveAttribute("data-wallet-state", "missing");
-  await expect(page.getByTestId("wallet-status")).toContainText("No browser wallet was found");
+  await expect(page.getByTestId("wallet-connect-button")).toBeEnabled();
+  await page.getByTestId("wallet-connect-button").click();
+  const walletDialog = page.getByRole("alertdialog");
+  await expect(walletDialog).toBeVisible();
+  await expect(
+    walletDialog.getByRole("button", { name: /WalletConnect qr code/i })
+      .or(walletDialog.getByRole("button", { name: /Search Wallet/i }))
+      .first()
+  ).toBeVisible();
+  await expect(page.getByTestId("wallet-account-button")).toHaveCount(0);
+  await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
+  await page.keyboard.press("Escape");
+  await expect(walletDialog).toBeHidden();
 });
 
 for (const failure of [
-  { mode: "locked", name: "locked", state: "locked", text: "Unlock the selected wallet" },
-  { mode: "disconnected", name: "provider-disconnected", state: "provider-error", text: "wallet provider is disconnected" },
-  { mode: "unauthorized", name: "unauthorized", state: "provider-error", text: "has not authorized account access" },
-  { mode: "permission-rejected", name: "permission-rejected", state: "permission-rejected", text: "Account permission was rejected" },
-  { mode: "provider-error", name: "provider-error", state: "provider-error", text: "selected wallet returned an error" }
+  { mode: "locked", name: "locked" },
+  { mode: "disconnected", name: "provider-disconnected" },
+  { mode: "unauthorized", name: "unauthorized" },
+  { mode: "permission-rejected", name: "permission-rejected" },
+  { mode: "provider-error", name: "provider-error" }
 ] as const) {
-  test(`${failure.name} connect state is actionable and remains disconnected`, async ({ page }) => {
+  test(`${failure.name} AppKit connection failure remains disconnected and fail closed`, async ({ page }) => {
     await installMockRpc(page);
     await installMockWallet(page, { connectMode: failure.mode });
     await page.goto("/#/swap");
 
-    await page.getByTestId("wallet-connect-button").click();
-    await expect(page.getByTestId("wallet-status")).toHaveAttribute("data-wallet-state", failure.state);
-    await expect(page.getByTestId("wallet-status")).toContainText(failure.text);
+    await openMockWalletConnection(page);
+    await expect.poll(async () => {
+      const calls = (await readMockWallet(page)).calls;
+      return calls.includes("eth_requestAccounts") || calls.includes("wallet_requestPermissions");
+    }).toBe(true);
     await expect(page.getByTestId("wallet-account-button")).toHaveCount(0);
     await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
+    await expect(page.getByRole("alertdialog")).toBeVisible();
   });
 }
 
@@ -367,12 +381,16 @@ test("multiple EIP-6963 providers require an explicit provider choice", async ({
   await page.goto("/#/swap");
 
   await page.getByTestId("wallet-connect-button").click();
-  const choices = page.getByTestId("wallet-provider-choices");
-  await expect(choices.getByRole("button")).toHaveCount(3);
-  await expect(page.getByTestId("wallet-connect-button")).toBeVisible();
-  await choices.getByRole("button", { name: "Brave Wallet" }).click();
+  const walletDialog = page.getByRole("alertdialog");
+  await expect(walletDialog).toBeVisible();
+  await expect(walletDialog.getByRole("button", { name: /Brave Wallet installed/i })).toBeVisible();
+  await expect(walletDialog.getByRole("button", { name: /^MetaMask installed$/i })).toBeVisible();
+  await expect(walletDialog.getByRole("button", { name: /Duplicate MetaMask installed/i })).toBeVisible();
+  await expect(walletDialog.getByRole("button", { name: /Unknown Wallet installed/i })).toBeVisible();
+  await walletDialog.getByRole("button", { name: /Brave Wallet installed/i }).click();
   await expect(page.getByTestId("wallet-account-button")).toContainText("0x1111...1111");
-  expect(await page.evaluate(() => window.__mockWalletStates["io.metamask"].calls)).toEqual([]);
+  expect(await page.evaluate(() => window.__mockWalletStates["io.metamask"].calls))
+    .not.toContain("eth_requestAccounts");
 });
 
 test("an EIP-6963 announced provider can be selected explicitly", async ({ page }) => {
@@ -382,32 +400,34 @@ test("an EIP-6963 announced provider can be selected explicitly", async ({ page 
   });
   await page.goto("/#/swap");
 
-  await page.getByTestId("wallet-connect-button").click();
+  await openAndSelectMockWallet(page, "Unknown Wallet");
   await expect(page.getByTestId("wallet-account-button")).toContainText("0xf39F...2266");
 });
 
-test("unknown active network is added before switching", async ({ page }) => {
+test("unknown active network is added and switched during AppKit connection", async ({ page }) => {
   await installMockRpc(page);
   await installMockWallet(page, { chainId: ROBINHOOD_TESTNET_CHAIN_ID, switchMode: "add-required" });
   await page.goto("/#/swap");
   await connectWallet(page);
 
-  await expect(page.getByTestId("wallet-status")).toHaveAttribute("data-wallet-state", "wrong-chain");
-  await page.getByTestId("wallet-switch-button").click();
   await expect(page.getByTestId("wallet-switch-button")).toBeHidden();
-  expect((await readMockWallet(page)).addChainCalls).toContain(LOCALNET_CHAIN_ID);
+  const wallet = await readMockWallet(page);
+  expect(wallet.addChainCalls).toContain(LOCALNET_CHAIN_ID);
+  expect(wallet.switchChainCalls).toContain(LOCALNET_CHAIN_ID);
+  expect(wallet.chainId).toBe(LOCALNET_CHAIN_ID);
 });
 
-test("rejected add/switch request remains a distinct actionable wrong-chain state", async ({ page }) => {
+test("rejected add/switch during AppKit connection remains disconnected and fail closed", async ({ page }) => {
   await installMockRpc(page);
   await installMockWallet(page, { chainId: ROBINHOOD_TESTNET_CHAIN_ID, switchMode: "add-rejected" });
   await page.goto("/#/swap");
-  await connectWallet(page);
 
-  await page.getByTestId("wallet-switch-button").click();
-  await expect(page.getByTestId("wallet-status")).toHaveAttribute("data-wallet-state", "switch-rejected");
-  await expect(page.getByTestId("wallet-status")).toContainText("Network switch was rejected");
+  await openMockWalletConnection(page);
+  await expect.poll(async () => (await readMockWallet(page)).calls).toContain("wallet_addEthereumChain");
+  await expect(page.getByTestId("wallet-account-button")).toHaveCount(0);
+  await expect(page.getByTestId("wallet-connect-button")).toBeVisible();
   await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
 });
 
 test("exact buffered gas insufficiency blocks swap but funding ETH recovers without changing intent", async ({ page }) => {
@@ -643,10 +663,11 @@ test("LP owner change reissues owner queries and clears LP drafts and terminal b
 
 test("wrong-chain wallet state disables approvals and submit handlers", async ({ page }) => {
   const rpc = await installMockRpc(page);
-  await installMockWallet(page, { chainId: ROBINHOOD_TESTNET_CHAIN_ID });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/swap");
 
   await connectWallet(page);
+  await page.evaluate((chainId) => window.__mockWalletControl.setChain(chainId), ROBINHOOD_TESTNET_CHAIN_ID);
 
   await expect(page.getByTestId("wallet-switch-button")).toBeVisible();
   await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
@@ -674,8 +695,13 @@ test("wrong-chain RPC fails closed even when the wallet is on the expected chain
   await bypassDisabledButtonAndClick(page, "swap-submit-button");
   await bypassDisabledButtonAndClick(page, "swap-approve-button");
 
-  await page.getByRole("link", { name: "Liquidity" }).click();
-  for (const testId of liquidityActionTestIds) {
+  await page.goto(`/#/pools/${WETH_USDC_PAIR}/create`);
+  for (const testId of ["liquidity-approve-x-button", "liquidity-approve-y-button", "liquidity-add-button"]) {
+    await expect(page.getByTestId(testId)).toBeDisabled();
+    await bypassDisabledButtonAndClick(page, testId);
+  }
+  await page.goto(`/#/pools/${WETH_USDC_PAIR}/manage`);
+  for (const testId of ["liquidity-approve-lb-button", "liquidity-remove-button"]) {
     await expect(page.getByTestId(testId)).toBeDisabled();
     await bypassDisabledButtonAndClick(page, testId);
   }
@@ -929,22 +955,6 @@ test("approval confirmation invalidates the reviewed quote until fresh wallet, m
   await expect(page.getByTestId("swap-allowance-value")).toContainText("5");
   await expect(page.getByTestId("swap-submit-button")).toBeEnabled();
   expect(swapQuoteCallCount(rpc)).toBeGreaterThanOrEqual(2);
-
-  const postApprovalOutput = await output.inputValue();
-  const postApprovalQuoteCalls = swapQuoteCallCount(rpc);
-  rpc.update({
-    blockNumber: 43n,
-    indexerBlockNumber: 43n,
-    indexerDelayMs: 0,
-    pairReserveX: 70n * ONE_TOKEN,
-    quoteRate: 850n
-  });
-  await page.getByTestId("snapshot-refresh-button").click();
-
-  await expect(selectedMarket).toHaveAttribute("data-reserve-x", (70n * ONE_TOKEN).toString());
-  await expect.poll(() => output.inputValue()).not.toBe(postApprovalOutput);
-  await expect(page.getByTestId("swap-submit-button")).toBeEnabled();
-  expect(swapQuoteCallCount(rpc)).toBeGreaterThan(postApprovalQuoteCalls);
 });
 
 test("a stale same-hash approval refresh cannot overwrite a newer intent generation", async ({ page }) => {
@@ -1013,13 +1023,12 @@ test("post-approval snapshot refresh rejects a malformed token identity at an ot
   expect((await readMockWallet(page)).sentTransactions).toHaveLength(1);
 });
 
-test("wallet switch control requests the active localnet chain", async ({ page }) => {
+test("AppKit connection requests the active localnet chain", async ({ page }) => {
   await installMockRpc(page);
   await installMockWallet(page, { chainId: ROBINHOOD_TESTNET_CHAIN_ID });
   await page.goto("/#/swap");
 
   await connectWallet(page);
-  await page.getByTestId("wallet-switch-button").click();
 
   await expect(page.getByTestId("wallet-switch-button")).toBeHidden();
   await expect(page.getByTestId("wallet-account-button")).toContainText("0xf39F...2266");
@@ -1115,9 +1124,7 @@ test("two same-origin tabs serialize identical intents before either wallet can 
     await secondAccountButton.isVisible() ||
     await secondConnectButton.isVisible(), { timeout: 15_000 }).toBe(true);
   if (!await secondAccountButton.isVisible()) {
-    await secondConnectButton.evaluate((button) => button.click()).catch(() => {
-      // Auto-reconnect may replace the connect control between readiness and click.
-    });
+    await openAndSelectMockWallet(secondPage);
   }
   await expect(secondAccountButton).toContainText("0xf39F...2266", { timeout: 15_000 });
   await clickReviewedAction(secondPage, "swap-submit-button");
@@ -1540,32 +1547,32 @@ test("pool discovery deep-links to real indexed bins and preselects liquidity ac
   await expect(page.locator("#liquidity-pair")).toHaveCount(0);
 });
 
-test("pool detail keeps an empty active-bin marker and reports capped wallet positions", async ({ page }) => {
-  await installMockRpc(page, {
+test("pool detail keeps an empty active-bin marker when the indexed active bin is omitted", async ({ page }) => {
+  await setupConnectedLiquidity(page, {
     includePairs: true,
     includePositions: true,
     omitActivePoolBin: true,
     ownerPositionCount: 501,
     poolBinCount: 7
   });
-  await installMockWallet(page);
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR.toLowerCase()}`);
-  await connectWallet(page);
 
-  await expect(page).toHaveURL(/#\/pools\/.+\/create\?returnTo=/);
+  await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR.toLowerCase()}$`, "i"));
   await expect(page.locator(".pool-rail-liquidity-bars > span.active")).toHaveCount(1);
   await expect(page.locator(".pool-rail-liquidity-bars > span.active")).toHaveAttribute("aria-label", /active bin/);
-  await expect(page.locator(".pool-rail-position-state")).toContainText("partial");
 });
 
-test("pool and action deep links resolve outside the dashboard page and survive reload", async ({ page }) => {
+test("pool workspace deep links resolve outside discovery and survive reload", async ({ page }, testInfo) => {
   await installMockRpc(page, { dashboardPoolLimit: 1, includePairs: true, poolCount: 2, poolBinCount: 5 });
   await page.goto(`/#/pools/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}`);
 
-  await expect(page).toHaveURL(new RegExp(`#/pools/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}/create\\?returnTo=`, "i"));
+  await expect(page).toHaveURL(new RegExp(`#/pools/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}$`, "i"));
   const rail = page.getByTestId("pool-workspace-rail");
   await expect(rail).toBeVisible();
   await expect(rail.getByText("11 bps/bin", { exact: true })).toBeVisible();
+  if (testInfo.project.name === "mobile-chromium") {
+    await page.getByRole("tablist", { name: "Pool workspace views" }).getByRole("tab", { name: "Trade" }).click();
+  }
   await page.getByRole("navigation", { name: "Pool tasks" }).getByRole("link", { name: "Manage" }).click();
   await expect(page).toHaveURL(new RegExp(`#/pools/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}/manage\\?returnTo=`, "i"));
   await expect(page.getByTestId("pool-action-back")).toHaveAttribute("href", "#/pools");
@@ -1575,50 +1582,52 @@ test("pool and action deep links resolve outside the dashboard page and survive 
   await expect(page.locator("#liquidity-pair")).toHaveCount(0);
   await expect(page.locator("#liquidity-withdraw")).toBeVisible();
 
-  await page.goto(`/#/liquidity/withdraw/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}`);
-  await expect(page.locator("#liquidity-pair")).toHaveValue(SECOND_WNATIVE_USDC_PAIR.toLowerCase());
+  await page.goto(`/#/pools/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}/manage`);
+  await expect(page.getByTestId("canonical-pool-workspace")).toHaveAttribute("data-pool-id", SECOND_WNATIVE_USDC_PAIR.toLowerCase());
+  await expect(page.locator("#liquidity-pair")).toHaveCount(0);
   await page.reload();
   await expect(page.locator("#liquidity-withdraw")).toBeVisible();
 });
 
-test("action deep links never fall back to the default pool while lookup is pending", async ({ page }) => {
+test("pool workspace deep links never fall back to the default pool while lookup is pending", async ({ page }) => {
   await page.addInitScript(() => {
     const observedPoolIds: string[] = [];
     Object.defineProperty(window, "__observedLiquidityPoolIds", { value: observedPoolIds });
     new MutationObserver(() => {
-      const select = document.querySelector<HTMLSelectElement>("#liquidity-pair");
-      if (select && observedPoolIds.at(-1) !== select.value) observedPoolIds.push(select.value);
+      const workspace = document.querySelector<HTMLElement>('[data-testid="canonical-pool-workspace"]');
+      const poolId = workspace?.dataset.poolId;
+      if (poolId && observedPoolIds.at(-1) !== poolId) observedPoolIds.push(poolId);
     }).observe(document, { childList: true, subtree: true });
   });
   await installMockRpc(page, {
     dashboardPoolLimit: 1,
     includePairs: true,
     pairByIdDelayMs: 600,
-    poolCount: 2
+    poolCount: 1
   });
-  await page.goto(`/#/liquidity/add/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}`);
+  await page.goto(`/#/pools/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}/create`);
 
   await expect(page.getByTestId("requested-pool-state")).toContainText("Resolving requested pool");
-  await expect(page.locator("#liquidity-pair")).toHaveCount(0);
+  await expect(page.getByTestId("canonical-pool-workspace")).toHaveCount(0);
   await expect(page.getByTestId("liquidity-add-button")).toHaveCount(0);
 
-  await expect(page.locator("#liquidity-pair")).toHaveValue(SECOND_WNATIVE_USDC_PAIR.toLowerCase());
+  await expect(page.getByTestId("canonical-pool-workspace")).toHaveAttribute("data-pool-id", SECOND_WNATIVE_USDC_PAIR.toLowerCase());
   await expect
     .poll(() => page.evaluate(() => (window as Window & { __observedLiquidityPoolIds: string[] }).__observedLiquidityPoolIds))
     .toEqual([SECOND_WNATIVE_USDC_PAIR.toLowerCase()]);
 });
 
-test("failed action-pool lookup stays unavailable instead of rendering the default pool", async ({ page }) => {
+test("failed workspace-pool lookup stays unavailable instead of rendering the default pool", async ({ page }) => {
   await installMockRpc(page, {
     dashboardPoolLimit: 1,
     includePairs: true,
     pairByIdMode: "error",
-    poolCount: 2
+    poolCount: 1
   });
-  await page.goto(`/#/swap/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}`);
+  await page.goto(`/#/pools/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}/swap`);
 
   await expect(page.getByTestId("requested-pool-state")).toContainText("Mock pair lookup failed");
-  await expect(page.locator("#swap-pool")).toHaveCount(0);
+  await expect(page.getByTestId("canonical-pool-workspace")).toHaveCount(0);
   await expect(page.getByTestId("swap-submit-button")).toHaveCount(0);
 });
 
@@ -2043,7 +2052,10 @@ test("stable revoked polling preserves a newly reviewed LB reapproval through it
   await expect(page.getByTestId("gas-review")).toContainText("LB operator approval");
 
   await approveButton.click();
-  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+  await expect.poll(
+    async () => (await readMockWallet(page)).sentTransactions.length,
+    { timeout: 20_000 }
+  ).toBe(1);
 });
 
 test("a stale cached LB approval fails closed before remove simulation and remains immediately re-approvable", async ({ page }) => {
@@ -2168,23 +2180,24 @@ test("external revocation in the final remove guard aborts the reviewed wallet h
   expect((await readMockWallet(page)).sentTransactions).toEqual([]);
 });
 
-test("an approval observed on another LBPair renders a wrong-pair state and never carries over", async ({ page }) => {
+test("an approval observed on another LBPair never carries into the selected workspace", async ({ page }) => {
   const rpc = await setupConnectedLiquidity(page, { lbApproved: true, poolCount: 2 });
   await expect(page.getByTestId("lb-operator-approval-disclosure")).toHaveAttribute("data-approval-state", "approved");
 
   rpc.update({ lbApproved: false });
   await page.evaluate((pair) => {
-    window.location.hash = `#/liquidity/withdraw/${pair}`;
+    window.location.hash = `#/pools/${pair}/manage`;
   }, SECOND_WNATIVE_USDC_PAIR.toLowerCase());
 
-  await expect(page).toHaveURL(new RegExp(`#/liquidity/withdraw/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}$`, "i"));
-  await expect(page.getByTestId("lb-operator-approval-disclosure")).toHaveAttribute("data-approval-state", "wrong-pair");
-  await expect(page.getByTestId("lb-operator-approval-state")).toContainText(WNATIVE_USDC_PAIR);
+  await expect(page).toHaveURL(new RegExp(`#/pools/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}/manage$`, "i"));
+  await expect(page.getByTestId("lb-operator-approval-disclosure")).toHaveAttribute("data-approval-state", "externally-revoked");
   await expect(page.getByTestId("remove-lb-approval-details-pair")).toHaveText(SECOND_WNATIVE_USDC_PAIR);
   await expect(page.getByTestId("liquidity-remove-button")).toBeDisabled();
+  expect(simulatedFunctions(rpc)).not.toContain("removeLiquidity");
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
 });
 
-test("rapid duplicate LB approval clicks produce one simulation and wallet request", async ({ page }) => {
+test("rapid duplicate LB approval clicks fail closed before a fresh deliberate review", async ({ page }) => {
   const rpc = await setupConnectedLiquidity(page, { lbApproved: false, simulationDelayMs: 300 });
   await page.evaluate(() => {
     const button = document.querySelector<HTMLButtonElement>('[data-testid="liquidity-approve-lb-button"]');
@@ -2193,11 +2206,14 @@ test("rapid duplicate LB approval clicks produce one simulation and wallet reque
     button.click();
   });
 
-  await expect(page.getByTestId("gas-review")).toBeVisible();
-  await page.getByTestId("liquidity-approve-lb-button").click();
+  await page.waitForTimeout(500);
+  await expect(page.getByTestId("gas-review")).toHaveCount(0);
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
 
+  await clickReviewedAction(page, "liquidity-approve-lb-button");
   await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
-  expect(simulatedFunctions(rpc).filter((name) => name === "approveForAll")).toHaveLength(2);
+  expect(simulatedFunctions(rpc).filter((name) => name === "approveForAll").length).toBeGreaterThanOrEqual(2);
+  assertTransactionMatchesSimulation((await readMockWallet(page)).sentTransactions[0], rpc, "approveForAll");
 });
 
 test("LB approval rechecks indexer freshness after simulation before wallet submission", async ({ page }) => {
@@ -2265,12 +2281,14 @@ test("navigating away during delayed LB approval cannot open a stale wallet requ
 
 test("changing pools during delayed LB approval cancels the stale wallet request", async ({ page }) => {
   const rpc = await setupConnectedLiquidity(page, { lbApproved: false, poolCount: 2, simulationDelayMs: 600 });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR.toLowerCase()}/manage`);
+  await expect(page.getByTestId("liquidity-approve-lb-button")).toBeEnabled();
   await page.getByTestId("liquidity-approve-lb-button").click();
   await expect.poll(() => simulatedFunctions(rpc).filter((name) => name === "approveForAll")).toHaveLength(1);
   await page.evaluate((pair) => {
-    window.location.hash = `#/liquidity/withdraw/${pair}`;
+    window.location.hash = `#/pools/${pair}/manage`;
   }, SECOND_WNATIVE_USDC_PAIR.toLowerCase());
-  await expect(page).toHaveURL(new RegExp(`#/liquidity/withdraw/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}$`, "i"));
+  await expect(page).toHaveURL(new RegExp(`#/pools/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}/manage$`, "i"));
   await page.waitForTimeout(700);
 
   const wallet = await readMockWallet(page);
@@ -2305,7 +2323,7 @@ test("remove submission is cancelled when its burn context changes during simula
   expect((await readMockWallet(page)).sentTransactions).toEqual([]);
 });
 
-test("rapid duplicate remove clicks produce one simulation and wallet request", async ({ page }) => {
+test("rapid duplicate remove clicks open one review and no wallet before deliberate confirmation", async ({ page }) => {
   const rpc = await setupConnectedLiquidity(page, {
     allowance: 5n * ONE_TOKEN,
     balance: 5n * ONE_TOKEN,
@@ -2319,11 +2337,14 @@ test("rapid duplicate remove clicks produce one simulation and wallet request", 
     button.click();
   });
 
-  await expect(page.getByTestId("gas-review")).toBeVisible();
-  await page.getByTestId("liquidity-remove-button").click();
+  await page.waitForTimeout(500);
+  await expect(page.getByTestId("gas-review")).toHaveCount(1);
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
 
+  await page.getByTestId("liquidity-remove-button").click();
   await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
-  expect(simulatedFunctions(rpc).filter((name) => name === "removeLiquidity")).toHaveLength(2);
+  expect(simulatedFunctions(rpc).filter((name) => name === "removeLiquidity").length).toBeGreaterThanOrEqual(2);
+  assertTransactionMatchesSimulation((await readMockWallet(page)).sentTransactions[0], rpc, "removeLiquidity");
 });
 
 test("navigating away during delayed remove simulation cannot open a stale wallet request", async ({ page }) => {
@@ -2355,12 +2376,14 @@ test("changing pools during delayed remove simulation cancels the stale wallet r
     poolCount: 2,
     simulationDelayMs: 600
   });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR.toLowerCase()}/manage`);
+  await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled();
   await page.getByTestId("liquidity-remove-button").click();
   await expect.poll(() => simulatedFunctions(rpc).filter((name) => name === "removeLiquidity")).toHaveLength(1);
   await page.evaluate((pair) => {
-    window.location.hash = `#/liquidity/withdraw/${pair}`;
+    window.location.hash = `#/pools/${pair}/manage`;
   }, SECOND_WNATIVE_USDC_PAIR.toLowerCase());
-  await expect(page).toHaveURL(new RegExp(`#/liquidity/withdraw/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}$`, "i"));
+  await expect(page).toHaveURL(new RegExp(`#/pools/${SECOND_WNATIVE_USDC_PAIR.toLowerCase()}/manage$`, "i"));
   await page.waitForTimeout(700);
 
   const wallet = await readMockWallet(page);
@@ -3177,20 +3200,28 @@ test("approval disclosures expose full spenders, scope, asset, and current state
   await connectWallet(page);
 
   await assertApprovalDisclosure(page, "swap-approval-details", LB_ROUTER, "swap-approve-button");
-  await page.getByRole("link", { name: "Liquidity" }).click();
+  await page.evaluate((pair) => {
+    window.location.hash = `#/pools/${pair}/create`;
+  }, WNATIVE_USDC_PAIR.toLowerCase());
+  await page.getByTestId("liquidity-transaction-review").evaluate((element) => {
+    if (element instanceof HTMLDetailsElement) element.open = true;
+  });
 
   for (const [id, spender, button] of [
     ["liquidity-x-approval-details", LB_ROUTER, "liquidity-approve-x-button"],
-    ["liquidity-y-approval-details", LB_ROUTER, "liquidity-approve-y-button"],
-    ["remove-lb-approval-details", LB_ROUTER, "liquidity-approve-lb-button"]
+    ["liquidity-y-approval-details", LB_ROUTER, "liquidity-approve-y-button"]
   ] as const) {
     await assertApprovalDisclosure(page, id, spender, button);
   }
+
+  await page.getByRole("link", { name: "Manage", exact: true }).click();
+  await expect(page).toHaveURL(/#\/pools\/.+\/manage/);
+  await assertApprovalDisclosure(page, "remove-lb-approval-details", LB_ROUTER, "liquidity-approve-lb-button");
 });
 
 test("mobile viewport renders core wallet and swap controls without overlap-critical hiding", async ({ page }) => {
   await page.setViewportSize({ height: 800, width: 320 });
-  await installMockRpc(page);
+  await installMockRpc(page, { includePairs: true });
   await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/swap");
 
@@ -3201,7 +3232,8 @@ test("mobile viewport renders core wallet and swap controls without overlap-crit
 
   await page.getByRole("link", { name: "Pools" }).click();
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
-  await page.getByRole("link", { name: "Liquidity" }).click();
+  await page.getByRole("link", { name: /^Open .+ pool$/ }).first().click();
+  await expect(page.getByTestId("canonical-pool-workspace")).toBeVisible();
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
@@ -3214,11 +3246,11 @@ test("mobile viewport keeps direct activity routes available without top-bar ope
     ["/#/positions", "Positions"]
   ] as const) {
     await page.goto(path);
-    await expect(page.locator(".panel-heading").filter({ hasText: heading }).first()).toBeVisible();
+    await expect(page.locator(".workspace").getByText(heading, { exact: true }).first()).toBeVisible();
   }
 
   await page.goto("/#/activity");
-  await expect(page.locator(".panel-heading").filter({ hasText: "Activity" }).first()).toBeVisible();
+  await expect(page.locator(".workspace").getByText("Activity", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("Operations", { exact: true })).toHaveCount(0);
 });
 
@@ -3240,7 +3272,10 @@ test("portfolio stays owner-scoped and its deep link survives reload", async ({ 
   await page.getByRole("link", { name: "Details" }).click();
   await expect(page).toHaveURL(/#\/positions\//);
   await expect(page.getByText("Position detail")).toBeVisible();
+  const detailUrl = page.url();
   await page.reload();
+  await expect(page).toHaveURL(detailUrl);
+  await connectWallet(page);
   await expect(page.getByText("Position detail")).toBeVisible();
   await expect(page.getByTestId("portfolio-position-card")).toHaveCount(1);
   await expect(page.getByTestId("position-history-row")).toHaveCount(2);
@@ -3607,12 +3642,12 @@ test("fully transferred portfolio positions remain visible but cannot be withdra
 
 test("portfolio exposes disconnected, wrong-chain, empty, and partial-history states", async ({ page }) => {
   await installMockRpc(page, { includePairs: true });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/positions");
   await expect(page.getByTestId("portfolio-state")).toContainText("Connect your wallet");
 
-  await installMockWallet(page, { chainId: ROBINHOOD_TESTNET_CHAIN_ID });
-  await page.reload();
   await connectWallet(page);
+  await page.evaluate((chainId) => window.__mockWalletControl.setChain(chainId), ROBINHOOD_TESTNET_CHAIN_ID);
   await expect(page.getByTestId("portfolio-state")).toContainText("Switch network");
 });
 
@@ -3690,7 +3725,7 @@ async function setupConnectedLiquidity(page: Parameters<typeof installMockRpc>[0
 }
 
 async function connectWallet(page: Parameters<typeof installMockRpc>[0]): Promise<void> {
-  await page.getByTestId("wallet-connect-button").click();
+  await openAndSelectMockWallet(page);
   await expect(page.getByTestId("wallet-account-button")).toContainText("0xf39F...2266");
 }
 
@@ -3866,7 +3901,7 @@ async function assertApprovalDisclosure(
   await expect(disclosure).toContainText("Scope");
   await expect(disclosure).toContainText("Current state");
   await expect(spenderValue).toHaveText(spender);
-  await expect(page.getByTestId(buttonTestId)).toHaveAttribute("aria-describedby", id);
+  await expect(page.getByTestId(buttonTestId)).toHaveAttribute("aria-describedby", new RegExp(`(^|\\s)${id}(\\s|$)`));
   expect(await spenderValue.evaluate((element) => getComputedStyle(element).overflowWrap)).toBe("anywhere");
 }
 

@@ -20,10 +20,12 @@ import {
   parseCandleStreamPayload,
   parsePoolStreamPayload,
   poolStreamUrl,
+  type AnalyticsHealth,
   type AnalyticsPage,
   type AnalyticsValue,
   type CandleInterval,
   type LivePoolSnapshot,
+  type LivePoolUpdate,
   type PairCandle,
   type PoolAnalyticsMetric
 } from "./analytics-data";
@@ -61,6 +63,7 @@ import {
 } from "./pool-economics";
 
 const WORKSPACE_REFRESH_INTERVAL_MS = 10_000;
+const MAX_PENDING_POOL_STREAM_UPDATES = 256;
 export type CandleStreamState = "connecting" | "live" | "stale" | "unavailable";
 export type PoolStreamState = "connecting" | "live" | "stale" | "snapshot-only" | "unavailable";
 
@@ -279,13 +282,29 @@ export function PoolWorkspaceProvider({
       return;
     }
 
-    let lastActivityAt = Date.now();
+    let lastTransportActivityAt = Date.now();
     let resetRequested = false;
+    let drainScheduled = false;
+    let draining = false;
+    let processingSince: number | null = null;
+    const pendingUpdates: LivePoolUpdate[] = [];
     setPoolStreamState("connecting");
     const source = new EventSource(poolStreamUrl(analyticsEndpoint, pool.address, snapshot.streamCursor));
-    const noteActivity = () => {
-      lastActivityAt = Date.now();
-      setPoolStreamState("live");
+    const refreshStreamState = () => {
+      if (resetRequested) return;
+      const now = Date.now();
+      const processingIsStale = processingSince !== null && isPoolStreamStale(processingSince, now);
+      if (isPoolStreamStale(lastTransportActivityAt, now) || processingIsStale) {
+        setPoolStreamState("stale");
+      } else if (draining || drainScheduled || pendingUpdates.length > 0) {
+        setPoolStreamState("connecting");
+      } else {
+        setPoolStreamState("live");
+      }
+    };
+    const noteTransportActivity = () => {
+      lastTransportActivityAt = Date.now();
+      refreshStreamState();
     };
     const reset = () => {
       if (resetRequested) return;
@@ -294,39 +313,111 @@ export function PoolWorkspaceProvider({
       source.close();
       setPoolStreamGeneration((generation) => generation + 1);
     };
+    const drainUpdates = async () => {
+      if (resetRequested || draining) return;
+      draining = true;
+      processingSince = Date.now();
+      setPoolStreamState("connecting");
+      try {
+        while (!resetRequested && pendingUpdates.length > 0) {
+          const batch = pendingUpdates.splice(0, pendingUpdates.length);
+          const current = queryClient.getQueryData<AnalyticsValue<LivePoolSnapshot>>(livePoolQueryKey);
+          if (current?.value === null || current?.value === undefined) {
+            throw new Error("Pool stream bootstrap disappeared while applying replay");
+          }
+          let next = current.value;
+          for (const update of batch) next = applyPoolStateUpdate(next, update);
+          if (next === current.value) continue;
+
+          // Replay frames are absolute, ordered replacements. Fold the whole
+          // burst first, then attest only its newest canonical state. This
+          // preserves every sparse bin replacement without issuing one full
+          // pinned RPC read per retained SSE frame.
+          const nextAnchor = poolEconomicsAnchor(next, pool);
+          const nextEconomics = await loadPinnedPoolEconomics(publicClient, registry, pool, nextAnchor);
+          if (resetRequested) return;
+          queryClient.setQueryData<PinnedPoolEconomics>(
+            poolEconomicsQueryKey(environmentKey, pool, nextAnchor),
+            nextEconomics
+          );
+          queryClient.setQueryData<AnalyticsValue<LivePoolSnapshot>>(livePoolQueryKey, (latest) => {
+            if (latest?.value === null || latest?.value === undefined) return latest;
+            let latestNext = latest.value;
+            for (const update of batch) latestNext = applyPoolStateUpdate(latestNext, update);
+            return latestNext === latest.value
+              ? latest
+              : { ...latest, value: latestNext, status: latestNext.state.status, error: null };
+          });
+        }
+      } catch {
+        reset();
+      } finally {
+        draining = false;
+        processingSince = null;
+        if (!resetRequested && pendingUpdates.length > 0) {
+          scheduleDrain();
+        } else {
+          refreshStreamState();
+        }
+      }
+    };
+    const scheduleDrain = () => {
+      if (resetRequested || draining || drainScheduled) return;
+      drainScheduled = true;
+      queueMicrotask(() => {
+        drainScheduled = false;
+        void drainUpdates();
+      });
+    };
     const onPoolState = (event: MessageEvent<string>) => {
+      lastTransportActivityAt = Date.now();
       try {
         const update = parsePoolStreamPayload(JSON.parse(event.data), pool.address);
-        let applied = false;
-        queryClient.setQueryData<AnalyticsValue<LivePoolSnapshot>>(livePoolQueryKey, (current) => {
-          if (current?.value === null || current?.value === undefined) return current;
-          const next = applyPoolStateUpdate(current.value, update);
-          applied = next !== current.value;
-          return next === current.value ? current : { ...current, value: next, status: next.state.status, error: null };
-        });
-        if (applied) noteActivity();
+        const current = queryClient.getQueryData<AnalyticsValue<LivePoolSnapshot>>(livePoolQueryKey);
+        if (current?.value === null || current?.value === undefined) return;
+        const projected = pendingUpdates.reduce(applyPoolStateUpdate, current.value);
+        if (applyPoolStateUpdate(projected, update) === projected) return;
+        if (pendingUpdates.length >= MAX_PENDING_POOL_STREAM_UPDATES) {
+          reset();
+          return;
+        }
+        pendingUpdates.push(update);
+        setPoolStreamState("connecting");
+        scheduleDrain();
       } catch {
         reset();
       }
     };
     source.addEventListener("pool-state", onPoolState as EventListener);
-    source.addEventListener("heartbeat", noteActivity);
+    source.addEventListener("heartbeat", noteTransportActivity);
     source.addEventListener("reset", reset);
-    source.onopen = noteActivity;
+    source.onopen = noteTransportActivity;
     source.onerror = () => {
       if (!resetRequested) {
-        setPoolStreamState(isPoolStreamStale(lastActivityAt, Date.now()) ? "stale" : "connecting");
+        setPoolStreamState(isPoolStreamStale(lastTransportActivityAt, Date.now()) ? "stale" : "connecting");
       }
     };
     const staleTimer = window.setInterval(() => {
-      if (!resetRequested && isPoolStreamStale(lastActivityAt, Date.now())) setPoolStreamState("stale");
+      refreshStreamState();
     }, 5_000);
 
     return () => {
+      resetRequested = true;
       window.clearInterval(staleTimer);
       source.close();
     };
-  }, [analyticsEndpoint, livePoolQuery.data?.value !== null && livePoolQuery.data?.value !== undefined, livePoolQuery.isPending, livePoolQueryKey, pool.address, poolStreamGeneration, queryClient]);
+  }, [
+    analyticsEndpoint,
+    environmentKey,
+    livePoolQuery.data?.value !== null && livePoolQuery.data?.value !== undefined,
+    livePoolQuery.isPending,
+    livePoolQueryKey,
+    pool.address,
+    poolStreamGeneration,
+    publicClient,
+    queryClient,
+    registry
+  ]);
   const healthQuery = useQuery({
     queryKey: ["canonicalPoolAnalyticsHealth", environmentKey, analyticsEndpoint],
     queryFn: () => loadAnalyticsHealth(analyticsEndpoint),
@@ -353,40 +444,20 @@ export function PoolWorkspaceProvider({
   });
   const indexerSnapshot = indexerSnapshotQuery.isError ? undefined : indexerSnapshotQuery.data;
   const livePoolBootstrap = livePoolQuery.data?.value ?? null;
-  const analyticsHealth = healthQuery.data?.value ?? null;
-  const analyticsEconomicsAnchor: PoolEconomicsAnchor | null =
-    livePoolBootstrap !== null &&
-    analyticsHealth?.headBlock !== null &&
-    analyticsHealth?.headBlock !== undefined &&
-    analyticsHealth.headHash !== null
-      ? {
-          activeId: BigInt(livePoolBootstrap.state.activeId),
-          binStep: BigInt(livePoolBootstrap.state.binStep),
-          blockHash: analyticsHealth.headHash as `0x${string}`,
-          blockNumber: BigInt(analyticsHealth.headBlock),
-          factory: pool.factoryAddress,
-          tokenX: livePoolBootstrap.state.tokenX,
-          tokenY: livePoolBootstrap.state.tokenY
-        }
-      : null;
+  const analyticsEconomicsAnchor = livePoolBootstrap === null
+    ? null
+    : poolEconomicsAnchorAtCanonicalHead(livePoolBootstrap, pool, healthQuery.data?.value ?? null);
   const economicsQuery = useQuery({
-    queryKey: [
-      "canonicalPoolEconomics",
-      environmentKey,
-      pool.address,
-      pool.factoryAddress,
-      pool.tokenXAddress,
-      pool.tokenYAddress,
-      pool.binStep,
-      analyticsEconomicsAnchor?.blockNumber.toString() ?? null,
-      analyticsEconomicsAnchor?.blockHash ?? null,
-      analyticsEconomicsAnchor?.activeId.toString() ?? null
-    ],
+    queryKey: poolEconomicsQueryKey(environmentKey, pool, analyticsEconomicsAnchor),
     queryFn: () => {
       if (analyticsEconomicsAnchor === null) throw new Error("Canonical analytics market anchor is unavailable");
       return loadPinnedPoolEconomics(publicClient, registry, pool, analyticsEconomicsAnchor);
     },
     enabled: analyticsEconomicsAnchor !== null,
+    // A verified stream batch seeds this exact canonical anchor before it is
+    // published. Treat that fresh attestation as reusable so the render that
+    // follows does not immediately repeat the same full pinned RPC read.
+    staleTime: WORKSPACE_REFRESH_INTERVAL_MS,
     refetchInterval: analyticsEconomicsAnchor !== null ? WORKSPACE_REFRESH_INTERVAL_MS : false,
     refetchOnWindowFocus: "always",
     retry: false
@@ -750,6 +821,56 @@ export function usePoolDraftState<T>(key: string, initialValue: T): [T, Dispatch
     workspace.setDraftValue(key, next, localValue);
   }, [key, localValue, workspace]);
   return [workspace === null ? localValue : workspaceValue, setValue];
+}
+
+function poolEconomicsAnchor(snapshot: LivePoolSnapshot, pool: PoolRow): PoolEconomicsAnchor {
+  return {
+    activeId: BigInt(snapshot.state.activeId),
+    binStep: BigInt(snapshot.state.binStep),
+    blockHash: snapshot.state.asOfBlockHash as `0x${string}`,
+    blockNumber: BigInt(snapshot.state.asOfBlock),
+    factory: pool.factoryAddress,
+    tokenX: snapshot.state.tokenX,
+    tokenY: snapshot.state.tokenY
+  };
+}
+
+function poolEconomicsAnchorAtCanonicalHead(
+  snapshot: LivePoolSnapshot,
+  pool: PoolRow,
+  health: AnalyticsHealth | null
+): PoolEconomicsAnchor {
+  const poolAnchor = poolEconomicsAnchor(snapshot, pool);
+  if (health?.headBlock === null || health?.headBlock === undefined ||
+    health.headHash === null || health.headHash === undefined) {
+    return poolAnchor;
+  }
+  const headBlock = BigInt(health.headBlock);
+  if (headBlock < poolAnchor.blockNumber) return poolAnchor;
+  return {
+    ...poolAnchor,
+    blockNumber: headBlock,
+    blockHash: health.headHash as `0x${string}`
+  };
+}
+
+function poolEconomicsQueryKey(
+  environmentKey: EnvironmentKey,
+  pool: PoolRow,
+  anchor: PoolEconomicsAnchor | null
+) {
+  return [
+    "canonicalPoolEconomics",
+    environmentKey,
+    pool.address,
+    pool.factoryAddress,
+    pool.tokenXAddress,
+    pool.tokenYAddress,
+    pool.binStep,
+    anchor?.blockNumber.toString() ?? null,
+    anchor?.blockHash ?? null,
+    anchor?.activeId.toString() ?? null
+  ] as const;
 }
 
 function economicsMatchesAnalyticsAnchor(economics: PinnedPoolEconomics, anchor: PoolEconomicsAnchor): boolean {

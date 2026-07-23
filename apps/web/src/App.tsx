@@ -274,7 +274,10 @@ import {
 } from "./analytics-data";
 import {
   buildCenteredBinDistribution,
-  type BinDistributionPoint
+  parsePoolManageSelectionIntent,
+  resolvePoolManageSelectionIntent,
+  type BinDistributionPoint,
+  type PoolManageSelectionIntent
 } from "./pool-workspace";
 import {
   buildPoolDiscoveryRequests,
@@ -1587,6 +1590,12 @@ function poolRowsFromCatalog(
   const legacyByAddress = new Map(legacyPools.map((pool) => [pool.address.toLowerCase(), pool]));
   const rows = catalog.flatMap((entry) => {
     if (entry.chainId !== registry.chainId) return [];
+    if (
+      !isAddress(entry.pair) ||
+      !isAddress(entry.tokenX) ||
+      !isAddress(entry.tokenY) ||
+      (entry.factoryAddress !== null && !isAddress(entry.factoryAddress))
+    ) return [];
     if (isDeprecatedPool(registry, entry.pair)) return [];
     const completeCreationProvenance =
       entry.factoryAddress !== null &&
@@ -1598,6 +1607,8 @@ function poolRowsFromCatalog(
     if (entry.factoryAddress !== null && !isAddressEqual(entry.factoryAddress, registry.contracts.lbFactory)) return [];
     const legacy = legacyByAddress.get(entry.pair.toLowerCase());
     if (legacy !== undefined && (
+      !isAddress(legacy.tokenXAddress) ||
+      !isAddress(legacy.tokenYAddress) ||
       !isAddressEqual(legacy.tokenXAddress, entry.tokenX) ||
       !isAddressEqual(legacy.tokenYAddress, entry.tokenY) ||
       legacy.binStep !== String(entry.binStep)
@@ -3156,12 +3167,26 @@ function SwapMarketChart({
     candleSeriesRef.current = candleSeries;
     volumeSeriesRef.current = volumeSeries;
 
+    let previousWidth = container.clientWidth;
+    let previousHeight = container.clientHeight;
     const observer = new ResizeObserver(([entry]) => {
       if (!entry) return;
+      const width = Math.floor(entry.contentRect.width);
+      const height = Math.floor(entry.contentRect.height);
       chart.applyOptions({
-        width: Math.floor(entry.contentRect.width),
-        height: Math.floor(entry.contentRect.height)
+        width,
+        height
       });
+      if (
+        width > 0 &&
+        height > 0 &&
+        (previousWidth <= 0 || previousHeight <= 0) &&
+        seriesTimesRef.current.size > 0
+      ) {
+        chart.timeScale().fitContent();
+      }
+      previousWidth = width;
+      previousHeight = height;
     });
     observer.observe(container);
 
@@ -6391,6 +6416,26 @@ function LiquidityView({
   const latestFullExitBatchReviewRef = useRef<FullExitBatchReviewState | null>(fullExitBatchReview);
   latestFullExitBatchReviewRef.current = fullExitBatchReview;
   const [selectedPositionIds, setSelectedPositionIds] = usePoolDraftState<string[]>("liquidity.selectedPositionIds", []);
+  const [managePositionSelectionHash, setManagePositionSelectionHash] = useState(() => window.location.hash);
+  const initialManagePositionSelection = useRef(
+    parsePoolManageSelectionIntent(managePositionSelectionHash, primaryPool?.address ?? null)
+  );
+  const appliedManagePositionSelectionContextRef = useRef(
+    `${primaryPool?.address.toLowerCase() ?? "none"}:${managePositionSelectionHash}`
+  );
+  const [managePositionSelectionIntent, setManagePositionSelectionIntent] =
+    useState<PoolManageSelectionIntent | null>(initialManagePositionSelection.current.intent);
+  const [failedManagePositionSelectionIntent, setFailedManagePositionSelectionIntent] =
+    useState<PoolManageSelectionIntent | null>(null);
+  const [managePositionSelectionVerification, setManagePositionSelectionVerification] =
+    useState<"idle" | "required" | "refreshing" | "ready" | "failed">(
+      initialManagePositionSelection.current.intent === null ? "idle" : "required"
+    );
+  const [managePositionSelectionNotice, setManagePositionSelectionNotice] = useState<string | null>(
+    initialManagePositionSelection.current.status === "invalid"
+      ? "The position-selection link is invalid. Select the bins you want to manage below."
+      : null
+  );
   const [removePercentInput, setRemovePercentInput] = usePoolDraftState("liquidity.removePercent", "100");
   const [explicitFullExitRequested, setExplicitFullExitRequested] = useState(false);
   const [liquidityReceiptPhase, setLiquidityReceiptPhase] = useState<"idle" | "lb-approval" | "remove">("idle");
@@ -6400,7 +6445,46 @@ function LiquidityView({
   const [submittedApproveYReceiptContext, setSubmittedApproveYReceiptContext] = useState<string | null>(null);
   const [submittedLbApprovalReceiptContext, setSubmittedLbApprovalReceiptContext] = useState<string | null>(null);
   const [submittedAddReceiptContext, setSubmittedAddReceiptContext] = useState<string | null>(null);
-  const intentionalEmptySelectionRef = useRef(false);
+  const intentionalEmptySelectionRef = useRef(
+    initialManagePositionSelection.current.status === "invalid"
+  );
+  useEffect(() => {
+    const readManagePositionSelectionHash = () => setManagePositionSelectionHash(window.location.hash);
+    window.addEventListener("hashchange", readManagePositionSelectionHash);
+    return () => window.removeEventListener("hashchange", readManagePositionSelectionHash);
+  }, []);
+  useEffect(() => {
+    const context = `${primaryPool?.address.toLowerCase() ?? "none"}:${managePositionSelectionHash}`;
+    if (appliedManagePositionSelectionContextRef.current === context) return;
+    appliedManagePositionSelectionContextRef.current = context;
+
+    const parsed = parsePoolManageSelectionIntent(
+      managePositionSelectionHash,
+      primaryPool?.address ?? null
+    );
+    setFailedManagePositionSelectionIntent(null);
+    if (parsed.status === "invalid") {
+      intentionalEmptySelectionRef.current = true;
+      setSelectedPositionIds([]);
+      setManagePositionSelectionIntent(null);
+      setManagePositionSelectionVerification("idle");
+      setManagePositionSelectionNotice(
+        "The position-selection link is invalid. Select the bins you want to manage below."
+      );
+      return;
+    }
+    if (parsed.intent !== null) {
+      intentionalEmptySelectionRef.current = true;
+      setSelectedPositionIds([]);
+      setManagePositionSelectionIntent(parsed.intent);
+      setManagePositionSelectionVerification("required");
+      setManagePositionSelectionNotice(null);
+      return;
+    }
+    setManagePositionSelectionIntent(null);
+    setManagePositionSelectionVerification("idle");
+    setManagePositionSelectionNotice(null);
+  }, [managePositionSelectionHash, primaryPool?.address, setSelectedPositionIds]);
   const portfolioPrefillKeyRef = useRef<string | null>(null);
   const rangePoolKeyRef = useRef<string | null>(null);
   const rangeEditGenerationRef = useRef(0);
@@ -7361,10 +7445,51 @@ function LiquidityView({
       return loadPaginatedPositionsForOwnerPair(registry, account.address, pool.pair);
     },
     enabled: rpcReady && connected && pool !== null && registry.endpoints.indexerUrl !== null,
+    refetchOnMount: "always",
     refetchInterval: rpcReady && connected && registry.endpoints.indexerUrl !== null ? 10_000 : false
   });
   const walletPositions = walletPositionsQuery.data?.rows ?? [];
   const walletPositionsPageInfo = walletPositionsQuery.data?.pageInfo ?? null;
+  const managePositionSelectionResolution = useMemo(
+    () => managePositionSelectionIntent === null
+      ? null
+      : resolvePoolManageSelectionIntent(
+          managePositionSelectionIntent,
+          walletPositions,
+          account.address ?? null,
+          pool?.pair ?? null
+        ),
+    [account.address, managePositionSelectionIntent, pool?.pair, walletPositions]
+  );
+  useEffect(() => {
+    if (
+      managePositionSelectionIntent === null ||
+      managePositionSelectionVerification !== "required" ||
+      !connected ||
+      account.address === undefined ||
+      !rpcReady ||
+      pool === null ||
+      registry.endpoints.indexerUrl === null
+    ) return;
+
+    let cancelled = false;
+    void walletPositionsQuery.refetch({ cancelRefetch: true }).then((result) => {
+      if (cancelled) return;
+      setManagePositionSelectionVerification(result.isError ? "failed" : "ready");
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    account.address,
+    connected,
+    managePositionSelectionIntent,
+    managePositionSelectionVerification,
+    pool?.pair,
+    registry.endpoints.indexerUrl,
+    rpcReady,
+    walletPositionsQuery.refetch
+  ]);
   const portfolioExitRequested = portfolioAction === "partial" || portfolioAction === "full";
   const portfolioIntentQuery = useQuery({
     queryKey: ["liquidityPortfolioIntent", registry.chainId, portfolioEndpoint, account.address, pool?.pair],
@@ -7758,6 +7883,7 @@ function LiquidityView({
     removePoolReady &&
     connected &&
     !onWrongChain &&
+    managePositionSelectionIntent === null &&
     hasSelectedPositions &&
     removeAmount !== null &&
     removeAmount > 0n &&
@@ -7803,6 +7929,7 @@ function LiquidityView({
     removePoolReady &&
     connected &&
     !onWrongChain &&
+    managePositionSelectionIntent === null &&
     hasSelectedPositions &&
     !liveLbApproved &&
     lbApprovalState !== "unavailable" &&
@@ -7899,6 +8026,65 @@ function LiquidityView({
       setExplicitFullExitRequested(portfolioAction === "full");
       setRemovePercentInput(portfolioAction === "partial" ? "50" : "100");
       setSelectedPositionIds(walletPositions.map((position) => position.id));
+      setManagePositionSelectionIntent(null);
+      return;
+    }
+    if (managePositionSelectionIntent !== null && managePositionSelectionResolution !== null) {
+      if (!connected || account.address === undefined) return;
+      if (!rpcReady || pool === null || registry.endpoints.indexerUrl === null) {
+        setManagePositionSelectionNotice(
+          "The exact position selection could not be verified because indexed positions are unavailable. Select bins manually."
+        );
+        intentionalEmptySelectionRef.current = true;
+        setSelectedPositionIds([]);
+        setFailedManagePositionSelectionIntent(managePositionSelectionIntent);
+        setManagePositionSelectionVerification("idle");
+        setManagePositionSelectionIntent(null);
+        return;
+      }
+      if (
+        managePositionSelectionVerification === "required" ||
+        managePositionSelectionVerification === "refreshing" ||
+        walletPositionsQuery.isLoading ||
+        walletPositionsQuery.isFetching
+      ) return;
+      if (managePositionSelectionVerification === "failed" || walletPositionsQuery.isError) {
+        setManagePositionSelectionNotice(
+          "The exact position selection could not be verified because the position refresh failed. Select bins manually or retry."
+        );
+        intentionalEmptySelectionRef.current = true;
+        setSelectedPositionIds([]);
+        setFailedManagePositionSelectionIntent(managePositionSelectionIntent);
+        setManagePositionSelectionVerification("idle");
+        setManagePositionSelectionIntent(null);
+        return;
+      }
+      if (managePositionSelectionVerification !== "ready") return;
+      if (managePositionSelectionResolution.status === "ready") {
+        intentionalEmptySelectionRef.current = false;
+        setSelectedPositionIds(managePositionSelectionResolution.positionIds);
+        setFailedManagePositionSelectionIntent(null);
+        setManagePositionSelectionNotice(null);
+        setManagePositionSelectionVerification("idle");
+        setManagePositionSelectionIntent(null);
+        return;
+      }
+      setManagePositionSelectionNotice(
+        managePositionSelectionResolution.status === "incomplete"
+          ? "The exact bins from the position view are no longer present in the refreshed index. Select bins manually or retry."
+          : managePositionSelectionResolution.status === "scope-mismatch"
+            ? "The position-selection link belongs to a different wallet or pool. Select bins manually."
+            : "The exact position selection is invalid. Select bins manually."
+      );
+      intentionalEmptySelectionRef.current = true;
+      setSelectedPositionIds([]);
+      setFailedManagePositionSelectionIntent(
+        managePositionSelectionResolution.status === "scope-mismatch"
+          ? null
+          : managePositionSelectionIntent
+      );
+      setManagePositionSelectionVerification("idle");
+      setManagePositionSelectionIntent(null);
       return;
     }
     setSelectedPositionIds((currentIds) => {
@@ -7921,7 +8107,21 @@ function LiquidityView({
 
       return sameStringArray(currentIds, nextIds) ? currentIds : nextIds;
     });
-  }, [pool?.pair, portfolioAction, walletPositions, walletPositionsQuery.isFetching, walletPositionsQuery.isLoading]);
+  }, [
+    managePositionSelectionIntent,
+    managePositionSelectionResolution,
+    managePositionSelectionVerification,
+    connected,
+    account.address,
+    pool?.pair,
+    portfolioAction,
+    registry.endpoints.indexerUrl,
+    rpcReady,
+    walletPositions,
+    walletPositionsQuery.isError,
+    walletPositionsQuery.isFetching,
+    walletPositionsQuery.isLoading
+  ]);
 
   useEffect(() => {
     setLiquiditySimulationError(null);
@@ -9509,6 +9709,7 @@ function LiquidityView({
   };
   const toggleSelectedPosition = (positionId: string) => {
     clearSubmittedRemoveReceipt();
+    setManagePositionSelectionIntent(null);
     setSelectedPositionIds((currentIds) => {
       const nextIds = currentIds.includes(positionId)
         ? currentIds.filter((currentId) => currentId !== positionId)
@@ -9520,13 +9721,22 @@ function LiquidityView({
   };
   const selectAllLoadedPositions = () => {
     clearSubmittedRemoveReceipt();
+    setManagePositionSelectionIntent(null);
     intentionalEmptySelectionRef.current = false;
     setSelectedPositionIds(walletPositions.map((position) => position.id));
   };
   const clearSelectedPositions = () => {
     clearSubmittedRemoveReceipt();
+    setManagePositionSelectionIntent(null);
     intentionalEmptySelectionRef.current = true;
     setSelectedPositionIds([]);
+  };
+  const retryManagePositionSelection = async () => {
+    const failedIntent = failedManagePositionSelectionIntent;
+    if (failedIntent === null) return;
+    setManagePositionSelectionNotice("Refreshing indexed positions before restoring the exact bin selection…");
+    setManagePositionSelectionIntent(failedIntent);
+    setManagePositionSelectionVerification("required");
   };
   const walletBalanceReadPending = walletQuery.isLoading || walletQuery.isFetching;
   const pairedFillWalletReady = walletData !== null && !walletBalanceReadPending && !walletQuery.isError;
@@ -10071,6 +10281,23 @@ function LiquidityView({
         <span className="field-label" id="position-select-label">
           Positions
         </span>
+        {managePositionSelectionNotice !== null ? (
+          <div className="state-row warning" data-testid="manage-position-selection-notice" role="status">
+            <AlertTriangle size={16} />
+            <span>{managePositionSelectionNotice}</span>
+            {failedManagePositionSelectionIntent !== null ? (
+              <button
+                className="secondary-button"
+                data-testid="manage-position-selection-retry"
+                disabled={walletPositionsQuery.isFetching}
+                onClick={() => void retryManagePositionSelection()}
+                type="button"
+              >
+                {walletPositionsQuery.isFetching ? "Refreshing…" : "Retry exact bins"}
+              </button>
+            ) : null}
+          </div>
+        ) : null}
         <PositionMultiSelect
           labelledBy="position-select-label"
           onClear={clearSelectedPositions}

@@ -17,7 +17,11 @@ import {
   type PositionRow
 } from "./data";
 import { returnHrefFromAction } from "./pool-discovery";
-import { summarizePoolPosition } from "./pool-workspace";
+import {
+  createPoolManageSelectionIntent,
+  poolManageSelectionIntentHref,
+  summarizePoolPosition,
+} from "./pool-workspace";
 import { usePoolDraftState, usePoolWorkspace } from "./pool-workspace-context";
 import { poolWorkspaceHref, type PoolWorkspaceTask } from "./pool-workspace-route";
 
@@ -49,8 +53,21 @@ export function PoolWorkspaceOwnerPanel() {
     () => summarizePoolPosition(workspace.positions, null),
     [workspace.positions]
   );
+  const manageSelectionIntent = useMemo(
+    () => createPoolManageSelectionIntent(
+      workspace.positions,
+      workspace.walletAddress,
+      workspace.pool.address
+    ),
+    [workspace.pool.address, workspace.positions, workspace.walletAddress]
+  );
   const returnHref = returnHrefFromAction(window.location.hash);
-  const manageHref = workspaceTaskHref(workspace.pool.id, "manage", returnHref);
+  const manageHref = manageSelectionIntent === null
+    ? workspaceTaskHref(workspace.pool.id, "manage", returnHref)
+    : poolManageSelectionIntentHref(
+        workspaceTaskHref(workspace.pool.id, "manage", returnHref),
+        manageSelectionIntent
+      );
   const createHref = workspaceTaskHref(workspace.pool.id, "create", returnHref);
   const canManage = canManagePoolPosition(
     workspace.positions,
@@ -88,12 +105,11 @@ export function PoolWorkspaceOwnerPanel() {
             History
           </button>
         </div>
-        {activeTab === "positions" && summary !== null && canManage ? (
+        {activeTab === "positions" && summary !== null && canManage && manageSelectionIntent !== null ? (
           <a
             className="pool-owner-panel-action"
             data-testid="pool-position-manage-link"
             href={manageHref}
-            onClick={() => workspace.setDraftValue<string[]>("liquidity.selectedPositionIds", summary.positionIds, [])}
           >
             Manage position
           </a>

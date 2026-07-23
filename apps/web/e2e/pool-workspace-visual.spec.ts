@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 
 import { installMockAnalyticsStream } from "./fixtures/mock-analytics-stream";
 import { installMockRpc, WNATIVE_USDC_PAIR, type MockRpcOptions } from "./fixtures/mock-rpc";
-import { installMockWallet, LOCALNET_CHAIN_ID } from "./fixtures/mock-wallet";
+import { installMockWallet, LOCALNET_CHAIN_ID, openAndSelectMockWallet } from "./fixtures/mock-wallet";
 
 type WorkspaceVisualCase = {
   name: "market" | "swap" | "create-position" | "manage-position" | "empty-wallet" | "partial-data";
@@ -38,12 +38,15 @@ for (const visualCase of CASES) {
 
     await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/${visualCase.route}`);
     if (visualCase.wallet) {
-      await page.getByTestId("wallet-connect-button").click();
+      await openAndSelectMockWallet(page);
       await expect(page.getByTestId("wallet-account-button")).toBeVisible();
     }
 
     const workspace = page.getByTestId("canonical-pool-workspace");
     await expect(workspace).toBeVisible();
+    const brand = page.getByRole("link", { name: "Feather Trade home" });
+    await expect(brand).toBeVisible();
+    await expect.poll(() => brand.locator("img").evaluate((image: HTMLImageElement) => image.complete && image.naturalWidth > 0)).toBe(true);
     await expect(page.getByTestId("swap-market-chart")).toContainText(visualCase.options.analyticsPartialHistory ? "Partial history" : "History ready");
 
     if (testInfo.project.name === "mobile-chromium" && visualCase.mobileView) {
@@ -65,6 +68,14 @@ for (const visualCase of CASES) {
     } else {
       if (visualCase.expandMetadata) {
         const state = page.getByTestId("pool-workspace-state");
+        const distribution = page.getByTestId("pool-rail-liquidity-distribution");
+        await expect(state).toContainText("Pool data delayed");
+        await expect(state.locator("small").first()).toBeVisible();
+        await expect(distribution.locator(".pool-rail-liquidity-skeleton")).toHaveCount(0);
+        await expect(distribution.locator(".pool-rail-liquidity-bars")).toBeVisible();
+        await page.evaluate(() => new Promise<void>((resolve) => {
+          window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve()));
+        }));
         if (testInfo.project.name === "chromium") {
           await expect.poll(() => state.evaluate((element) => {
             const rail = element.closest<HTMLElement>(".pool-workspace-rail");
@@ -75,14 +86,28 @@ for (const visualCase of CASES) {
           const state = element as HTMLElement;
           const rail = state.closest<HTMLElement>(".pool-workspace-rail");
           if (desktop && rail) {
-            rail.scrollTop = Math.max(0, state.offsetTop - 16);
+            rail.scrollTop = rail.scrollHeight;
           } else {
-            state.scrollIntoView({ behavior: "auto", block: "center" });
+            const bounds = state.getBoundingClientRect();
+            const top = window.scrollY + bounds.top - Math.max(16, (window.innerHeight - bounds.height) / 2);
+            window.scrollTo({ behavior: "auto", left: 0, top });
           }
         }, testInfo.project.name === "chromium");
         if (testInfo.project.name === "chromium") {
+          await expect.poll(() => state.evaluate((element) => {
+            const rail = element.closest<HTMLElement>(".pool-workspace-rail");
+            if (rail === null) return false;
+            const railBounds = rail.getBoundingClientRect();
+            const stateBounds = element.getBoundingClientRect();
+            return stateBounds.top >= railBounds.top - 1 && stateBounds.bottom <= railBounds.bottom + 1;
+          })).toBe(true);
           await page.evaluate(() => window.scrollTo({ behavior: "auto", left: 0, top: 0 }));
           await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(0);
+        } else {
+          await expect.poll(() => state.evaluate((element) => {
+            const bounds = element.getBoundingClientRect();
+            return bounds.top >= 0 && bounds.bottom <= window.innerHeight;
+          })).toBe(true);
         }
       } else {
         await page.evaluate(() => window.scrollTo({ behavior: "auto", left: 0, top: 0 }));
