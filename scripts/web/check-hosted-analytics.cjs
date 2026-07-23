@@ -76,7 +76,7 @@ async function main() {
           pair chainId tokenX tokenY decimalsX decimalsY activeId
           reserveX reserveY marketPriceQuoteE18 asOfBlock asOfBlockHash
         }
-        bins { binId reserveX reserveY asOfBlock asOfBlockHash }
+        bins { binId reserveX reserveY updatedAtBlock updatedAtBlockHash }
         streamCursor
       }
       pairCandles(
@@ -87,7 +87,8 @@ async function main() {
         first: 100
       ) {
         nodes {
-          pair interval startTimestamp endTimestamp open high low close
+          pair interval startTimestamp endTimestamp
+          openUsdE18 highUsdE18 lowUsdE18 closeUsdE18
           finalized revision firstBlockHash lastBlockHash
         }
         pageInfo { hasNextPage partial }
@@ -178,7 +179,10 @@ async function verifyCandleStream(origin, pair, cursor) {
   url.searchParams.set("interval", "HOUR");
   url.searchParams.set("after", cursor);
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10_000);
+  // The analytics service guarantees a heartbeat every 15 seconds. Allow one
+  // complete heartbeat interval through reverse-proxy buffering, then require
+  // an actual SSE frame so this checks more than response headers.
+  const timeout = setTimeout(() => controller.abort(), 25_000);
   try {
     const response = await fetch(url, {
       headers: {
@@ -195,7 +199,16 @@ async function verifyCandleStream(origin, pair, cursor) {
     if (!(response.headers.get("content-type") ?? "").toLowerCase().startsWith("text/event-stream")) {
       throw new Error("Hosted analytics candle stream did not return an event stream");
     }
-    await response.body?.cancel();
+    if (response.body === null) {
+      throw new Error("Hosted analytics candle stream returned no body");
+    }
+    const reader = response.body.getReader();
+    const first = await reader.read();
+    const frame = first.done ? "" : new TextDecoder().decode(first.value);
+    if (!/^event: (?:heartbeat|candle|reset)$/m.test(frame)) {
+      throw new Error("Hosted analytics candle stream returned no recognized SSE frame");
+    }
+    await reader.cancel();
   } finally {
     clearTimeout(timeout);
   }
