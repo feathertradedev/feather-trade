@@ -30,6 +30,7 @@ try {
   const extracted = path.join(temp, "extracted");
   run(custody, ["verify", "--environment", "testnet", "--commit", commit, "--bundle", relative(bundle), "--output", relative(extracted)]);
   assert.equal(fs.readFileSync(path.join(extracted, "dist/assets/index-a.js"), "utf8"), "console.log('release')\n");
+  assertPortableArchiveExtraction(bundle);
 
   const evidenceDir = path.join(temp, "evidence");
   run(evidence, ["--environment", "testnet", "--commit", commit, "--custody", path.join(bundle, "custody.json"), "--deployed-url", "https://RELEASE.example:443/", "--output", evidenceDir, "--outcome", "promoted"]);
@@ -78,6 +79,7 @@ try {
     assert.notEqual(run(evidence, ["--validate-url", hostileUrl, "--github-output", githubOutput], false).status, 0, `must reject ${hostileUrl}`);
   }
 
+  testSourceMetadataRejection(manifest);
   testAdversarialArchives(bundle, extracted);
   testVpsPromotionAdapter({ bundle: sepoliaBundle, extracted: sepoliaExtracted, environment: "sepolia" });
 
@@ -174,6 +176,9 @@ function validateWorkflowContract() {
   assert.match(fs.readFileSync(remoteAdapter, "utf8"), /PROMOTION_CONFIRM=confirmed/);
   const custodySource = fs.readFileSync(custody, "utf8");
   assert.match(custodySource, /validateArchiveEntries\(archive\)/);
+  assert.match(custodySource, /COPYFILE_DISABLE: "1"/);
+  assert.match(custodySource, /COPY_EXTENDED_ATTRIBUTES_DISABLE: "1"/);
+  assert.match(custodySource, /macOS metadata is forbidden in promotion artifacts/);
   assert.match(custodySource, /links and special files are forbidden/);
   assert.match(custodySource, /duplicate promotion archive path/);
   for (const action of workflow.matchAll(/uses: ([^\s]+)/g)) {
@@ -811,9 +816,23 @@ function testAdversarialArchives(bundle, extracted) {
     ["hardlink", [{ name: "dist/hard", type: "1", link: "manifest.json" }], /promotion archive links and special files are forbidden: dist\/hard/],
     ["special file", [{ name: "dist/fifo", type: "6" }], /promotion archive links and special files are forbidden: dist\/fifo/],
     ["duplicate entries", [{ name: "dist/file", type: "0", body: "a" }, { name: "dist/file", type: "0", body: "b" }], /duplicate promotion archive path: dist\/file/],
-    ["unexpected roots", [{ name: "unexpected/file", type: "0", body: "x" }], /unexpected promotion archive path: unexpected\/file/]
+    ["unexpected roots", [{ name: "unexpected/file", type: "0", body: "x" }], /unexpected promotion archive path: unexpected\/file/],
+    ["AppleDouble sidecar", [{ name: "dist/._index.html", type: "0", body: "metadata" }], /macOS metadata is forbidden in promotion artifacts: dist\/\._index\.html/],
+    ["PAX AppleDouble path", [
+      { name: "PaxHeaders/index", type: "x", body: makePaxRecord("path", "dist/._pax-index.html") },
+      { name: "dist/index.html", type: "0", body: "content" }
+    ], /macOS metadata is forbidden in promotion artifacts: dist\/\._pax-index\.html/],
+    ["GNU long AppleDouble path", [
+      { name: "././@LongLink", type: "L", body: "dist/._gnu-long-index.html\0" },
+      { name: "dist/index.html", type: "0", body: "content" }
+    ], /macOS metadata is forbidden in promotion artifacts: dist\/\._gnu-long-index\.html/],
+    ["Apple metadata directory", [{ name: "dist/__MACOSX/metadata", type: "0", body: "metadata" }], /macOS metadata is forbidden in promotion artifacts: dist\/__MACOSX\/metadata/],
+    ["Finder metadata", [{ name: "dist/.DS_Store", type: "0", body: "metadata" }], /macOS metadata is forbidden in promotion artifacts: dist\/\.DS_Store/],
+    ["hidden trailing archive", [], /promotion archive contains non-zero data after its end marker/, [
+      { name: "dist/._hidden-after-end", type: "0", body: "metadata" }
+    ]]
   ];
-  for (const [label, hostileEntries, rejection] of fixtures) {
+  for (const [label, hostileEntries, rejection, entriesAfterEnd = []] of fixtures) {
     const fixtureBundle = path.join(path.dirname(bundle), `hostile-${label.replaceAll(" ", "-")}`);
     fs.mkdirSync(fixtureBundle);
     const metadata = {
@@ -829,9 +848,13 @@ function testAdversarialArchives(bundle, extracted) {
       { name: "dist", type: "5" },
       ...hostileEntries
     ];
-    const archive = zlib.gzipSync(makeTar(entries));
+    const tarPayload = entriesAfterEnd.length > 0
+      ? Buffer.concat([makeTar(entries), makeTar(entriesAfterEnd)])
+      : makeTar(entries);
+    const archive = zlib.gzipSync(tarPayload);
     const archivePath = path.join(fixtureBundle, "web-promotion.tar.gz");
     fs.writeFileSync(archivePath, archive);
+    if (label === "AppleDouble sidecar") assertMacOsBsdtarAppleDoubleBehavior(archivePath);
     const envelope = {
       ...metadata,
       archiveSha256: crypto.createHash("sha256").update(archive).digest("hex"),
@@ -842,6 +865,89 @@ function testAdversarialArchives(bundle, extracted) {
     assert.notEqual(result.status, 0, `${label} archive must be rejected`);
     assert.match(`${result.stdout}\n${result.stderr}`, rejection, `${label} archive must reach its intended entry rejection`);
   }
+}
+
+function makePaxRecord(key, value) {
+  let length = Buffer.byteLength(` ${key}=${value}\n`) + 1;
+  while (true) {
+    const record = `${length} ${key}=${value}\n`;
+    const actual = Buffer.byteLength(record);
+    if (actual === length) return record;
+    length = actual;
+  }
+}
+
+function assertMacOsBsdtarAppleDoubleBehavior(archive) {
+  if (process.platform !== "darwin") return;
+  const version = childProcess.spawnSync("tar", ["--version"], { cwd: root, encoding: "utf8" });
+  if (!/bsdtar/i.test(`${version.stdout}\n${version.stderr}`)) return;
+  const listing = childProcess.spawnSync("tar", ["-tzf", archive], {
+    cwd: root,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      COPYFILE_DISABLE: "1",
+      COPY_EXTENDED_ATTRIBUTES_DISABLE: "1"
+    }
+  });
+  assert(
+    listing.status !== 0 || !listing.stdout.split("\n").includes("dist/._index.html"),
+    "macOS bsdtar fixture must exercise AppleDouble consumption rather than an ordinary visible entry"
+  );
+}
+
+function testSourceMetadataRejection(manifest) {
+  const metadataDist = path.join(temp, "metadata-dist");
+  fs.mkdirSync(path.join(metadataDist, "assets"), { recursive: true });
+  fs.writeFileSync(path.join(metadataDist, "index.html"), "clean\n");
+  fs.writeFileSync(path.join(metadataDist, "assets", "._index.js"), "AppleDouble\n");
+  const result = run(custody, [
+    "create",
+    "--environment", "testnet",
+    "--commit", commit,
+    "--manifest", relative(manifest),
+    "--dist", relative(metadataDist),
+    "--output", relative(path.join(temp, "metadata-bundle"))
+  ], false);
+  assert.notEqual(result.status, 0, "source AppleDouble sidecars must be rejected");
+  assert.match(`${result.stdout}\n${result.stderr}`, /macOS metadata is forbidden in promotion artifacts: dist\/assets\/\._index\.js/);
+}
+
+function assertPortableArchiveExtraction(bundle) {
+  const destination = path.join(temp, "portable-extraction");
+  fs.mkdirSync(destination);
+  const archive = path.join(bundle, "web-promotion.tar.gz");
+  const extraction = childProcess.spawnSync("tar", [
+    "-xzf", archive,
+    "-C", destination,
+    "--no-same-owner",
+    "--no-same-permissions"
+  ], {
+    cwd: root,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      COPYFILE_DISABLE: "1",
+      COPY_EXTENDED_ATTRIBUTES_DISABLE: "1"
+    }
+  });
+  assert.equal(extraction.status, 0, `${extraction.stdout}\n${extraction.stderr}`);
+  const expected = JSON.parse(fs.readFileSync(path.join(bundle, "custody.json"), "utf8")).files;
+  const actual = listRegularFiles(destination)
+    .map((file) => path.relative(destination, file).split(path.sep).join("/"))
+    .filter((file) => file !== "custody.json")
+    .map((file) => {
+      const body = fs.readFileSync(path.join(destination, file));
+      return {
+        path: file,
+        bytes: body.length,
+        sha256: crypto.createHash("sha256").update(body).digest("hex")
+      };
+    })
+    .sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
+  assert.deepEqual(actual, expected, "portable extraction must contain exactly the custody inventory");
+  assert(!listRegularFiles(destination).some((file) => /(^|[/\\])(?:\._|__MACOSX(?:[/\\]|$)|\.DS_Store$)/.test(path.relative(destination, file))),
+    "portable extraction must not contain macOS metadata sidecars");
 }
 
 function makeTar(entries) {
