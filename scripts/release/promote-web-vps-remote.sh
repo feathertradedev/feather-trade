@@ -762,9 +762,14 @@ promote() {
   watchdog_pid=$!
   watchdog_started=1
   watchdog_wait=0
+  # The watchdog verifies the complete immutable release payload before it
+  # marks itself ready. Real production artifacts can take materially longer
+  # than the tiny fixture used by the promotion tests, especially on a small
+  # VPS, so allow a bounded minute for that integrity pass.
+  watchdog_ready_wait_limit=60
   while [ ! -f "$activation_watchdog_marker" ]; do
     kill -0 "$watchdog_pid" 2>/dev/null || fail "activation watchdog failed to start"
-    [ "$watchdog_wait" -lt 5 ] || fail "activation watchdog did not become ready"
+    [ "$watchdog_wait" -lt "$watchdog_ready_wait_limit" ] || fail "activation watchdog did not become ready"
     watchdog_wait=$((watchdog_wait + 1))
     sleep 1
   done

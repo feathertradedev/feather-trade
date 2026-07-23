@@ -169,6 +169,8 @@ function validateWorkflowContract() {
   assert.match(fs.readFileSync(remoteAdapter, "utf8"), /release payload integrity check failed/);
   assert.match(fs.readFileSync(remoteAdapter, "utf8"), /activation record anchor identity does not match/);
   assert.match(fs.readFileSync(remoteAdapter, "utf8"), /lease_watch/);
+  assert.match(fs.readFileSync(remoteAdapter, "utf8"), /watchdog_ready_wait_limit=60/,
+    "production payload verification must have a bounded watchdog startup allowance");
   assert.match(fs.readFileSync(remoteAdapter, "utf8"), /PROMOTION_CONFIRM=confirmed/);
   const custodySource = fs.readFileSync(custody, "utf8");
   assert.match(custodySource, /validateArchiveEntries\(archive\)/);
