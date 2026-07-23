@@ -11,6 +11,10 @@ const configuredWalletModalReadyGraceMs = Number(import.meta.env.VITE_WALLET_MOD
 const WALLET_MODAL_READY_GRACE_MS = Number.isFinite(configuredWalletModalReadyGraceMs)
   ? Math.min(10_000, Math.max(0, configuredWalletModalReadyGraceMs))
   : 2_000;
+const configuredWalletModalOpenTimeoutMs = Number(import.meta.env.VITE_WALLET_MODAL_OPEN_TIMEOUT_MS);
+const WALLET_MODAL_OPEN_TIMEOUT_MS = Number.isFinite(configuredWalletModalOpenTimeoutMs)
+  ? Math.min(15_000, Math.max(250, configuredWalletModalOpenTimeoutMs))
+  : 5_000;
 
 const walletNetworks = (
   publicReleaseEnvironment === "sepolia"
@@ -121,6 +125,10 @@ type WalletModal = ReturnType<typeof loadAppKit>;
 let appKit: WalletModal | null = null;
 let appKitInitializationAttempted = false;
 let walletModalOpen = false;
+let walletModalOpenGeneration = 0;
+let walletModalOpenOperation: Promise<void> | null = null;
+let walletModalUnavailableError: Error | null = null;
+let walletModalCleanupGeneration: number | null = null;
 let walletModalSubscriptionAttached = false;
 const walletModalSubscribers = new Set<(open: boolean) => void>();
 
@@ -154,6 +162,20 @@ function publishWalletModalOpen(open: boolean): void {
   for (const listener of walletModalSubscribers) listener(open);
 }
 
+function closeWalletModalSafely(walletModal: WalletModal, generation: number): void {
+  publishWalletModalOpen(false);
+  if (walletModalOpenGeneration !== generation || !walletModal.getState().open) return;
+  if (walletModalCleanupGeneration === generation) return;
+  walletModalCleanupGeneration = generation;
+  try {
+    void walletModal.close().catch((error: unknown) => {
+      console.warn("Wallet modal cleanup did not complete.", error);
+    });
+  } catch (error) {
+    console.warn("Wallet modal cleanup could not start.", error);
+  }
+}
+
 function getWalletModal(): WalletModal | null {
   if (!walletModalConfigured) return null;
   if (appKitInitializationAttempted) return appKit;
@@ -179,7 +201,7 @@ async function waitForWalletModalReadiness(): Promise<void> {
   ]);
 }
 
-export async function openWalletModal(): Promise<void> {
+async function performWalletModalOpen(generation: number): Promise<void> {
   const walletModal = getWalletModal();
   if (walletModal === null) {
     throw new Error("Wallet modal is not configured");
@@ -191,10 +213,67 @@ export async function openWalletModal(): Promise<void> {
   // Mark ownership before AppKit mounts its portal. This closes the small gap
   // in which an immediate Escape could otherwise reach the underlying wizard.
   publishWalletModalOpen(true);
+  const openPromise = Promise.resolve().then(() => walletModal.open({ view: "Connect" }));
+  let timedOut = false;
+  let openTimeout: number | undefined;
   try {
-    await walletModal.open({ view: "Connect" });
+    await Promise.race([
+      openPromise,
+      new Promise<never>((_, reject) => {
+        openTimeout = window.setTimeout(
+          () => {
+            timedOut = true;
+            reject(new Error("Wallet chooser did not open before its safety deadline"));
+          },
+          WALLET_MODAL_OPEN_TIMEOUT_MS
+        );
+      })
+    ]);
+    if (walletModalOpenGeneration !== generation || !walletModal.getState().open) {
+      throw new Error("Wallet chooser completed without entering its open state");
+    }
   } catch (error) {
-    publishWalletModalOpen(false);
+    if (timedOut) {
+      walletModalUnavailableError = error instanceof Error
+        ? error
+        : new Error("Wallet chooser did not open before its safety deadline");
+    }
+    closeWalletModalSafely(walletModal, generation);
+    // AppKit does not expose cancellation for the prefetch awaited by open().
+    // If a timed-out request eventually settles and mounts its portal, close
+    // that stale modal. The timeout latches AppKit unavailable for this page
+    // session, so no newer AppKit attempt can be displaced by this cleanup.
+    void openPromise.then(() => {
+      closeWalletModalSafely(walletModal, generation);
+    }).catch(() => {});
     throw error;
+  } finally {
+    if (openTimeout !== undefined) window.clearTimeout(openTimeout);
   }
+}
+
+export function openWalletModal(): Promise<void> {
+  if (walletModalUnavailableError !== null) {
+    return Promise.reject(walletModalUnavailableError);
+  }
+  if (walletModalOpenOperation !== null) {
+    return walletModalOpenOperation;
+  }
+  if (walletModalIsOpen()) {
+    return Promise.resolve();
+  }
+
+  const generation = ++walletModalOpenGeneration;
+  walletModalCleanupGeneration = null;
+  const operation = performWalletModalOpen(generation);
+  walletModalOpenOperation = operation;
+  void operation.then(
+    () => {
+      if (walletModalOpenOperation === operation) walletModalOpenOperation = null;
+    },
+    () => {
+      if (walletModalOpenOperation === operation) walletModalOpenOperation = null;
+    }
+  );
+  return operation;
 }

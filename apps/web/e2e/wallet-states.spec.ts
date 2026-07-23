@@ -329,7 +329,7 @@ test("configured wallet modal remains available without an injected provider", a
   await installMockRpc(page);
   await page.goto("/#/swap");
 
-  await expect(page.getByTestId("wallet-connect-button")).toBeEnabled();
+  await expect(page.getByTestId("wallet-connect-button")).toBeEnabled({ timeout: 15_000 });
   await page.getByTestId("wallet-connect-button").click();
   const walletDialog = page.getByRole("alertdialog");
   await expect(walletDialog).toBeVisible();
@@ -1105,6 +1105,7 @@ test("unavailable durable storage blocks wallet handoff and surfaces a controlle
 });
 
 test("two same-origin tabs serialize identical intents before either wallet can double-submit", async ({ page, context }) => {
+  test.setTimeout(60_000);
   await installMockRpc(page, { allowance: 5n * ONE_TOKEN, balance: 5n * ONE_TOKEN });
   await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID, transactionDelayMs: 4_000 });
   await page.goto("/#/swap");

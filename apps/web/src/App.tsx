@@ -1056,10 +1056,24 @@ function BinGlyph({ mode }: { mode: "spot" | "curve" | "bidask" }) {
   return <span className={`bin-glyph ${mode}`} aria-hidden="true">{heights.map((height, index) => <i key={index} style={{ height }} />)}</span>;
 }
 
+const BROWSER_WALLET_FALLBACK_EVENT = "feather:browser-wallet-fallback";
+
+interface BrowserWalletFallbackRequest {
+  handled: boolean;
+}
+
+function requestBrowserWalletFallback(): boolean {
+  const detail: BrowserWalletFallbackRequest = { handled: false };
+  window.dispatchEvent(new CustomEvent<BrowserWalletFallbackRequest>(BROWSER_WALLET_FALLBACK_EVENT, { detail }));
+  return detail.handled;
+}
+
 function WalletPanel({ activeChain }: { activeChain: Chain }) {
   const [localFailure, setLocalFailure] = useState<WalletFailure | null>(null);
   const [discoverySettled, setDiscoverySettled] = useState(false);
   const walletDialogRef = useRef<HTMLDialogElement>(null);
+  const walletModalFlowRef = useRef<Promise<void> | null>(null);
+  const browserWalletConnectInFlightRef = useRef<string | null>(null);
   const account = useAccount();
   const activeWalletChainId = useChainId();
   const { connect, connectors, error: connectError, isPending, reset: resetConnect } = useConnect();
@@ -1069,6 +1083,7 @@ function WalletPanel({ activeChain }: { activeChain: Chain }) {
   const availableConnectors = discoveredConnectors.length > 0
     ? discoveredConnectors.filter((connector, index, all) => all.findIndex((candidate) => candidate.id === connector.id) === index)
     : connectors;
+  const browserWalletConnectors = availableConnectors.filter((connector) => connector.type === "injected");
   const connected = account.status === "connected";
   const onWrongChain = connected && activeWalletChainId !== activeChain.id;
   const noProviderFailure: WalletFailure | null = discoverySettled && !walletModalConfigured && connectors.length === 0
@@ -1082,7 +1097,8 @@ function WalletPanel({ activeChain }: { activeChain: Chain }) {
     return () => window.clearTimeout(timeout);
   }, []);
 
-  const connectWith = async (connector: (typeof connectors)[number]) => {
+  type WalletConnector = (typeof connectors)[number];
+  const connectWith = useCallback(async (connector: WalletConnector): Promise<boolean> => {
     resetConnect();
     setLocalFailure(null);
     const provider = await connector.getProvider().catch(() => undefined) as {
@@ -1090,29 +1106,75 @@ function WalletPanel({ activeChain }: { activeChain: Chain }) {
     } | undefined;
     if (!provider) {
       setLocalFailure({ action: "Install or enable an EIP-1193 wallet, then reload this page.", kind: "missing" });
-      return;
+      return false;
     }
     if (provider._metamask?.isUnlocked && !await provider._metamask.isUnlocked().catch(() => true)) {
       setLocalFailure({ action: "Unlock the selected wallet, then connect again.", kind: "locked" });
-      return;
+      return false;
     }
     connect({ connector });
-  };
+    return true;
+  }, [connect, resetConnect]);
+  const browserWalletConnectorsRef = useRef<WalletConnector[]>(browserWalletConnectors);
+  const connectWithRef = useRef(connectWith);
+  browserWalletConnectorsRef.current = browserWalletConnectors;
+  connectWithRef.current = connectWith;
+
+  const openBrowserWalletFallback = useCallback((): boolean => {
+    const currentConnectors = browserWalletConnectorsRef.current;
+    if (currentConnectors.length === 1) {
+      const connector = currentConnectors[0];
+      if (browserWalletConnectInFlightRef.current === connector.uid) return true;
+      browserWalletConnectInFlightRef.current = connector.uid;
+      void connectWithRef.current(connector).then((started) => {
+        if (!started && browserWalletConnectInFlightRef.current === connector.uid) {
+          browserWalletConnectInFlightRef.current = null;
+        }
+      });
+      return true;
+    }
+    if (currentConnectors.length > 1) {
+      const dialog = walletDialogRef.current;
+      if (dialog !== null && !dialog.open) dialog.showModal();
+      return dialog !== null;
+    }
+    return false;
+  }, []);
+
+  useEffect(() => {
+    if (connected || connectError !== null || localFailure !== null) {
+      browserWalletConnectInFlightRef.current = null;
+    }
+  }, [connectError, connected, localFailure]);
+
+  useEffect(() => {
+    const handleBrowserWalletFallback = (event: Event) => {
+      const request = event as CustomEvent<BrowserWalletFallbackRequest>;
+      if (!request.detail.handled) request.detail.handled = openBrowserWalletFallback();
+    };
+    window.addEventListener(BROWSER_WALLET_FALLBACK_EVENT, handleBrowserWalletFallback);
+    return () => window.removeEventListener(BROWSER_WALLET_FALLBACK_EVENT, handleBrowserWalletFallback);
+  }, [openBrowserWalletFallback]);
 
   const openConnectionFlow = () => {
     resetConnect();
     setLocalFailure(null);
     if (walletModalConfigured) {
-      void openWalletModal().catch(() => {
-        setLocalFailure({ action: "The wallet chooser could not open. Reload the page and try again.", kind: "provider-error" });
+      if (walletModalFlowRef.current !== null) return;
+      const flow = openWalletModal();
+      walletModalFlowRef.current = flow;
+      void flow.catch(() => {
+        if (!openBrowserWalletFallback()) {
+          setLocalFailure({ action: "The wallet chooser could not open. Reload the page and try again.", kind: "provider-error" });
+        }
+      }).finally(() => {
+        if (walletModalFlowRef.current === flow) walletModalFlowRef.current = null;
       });
       return;
     }
-    if (availableConnectors.length === 1) {
-      void connectWith(availableConnectors[0]);
-      return;
+    if (!openBrowserWalletFallback()) {
+      setLocalFailure({ action: "No browser wallet was found. Install a compatible wallet, then reload this page.", kind: "missing" });
     }
-    walletDialogRef.current?.showModal();
   };
 
   if (!connected) {
@@ -1128,7 +1190,7 @@ function WalletPanel({ activeChain }: { activeChain: Chain }) {
           {isPending ? <LoaderCircle className="spin" size={18} /> : <Wallet size={18} />}
           <span>{isPending ? "Connecting" : "Connect wallet"}</span>
         </button>
-        {!walletModalConfigured && availableConnectors.length > 1 ? (
+        {browserWalletConnectors.length > 1 ? (
           <dialog
             aria-labelledby="wallet-provider-title"
             className="wallet-provider-dialog"
@@ -1145,7 +1207,7 @@ function WalletPanel({ activeChain }: { activeChain: Chain }) {
                 </button>
               </header>
               <div className="wallet-provider-choices" data-testid="wallet-provider-choices" role="group" aria-label="Choose wallet provider">
-                {availableConnectors.map((connector) => (
+                {browserWalletConnectors.map((connector) => (
                   <button
                     className="wallet-provider-option"
                     data-provider-id={connector.id}
@@ -5823,7 +5885,11 @@ function PoolCreationWizard({
         setError("Use Connect wallet in the application header before reviewing pool creation.");
         return;
       }
-      void openWalletModal().catch(() => setError("The wallet chooser could not open. Reload the page and try again."));
+      void openWalletModal().catch(() => {
+        if (!requestBrowserWalletFallback()) {
+          setError("The wallet chooser could not open. Reload the page and try again.");
+        }
+      });
       return;
     }
     if (!walletOnCreationChain) {

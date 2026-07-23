@@ -23,6 +23,7 @@ export default defineConfig({
     env: {
       VITE_ANALYTICS_LOCALNET_URL: "http://127.0.0.1:8787/graphql",
       VITE_REOWN_PROJECT_ID: testReownProjectId,
+      VITE_WALLET_MODAL_OPEN_TIMEOUT_MS: "3000",
       VITE_WALLET_MODAL_READY_GRACE_MS: "0"
     },
     reuseExistingServer: !process.env.CI,

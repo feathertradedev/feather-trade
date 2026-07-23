@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "./fixtures/test";
+import { expect, REOWN_API_PATTERN, test, type Page } from "./fixtures/test";
 import { decodeFunctionData, type Address } from "viem";
 
 import { lbRouterAbi } from "../../../packages/sdk/src/abi";
@@ -65,9 +65,20 @@ async function submitReviewedCreation(page: Page) {
   await page.getByTestId("pool-create-submit").click();
 }
 
-test("wallet chooser dismissal preserves pool configuration and does not close the wizard", async ({ page }) => {
+test("wallet chooser outage fallback and dismissal preserve pool configuration", async ({ context, page }) => {
+  await context.unroute(REOWN_API_PATTERN);
+  await context.route(REOWN_API_PATTERN, () => new Promise(() => {}));
   await installMockRpc(page, creationRpc);
-  await installMockWallet(page, { allowTransactions: false, chainId: LOCALNET_CHAIN_ID });
+  await installMockWallet(page, {
+    additionalProviders: [{
+      account: "0x1111111111111111111111111111111111111111",
+      name: "Backup Wallet",
+      rdns: "org.example.backup",
+      uuid: "robinhood-lb-backup-wallet"
+    }],
+    allowTransactions: false,
+    chainId: LOCALNET_CHAIN_ID
+  });
   await page.goto("/#/pools");
   await page.getByTestId("pool-create-launch").click();
   await page.getByTestId("pool-create-token-x").fill(WNATIVE);
@@ -78,7 +89,7 @@ test("wallet chooser dismissal preserves pool configuration and does not close t
   await expect(page.getByTestId("pool-create-review-action")).toHaveText("Connect wallet to review");
 
   await page.getByTestId("pool-create-review-action").click();
-  await expect(page.getByRole("alertdialog")).toBeVisible();
+  await expect(page.getByTestId("wallet-provider-choices")).toBeVisible();
   await page.keyboard.press("Escape");
   await page.waitForTimeout(250);
   await expect(page.getByTestId("pool-creation-wizard")).toBeVisible();
@@ -87,7 +98,11 @@ test("wallet chooser dismissal preserves pool configuration and does not close t
     ["feather.pool-creation-open.v1.localnet", "true"]
   ]);
 
-  await connectMockWallet(page);
+  await page.getByTestId("wallet-connect-button").click();
+  const walletChoices = page.getByTestId("wallet-provider-choices");
+  await expect(walletChoices).toBeVisible();
+  await walletChoices.getByRole("button", { name: /Mock MetaMask/i }).click();
+  await expect(page.getByTestId("wallet-account-button")).toContainText("0xf39F...2266");
   await expect(page.getByTestId("pool-create-price")).toHaveValue("1");
   await expect(page.getByTestId("pool-create-review-action")).toHaveText("Review exact creation");
 });
