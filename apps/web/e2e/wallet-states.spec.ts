@@ -2129,11 +2129,32 @@ test("approval becoming sufficient in the final guard is a benign skip that enab
   await approveButton.click();
   await expect(page.getByTestId("gas-review")).toContainText("LB operator approval");
   const readsBeforeSubmit = rpc.snapshot().ethCalls.filter((call) => call.functionName === "isApprovedForAll").length;
+  const gasEstimatesBeforeSubmit = rpc.snapshot().gasEstimatesCompleted;
+  let releaseFinalGuard!: () => void;
+  let observeFinalGuard!: () => void;
+  const finalGuardReleased = new Promise<void>((resolve) => {
+    releaseFinalGuard = resolve;
+  });
+  const finalGuardObserved = new Promise<void>((resolve) => {
+    observeFinalGuard = resolve;
+  });
+  rpc.update({
+    beforeLbApprovalResult: async ({ completedGasEstimates, readNumber }) => {
+      if (
+        completedGasEstimates <= gasEstimatesBeforeSubmit ||
+        readNumber !== readsBeforeSubmit + 3
+      ) return;
+      observeFinalGuard();
+      await finalGuardReleased;
+    }
+  });
   const secondClick = approveButton.click();
-  await expect.poll(() => rpc.snapshot().ethCalls.filter((call) => call.functionName === "isApprovedForAll").length).toBeGreaterThanOrEqual(readsBeforeSubmit + 2);
+  await finalGuardObserved;
   rpc.update({ lbApproved: true });
+  releaseFinalGuard();
   await secondClick;
 
+  expect(rpc.snapshot().ethCalls.filter((call) => call.functionName === "isApprovedForAll")).toHaveLength(readsBeforeSubmit + 3);
   await expect(page.getByTestId("lb-operator-approval-disclosure")).toHaveAttribute("data-approval-state", "approved");
   await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled();
   expect((await readMockWallet(page)).sentTransactions).toEqual([]);
@@ -3522,6 +3543,9 @@ test("same-pool partial-to-full route prefill cannot reuse the partial receipt",
   await connectWallet(page);
   await clickReviewedAction(page, "liquidity-remove-button");
   await expect(page.getByText("Liquidity removed")).toBeVisible();
+  const journalCountBeforeRouteChange = await persistedTransactionJournalCount(page);
+  const journalHashesBeforeRouteChange = await persistedTransactionJournalHashes(page);
+  expect(journalCountBeforeRouteChange).toBeGreaterThan(0);
 
   await page.evaluate((pair) => {
     const root = document.documentElement;
@@ -3537,6 +3561,8 @@ test("same-pool partial-to-full route prefill cannot reuse the partial receipt",
   await expect(page.locator("#remove-percent")).toHaveValue("100");
   await expect(page.getByText("Liquidity removed")).toHaveCount(0);
   await expect(page.locator("html")).toHaveAttribute("data-stale-remove-receipt-paint", "false");
+  expect(await persistedTransactionJournalCount(page)).toBe(journalCountBeforeRouteChange);
+  expect(await persistedTransactionJournalHashes(page)).toEqual(journalHashesBeforeRouteChange);
 });
 
 test("portfolio exits fail closed when the exact analytics bin set is missing from the indexer", async ({ page }) => {

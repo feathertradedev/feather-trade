@@ -1579,6 +1579,7 @@ function ContentView({
         <LiquidityView
           environmentKey={environmentKey}
           initialSection={liquiditySection}
+          key={`${selectedPool?.id ?? "none"}:${portfolioAction ?? liquiditySection ?? "default"}`}
           onRefresh={onRefresh}
           onSelectedPoolChange={handleSelectedPoolChange}
           poolOptions={actionPoolOptions}

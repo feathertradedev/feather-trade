@@ -44,6 +44,10 @@ const RPC_ABI = [...erc20Abi, ...lbFactoryAbi, ...lbPairAbi, ...lbQuoterAbi, ...
 const ZERO_HOOKS = `0x${"0".repeat(64)}` as Hex;
 
 export interface MockRpcOptions {
+  beforeLbApprovalResult?: (context: {
+    completedGasEstimates: number;
+    readNumber: number;
+  }) => Promise<void> | void;
   activeId?: number;
   analyticsIncludeOtherOwner?: boolean;
   analyticsMetricTokenMismatch?: boolean;
@@ -1552,6 +1556,10 @@ async function handleEthCall(
   }
 
   if (functionName === "isApprovedForAll") {
+    await options.beforeLbApprovalResult?.({
+      completedGasEstimates: state.gasEstimatesCompleted,
+      readNumber: state.ethCalls.filter((item) => item.functionName === "isApprovedForAll").length
+    });
     return encodeFunctionResult({ abi: lbPairAbi, functionName, result: options.lbApproved ?? true });
   }
 

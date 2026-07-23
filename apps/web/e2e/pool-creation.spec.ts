@@ -81,8 +81,8 @@ test("wallet chooser outage fallback and dismissal preserve pool configuration",
   });
   await page.goto("/#/pools");
   await page.getByTestId("pool-create-launch").click();
-  await page.getByTestId("pool-create-token-x").fill(WNATIVE);
-  await page.getByTestId("pool-create-token-y").selectOption(USDT);
+  await expect(page.getByTestId("pool-create-token-x")).toHaveValue(WNATIVE);
+  await expect(page.getByTestId("pool-create-token-y")).toHaveValue(USDT);
   await page.getByRole("button", { name: "Continue to configure" }).click();
   await page.getByTestId("pool-create-price").fill("1");
   await page.getByTestId("pool-create-risk-ack").check();
