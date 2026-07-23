@@ -77,6 +77,7 @@ export async function createBlockSource(options = {}) {
   let priceRounds = new Map();
   let nextBlock = config.startBlock;
   let firstFetch = true;
+  let identityRefreshPending = false;
 
   await assertChain(config);
 
@@ -86,7 +87,11 @@ export async function createBlockSource(options = {}) {
     if (persistedCursor === null || retainedHead === null || retainedHead === undefined) return null;
     const cursor = parseCursor(persistedCursor);
     const retainedNumber = safeNumber(retainedHead.number, "retained canonical head number");
-    if (cursor !== retainedNumber + 1 || retainedNumber < config.startBlock) return null;
+    if (
+      retainedNumber < config.startBlock ||
+      cursor < config.startBlock ||
+      cursor > retainedNumber + 1
+    ) return null;
 
     const rawHeader = await rpc(config, "eth_getBlockByNumber", [quantity(retainedNumber), false], signal);
     const header = parseHeader(rawHeader, retainedNumber);
@@ -129,9 +134,14 @@ export async function createBlockSource(options = {}) {
       poolProgressAfter: clonePoolProgress(poolProgress),
       priceRoundsAfter: clonePriceRounds(priceRounds)
     });
-    nextBlock = cursor;
+    nextBlock = retainedNumber + 1;
     firstFetch = false;
-    return persistedCursor;
+    // Live ingestion advances the retained canonical head without rewriting the
+    // completed backfill cursor. Resume from the attested head, then publish one
+    // fresh snapshot on the next canonical block so newly added identity fields
+    // can enrich legacy checkpoints without mutating an already-persisted block.
+    identityRefreshPending = true;
+    return String(nextBlock);
   }
 
   async function fetchPage(cursor, signal) {
@@ -210,12 +220,14 @@ export async function createBlockSource(options = {}) {
         start,
         end,
         expectedParentHash,
+        identityRefreshPending,
         signal
       );
       blocks = loaded.blocks;
       pairs = loaded.pairs;
       poolProgress = loaded.poolProgress;
       priceRounds = loaded.priceRounds;
+      if (identityRefreshPending && loaded.blocks.length > 0) identityRefreshPending = false;
       for (const state of loaded.states) {
         canonicalBlocks.set(safeNumber(state.block.number, "canonical block number"), {
           block: state.block,
@@ -275,6 +287,7 @@ async function loadRange(
   start,
   end,
   expectedParentHash,
+  forceIdentityRefresh,
   signal
 ) {
   const pairs = clonePairs(initialPairs);
@@ -339,7 +352,10 @@ async function loadRange(
     }
 
     const createdInBlock = new Set(blockFactoryLogs.map((log) => parsePairCreatedLog(log).pair));
-    const touchedPairs = [...new Set([...createdInBlock, ...logsByPair.keys()])].sort();
+    const refreshIdentities = new Set(
+      forceIdentityRefresh && header === headers[0] ? pairs.keys() : []
+    );
+    const touchedPairs = [...new Set([...createdInBlock, ...logsByPair.keys(), ...refreshIdentities])].sort();
     const eventsByPair = new Map();
     const snapshots = [];
 
@@ -363,7 +379,7 @@ async function loadRange(
         events: parsed.map((entry) => ({ ...entry.event, source: entry.source })),
         rawSourceEventIds: pairLogsForBlock.map(logEventId),
         snapshotSource,
-        forceReplace: createdInBlock.has(pairAddress),
+        forceReplace: createdInBlock.has(pairAddress) || refreshIdentities.has(pairAddress),
         signal
       });
       snapshots.push({ identity, pairState, snapshotSource, observation });

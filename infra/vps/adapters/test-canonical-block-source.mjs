@@ -47,7 +47,7 @@ const TOPIC = {
 };
 
 test("direct RPC source discovers pools, hash-pins state and Chainlink prices, deduplicates rounds, and repairs reorgs", async () => {
-  const state = { reorg: false, calls: [], latestCalls: [], codeChecks: [], logFilters: [] };
+  const state = { reorg: false, head: 102, calls: [], latestCalls: [], codeChecks: [], logFilters: [] };
   const server = createServer(async (request, response) => {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
@@ -196,12 +196,18 @@ test("direct RPC source discovers pools, hash-pins state and Chainlink prices, d
       pricePolicies: PRICE_POLICIES
     });
     assert.equal(await resumedSource.startupCursor({
-      persistedCursor: "103",
+      persistedCursor: "102",
       retainedHead: second.canonicalHead
     }), "103");
+    state.head = 103;
     const resumed = await resumedSource.fetchPage("103");
-    assert.deepEqual(resumed.blocks, []);
-    assert.equal(resumed.nextCursor, "103");
+    assert.deepEqual(resumed.blocks.map((block) => block.number), [103n]);
+    assert.equal(resumed.nextCursor, "104");
+    const resumedSnapshot = resumed.blocks[0].events.find((event) => event.kind === "pair-snapshot");
+    assert.equal(resumedSnapshot?.factoryAddress, FACTORY);
+    assert.equal(resumedSnapshot?.createdAtBlock, 100n);
+    assert.equal(resumedSnapshot?.creationTransactionHash, txHash(100));
+    assert.equal(resumedSnapshot?.poolState?.replaceBinWindow, true);
 
     state.reorg = true;
     const replacement = await source.fetchPage("103");
@@ -268,7 +274,7 @@ function rpcResult(payload, state) {
     state.codeChecks.push(target);
     return [FACTORY, FEED_X, FEED_Y].includes(target) ? "0x60016000" : "0x";
   }
-  if (payload.method === "eth_blockNumber") return quantity(102);
+  if (payload.method === "eth_blockNumber") return quantity(state.head);
   if (payload.method === "eth_getBlockByNumber") {
     const number = Number(BigInt(payload.params[0]));
     return block(number, state.reorg);
@@ -425,7 +431,7 @@ function rawLog({ number, index, address, topics, data, reorg }) {
 }
 
 function block(number, reorg) {
-  if (number < 100 || number > 102) return null;
+  if (number < 100 || number > 103) return null;
   return {
     number: quantity(number),
     hash: blockHash(number, reorg && number >= 101),
@@ -444,7 +450,7 @@ function blockHash(number, reorg) {
 }
 
 function blockNumberForHash(value, reorg) {
-  for (let number = 100; number <= 102; number += 1) {
+  for (let number = 100; number <= 103; number += 1) {
     if (blockHash(number, reorg && number >= 101) === value) return number;
   }
   throw new Error(`Unknown canonical block hash ${value}`);
