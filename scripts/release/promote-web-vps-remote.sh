@@ -204,6 +204,7 @@ activation_record_paths() {
   activation_confirmation="$activation_records/$record_environment-$record_commit-$record_run_token.confirmed"
   activation_watchdog_marker="$activation_records/$record_environment-$record_commit-$record_run_token.watchdog"
   activation_intent="$activation_records/$record_environment-$record_commit-$record_run_token.intent"
+  activation_rollback_completion="$activation_records/$record_environment-$record_commit-$record_run_token.rollback"
 }
 
 write_activation_intent() {
@@ -452,6 +453,84 @@ write_confirmation() {
   mv "$confirmation_tmp" "$confirmation_file"
 }
 
+write_rollback_completion() {
+  rollback_completion_file=$1
+  rollback_completion_target=$2
+  rollback_completion_identity=$3
+  rollback_completion_tmp="$rollback_completion_file.tmp.$$"
+  {
+    printf '%s\n' "schema=robinhood.web-promotion-rollback.v1"
+    printf '%s\n' "record_sha256=$record_checksum"
+    printf '%s\n' "rollback_target=$rollback_completion_target"
+    printf '%s\n' "current_link_identity=$rollback_completion_identity"
+  } > "$rollback_completion_tmp"
+  rollback_completion_checksum=$(sha256_file "$rollback_completion_tmp")
+  printf '%s\n' "rollback_sha256=$rollback_completion_checksum" >> "$rollback_completion_tmp"
+  chmod 0400 "$rollback_completion_tmp"
+  mv "$rollback_completion_tmp" "$rollback_completion_file"
+}
+
+validate_rollback_completion() {
+  rollback_completion_file=$1
+  [ -f "$rollback_completion_file" ] && [ ! -L "$rollback_completion_file" ] || fail "rollback completion evidence is invalid"
+  [ "$(wc -l < "$rollback_completion_file" | tr -d '[:space:]')" = "5" ] || fail "rollback completion evidence shape is invalid"
+  rollback_completion_line_1=$(sed -n '1p' "$rollback_completion_file")
+  rollback_completion_line_2=$(sed -n '2p' "$rollback_completion_file")
+  rollback_completion_line_3=$(sed -n '3p' "$rollback_completion_file")
+  rollback_completion_line_4=$(sed -n '4p' "$rollback_completion_file")
+  rollback_completion_line_5=$(sed -n '5p' "$rollback_completion_file")
+  [ "$rollback_completion_line_1" = "schema=robinhood.web-promotion-rollback.v1" ] || fail "rollback completion evidence schema is invalid"
+  [ "$rollback_completion_line_2" = "record_sha256=$record_checksum" ] || fail "rollback completion evidence record identity is invalid"
+  rollback_completion_target=${rollback_completion_line_3#rollback_target=}
+  rollback_completion_identity=${rollback_completion_line_4#current_link_identity=}
+  [ "$rollback_completion_line_3" = "rollback_target=$rollback_completion_target" ] || fail "rollback completion evidence target is invalid"
+  [ "$rollback_completion_line_4" = "current_link_identity=$rollback_completion_identity" ] || fail "rollback completion evidence pointer identity is invalid"
+  [ "$rollback_completion_target" = "$record_rollback_target" ] || fail "rollback completion evidence target does not match its activation record"
+  if [ "$rollback_completion_target" = "none" ]; then
+    [ "$rollback_completion_identity" = "none" ] || fail "rollback completion evidence for an empty pointer has an identity"
+  else
+    validate_release_target "$rollback_completion_target"
+    validate_link_identity "$rollback_completion_identity"
+  fi
+  rollback_completion_checksum=${rollback_completion_line_5#rollback_sha256=}
+  [ "$rollback_completion_line_5" = "rollback_sha256=$rollback_completion_checksum" ] || fail "rollback completion evidence checksum is invalid"
+  validate_digest "$rollback_completion_checksum"
+  computed_rollback_completion_checksum=$(sed -n '1,4p' "$rollback_completion_file" | sha256_stream)
+  [ "$computed_rollback_completion_checksum" = "$rollback_completion_checksum" ] || fail "rollback completion evidence integrity check failed"
+}
+
+rollback_completion_matches_current() {
+  rollback_completion_root=$1
+  rollback_completion_current="$rollback_completion_root/current"
+  validate_rollback_completion "$activation_rollback_completion"
+  if [ "$rollback_completion_target" = "none" ]; then
+    [ ! -e "$rollback_completion_current" ] && [ ! -L "$rollback_completion_current" ]
+    return
+  fi
+  [ -L "$rollback_completion_current" ] || return 1
+  [ "$(readlink "$rollback_completion_current")" = "$rollback_completion_target" ] || return 1
+  [ "$(link_identity "$rollback_completion_current")" = "$rollback_completion_identity" ]
+}
+
+persist_rollback_completion() {
+  rollback_completion_root=$1
+  rollback_completion_current="$rollback_completion_root/current"
+  if [ -e "$activation_rollback_completion" ] || [ -L "$activation_rollback_completion" ]; then
+    rollback_completion_matches_current "$rollback_completion_root" || fail "rollback completion evidence conflicts with the current pointer"
+    return
+  fi
+  if [ "$record_rollback_target" = "none" ]; then
+    [ ! -e "$rollback_completion_current" ] && [ ! -L "$rollback_completion_current" ] || fail "rollback completion cannot bind a non-empty current pointer"
+    rollback_completion_identity_value=none
+  else
+    [ -L "$rollback_completion_current" ] || fail "rollback completion cannot bind a missing current pointer"
+    [ "$(readlink "$rollback_completion_current")" = "$record_rollback_target" ] || fail "rollback completion cannot bind a different current target"
+    rollback_completion_identity_value=$(link_identity "$rollback_completion_current")
+  fi
+  write_rollback_completion "$activation_rollback_completion" "$record_rollback_target" "$rollback_completion_identity_value"
+  rollback_completion_matches_current "$rollback_completion_root" || fail "rollback completion evidence could not be verified"
+}
+
 activation_is_confirmed() {
   if [ ! -e "$activation_confirmation" ] && [ ! -L "$activation_confirmation" ]; then
     return 1
@@ -493,6 +572,34 @@ current_release_is_confirmed() {
     [ "$record_link_identity" = "$confirmed_current_identity" ] || continue
     activation_record_is_current "$confirmed_root" || fail "current activation anchor does not match its record"
     activation_is_confirmed || fail "current release has an unconfirmed activation lease"
+    return 0
+  done
+  return 1
+}
+
+current_release_has_unconfirmed_activation() {
+  pending_root=$1
+  pending_environment=$2
+  pending_commit=$3
+  pending_current="$pending_root/current"
+  [ -L "$pending_current" ] || return 1
+  [ "$(readlink "$pending_current")" = "releases/$pending_commit/dist" ] || return 1
+  pending_current_identity=$(link_identity "$pending_current")
+  pending_archive_digest=$(sed -n '1p' "$pending_root/releases/$pending_commit/.archive-sha256")
+  validate_digest "$pending_archive_digest"
+  pending_prefix="$pending_environment-$pending_commit-"
+  for pending_record in "$pending_root/.promotion-records/$pending_prefix"*.record; do
+    [ -f "$pending_record" ] && [ ! -L "$pending_record" ] || continue
+    pending_name=${pending_record##*/}
+    pending_run_token=${pending_name#"$pending_prefix"}
+    pending_run_token=${pending_run_token%.record}
+    validate_run_token "$pending_run_token"
+    validate_activation_record "$pending_root" "$pending_environment" "$pending_commit" "$pending_archive_digest" "$pending_run_token"
+    [ "$record_link_identity" = "$pending_current_identity" ] || continue
+    activation_record_is_current "$pending_root" || fail "current activation anchor does not match its record"
+    if activation_is_confirmed; then
+      return 1
+    fi
     return 0
   done
   return 1
@@ -715,6 +822,10 @@ promote() {
     current_commit=$validated_target_commit
     validate_release_directory "$root/releases/$current_commit" - "$current_commit" "$environment"
     if [ "$current_target" != "$release_target" ]; then
+      if current_release_has_unconfirmed_activation "$root" "$environment" "$current_commit"; then
+        fail "current release is bound to an unconfirmed activation and cannot be used as a rollback candidate"
+      fi
+      activation_record_paths "$root" "$environment" "$commit" "$run_token"
       rollback_target=$current_target
       if [ -e "$previous" ] && [ ! -L "$previous" ]; then
         fail "previous release pointer is not a symbolic link"
@@ -936,6 +1047,7 @@ lease_watch() {
       ln -s "$record_rollback_target" "$current_tmp"
       replace_link "$current_tmp" "$current"
     fi
+    persist_rollback_completion "$root"
     rm -f "$activation_intent"
     return
   fi
@@ -978,6 +1090,13 @@ recover_rollback() {
   fi
   if ! activation_record_is_current "$root"; then
     validate_observed_current "$root" "$environment"
+    if [ -e "$activation_rollback_completion" ] || [ -L "$activation_rollback_completion" ]; then
+      if rollback_completion_matches_current "$root"; then
+        rm -f "$activation_intent"
+        printf '%s\n' "PROMOTION_ROLLBACK=restored"
+        return
+      fi
+    fi
     rm -f "$activation_intent"
     printf '%s\n' "PROMOTION_ROLLBACK=not-current"
     return
@@ -989,6 +1108,7 @@ recover_rollback() {
     ln -s "$record_rollback_target" "$current_tmp"
     replace_link "$current_tmp" "$current"
   fi
+  persist_rollback_completion "$root"
   rm -f "$activation_intent"
   printf '%s\n' "PROMOTION_ROLLBACK=restored"
 }

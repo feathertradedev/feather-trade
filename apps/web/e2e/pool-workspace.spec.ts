@@ -646,7 +646,10 @@ test("pool workspace keeps truthful owner positions and history beneath the char
   await expect(page.getByTestId("pool-workspace-owner-panel").getByRole("tab", { exact: true, name: "History" })).toHaveAttribute("aria-selected", "true");
   await page.getByTestId("pool-workspace-owner-panel").getByRole("tab", { name: "Positions" }).click();
   await page.getByTestId("pool-position-manage-link").click();
-  await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/manage$`, "i"));
+  await expect(page).toHaveURL(new RegExp(
+    `#/pools/${WNATIVE_USDC_PAIR}/manage\\?manageOwner=${DEFAULT_ACCOUNT}&manageBins=${TEST_ACTIVE_ID}$`,
+    "i"
+  ));
   await expect(page.locator(".position-option")).toHaveCount(1);
   await expect(page.locator(".position-option").first().locator('input[type="checkbox"]')).toBeChecked();
   await selectPoolWorkspaceView(page, "Market");
@@ -790,7 +793,10 @@ test("canonical out-of-range bins stay truthful and keep management pool-scoped"
   await expect(panel.getByTestId("pool-position-accounting")).toContainText("Out of range");
   await expect(panel.getByTestId("pool-position-manage-link")).toHaveAttribute(
     "href",
-    `#/pools/${WNATIVE_USDC_PAIR.toLowerCase()}/manage`
+    new RegExp(
+      `^#/pools/${WNATIVE_USDC_PAIR}/manage\\?manageOwner=${DEFAULT_ACCOUNT}&manageBins=${TEST_ACTIVE_ID + 10}$`,
+      "i"
+    )
   );
 });
 
@@ -1101,7 +1107,10 @@ test("mobile workspace isolates Market, Trade, and Positions while preserving ta
   await page.keyboard.press("End");
   await expect(positionsTab).toHaveAttribute("aria-selected", "true");
   await page.getByTestId("pool-position-manage-link").click();
-  await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/manage$`, "i"));
+  await expect(page).toHaveURL(new RegExp(
+    `#/pools/${WNATIVE_USDC_PAIR}/manage\\?manageOwner=${DEFAULT_ACCOUNT}&manageBins=${TEST_ACTIVE_ID}$`,
+    "i"
+  ));
   await expect(tradeTab).toHaveAttribute("aria-selected", "true");
   await expect(page.getByTestId("liquidity-remove-button")).toBeInViewport();
 

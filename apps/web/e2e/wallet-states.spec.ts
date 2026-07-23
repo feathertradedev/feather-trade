@@ -1105,33 +1105,45 @@ test("unavailable durable storage blocks wallet handoff and surfaces a controlle
 });
 
 test("two same-origin tabs serialize identical intents before either wallet can double-submit", async ({ page, context }) => {
-  test.setTimeout(60_000);
+  test.setTimeout(90_000);
   await installMockRpc(page, { allowance: 5n * ONE_TOKEN, balance: 5n * ONE_TOKEN });
-  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID, transactionDelayMs: 4_000 });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID, transactionMode: "controlled" });
   await page.goto("/#/swap");
   await connectWallet(page);
 
-  await clickReviewedAction(page, "swap-submit-button");
-  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
-
   const secondPage = await context.newPage();
+  await secondPage.addInitScript(() => {
+    for (const key of Array.from({ length: window.localStorage.length }, (_, index) => window.localStorage.key(index))) {
+      if (key === null) continue;
+      if (key === "wagmi.store" || key === "wagmi.recentConnectorId" || key.startsWith("@appkit/")) {
+        window.localStorage.removeItem(key);
+      }
+    }
+  });
   await installMockRpc(secondPage, { allowance: 5n * ONE_TOKEN, balance: 5n * ONE_TOKEN });
   await installMockWallet(secondPage, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
   await secondPage.goto("/#/swap");
-  await secondPage.evaluate(() => window.dispatchEvent(new Event("eip6963:requestProvider")));
-  const secondAccountButton = secondPage.getByTestId("wallet-account-button");
-  const secondConnectButton = secondPage.getByTestId("wallet-connect-button");
-  await expect.poll(async () =>
-    await secondAccountButton.isVisible() ||
-    await secondConnectButton.isVisible(), { timeout: 15_000 }).toBe(true);
-  if (!await secondAccountButton.isVisible()) {
-    await openAndSelectMockWallet(secondPage);
-  }
-  await expect(secondAccountButton).toContainText("0xf39F...2266", { timeout: 15_000 });
-  await clickReviewedAction(secondPage, "swap-submit-button");
+  await connectWallet(secondPage);
+
+  const firstSubmitButton = page.getByTestId("swap-submit-button");
+  const secondSubmitButton = secondPage.getByTestId("swap-submit-button");
+  await expect(firstSubmitButton).toBeEnabled({ timeout: 30_000 });
+  await expect(secondSubmitButton).toBeEnabled({ timeout: 30_000 });
+  expect(await persistedTransactionJournalCount(page)).toBe(0);
+  expect(await persistedTransactionJournalCount(secondPage)).toBe(0);
+
+  await openGasReviewAfterReady(page, "swap-submit-button");
+  await firstSubmitButton.click();
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+  await expect.poll(() => persistedTransactionJournalCount(page)).toBe(1);
+  await expect.poll(() => persistedTransactionJournalCount(secondPage)).toBe(1);
+
+  await openGasReviewAfterReady(secondPage, "swap-submit-button");
+  await secondSubmitButton.click();
 
   await expect(secondPage.getByTestId("swap-failure-state")).toContainText(/still unresolved/i);
   expect((await readMockWallet(secondPage)).sentTransactions).toHaveLength(0);
+  await page.evaluate(() => window.__mockWalletControl.releaseNextTransaction());
   await expect.poll(() => persistedTransactionJournalHashes(page), { timeout: 8_000 }).toHaveLength(1);
 });
 
@@ -2111,7 +2123,7 @@ test("a same-valued false poll reconciles a direct-read approval that was revoke
 });
 
 test("approval becoming sufficient in the final guard is a benign skip that enables remove", async ({ page }) => {
-  const rpc = await setupConnectedLiquidity(page, { lbApproved: false, pairCodeDelayMs: 300 });
+  const rpc = await setupConnectedLiquidity(page, { lbApproved: false, walletReadDelayMs: 300 });
   const approveButton = page.getByTestId("liquidity-approve-lb-button");
 
   await approveButton.click();
@@ -3734,6 +3746,17 @@ async function clickReviewedAction(page: Parameters<typeof installMockRpc>[0], t
   await page.getByTestId(testId).click();
   await expect(page.getByTestId("gas-review")).toBeVisible();
   await page.getByTestId(testId).click();
+}
+
+async function openGasReviewAfterReady(page: Parameters<typeof installMockRpc>[0], testId: string): Promise<void> {
+  const action = page.getByTestId(testId);
+  await expect(action).toBeEnabled({ timeout: 30_000 });
+  await expect.poll(() => page.evaluate((id) => {
+    if (document.querySelector('[data-testid="gas-review"]') !== null) return true;
+    const button = document.querySelector(`[data-testid="${id}"]`);
+    if (button instanceof HTMLButtonElement && !button.disabled) button.click();
+    return false;
+  }, testId), { timeout: 20_000 }).toBe(true);
 }
 
 async function bypassDisabledButtonAndClick(page: Parameters<typeof installMockRpc>[0], testId: string): Promise<void> {

@@ -286,6 +286,21 @@ if (process.env.FAKE_SMOKE_REPOINT_TARGET) {
   fs.unlinkSync(current);
   fs.symlinkSync(process.env.FAKE_SMOKE_REPOINT_TARGET, current);
 }
+if (process.env.FAKE_ANALYTICS_SMOKE_WAIT_FOR_TARGET && args.includes("--origin")) {
+  const current = path.join(process.env.FAKE_VPS_ROOT, "current");
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    try {
+      if (fs.readlinkSync(current) === process.env.FAKE_ANALYTICS_SMOKE_WAIT_FOR_TARGET) break;
+    } catch {}
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+  }
+  try {
+    if (fs.readlinkSync(current) !== process.env.FAKE_ANALYTICS_SMOKE_WAIT_FOR_TARGET) process.exit(74);
+  } catch {
+    process.exit(74);
+  }
+}
 if (process.env.FAKE_SMOKE_FAIL === "1" && args.includes("--url")) process.exit(72);
 if (process.env.FAKE_ANALYTICS_SMOKE_FAIL === "1" && args.includes("--origin")) process.exit(73);
 `);
@@ -317,7 +332,7 @@ if (process.env.FAKE_ANALYTICS_SMOKE_FAIL === "1" && args.includes("--origin")) 
     WEB_PROMOTION_SMOKE_BIN: fakeSmoke,
     WEB_PROMOTION_SSH_BIN: fakeSsh,
     WEB_PROMOTION_TEST_MODE: "1",
-    WEB_PROMOTION_LEASE_SECONDS: "10",
+    WEB_PROMOTION_LEASE_SECONDS: "30",
     WEB_VPS_DEPLOYED_ORIGIN: "https://release.example:443/",
     WEB_VPS_DOCS_ORIGIN: "https://docs.release.example:443/",
     WEB_VPS_RELEASE_ROOT: vpsRoot,
@@ -466,6 +481,106 @@ if (process.env.FAKE_ANALYTICS_SMOKE_FAIL === "1" && args.includes("--origin")) 
     "failed analytics smoke must restore the verified prior release before activation is confirmed"
   );
 
+  const watchdogRollbackRoot = path.join(temp, "vps-watchdog-smoke-rollback");
+  installReleaseFixture(path.join(watchdogRollbackRoot, "releases", oldCommit), { commit: oldCommit, environment, index: "old release\n" });
+  fs.symlinkSync(oldTarget, path.join(watchdogRollbackRoot, "current"));
+  const failedAfterWatchdogRollback = runAdapter({
+    ...baseEnv,
+    FAKE_ANALYTICS_SMOKE_FAIL: "1",
+    FAKE_ANALYTICS_SMOKE_WAIT_FOR_TARGET: oldTarget,
+    FAKE_VPS_ROOT: watchdogRollbackRoot,
+    WEB_PROMOTION_LEASE_SECONDS: "2",
+    WEB_VPS_RELEASE_ROOT: watchdogRollbackRoot
+  }, false);
+  assert.notEqual(failedAfterWatchdogRollback.status, 0, "a failed smoke after lease expiry must fail promotion");
+  assert.match(
+    `${failedAfterWatchdogRollback.stdout}\n${failedAfterWatchdogRollback.stderr}`,
+    /hosted analytics smoke failed.*prior verified release was restored/i
+  );
+  assert.equal(
+    fs.readlinkSync(path.join(watchdogRollbackRoot, "current")),
+    oldTarget,
+    "an expired activation lease must be recognized as an already completed rollback"
+  );
+
+  const abaRollbackRoot = path.join(temp, "vps-aba-same-target-rollback");
+  installReleaseFixture(path.join(abaRollbackRoot, "releases", oldCommit), { commit: oldCommit, environment, index: "old release\n" });
+  fs.symlinkSync(oldTarget, path.join(abaRollbackRoot, "current"));
+  const abaRollback = runAdapter({
+    ...baseEnv,
+    FAKE_SMOKE_FAIL: "1",
+    FAKE_SMOKE_REPOINT_TARGET: oldTarget,
+    FAKE_VPS_ROOT: abaRollbackRoot,
+    WEB_VPS_RELEASE_ROOT: abaRollbackRoot
+  }, false);
+  const abaRollbackOutput = `${abaRollback.stdout}\n${abaRollback.stderr}`;
+  assert.notEqual(abaRollback.status, 0, "a same-target replacement during smoke must fail promotion");
+  assert.match(abaRollbackOutput, /guarded rollback could not restore/i);
+  assert.doesNotMatch(abaRollbackOutput, /prior verified release was restored/i,
+    "target equality without record-bound pointer identity must never claim a completed rollback");
+  assert.equal(fs.readlinkSync(path.join(abaRollbackRoot, "current")), oldTarget);
+
+  const overlappingRoot = path.join(temp, "vps-overlapping-activations");
+  const overlappingCommit = "3".repeat(40);
+  const overlappingTarget = `releases/${overlappingCommit}/dist`;
+  const overlappingArchiveSource = path.join(bundle, "web-promotion.tar.gz");
+  const overlappingArchiveDigest = crypto.createHash("sha256")
+    .update(fs.readFileSync(overlappingArchiveSource))
+    .digest("hex");
+  const overlappingHelperDigest = crypto.createHash("sha256")
+    .update(fs.readFileSync(remoteAdapter))
+    .digest("hex");
+  const firstRunToken = "overlap-a";
+  const secondRunToken = "overlap-b";
+  installReleaseFixture(path.join(overlappingRoot, "releases", oldCommit), { commit: oldCommit, environment, index: "old release\n" });
+  fs.symlinkSync(oldTarget, path.join(overlappingRoot, "current"));
+
+  const firstArchive = path.join(overlappingRoot, ".incoming", `${environment}-${commit}-${firstRunToken}.tar.gz`);
+  const firstHelper = path.join(overlappingRoot, ".incoming", `${environment}-${commit}-${firstRunToken}.helper.sh`);
+  runRemote("prepare", [
+    overlappingRoot, environment, commit, firstArchive, firstHelper, overlappingArchiveDigest, firstRunToken
+  ]);
+  fs.copyFileSync(overlappingArchiveSource, firstArchive);
+  fs.copyFileSync(remoteAdapter, firstHelper);
+  fs.chmodSync(firstHelper, 0o500);
+  runRemote("promote", [
+    overlappingRoot, environment, commit, overlappingArchiveDigest, firstArchive, firstRunToken,
+    firstHelper, overlappingHelperDigest, "30"
+  ]);
+  const pendingFirstIdentity = fs.lstatSync(path.join(overlappingRoot, "current"));
+  assert.equal(fs.readlinkSync(path.join(overlappingRoot, "current")), `releases/${commit}/dist`);
+
+  const secondArchive = path.join(overlappingRoot, ".incoming", `${environment}-${overlappingCommit}-${secondRunToken}.tar.gz`);
+  const secondHelper = path.join(overlappingRoot, ".incoming", `${environment}-${overlappingCommit}-${secondRunToken}.helper.sh`);
+  runRemote("prepare", [
+    overlappingRoot, environment, overlappingCommit, secondArchive, secondHelper, overlappingArchiveDigest, secondRunToken
+  ]);
+  fs.copyFileSync(overlappingArchiveSource, secondArchive);
+  fs.copyFileSync(remoteAdapter, secondHelper);
+  fs.chmodSync(secondHelper, 0o500);
+  const overlappingPromotion = runRemote("promote", [
+    overlappingRoot, environment, overlappingCommit, overlappingArchiveDigest, secondArchive, secondRunToken,
+    secondHelper, overlappingHelperDigest, "30"
+  ], false);
+  assert.notEqual(overlappingPromotion.status, 0, "a second activation must not adopt an unconfirmed current release as its rollback target");
+  assert.match(`${overlappingPromotion.stdout}\n${overlappingPromotion.stderr}`,
+    /unconfirmed activation.*cannot be used as a rollback candidate/i);
+  assert.equal(fs.readlinkSync(path.join(overlappingRoot, "current")), `releases/${commit}/dist`);
+  const identityAfterRejectedOverlap = fs.lstatSync(path.join(overlappingRoot, "current"));
+  assert.equal(identityAfterRejectedOverlap.dev, pendingFirstIdentity.dev);
+  assert.equal(identityAfterRejectedOverlap.ino, pendingFirstIdentity.ino,
+    "a rejected overlapping activation must not replace the pending current pointer");
+  assert.notEqual(fs.readlinkSync(path.join(overlappingRoot, "current")), overlappingTarget);
+  runRemote("cleanup", [
+    overlappingRoot, secondArchive, secondHelper, environment, overlappingCommit, overlappingArchiveDigest, secondRunToken
+  ]);
+  const firstRecovery = runRemote("recover-rollback", [
+    overlappingRoot, environment, commit, overlappingArchiveDigest, firstRunToken
+  ]);
+  assert.match(firstRecovery.stdout, /PROMOTION_ROLLBACK=restored/);
+  assert.equal(fs.readlinkSync(path.join(overlappingRoot, "current")), oldTarget,
+    "the original failed activation must remain able to restore its confirmed predecessor");
+
   const guardedRoot = path.join(temp, "vps-guarded-rollback");
   const concurrentCommit = "2".repeat(40);
   const concurrentTarget = `releases/${concurrentCommit}/dist`;
@@ -549,17 +664,29 @@ if (process.env.FAKE_ANALYTICS_SMOKE_FAIL === "1" && args.includes("--origin")) 
     FAKE_SSH_FAIL_AFTER_PROMOTE: "1",
     FAKE_SSH_STATE: supersededSameCommitState,
     FAKE_VPS_ROOT: supersededSameCommitRoot,
-    WEB_PROMOTION_LEASE_SECONDS: "4",
+    WEB_PROMOTION_LEASE_SECONDS: "15",
     WEB_VPS_RELEASE_ROOT: supersededSameCommitRoot
   }, false);
   assert.notEqual(supersededSameCommit.status, 0);
   const sameCommitTarget = `releases/${commit}/dist`;
   assert.equal(fs.readlinkSync(path.join(supersededSameCommitRoot, "current")), sameCommitTarget);
-  fs.unlinkSync(path.join(supersededSameCommitRoot, "current"));
-  fs.symlinkSync(sameCommitTarget, path.join(supersededSameCommitRoot, "current"));
-  childProcess.spawnSync("sleep", ["4.2"]);
-  assert.equal(fs.readlinkSync(path.join(supersededSameCommitRoot, "current")), sameCommitTarget,
+  const sameCommitCurrent = path.join(supersededSameCommitRoot, "current");
+  fs.unlinkSync(sameCommitCurrent);
+  fs.symlinkSync(sameCommitTarget, sameCommitCurrent);
+  const replacementIdentity = fs.lstatSync(sameCommitCurrent);
+  const supersededIntent = path.join(
+    supersededSameCommitRoot,
+    ".promotion-records",
+    `${environment}-${commit}-123456-2.intent`
+  );
+  waitFor(() => !fs.existsSync(supersededIntent), 22_000,
+    "the stale same-commit watchdog must finish before its pointer identity is evaluated");
+  const identityAfterWatchdog = fs.lstatSync(sameCommitCurrent);
+  assert.equal(fs.readlinkSync(sameCommitCurrent), sameCommitTarget,
     "the anchored symlink identity must protect a newer same-commit activation from stale rollback");
+  assert.equal(identityAfterWatchdog.dev, replacementIdentity.dev);
+  assert.equal(identityAfterWatchdog.ino, replacementIdentity.ino,
+    "the stale watchdog must not replace a newer same-target symlink");
 
   const transportEvents = fs.readFileSync(transportLog, "utf8").trim().split("\n").map((line) => JSON.parse(line));
   assert(transportEvents.some((event) => event.type === "scp"));
@@ -663,6 +790,15 @@ function waitFor(predicate, timeoutMs, message) {
 
 function runAdapter(env, expectSuccess = true) {
   const result = childProcess.spawnSync("bash", [providerAdapter], { cwd: root, encoding: "utf8", env });
+  if (expectSuccess) assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  return result;
+}
+
+function runRemote(action, args, expectSuccess = true) {
+  const result = childProcess.spawnSync("sh", [remoteAdapter, action, ...args], {
+    cwd: root,
+    encoding: "utf8"
+  });
   if (expectSuccess) assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
   return result;
 }
