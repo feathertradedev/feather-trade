@@ -40,6 +40,16 @@ export async function installMockWallet(page: Page, options: MockWalletOptions =
       type Listener = (...args: unknown[]) => void;
       type ProviderState = Window["__mockWalletState"];
 
+      // Each document receives a newly constructed mock EIP-6963 provider.
+      // Do not let AppKit restore a connector bound to the provider object from
+      // the previous document; that state can only enter ConnectingExternal.
+      // Feather-owned persistence such as the transaction journal is retained.
+      for (const key of Object.keys(window.localStorage)) {
+        if (key.startsWith("@appkit/") || key === "wagmi.store" || key === "wagmi.recentConnectorId") {
+          window.localStorage.removeItem(key);
+        }
+      }
+
       function toHex(value: number) {
         return `0x${value.toString(16)}`;
       }
