@@ -73,6 +73,7 @@ import {
   Network,
   RefreshCw,
   Server,
+  ShieldOff,
   Wallet,
   X
 } from "lucide-react";
@@ -6505,12 +6506,13 @@ function LiquidityView({
   );
   const [removePercentInput, setRemovePercentInput] = usePoolDraftState("liquidity.removePercent", "100");
   const [explicitFullExitRequested, setExplicitFullExitRequested] = useState(false);
-  const [liquidityReceiptPhase, setLiquidityReceiptPhase] = useState<"idle" | "lb-approval" | "remove">("idle");
+  const [liquidityReceiptPhase, setLiquidityReceiptPhase] = useState<"idle" | "lb-approval" | "lb-revocation" | "remove">("idle");
   const [submittedRemoveReceiptContext, setSubmittedRemoveReceiptContext] = useState<string | null>(null);
   const [submittedFullExitHash, setSubmittedFullExitHash] = useState<Address | null>(null);
   const [submittedApproveXReceiptContext, setSubmittedApproveXReceiptContext] = useState<string | null>(null);
   const [submittedApproveYReceiptContext, setSubmittedApproveYReceiptContext] = useState<string | null>(null);
   const [submittedLbApprovalReceiptContext, setSubmittedLbApprovalReceiptContext] = useState<string | null>(null);
+  const [submittedLbRevocationReceiptContext, setSubmittedLbRevocationReceiptContext] = useState<string | null>(null);
   const [submittedAddReceiptContext, setSubmittedAddReceiptContext] = useState<string | null>(null);
   const intentionalEmptySelectionRef = useRef(
     initialManagePositionSelection.current.status === "invalid"
@@ -6559,6 +6561,7 @@ function LiquidityView({
   const approveXSubmitInFlightRef = useRef<number | null>(null);
   const approveYSubmitInFlightRef = useRef<number | null>(null);
   const approveLbSubmitInFlightRef = useRef<number | null>(null);
+  const revokeLbSubmitInFlightRef = useRef<number | null>(null);
   const addSubmitInFlightRef = useRef<number | null>(null);
   const nativeAddMaxProbeRef = useRef<"x" | "y" | null>(null);
   const nativeAddMaxBindingRef = useRef<{ balance: bigint; context: string; gasPrice: bigint; reserve: bigint; side: "x" | "y"; value: bigint } | null>(null);
@@ -6580,6 +6583,7 @@ function LiquidityView({
   const [handledApproveXHash, setHandledApproveXHash] = useState<Address | null>(null);
   const [handledApproveYHash, setHandledApproveYHash] = useState<Address | null>(null);
   const [handledLbApprovalHash, setHandledLbApprovalHash] = useState<Address | null>(null);
+  const [handledLbRevocationHash, setHandledLbRevocationHash] = useState<Address | null>(null);
   const [handledAddHash, setHandledAddHash] = useState<Address | null>(null);
   const [handledRemoveHash, setHandledRemoveHash] = useState<Address | null>(null);
   const registry = registries[environmentKey];
@@ -6593,11 +6597,13 @@ function LiquidityView({
   const approveXWrite = useWriteContract();
   const approveYWrite = useWriteContract();
   const approveLbWrite = useWriteContract();
+  const revokeLbWrite = useWriteContract();
   const addWrite = useSendTransaction();
   const removeWrite = useSendTransaction();
   const approveXReceipt = useWaitForTransactionReceipt({ hash: approveXWrite.data });
   const approveYReceipt = useWaitForTransactionReceipt({ hash: approveYWrite.data });
   const approveLbReceipt = useWaitForTransactionReceipt({ hash: approveLbWrite.data });
+  const revokeLbReceipt = useWaitForTransactionReceipt({ hash: revokeLbWrite.data });
   const addReceipt = useWaitForTransactionReceipt({ hash: addWrite.data });
   const removeReceipt = useWaitForTransactionReceipt({ hash: removeWrite.data });
   const transactionJournal = useTransactionJournal();
@@ -7593,6 +7599,23 @@ function LiquidityView({
   ].join("|");
   const latestLbApprovalExecutionFingerprint = useRef(lbApprovalExecutionFingerprint);
   latestLbApprovalExecutionFingerprint.current = lbApprovalExecutionFingerprint;
+  const lbRevocationExecutionFingerprint = [
+    account.address ?? "",
+    pool?.pair ?? "",
+    registry.chain.id.toString(),
+    activeWalletChainId?.toString() ?? "",
+    registry.contracts.lbRouter,
+    liveLbApproved ? "revocation-required" : "revocation-not-required"
+  ].join("|");
+  const lbRevocationFormFingerprint = [
+    account.address ?? "",
+    pool?.pair ?? "",
+    registry.chain.id.toString(),
+    activeWalletChainId?.toString() ?? "",
+    registry.contracts.lbRouter
+  ].join("|");
+  const latestLbRevocationExecutionFingerprint = useRef(lbRevocationExecutionFingerprint);
+  latestLbRevocationExecutionFingerprint.current = lbRevocationExecutionFingerprint;
   const removeExecutionContextFingerprint = burnExecutionContextFingerprint({
     account: account.address ?? null,
     assetMode: effectiveRemoveAssetMode,
@@ -7880,6 +7903,7 @@ function LiquidityView({
   const approveXSuccess = submittedApproveXReceiptContext === approveXExecutionFingerprint && approveXReceipt.data?.status === "success";
   const approveYSuccess = submittedApproveYReceiptContext === approveYExecutionFingerprint && approveYReceipt.data?.status === "success";
   const approveLbSuccess = submittedLbApprovalReceiptContext === lbApprovalFormFingerprint && approveLbReceipt.data?.status === "success";
+  const revokeLbSuccess = submittedLbRevocationReceiptContext === lbRevocationFormFingerprint && revokeLbReceipt.data?.status === "success";
   const addSuccess = submittedAddReceiptContext === addExecutionFingerprint && addReceipt.data?.status === "success";
   const nativeAddAccountingRequired = submittedLiquidityAddReview?.review.assetMode === "native" && submittedLiquidityAddReview.executionFingerprint === submittedAddReceiptContext;
   const addSuccessReconciled = addSuccess && (!nativeAddAccountingRequired || addReceiptReconciliationQuery.data !== undefined);
@@ -7887,6 +7911,7 @@ function LiquidityView({
   const approveXReverted = submittedApproveXReceiptContext === approveXExecutionFingerprint && (approveXReceipt.data?.status === "reverted" || isRevertedReceiptError(approveXReceipt.error));
   const approveYReverted = submittedApproveYReceiptContext === approveYExecutionFingerprint && (approveYReceipt.data?.status === "reverted" || isRevertedReceiptError(approveYReceipt.error));
   const approveLbReverted = submittedLbApprovalReceiptContext === lbApprovalFormFingerprint && (approveLbReceipt.data?.status === "reverted" || isRevertedReceiptError(approveLbReceipt.error));
+  const revokeLbReverted = submittedLbRevocationReceiptContext === lbRevocationFormFingerprint && (revokeLbReceipt.data?.status === "reverted" || isRevertedReceiptError(revokeLbReceipt.error));
   const addReverted = submittedAddReceiptContext === addExecutionFingerprint && (addReceipt.data?.status === "reverted" || isRevertedReceiptError(addReceipt.error));
   const removeReverted = removeReceipt.data?.status === "reverted" || isRevertedReceiptError(removeReceipt.error);
   const removeReceiptMatchesCurrentIntent =
@@ -7897,17 +7922,21 @@ function LiquidityView({
   const currentRemoveReverted = removeReceiptMatchesCurrentIntent && removeReverted;
   const currentLbApprovalSuccess = liquidityReceiptPhase === "lb-approval" && approveLbSuccess;
   const currentLbApprovalReverted = liquidityReceiptPhase === "lb-approval" && approveLbReverted;
+  const currentLbRevocationSuccess = liquidityReceiptPhase === "lb-revocation" && revokeLbSuccess;
+  const currentLbRevocationReverted = liquidityReceiptPhase === "lb-revocation" && revokeLbReverted;
   const liquidityActionError =
     liquiditySimulationError ??
     gasReviewError ??
     (submittedApproveXReceiptContext === approveXExecutionFingerprint ? getWriteError(approveXWrite.error) : null) ??
     (submittedApproveYReceiptContext === approveYExecutionFingerprint ? getWriteError(approveYWrite.error) : null) ??
     (submittedLbApprovalReceiptContext === lbApprovalFormFingerprint ? getWriteError(approveLbWrite.error) : null) ??
+    (submittedLbRevocationReceiptContext === lbRevocationFormFingerprint ? getWriteError(revokeLbWrite.error) : null) ??
     (submittedAddReceiptContext === addExecutionFingerprint ? getWriteError(addWrite.error) : null) ??
     (removeReceiptMatchesCurrentIntent ? getWriteError(removeWrite.error) : null) ??
     (submittedApproveXReceiptContext === approveXExecutionFingerprint ? getWriteError(approveXReceipt.error) : null) ??
     (submittedApproveYReceiptContext === approveYExecutionFingerprint ? getWriteError(approveYReceipt.error) : null) ??
     (submittedLbApprovalReceiptContext === lbApprovalFormFingerprint ? getWriteError(approveLbReceipt.error) : null) ??
+    (submittedLbRevocationReceiptContext === lbRevocationFormFingerprint ? getWriteError(revokeLbReceipt.error) : null) ??
     (submittedAddReceiptContext === addExecutionFingerprint ? getWriteError(addReceipt.error) : null) ??
     (removeReceiptMatchesCurrentIntent ? getWriteError(removeReceipt.error) : null);
   const addPoolReady = selectedPool.ready && pool !== null;
@@ -8006,7 +8035,22 @@ function LiquidityView({
     liquiditySimulationError === null &&
     !liquiditySimulationPending &&
     !approveLbWrite.isPending &&
-    !approveLbReceipt.isLoading;
+    !approveLbReceipt.isLoading &&
+    !revokeLbWrite.isPending &&
+    !revokeLbReceipt.isLoading;
+  const canRevokeLb =
+    removePoolReady &&
+    connected &&
+    !onWrongChain &&
+    liveLbApproved &&
+    liquidityExitAttestationQuery.data !== undefined &&
+    liquidityExitAttestationQuery.error === null &&
+    liquiditySimulationError === null &&
+    !liquiditySimulationPending &&
+    !approveLbWrite.isPending &&
+    !approveLbReceipt.isLoading &&
+    !revokeLbWrite.isPending &&
+    !revokeLbReceipt.isLoading;
   useEffect(() => {
     intentionalEmptySelectionRef.current = false;
   }, [account.address, pool?.pair, registry.chainId]);
@@ -8017,6 +8061,7 @@ function LiquidityView({
     approveXSubmitInFlightRef.current = null;
     approveYSubmitInFlightRef.current = null;
     approveLbSubmitInFlightRef.current = null;
+    revokeLbSubmitInFlightRef.current = null;
     addSubmitInFlightRef.current = null;
     removeSubmitInFlightRef.current = null;
     setLiquiditySimulationPending(false);
@@ -8028,6 +8073,7 @@ function LiquidityView({
       approveXSubmitInFlightRef.current = null;
       approveYSubmitInFlightRef.current = null;
       approveLbSubmitInFlightRef.current = null;
+      revokeLbSubmitInFlightRef.current = null;
       addSubmitInFlightRef.current = null;
       removeSubmitInFlightRef.current = null;
     };
@@ -8067,6 +8113,14 @@ function LiquidityView({
       approveLbSubmitInFlightRef.current = null;
     }
   }, [approveLbReceipt.data, approveLbReceipt.error, approveLbWrite.data, approveLbWrite.error]);
+
+  useEffect(() => {
+    if (revokeLbSubmitInFlightRef.current === null) return;
+
+    if (revokeLbWrite.error || revokeLbWrite.data || revokeLbReceipt.data || revokeLbReceipt.error) {
+      revokeLbSubmitInFlightRef.current = null;
+    }
+  }, [revokeLbReceipt.data, revokeLbReceipt.error, revokeLbWrite.data, revokeLbWrite.error]);
 
   useEffect(() => {
     if (removeSubmitInFlightRef.current === null) return;
@@ -8233,6 +8287,15 @@ function LiquidityView({
       setHandledLbApprovalHash(approveLbWrite.data);
     }
 
+    if (revokeLbSuccess && revokeLbWrite.data && revokeLbWrite.data !== handledLbRevocationHash) {
+      if (currentLbApprovalGrant !== null) {
+        setLbApprovalObservation({ ...currentLbApprovalGrant, approved: false });
+      }
+      setRemoveQuoteReviewRequired("Router access was revoked in Feather. Re-approve this exact pair and router before withdrawing.");
+      void walletQuery.refetch();
+      setHandledLbRevocationHash(revokeLbWrite.data);
+    }
+
     if (addSuccess && addWrite.data && addWrite.data !== handledAddHash) {
       void walletQuery.refetch();
       void walletPositionsQuery.refetch();
@@ -8270,10 +8333,13 @@ function LiquidityView({
     handledApproveXHash,
     handledApproveYHash,
     handledLbApprovalHash,
+    handledLbRevocationHash,
     handledRemoveHash,
     onRefresh,
     removeSuccess,
     removeWrite.data,
+    revokeLbSuccess,
+    revokeLbWrite.data,
     submittedFullExitHash,
     selectedBurnSnapshotQuery,
     walletPositionsQuery,
@@ -8701,6 +8767,148 @@ function LiquidityView({
     } finally {
       if (!submitted && approveLbSubmitInFlightRef.current === submittedOperationGeneration) {
         approveLbSubmitInFlightRef.current = null;
+        setLiquiditySimulationPending(false);
+      }
+    }
+  };
+
+  const handleRevokeLb = async () => {
+    if (revokeLbSubmitInFlightRef.current !== null || !canRevokeLb || !pool || !account.address) return;
+
+    const submittedOperationGeneration = liquidityOperationGenerationRef.current;
+    const submittedExecutionFingerprint = lbRevocationExecutionFingerprint;
+    const args = [registry.contracts.lbRouter, false] as const;
+    revokeLbSubmitInFlightRef.current = submittedOperationGeneration;
+    revokeLbWrite.reset();
+    setSubmittedLbRevocationReceiptContext(null);
+    setGasReviewError(null);
+    const operationIsCurrent = () =>
+      liquidityOperationGenerationRef.current === submittedOperationGeneration &&
+      revokeLbSubmitInFlightRef.current === submittedOperationGeneration;
+    let submitted = false;
+    try {
+      try {
+        await attestLiquidityPair("remove-liquidity");
+      } catch (error) {
+        setLiquiditySimulationError(getWriteError(error));
+        return;
+      }
+      try {
+        if (!await readLiveLbApproval()) {
+          setLiquiditySimulationError(null);
+          setGasReview(null);
+          return;
+        }
+      } catch (error) {
+        setLiquiditySimulationError(`Live LB operator revocation preflight failed: ${getWriteError(error) ?? "approval state unavailable"}`);
+        return;
+      }
+      setLiquiditySimulationError(null);
+
+      const simulated = await runPreSubmitSimulation(
+        () =>
+          publicClient.simulateContract({
+            account: account.address,
+            address: pool.pair,
+            abi: lbPairAbi,
+            functionName: "approveForAll",
+            args
+          }),
+        setLiquiditySimulationError,
+        setLiquiditySimulationPending,
+        operationIsCurrent
+      );
+      if (!simulated || !operationIsCurrent()) return;
+      if (latestLbRevocationExecutionFingerprint.current !== submittedExecutionFingerprint) {
+        setLiquiditySimulationError("LB revocation account, chain, pair, operator, or approval state changed during simulation; review the current state and try again");
+        return;
+      }
+
+      try {
+        if (!await readLiveLbApproval()) {
+          setLiquiditySimulationError(null);
+          setGasReview(null);
+          return;
+        }
+      } catch (error) {
+        setLiquiditySimulationError(`Live LB operator revocation recheck failed: ${getWriteError(error) ?? "approval state unavailable"}`);
+        return;
+      }
+
+      if (!operationIsCurrent()) return;
+      const gasReviewIsCurrent = () =>
+        operationIsCurrent() &&
+        latestLbRevocationExecutionFingerprint.current === submittedExecutionFingerprint;
+      const gasApproved = await reviewExactGas({
+        action: "LB operator revocation",
+        currentReview: gasReview,
+        estimateGas: () => publicClient.estimateContractGas(simulated.request),
+        executionFingerprint: submittedExecutionFingerprint,
+        getBalance: () => publicClient.getBalance({ address: account.address }),
+        getGasPrice: () => publicClient.getGasPrice(),
+        isCurrent: gasReviewIsCurrent,
+        setError: setGasReviewError,
+        setReview: setGasReview
+      });
+      if (!gasApproved || !gasReviewIsCurrent()) return;
+      try {
+        await attestLiquidityPair("remove-liquidity");
+      } catch (error) {
+        setLiquiditySimulationError(getWriteError(error));
+        return;
+      }
+
+      setLiquidityReceiptPhase("lb-revocation");
+      setSubmittedLbRevocationReceiptContext(lbRevocationFormFingerprint);
+      const submittedContext = {
+        account: account.address,
+        calldataFingerprint: keccak256(encodeFunctionData({ abi: lbPairAbi, functionName: "approveForAll", args })),
+        chainId: activeWalletChainId,
+        deploymentEpoch: deploymentEpoch(registry),
+        environment: environmentKey,
+        executionFingerprint: submittedExecutionFingerprint,
+        intent: "approval" as const,
+        providerId: account.connector?.id ?? "unknown",
+        providerUid: account.connector?.uid ?? "unknown",
+        submittedAt: Date.now(),
+        target: pool.pair,
+        value: 0n
+      };
+      try {
+        const hash = await submitJournaledTransaction({
+          isCurrent: gasReviewIsCurrent,
+          journal: transactionJournal,
+          reviewed: reviewedTransactionIntent(submittedContext, {
+            poolId: pool.pair,
+            recipient: null,
+            refundRecipient: null,
+            settingsFingerprint: [account.address, activeWalletChainId, pool.pair, registry.contracts.lbRouter, "false"].join("|")
+          }),
+          preWalletGuard: async () => {
+            await attestLiquidityPair("remove-liquidity");
+            if (!await readLiveLbApproval()) {
+              throw new PairAttestationError("context-changed", "LB operator access is already revoked; the redundant revocation was not opened in the wallet");
+            }
+            if (!gasReviewIsCurrent()) {
+              throw new PairAttestationError("context-changed", "LB revocation account, chain, pair, operator, or approval state changed before wallet confirmation");
+            }
+          },
+          send: () => revokeLbWrite.writeContractAsync(simulated.request)
+        });
+        submitted = hash !== null;
+      } catch (error) {
+        if (error instanceof PairAttestationError && error.message.includes("already revoked")) {
+          setLiquiditySimulationError(null);
+          setGasReview(null);
+          setLiquidityReceiptPhase("idle");
+          setSubmittedLbRevocationReceiptContext(null);
+        } else if (!isUserRejectedSubmission(error)) {
+          setLiquiditySimulationError(getWriteError(error) ?? "Transaction journal blocked LB operator revocation");
+        }
+      }
+    } finally {
+      if (!submitted && revokeLbSubmitInFlightRef.current === submittedOperationGeneration) {
+        revokeLbSubmitInFlightRef.current = null;
         setLiquiditySimulationPending(false);
       }
     }
@@ -10458,6 +10666,20 @@ function LiquidityView({
           operator={registry.contracts.lbRouter}
           pair={pool?.pair ?? null}
         />
+        <button
+          aria-describedby="remove-lb-approval-details liquidity-remove-status"
+          className="secondary-button wide revoke-operator-button"
+          data-testid="liquidity-revoke-lb-button"
+          disabled={!canRevokeLb}
+          onClick={handleRevokeLb}
+          title={`Revoke operator ${registry.contracts.lbRouter} from every LB token ID in pair ${pool?.pair ?? "not selected"}`}
+          type="button"
+        >
+          {liquiditySimulationPending || revokeLbWrite.isPending || revokeLbReceipt.isLoading
+            ? <LoaderCircle className="spin" size={18} />
+            : <ShieldOff size={18} />}
+          <span>{liveLbApproved ? "Revoke router access" : "Router access not granted"}</span>
+        </button>
 
         <dl className="contract-list">
           <div>
@@ -10496,7 +10718,11 @@ function LiquidityView({
         </div>
 
         <LiquidityStateRows
-          actionError={currentRemoveOrphaned ? "Native withdrawal receipt was reorganized; canonical accounting was removed and retry remains journal-blocked." : nativeRemoveOrphanNotice ?? removeQuoteReviewRequired ?? liquidityActionError}
+          actionError={currentLbRevocationSuccess
+            ? null
+            : currentRemoveOrphaned
+              ? "Native withdrawal receipt was reorganized; canonical accounting was removed and retry remains journal-blocked."
+              : nativeRemoveOrphanNotice ?? removeQuoteReviewRequired ?? liquidityActionError}
           finalActionPending={liquidityReceiptPhase === "remove" && (
             removeWrite.isPending || (
               removeWrite.data !== undefined &&
@@ -10516,10 +10742,38 @@ function LiquidityView({
               ? null
               : removeInputError}
           insufficientBalance={false}
-          pendingHash={liquidityReceiptPhase === "remove" ? removeWrite.data : liquidityReceiptPhase === "lb-approval" ? approveLbWrite.data : undefined}
-          prerequisitePending={liquidityReceiptPhase === "lb-approval" && (approveLbWrite.isPending || approveLbReceipt.isLoading)}
-          prerequisiteSuccessText={currentLbApprovalSuccess ? "LB approval confirmed" : null}
-          revertedText={currentRemoveReverted ? "Remove liquidity reverted" : currentLbApprovalReverted ? "LB approval reverted" : null}
+          pendingHash={
+            liquidityReceiptPhase === "remove"
+              ? removeWrite.data
+              : liquidityReceiptPhase === "lb-approval"
+                ? approveLbWrite.data
+                : liquidityReceiptPhase === "lb-revocation"
+                  ? revokeLbWrite.data
+                  : undefined
+          }
+          prerequisitePending={
+            liquidityReceiptPhase === "lb-approval"
+              ? approveLbWrite.isPending || approveLbReceipt.isLoading
+              : liquidityReceiptPhase === "lb-revocation"
+                ? revokeLbWrite.isPending || revokeLbReceipt.isLoading
+                : false
+          }
+          prerequisiteSuccessText={
+            currentLbApprovalSuccess
+              ? "LB approval confirmed"
+              : currentLbRevocationSuccess
+                ? "Router access revoked"
+                : null
+          }
+          revertedText={
+            currentRemoveReverted
+              ? "Remove liquidity reverted"
+              : currentLbApprovalReverted
+                ? "LB approval reverted"
+                : currentLbRevocationReverted
+                  ? "Router revocation reverted"
+                  : null
+          }
           testId="liquidity-remove-status"
         />
         <NativeRemoveReceiptReview

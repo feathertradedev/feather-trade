@@ -69,8 +69,8 @@ export function LbOperatorApprovalDisclosure({
         <div><dt>Requested</dt><dd>Persistent pair-wide operator access for the current router</dd></div>
         <div><dt>Scope</dt><dd>Every LB token ID held now or later by this owner in this exact LBPair ERC-1155 contract. It is not limited to the selected bins or this withdrawal.</dd></div>
         <div><dt>Persistence</dt><dd>Remains on-chain for this exact pair and operator until explicitly revoked. Disconnecting the wallet or this site does not revoke it.</dd></div>
-        <div><dt>Manual / external revocation</dt><dd>On {networkName} (chain {chainId}), use a trusted explorer or contract interface to call <code>approveForAll({operator}, false)</code> on LBPair <code>{pair ?? "not selected"}</code>. This is an on-chain transaction and costs gas. Then verify <code>isApprovedForAll({account ?? "owner"}, {operator})</code> returns false on that same chain.</dd></div>
-        <div><dt>In-app revoke</dt><dd>Not offered in this release; tracked as P1 follow-on #42.</dd></div>
+        <div><dt>In-app revocation</dt><dd>Use Revoke router access below. Feather rechecks this exact owner, LBPair, router, chain, and live approval state before simulation and again before opening the wallet. Revocation is an on-chain transaction and costs gas.</dd></div>
+        <div><dt>External verification</dt><dd>After revocation, verify <code>isApprovedForAll({account ?? "owner"}, {operator})</code> returns false for LBPair <code>{pair ?? "not selected"}</code> on {networkName} (chain {chainId}).</dd></div>
       </dl>
     </section>
   );

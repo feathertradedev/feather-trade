@@ -5172,6 +5172,19 @@ a {
   font-size: 0.73rem;
 }
 
+.revoke-operator-button {
+  margin-top: 8px;
+  color: #e7aaa6;
+  background: rgb(119 41 41 / 8%);
+  border-color: rgb(220 101 94 / 35%);
+}
+
+.revoke-operator-button:hover:not(:disabled) {
+  color: #ffd0cc;
+  background: rgb(119 41 41 / 14%);
+  border-color: rgb(220 101 94 / 55%);
+}
+
 .liquidity-action-dock .transaction-status {
   min-height: 34px;
   margin-top: 8px;

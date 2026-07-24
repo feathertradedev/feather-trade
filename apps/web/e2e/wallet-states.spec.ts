@@ -1962,7 +1962,7 @@ test("fresh LB approval still simulates and submits once after complete prefligh
   assertTransactionMatchesSimulation((await readMockWallet(page)).sentTransactions[0], rpc, "approveForAll");
 });
 
-test("pair-wide LB approval disclosure shows exact scope, persistence, addresses, and manual revocation", async ({ page }) => {
+test("pair-wide LB approval disclosure shows exact scope, persistence, addresses, and in-app revocation", async ({ page }) => {
   await setupConnectedLiquidity(page, { lbApproved: true });
 
   const disclosure = page.getByTestId("lb-operator-approval-disclosure");
@@ -1970,15 +1970,116 @@ test("pair-wide LB approval disclosure shows exact scope, persistence, addresses
   await expect(disclosure).toContainText("Every LB token ID held now or later");
   await expect(disclosure).toContainText("not limited to the selected bins or this withdrawal");
   await expect(disclosure).toContainText("Disconnecting the wallet or this site does not revoke it");
-  await expect(disclosure).toContainText(`approveForAll(${LB_ROUTER}, false)`);
+  await expect(disclosure).toContainText("Use Revoke router access below");
+  await expect(disclosure).toContainText("rechecks this exact owner, LBPair, router, chain, and live approval state");
   await expect(disclosure).toContainText(new RegExp(`isApprovedForAll\\(${DEFAULT_ACCOUNT}, ${LB_ROUTER}\\)`, "i"));
   await expect(disclosure).toContainText("costs gas");
-  await expect(disclosure).toContainText("P1 follow-on #42");
   await expect(disclosure).toContainText("Local Anvil · chain 31337");
-  await expect(disclosure).toContainText("On Local Anvil (chain 31337)");
-  await expect(disclosure).toContainText("returns false on that same chain");
+  await expect(disclosure).toContainText("returns false");
   await expect(page.getByTestId("remove-lb-approval-details-pair")).toHaveText(WNATIVE_USDC_PAIR);
   await expect(page.getByTestId("remove-lb-approval-details-spender")).toHaveText(LB_ROUTER);
+  await expect(page.getByTestId("liquidity-revoke-lb-button")).toBeEnabled();
+});
+
+test("in-app LB revocation submits the exact pair and router false grant once and reconciles live state", async ({ page }) => {
+  const rpc = await setupConnectedLiquidity(page, { lbApproved: true, lbApprovedAfterReceipt: false });
+  const revokeButton = page.getByTestId("liquidity-revoke-lb-button");
+
+  await expect(revokeButton).toBeEnabled();
+  await clickReviewedAction(page, "liquidity-revoke-lb-button");
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
+
+  const wallet = await readMockWallet(page);
+  const decoded = decodeSubmittedTransaction(wallet.sentTransactions[0]);
+  expect(decoded.functionName).toBe("approveForAll");
+  const [operator, approved] = decoded.args as readonly [string, boolean];
+  expect(operator.toLowerCase()).toBe(LB_ROUTER.toLowerCase());
+  expect(approved).toBe(false);
+  expect((wallet.sentTransactions[0] as { to?: string }).to?.toLowerCase()).toBe(WNATIVE_USDC_PAIR.toLowerCase());
+  assertTransactionMatchesSimulation(wallet.sentTransactions[0], rpc, "approveForAll");
+
+  await expect(page.getByText("Router access revoked")).toBeVisible();
+  await expect(page.getByTestId("lb-operator-approval-disclosure")).toHaveAttribute("data-approval-state", "externally-revoked");
+  await expect(revokeButton).toBeDisabled();
+  await expect(page.getByTestId("liquidity-approve-lb-button")).toBeEnabled();
+});
+
+test("in-app LB revocation is unavailable when the exact pair and operator grant is already false", async ({ page }) => {
+  const rpc = await setupConnectedLiquidity(page, { lbApproved: false });
+
+  const revokeButton = page.getByTestId("liquidity-revoke-lb-button");
+  await expect(revokeButton).toBeDisabled();
+  await expect(revokeButton).toContainText("Router access not granted");
+  await bypassDisabledButtonAndClick(page, "liquidity-revoke-lb-button");
+  await waitForForcedClickEffects(page);
+
+  expect(simulatedFunctions(rpc)).not.toContain("approveForAll");
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
+test("LB revocation skips a stale reviewed action when live access was already revoked", async ({ page }) => {
+  const rpc = await setupConnectedLiquidity(page, { lbApproved: true });
+  const revokeButton = page.getByTestId("liquidity-revoke-lb-button");
+
+  await revokeButton.click();
+  await expect(page.getByTestId("gas-review")).toContainText("LB operator revocation");
+  rpc.update({ lbApproved: false });
+  await revokeButton.click();
+
+  await expect(page.getByTestId("lb-operator-approval-disclosure")).toHaveAttribute("data-approval-state", "externally-revoked");
+  await expect(page.getByTestId("gas-review")).toHaveCount(0);
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
+test("LB revocation final guard blocks the wallet if access changes after gas review", async ({ page }) => {
+  const rpc = await setupConnectedLiquidity(page, { lbApproved: true, walletReadDelayMs: 200 });
+  const revokeButton = page.getByTestId("liquidity-revoke-lb-button");
+
+  await revokeButton.click();
+  await expect(page.getByTestId("gas-review")).toContainText("LB operator revocation");
+  const readsBeforeSubmit = rpc.snapshot().ethCalls.filter((call) => call.functionName === "isApprovedForAll").length;
+  const gasEstimatesBeforeSubmit = rpc.snapshot().gasEstimatesCompleted;
+  let releaseFinalGuard!: () => void;
+  let observeFinalGuard!: () => void;
+  const finalGuardReleased = new Promise<void>((resolve) => {
+    releaseFinalGuard = resolve;
+  });
+  const finalGuardObserved = new Promise<void>((resolve) => {
+    observeFinalGuard = resolve;
+  });
+  rpc.update({
+    beforeLbApprovalResult: async ({ completedGasEstimates, readNumber }) => {
+      if (completedGasEstimates <= gasEstimatesBeforeSubmit || readNumber !== readsBeforeSubmit + 3) return;
+      observeFinalGuard();
+      await finalGuardReleased;
+    }
+  });
+
+  const secondClick = revokeButton.click();
+  await finalGuardObserved;
+  rpc.update({ lbApproved: false });
+  releaseFinalGuard();
+  await secondClick;
+
+  await expect(page.getByTestId("lb-operator-approval-disclosure")).toHaveAttribute("data-approval-state", "externally-revoked");
+  await expect(page.getByTestId("gas-review")).toHaveCount(0);
+  expect((await readMockWallet(page)).sentTransactions).toEqual([]);
+});
+
+test("rapid duplicate LB revocation confirmations produce one wallet request", async ({ page }) => {
+  await setupConnectedLiquidity(page, { lbApproved: true });
+  const revokeButton = page.getByTestId("liquidity-revoke-lb-button");
+
+  await revokeButton.click();
+  await expect(page.getByTestId("gas-review")).toContainText("LB operator revocation");
+  await page.evaluate(() => {
+    const button = document.querySelector<HTMLButtonElement>('[data-testid="liquidity-revoke-lb-button"]');
+    if (!button) throw new Error("LB revocation button is unavailable");
+    button.click();
+    button.click();
+  });
+
+  await expect.poll(async () => (await readMockWallet(page)).sentTransactions.length).toBe(1);
 });
 
 test("an approved LB grant becomes unavailable on an exact wallet-read error and recovers on the next live read", async ({ page }) => {
