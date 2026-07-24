@@ -128,7 +128,7 @@ export interface MockRpcOptions {
   pairTokenXAfterReceipt?: string;
   pairTokenY?: string;
   pairByIdDelayMs?: number;
-  pairByIdMode?: "ready" | "error";
+  pairByIdMode?: "ready" | "error" | "missing";
   poolActivityMode?: "ready" | "empty";
   poolEconomicsReadDelayMs?: number;
   poolStateAsOfBlock?: bigint;
@@ -159,6 +159,9 @@ export interface MockRpcOptions {
   transactionEffectsByHash?: Readonly<Record<string, "lb-approval" | "remove">>;
   simulationDelayMs?: number;
   simulationMode?: "success" | "error";
+  trustedPriceObservedAt?: number;
+  trustedPriceQuotePerBaseE18?: string;
+  trustedPriceStatus?: "ready" | "partial" | "unavailable";
   walletReadMode?: "ready" | "error";
   walletReadDelayMs?: number;
 }
@@ -225,6 +228,8 @@ interface GraphRequest {
     interval?: "ONE_MINUTE" | "FIVE_MINUTES" | "FIFTEEN_MINUTES" | "HOUR" | "FOUR_HOURS" | "DAY" | "WEEK";
     owner?: string;
     pair?: string;
+    baseToken?: string;
+    quoteToken?: string;
     radius?: number;
     pairId?: string;
     skip?: number;
@@ -485,6 +490,44 @@ function mockAnalyticsResponse(body: GraphRequest, options: MockRpcOptions): Rec
       };
     }).filter((_, index, candles) => options.analyticsCandleGap !== true || index !== Math.max(1, candles.length - 23));
     return { data: { pairCandles: { nodes, pageInfo: { endCursor: null, hasNextPage: false, partial }, streamCursor: "0" } } };
+  }
+  if (query.includes("PoolCreationTrustedPairPrice")) {
+    const baseToken = (body.variables?.baseToken ?? WNATIVE).toLowerCase();
+    const quoteToken = (body.variables?.quoteToken ?? USDC).toLowerCase();
+    const status = options.trustedPriceStatus ?? "unavailable";
+    if (status !== "ready") {
+      return {
+        data: {
+          trustedPairPrice: {
+            baseToken,
+            quoteToken,
+            quotePerBaseE18: null,
+            status: status === "partial" ? "PARTIAL" : "UNAVAILABLE"
+          }
+        }
+      };
+    }
+    const observedAt = options.trustedPriceObservedAt ?? 1_720_000_000;
+    return {
+      data: {
+        trustedPairPrice: {
+          baseToken,
+          quoteToken,
+          quotePerBaseE18: options.trustedPriceQuotePerBaseE18 ?? "160000000000000000000",
+          status: "READY",
+          baseSource: "chainlink-data-feed",
+          quoteSource: "chainlink-data-feed",
+          baseObservedAt: observedAt,
+          quoteObservedAt: observedAt,
+          baseAgeSeconds: 3,
+          quoteAgeSeconds: 2,
+          asOfBlock: String(options.analyticsAsOfBlock ?? options.blockNumber ?? DEFAULT_BLOCK_NUMBER),
+          asOfBlockHash: options.analyticsHeadHash ?? options.blockHash ??
+            "0x2222222222222222222222222222222222222222222222222222222222222222",
+          asOfTimestamp: observedAt + 3
+        }
+      }
+    };
   }
   if (query.includes("WebAnalyticsHealth")) {
     return { data: { analyticsHealth: mockAnalyticsHealth(options, partial) } };
@@ -875,6 +918,7 @@ function mockGraphResponse(body: GraphRequest, options: MockRpcOptions): Record<
 
   if (query.includes("PairById")) {
     if (options.pairByIdMode === "error") return { errors: [{ message: "Mock pair lookup failed" }] };
+    if (options.pairByIdMode === "missing") return { data: { pair: null } };
     const pair = typeof body.variables?.id === "string" ? mockPairByAddress(options, body.variables.id) : null;
     return { data: { pair } };
   }

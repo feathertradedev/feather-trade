@@ -1,0 +1,72 @@
+{
+  "schemaVersion": "feather.factory-preset-policy.v1",
+  "environment": "sepolia",
+  "chainId": 11155111,
+  "factory": "0xe521A00F81A60b77Eb39EC2097F94aF532DFb811",
+  "owner": "0xC1A4747D52CDBAac26294495c6f0be49a0f0DDAA",
+  "approval": {
+    "scope": "sepolia-only",
+    "mainnetPolicy": "separate-explicit-approval-required",
+    "selection": "small-curated-set",
+    "rationale": "Sepolia exposes two volatile-market choices with identical 0.10%-0.59% fee bounds. Step 10 offers finer price granularity; step 20 offers a wider bin for higher-volatility testing and permits the canonical WETH/USDC replacement to coexist with the deprecated step-10 pool."
+  },
+  "evidence": {
+    "blockNumber": "11337723",
+    "blockHash": "0xc42e698b2469f5103e59cd8e3a1b081e0d6acf9d135f6a672bbfa3779abee737",
+    "source": "live Sepolia factory reads",
+    "parameterReference": "contracts/joe-v2/script/config/bips-config.sol",
+    "adaptation": "Step 10 matches the reviewed Liquidity Book reference. Step 20 halves baseFactor and variableFeeControl relative to the reference step 20 so the wider bin retains the approved 0.10%-0.59% fee envelope already exercised by the canonical Sepolia replacement."
+  },
+  "presets": [
+    {
+      "binStep": 10,
+      "baseFactor": 10000,
+      "filterPeriod": 30,
+      "decayPeriod": 600,
+      "reductionFactor": 5000,
+      "variableFeeControl": 40000,
+      "protocolShare": 0,
+      "maxVolatilityAccumulator": 350000,
+      "open": true,
+      "marketProfile": "standard-volatile",
+      "minimumFeeRateE18": "1000000000000000",
+      "maximumFeeRateE18": "5900000000000000"
+    },
+    {
+      "binStep": 20,
+      "baseFactor": 5000,
+      "filterPeriod": 30,
+      "decayPeriod": 600,
+      "reductionFactor": 5000,
+      "variableFeeControl": 10000,
+      "protocolShare": 0,
+      "maxVolatilityAccumulator": 350000,
+      "open": true,
+      "marketProfile": "highly-volatile-testnet",
+      "minimumFeeRateE18": "1000000000000000",
+      "maximumFeeRateE18": "5900000000000000"
+    }
+  ],
+  "knownPairIdentities": [
+    {
+      "baseToken": "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9",
+      "quoteToken": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+      "binStep": 10,
+      "pair": "0x3136C5F3b48fe486c696bEDC031B9cB9D3e9EA62",
+      "status": "deprecated-do-not-fund"
+    },
+    {
+      "baseToken": "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9",
+      "quoteToken": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+      "binStep": 20,
+      "pair": "0x79EFAC7c0e75fa1aC41dbef2A864659A9097E440",
+      "status": "canonical"
+    }
+  ],
+  "provisioning": {
+    "simulationRequired": true,
+    "ownerOnly": true,
+    "automaticBroadcast": false,
+    "migrationPolicy": "Existing pools remain immutable and addressable by exact pair plus bin step. Closing or replacing a preset requires a new versioned policy and affects only future pool creation; it never migrates or silently reroutes an existing pool."
+  }
+}
