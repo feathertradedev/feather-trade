@@ -46,9 +46,6 @@ const environments = {
 
 const addresses = {
   deployer: "0x1111111111111111111111111111111111111111",
-  feeRecipient: "0x2222222222222222222222222222222222222222",
-  initialOwner: "0x3333333333333333333333333333333333333333",
-  lbFactoryOwner: "0x4444444444444444444444444444444444444444",
   lbFactory: "0x5555555555555555555555555555555555555555",
   lbPairImplementation: "0x6666666666666666666666666666666666666666",
   lbQuoter: "0x7777777777777777777777777777777777777777",
@@ -126,9 +123,9 @@ function buildManifest(config) {
       lbRouter: addresses.lbRouter
     },
     ownership: {
-      feeRecipient: addresses.feeRecipient,
-      initialOwner: addresses.initialOwner,
-      lbFactoryOwner: addresses.lbFactoryOwner
+      feeRecipient: addresses.deployer,
+      initialOwner: addresses.deployer,
+      lbFactoryOwner: addresses.deployer
     },
     tokens: {
       wrappedNative
@@ -146,9 +143,9 @@ function buildManifest(config) {
       variableFeeControl: 40_000
     },
     constructorArgs: {
-      feeRecipient: addresses.feeRecipient,
+      feeRecipient: addresses.deployer,
       flashLoanFee: 5_000_000_000_000,
-      initialOwner: addresses.initialOwner,
+      initialOwner: addresses.deployer,
       quoterFactoryV1: "0x0000000000000000000000000000000000000000",
       quoterFactoryV2_1: "0x0000000000000000000000000000000000000000",
       quoterFactoryV2_2: addresses.lbFactory,
