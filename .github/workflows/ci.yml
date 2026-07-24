@@ -318,6 +318,7 @@ jobs:
           EVM_DEPLOYER_PRIVATE_KEY: public-canary-evm-deployer-key
           EVM_DEPLOY_RPC_URL: public-canary-evm-deploy-rpc
           SEPOLIA_RPC_URL: public-canary-sepolia-rpc
+          VITE_ANALYTICS_SEPOLIA_URL: https://analytics.sepolia.example.com/graphql
           VITE_REOWN_PROJECT_ID: public_wallet_project_0123456789
         run: |
           mkdir -p .local/public-web

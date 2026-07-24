@@ -7,6 +7,7 @@ const path = require("node:path");
 
 const repoRoot = path.resolve(__dirname, "../..");
 const fixtureWriter = path.join(repoRoot, "scripts/web/create-public-config-fixture.cjs");
+const evmManifestValidator = path.join(repoRoot, "scripts/evm/validate-manifest.cjs");
 const validator = path.join(repoRoot, "scripts/web/validate-public-config.cjs");
 const anvilOwner = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 const legacyRoutingSlots = [
@@ -70,6 +71,15 @@ const mainnetManifestPath = writeFixture(dir, "robinhood");
 expectPass("synthetic public Sepolia manifest without an indexer", "sepolia", sepoliaManifestPath);
 expectPass("synthetic public testnet manifest", "robinhoodTestnet", testnetManifestPath);
 expectPass("synthetic public mainnet manifest", "robinhood", mainnetManifestPath);
+const evmManifestResult = childProcess.spawnSync(
+  process.execPath,
+  [evmManifestValidator, sepoliaManifestPath, "sepolia", "11155111"],
+  { cwd: repoRoot, encoding: "utf8" }
+);
+assert(
+  evmManifestResult.status === 0,
+  `synthetic public Sepolia fixture must satisfy the deployment manifest validator:\n${evmManifestResult.stderr}\n${evmManifestResult.stdout}`
+);
 
 const dryRunPath = path.join(dir, "dry-run.json");
 writeJson(dryRunPath, readJson(testnetManifestPath));
