@@ -2350,7 +2350,12 @@ test("remove submission is cancelled when its burn context changes during simula
 
   await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled();
   await page.getByTestId("liquidity-remove-button").click();
-  await expect.poll(() => simulatedFunctions(rpc).filter((name) => name === "removeLiquidity").length).toBe(1);
+  // Observe the call inside the mocked delay; Playwright's wider default polling gaps can land after simulation completes.
+  await expect
+    .poll(() => simulatedFunctions(rpc).filter((name) => name === "removeLiquidity").length, {
+      intervals: [25]
+    })
+    .toBe(1);
   await page.locator("#remove-percent").fill("50");
 
   await expect(page.getByText("Remove execution context changed during live reads or simulation; review the current inputs and try again").first()).toBeVisible();
