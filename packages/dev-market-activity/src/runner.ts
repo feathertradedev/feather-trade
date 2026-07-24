@@ -405,7 +405,12 @@ async function sendPreparedTransaction(
   const estimate = await clients.publicClient.estimateGas(request);
   const gas = estimate + (estimate * 2_000n + 9_999n) / 10_000n;
   await clients.publicClient.call({ ...request, gas });
-  return clients.walletClient.sendTransaction({ ...request, gas, chain: clients.walletClient.chain });
+  return clients.walletClient.sendTransaction({
+    ...request,
+    account: clients.account,
+    gas,
+    chain: clients.walletClient.chain
+  });
 }
 
 function createClients(config: MarketActivityConfig): RuntimeClients {
