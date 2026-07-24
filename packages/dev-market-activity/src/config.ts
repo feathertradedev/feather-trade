@@ -2,10 +2,12 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 
 import {
+  assertSepoliaRuntimeManifest,
   findTokenMetadata,
   readDeploymentManifest,
   registryFromLocalnetManifest,
   registryFromRobinhoodManifest,
+  registryFromSepoliaManifest,
   type DexRegistry,
   type TokenMetadata
 } from "@robinhood-lb/sdk";
@@ -55,9 +57,19 @@ export function loadMarketActivityConfig(env: NodeJS.ProcessEnv = process.env): 
     const configured = manifest.seededPools.wethUsdc;
     if (configured === undefined) throw new Error("Localnet manifest does not define seededPools.wethUsdc");
     pool = configured;
-  } else {
+  } else if (manifest.schemaVersion === "lb.robinhood.v1") {
     if (manifest.environment !== "testnet") throw new Error("Development market activity rejects mainnet unconditionally");
     registry = registryFromRobinhoodManifest(manifest);
+    environment = "testnet";
+    pool = {
+      pair: address(required(env, "MARKET_ACTIVITY_POOL"), "MARKET_ACTIVITY_POOL"),
+      tokenX: address(required(env, "MARKET_ACTIVITY_WETH"), "MARKET_ACTIVITY_WETH"),
+      tokenY: address(required(env, "MARKET_ACTIVITY_USDC"), "MARKET_ACTIVITY_USDC"),
+      binStep: positiveInteger(env.MARKET_ACTIVITY_BIN_STEP, 10, "MARKET_ACTIVITY_BIN_STEP")
+    };
+  } else {
+    assertSepoliaRuntimeManifest(manifest);
+    registry = registryFromSepoliaManifest(manifest);
     environment = "testnet";
     pool = {
       pair: address(required(env, "MARKET_ACTIVITY_POOL"), "MARKET_ACTIVITY_POOL"),

@@ -21,7 +21,7 @@ export interface PinnedPoolEconomics {
   decimalsY: number;
   factory: Address;
   feeRates: CurrentFeeRates;
-  source: "rpc-at-indexer-block";
+  source: "rpc-at-canonical-analytics-block";
   tokenX: Address;
   tokenY: Address;
 }
@@ -59,7 +59,7 @@ export async function loadPinnedPoolEconomics(
   if (anchor.blockNumber < 0n) throw new Error("Pool economics anchor block is invalid");
   const block = await publicClient.getBlock({ blockNumber: anchor.blockNumber });
   if (block.hash === null || block.hash.toLowerCase() !== anchor.blockHash.toLowerCase()) {
-    throw new Error("Pool economics RPC block hash differs from the indexer snapshot");
+    throw new Error("Pool economics RPC block hash differs from the canonical analytics anchor");
   }
   const [factory, tokenX, tokenY, decimalsXRaw, decimalsYRaw, binStepRaw, activeIdRaw, staticFeesRaw, variableFeesRaw] = await Promise.all([
     publicClient.readContract({ address: pool.address, abi: lbPairAbi, functionName: "getFactory", blockNumber: block.number }),
@@ -75,11 +75,11 @@ export async function loadPinnedPoolEconomics(
 
   assertAddressIdentity(factory, registry.contracts.lbFactory, "registry factory");
   assertAddressIdentity(factory, pool.factoryAddress, "indexed factory");
-  assertAddressIdentity(factory, anchor.factory, "indexer snapshot factory");
+  assertAddressIdentity(factory, anchor.factory, "canonical analytics factory");
   assertAddressIdentity(tokenX, pool.tokenXAddress, "token X");
-  assertAddressIdentity(tokenX, anchor.tokenX, "indexer snapshot token X");
+  assertAddressIdentity(tokenX, anchor.tokenX, "canonical analytics token X");
   assertAddressIdentity(tokenY, pool.tokenYAddress, "token Y");
-  assertAddressIdentity(tokenY, anchor.tokenY, "indexer snapshot token Y");
+  assertAddressIdentity(tokenY, anchor.tokenY, "canonical analytics token Y");
   const decimalsX = Number(decimalsXRaw);
   const decimalsY = Number(decimalsYRaw);
   assertTokenDecimals(decimalsX, allowlistedTokenX.decimals, pool.tokenX?.decimals ?? null, "token X");
@@ -88,9 +88,9 @@ export async function loadPinnedPoolEconomics(
   if (binStep.toString() !== pool.binStep) {
     throw new Error(`Pinned pool bin step ${binStep} differs from indexed bin step ${pool.binStep}`);
   }
-  if (binStep !== anchor.binStep) throw new Error("Pinned pool bin step differs from the indexer snapshot");
+  if (binStep !== anchor.binStep) throw new Error("Pinned pool bin step differs from the canonical analytics anchor");
   const activeId = BigInt(activeIdRaw);
-  if (activeId !== anchor.activeId) throw new Error("Pinned pool active ID differs from the indexer snapshot");
+  if (activeId !== anchor.activeId) throw new Error("Pinned pool active ID differs from the canonical analytics anchor");
   const staticFees = staticFeeParameters(staticFeesRaw);
   const variableFees = variableFeeParameters(variableFeesRaw);
   const feeRates = quoteCurrentFeeRates({
@@ -117,7 +117,7 @@ export async function loadPinnedPoolEconomics(
     decimalsY,
     factory,
     feeRates,
-    source: "rpc-at-indexer-block",
+    source: "rpc-at-canonical-analytics-block",
     tokenX,
     tokenY
   };

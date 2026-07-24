@@ -1,0 +1,130 @@
+name: feather-vps
+
+x-logging: &bounded-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  analytics:
+    image: ${FEATHER_ANALYTICS_IMAGE_REPOSITORY:?set FEATHER_ANALYTICS_IMAGE_REPOSITORY}@sha256:${FEATHER_ANALYTICS_IMAGE_DIGEST:?set FEATHER_ANALYTICS_IMAGE_DIGEST}
+    restart: unless-stopped
+    init: true
+    env_file:
+      - path: ${FEATHER_ANALYTICS_ENV_FILE:?set FEATHER_ANALYTICS_ENV_FILE}
+        required: true
+    environment:
+      ANALYTICS_HOST: 0.0.0.0
+      ANALYTICS_PORT: "8787"
+      # Caddy is the only trusted proxy and replaces X-Forwarded-For with the
+      # socket client address before forwarding public analytics requests.
+      ANALYTICS_CORS_ORIGINS: https://${FEATHER_APP_DOMAIN:?set FEATHER_APP_DOMAIN}
+      ANALYTICS_TRUST_PROXY: "true"
+      ANALYTICS_MAX_STREAMS_PER_IP: ${FEATHER_ANALYTICS_MAX_STREAMS_PER_IP:-20}
+      ANALYTICS_GRAPHQL_REQUESTS_PER_MINUTE: ${FEATHER_ANALYTICS_GRAPHQL_REQUESTS_PER_MINUTE:-120}
+      ANALYTICS_GRAPHQL_RATE_LIMIT_CLIENTS: ${FEATHER_ANALYTICS_GRAPHQL_RATE_LIMIT_CLIENTS:-4096}
+      ANALYTICS_POSITION_SNAPSHOT_TIMEOUT_MS: ${FEATHER_ANALYTICS_POSITION_SNAPSHOT_TIMEOUT_MS:-5000}
+      ANALYTICS_DATABASE_KEEPALIVE_INITIAL_DELAY_MS: ${FEATHER_ANALYTICS_DATABASE_KEEPALIVE_INITIAL_DELAY_MS:-10000}
+      ANALYTICS_DATABASE_HEALTH_INTERVAL_MS: ${FEATHER_ANALYTICS_DATABASE_HEALTH_INTERVAL_MS:-5000}
+      ANALYTICS_DATABASE_FAILURE_GRACE_MS: ${FEATHER_ANALYTICS_DATABASE_FAILURE_GRACE_MS:-120000}
+    expose:
+      - "8787"
+    volumes:
+      - type: bind
+        source: ${FEATHER_ANALYTICS_CONFIG_DIR:?set FEATHER_ANALYTICS_CONFIG_DIR}
+        target: /run/feather/config
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${FEATHER_ANALYTICS_ADAPTERS_DIR:?set FEATHER_ANALYTICS_ADAPTERS_DIR}
+        target: /run/feather/adapters
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      - backend
+      - egress
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    cpus: "${FEATHER_ANALYTICS_CPUS:-2.0}"
+    mem_limit: ${FEATHER_ANALYTICS_MEMORY_LIMIT:-2g}
+    stop_grace_period: 30s
+    logging: *bounded-logging
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:8787/readyz').then((response)=>{if(!response.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  caddy:
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    restart: unless-stopped
+    init: true
+    environment:
+      FEATHER_APP_DOMAIN: ${FEATHER_APP_DOMAIN:?set FEATHER_APP_DOMAIN}
+      FEATHER_DOCS_DOMAIN: ${FEATHER_DOCS_DOMAIN:?set FEATHER_DOCS_DOMAIN}
+      FEATHER_APP_CONNECT_SRC: ${FEATHER_APP_CONNECT_SRC:?set FEATHER_APP_CONNECT_SRC}
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+      - "443:443/udp"
+    volumes:
+      - type: bind
+        source: ./Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${FEATHER_RELEASES_DIR:?set FEATHER_RELEASES_DIR}
+        target: /srv/feather/releases
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: volume
+        source: caddy_data
+        target: /data
+      - type: volume
+        source: caddy_config
+        target: /config
+    networks:
+      - edge
+      - backend
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    cpus: "${FEATHER_CADDY_CPUS:-1.0}"
+    mem_limit: ${FEATHER_CADDY_MEMORY_LIMIT:-512m}
+    stop_grace_period: 30s
+    logging: *bounded-logging
+
+networks:
+  edge: {}
+  backend:
+    internal: true
+  egress:
+    enable_ipv6: true
+
+volumes:
+  caddy_data: {}
+  caddy_config: {}

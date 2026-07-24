@@ -1,0 +1,41 @@
+{
+  "$schema": "./schema.json",
+  "schemaVersion": "lb.token-list.v1",
+  "environment": "sepolia",
+  "chainId": 11155111,
+  "name": "Ethereum Sepolia Token List",
+  "updatedAt": "2026-07-22",
+  "tokens": [
+    {
+      "id": "weth",
+      "approvalBehavior": "standard-bool",
+      "symbol": "WETH",
+      "name": "Wrapped Ether",
+      "address": "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9",
+      "decimals": 18,
+      "logoURI": "/token-assets/weth.svg",
+      "tags": ["canonical", "testnet", "wrapped-native"],
+      "risk": {
+        "reviewStatus": "standard",
+        "flags": [],
+        "disabledActions": []
+      }
+    },
+    {
+      "id": "usdc",
+      "approvalBehavior": "standard-bool",
+      "symbol": "USDC",
+      "name": "USD Coin",
+      "address": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+      "decimals": 6,
+      "logoURI": "/token-assets/usdc.svg",
+      "tags": ["canonical", "quote", "stablecoin", "testnet"],
+      "risk": {
+        "reviewStatus": "restricted",
+        "flags": ["upgradeable", "blacklistable"],
+        "disabledActions": [],
+        "notes": "Circle USDC is upgradeable and exposes administrative controls that can pause transfers or block addresses."
+      }
+    }
+  ]
+}

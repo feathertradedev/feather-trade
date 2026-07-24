@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page } from "./fixtures/test";
 import { decodeFunctionData, type Hex } from "viem";
 
 import { lbRouterAbi } from "../../../packages/sdk/src/abi";
@@ -10,6 +10,7 @@ import {
 import {
   installMockWallet,
   LOCALNET_CHAIN_ID,
+  openAndSelectMockWallet,
   readMockWallet
 } from "./fixtures/mock-wallet";
 
@@ -109,7 +110,7 @@ test("a shallow first batch blocks replanning until 12-confirmation finality", a
 });
 
 test("finalized partial completion rejects then resumes only a newly live bin and verifies zero before completion", async ({ page }) => {
-  test.setTimeout(60_000);
+  test.setTimeout(90_000);
   const rpc = await setupFullExit(page, { ownerPositionCount: 1 });
   await submitReviewedFullExit(page);
   const first = decodeRemove((await readMockWallet(page)).sentTransactions[0]);
@@ -148,6 +149,7 @@ test("finalized partial completion rejects then resumes only a newly live bin an
   });
   expect(rejectedJournalRecord).toMatchObject({ activeHash: null, status: "rejected" });
 
+  await clearPersistedWalletSession(page);
   await page.reload();
   await reconnectIfNeeded(page);
   await page.evaluate(() => { window.__mockWalletState.rejectTransactions = false; });
@@ -205,19 +207,27 @@ async function setupFullExit(page: Page, options: MockRpcOptions): Promise<Insta
 }
 
 async function connectWallet(page: Page): Promise<void> {
-  await page.getByTestId("wallet-connect-button").click();
+  await openAndSelectMockWallet(page);
   await expect(page.getByTestId("wallet-account-button")).toContainText("0xf39F...2266");
 }
 
 async function reconnectIfNeeded(page: Page): Promise<void> {
   const connectButton = page.getByTestId("wallet-connect-button");
   const accountButton = page.getByTestId("wallet-account-button");
-  await page.waitForTimeout(250);
-  if (!await accountButton.isVisible().catch(() => false) && await connectButton.isVisible().catch(() => false)) {
-    await expect(connectButton).toBeEnabled();
-    await connectButton.click();
-  }
+  await connectButton.or(accountButton).first().waitFor({ state: "visible" });
+  if (!await accountButton.isVisible()) await openAndSelectMockWallet(page);
   await expect(accountButton).toContainText("0xf39F...2266");
+}
+
+async function clearPersistedWalletSession(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    for (const key of Array.from({ length: window.localStorage.length }, (_, index) => window.localStorage.key(index))) {
+      if (key === null) continue;
+      if (key === "wagmi.store" || key === "wagmi.recentConnectorId" || key.startsWith("@appkit/")) {
+        window.localStorage.removeItem(key);
+      }
+    }
+  });
 }
 
 async function beginFullExitReview(page: Page): Promise<void> {

@@ -17,7 +17,11 @@ import {
   type PositionRow
 } from "./data";
 import { returnHrefFromAction } from "./pool-discovery";
-import { summarizePoolPosition } from "./pool-workspace";
+import {
+  createPoolManageSelectionIntent,
+  poolManageSelectionIntentHref,
+  summarizePoolPosition,
+} from "./pool-workspace";
 import { usePoolDraftState, usePoolWorkspace } from "./pool-workspace-context";
 import { poolWorkspaceHref, type PoolWorkspaceTask } from "./pool-workspace-route";
 
@@ -49,8 +53,21 @@ export function PoolWorkspaceOwnerPanel() {
     () => summarizePoolPosition(workspace.positions, null),
     [workspace.positions]
   );
+  const manageSelectionIntent = useMemo(
+    () => createPoolManageSelectionIntent(
+      workspace.positions,
+      workspace.walletAddress,
+      workspace.pool.address
+    ),
+    [workspace.pool.address, workspace.positions, workspace.walletAddress]
+  );
   const returnHref = returnHrefFromAction(window.location.hash);
-  const manageHref = workspaceTaskHref(workspace.pool.id, "manage", returnHref);
+  const manageHref = manageSelectionIntent === null
+    ? workspaceTaskHref(workspace.pool.id, "manage", returnHref)
+    : poolManageSelectionIntentHref(
+        workspaceTaskHref(workspace.pool.id, "manage", returnHref),
+        manageSelectionIntent
+      );
   const createHref = workspaceTaskHref(workspace.pool.id, "create", returnHref);
   const canManage = canManagePoolPosition(
     workspace.positions,
@@ -88,12 +105,11 @@ export function PoolWorkspaceOwnerPanel() {
             History
           </button>
         </div>
-        {activeTab === "positions" && summary !== null && canManage ? (
+        {activeTab === "positions" && summary !== null && canManage && manageSelectionIntent !== null ? (
           <a
             className="pool-owner-panel-action"
             data-testid="pool-position-manage-link"
             href={manageHref}
-            onClick={() => workspace.setDraftValue<string[]>("liquidity.selectedPositionIds", summary.positionIds, [])}
           >
             Manage position
           </a>
@@ -383,13 +399,13 @@ function PositionHistoryContent() {
     if (workspace.historyState === "partial" || workspace.historyState === "stale") {
       return (
         <OwnerPanelState
-          detail={workspace.historyError ?? "Indexed owner history is incomplete, so no events can be confirmed yet."}
+          detail={workspace.historyError ?? "Canonical owner history is incomplete, so no events can be confirmed yet."}
           title={workspace.historyState === "stale" ? "Position history is stale" : "Position history is partial"}
           tone={workspace.historyState}
         />
       );
     }
-    return <OwnerPanelState detail="No indexed liquidity events were found for this wallet and pool." title="No position history yet" />;
+    return <OwnerPanelState detail="No canonical liquidity or position-transfer events were found for this wallet and pool." title="No position history yet" />;
   }
 
   const visibleHistory = workspace.history.slice(0, visibleCount);
@@ -427,7 +443,7 @@ function PoolActivityContent() {
   return (
     <div data-testid="pool-activity-feed">
       <div className="pool-owner-activity-heading">
-        <span>{activity.windowed ? "Latest indexed pool events" : "Indexed pool events"}</span>
+        <span>{activity.windowed ? "Latest canonical pool events" : "Canonical pool events"}</span>
         {workspace.walletAddress === null ? (
           <small>Connect to filter by wallet</small>
         ) : (
@@ -443,22 +459,22 @@ function PoolActivityContent() {
       </div>
       {activity.state === "loading" ? <OwnerPanelSkeleton label="Loading pool activity" /> : null}
       {activity.state === "unavailable" ? (
-        <OwnerPanelState detail="Pair-scoped pool activity is not configured for this environment." title="Pool activity unavailable" />
+        <OwnerPanelState detail="Canonical pair activity is not configured for this environment." title="Pool activity unavailable" />
       ) : null}
       {activity.state === "error" && activity.rows.length === 0 ? (
         <OwnerPanelState detail={activity.error ?? "The pool activity request failed."} title="Pool activity could not load" tone="error" />
       ) : null}
       {(activity.state === "partial" || activity.state === "stale" || (activity.state === "error" && activity.rows.length > 0)) ? (
         <OwnerPanelNotice tone={activity.state === "error" ? "error" : activity.state}>
-          {activity.error ?? "Pool activity is incomplete. Known indexed events remain visible."}
+          {activity.error ?? "Pool activity is incomplete. Known canonical events remain visible."}
         </OwnerPanelNotice>
       ) : null}
       {activity.state !== "loading" && activity.state !== "unavailable" && !(activity.state === "error" && activity.rows.length === 0) ? (
         activity.rows.length === 0 ? (
           <OwnerPanelState
             detail={activity.walletOnly
-              ? "No indexed swaps or liquidity events from this wallet were found in the current pool window."
-              : "No indexed swaps or liquidity events were found in the current pool window."}
+              ? "No canonical liquidity or position events from this wallet were found in the current pool window."
+              : "No canonical swaps, liquidity changes, or position transfers were found in the current pool window."}
             title={activity.walletOnly ? "No wallet activity" : "No pool activity yet"}
           />
         ) : (
@@ -495,10 +511,10 @@ function PoolPositionHistoryRow({ event }: { event: PositionHistoryRow }) {
       </div>
       <span>{eventAmounts}</span>
       <span>Block {event.blockNumber}</span>
-      {explorerUrl ? (
+      {explorerUrl && event.transactionHash !== "" ? (
         <a href={`${explorerUrl}/tx/${encodeURIComponent(event.transactionHash)}`} rel="noreferrer" target="_blank">{transactionLabel} ↗</a>
       ) : (
-        <span>{transactionLabel}</span>
+        <span>{event.transactionHash === "" ? "Canonical event" : transactionLabel}</span>
       )}
     </article>
   );
@@ -521,10 +537,10 @@ function PoolActivityRow({ event }: { event: ActivityRow }) {
       </div>
       <span>{eventAmounts}</span>
       <span>{formatCompactAddress(event.account)}</span>
-      {explorerUrl ? (
+      {explorerUrl && event.transactionHash !== "" ? (
         <a href={`${explorerUrl}/tx/${encodeURIComponent(event.transactionHash)}`} rel="noreferrer" target="_blank">{transactionLabel} ↗</a>
       ) : (
-        <span>{transactionLabel}</span>
+        <span>{event.transactionHash === "" ? "Canonical event" : transactionLabel}</span>
       )}
     </article>
   );

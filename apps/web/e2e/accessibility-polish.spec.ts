@@ -1,10 +1,10 @@
-import { expect, test, type Locator, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "./fixtures/test";
 
 import { installMockRpc } from "./fixtures/mock-rpc";
-import { installMockWallet, LOCALNET_CHAIN_ID, readMockWallet } from "./fixtures/mock-wallet";
+import { installMockWallet, LOCALNET_CHAIN_ID, openAndSelectMockWallet, readMockWallet } from "./fixtures/mock-wallet";
 
 async function connect(page: Page) {
-  await page.getByTestId("wallet-connect-button").click();
+  await openAndSelectMockWallet(page);
   await expect(page.getByTestId("wallet-account-button")).toBeVisible();
 }
 

@@ -4,6 +4,8 @@
 .env
 .env.*
 !.env.example
+infra/vps/*.env
+!infra/vps/*.env.example
 
 # JavaScript/TypeScript workspaces
 node_modules/
@@ -44,3 +46,9 @@ docs/
 .local/
 deployments/localnet/*.json
 deployments/robinhood/*/*.json
+deployments/evm/*
+!deployments/evm/README.md
+!deployments/evm/sepolia/
+deployments/evm/sepolia/*
+!deployments/evm/sepolia/public.json
+!deployments/evm/sepolia/pool-releases.json

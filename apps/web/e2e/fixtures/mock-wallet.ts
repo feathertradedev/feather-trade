@@ -40,6 +40,16 @@ export async function installMockWallet(page: Page, options: MockWalletOptions =
       type Listener = (...args: unknown[]) => void;
       type ProviderState = Window["__mockWalletState"];
 
+      // Each document receives a newly constructed mock EIP-6963 provider.
+      // Do not let AppKit restore a connector bound to the provider object from
+      // the previous document; that state can only enter ConnectingExternal.
+      // Feather-owned persistence such as the transaction journal is retained.
+      for (const key of Object.keys(window.localStorage)) {
+        if (key.startsWith("@appkit/") || key === "wagmi.store" || key === "wagmi.recentConnectorId") {
+          window.localStorage.removeItem(key);
+        }
+      }
+
       function toHex(value: number) {
         return `0x${value.toString(16)}`;
       }
@@ -240,6 +250,31 @@ export async function installMockWallet(page: Page, options: MockWalletOptions =
       transactionMode: options.transactionMode ?? "ready"
     }
   );
+}
+
+export async function openMockWalletConnection(page: Page, providerName = "Mock MetaMask"): Promise<void> {
+  const connectButton = page.getByTestId("wallet-connect-button");
+  const accountButton = page.getByTestId("wallet-account-button");
+  await connectButton.or(accountButton).first().waitFor({ state: "visible", timeout: 15_000 });
+  if (!await accountButton.isVisible()) {
+    await connectButton.click({ timeout: 15_000 }).catch(async (error: unknown) => {
+      if (!await accountButton.isVisible()) throw error;
+    });
+  }
+  if (await accountButton.isVisible()) return;
+  const escapedName = providerName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const appKitWallet = page.getByRole("button", { name: new RegExp(`${escapedName} installed`, "i") });
+  await appKitWallet.or(accountButton).first().waitFor({ state: "visible", timeout: 15_000 });
+  if (!await accountButton.isVisible()) await appKitWallet.click();
+}
+
+export async function openAndSelectMockWallet(page: Page, providerName = "Mock MetaMask"): Promise<void> {
+  await openMockWalletConnection(page, providerName);
+  const accountButton = page.getByTestId("wallet-account-button");
+  const escapedName = providerName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const appKitWallet = page.getByRole("button", { name: new RegExp(`${escapedName} installed`, "i") });
+  await accountButton.waitFor({ state: "visible", timeout: 15_000 });
+  await appKitWallet.waitFor({ state: "hidden", timeout: 15_000 });
 }
 
 export async function readMockWallet(page: Page): Promise<MockWalletSnapshot> {

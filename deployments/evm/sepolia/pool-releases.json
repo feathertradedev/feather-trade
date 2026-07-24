@@ -1,0 +1,49 @@
+{
+  "schemaVersion": "feather.pool-release-policy.v1",
+  "environment": "sepolia",
+  "chainId": 11155111,
+  "factory": "0xe521A00F81A60b77Eb39EC2097F94aF532DFb811",
+  "epochs": [
+    {
+      "id": "sepolia-weth-usdc-mispriced-empty-2026-07-23",
+      "pair": "0x3136C5F3b48fe486c696bEDC031B9cB9D3e9EA62",
+      "status": "deprecated-do-not-fund",
+      "canonical": false,
+      "reason": "Initial WETH/USDC price was entered with the wrong orientation. The pool is empty and must remain unfunded."
+    },
+    {
+      "id": "sepolia-weth-usdc-step-20-2026-07-23",
+      "pair": "0x79EFAC7c0e75fa1aC41dbef2A864659A9097E440",
+      "status": "canonical",
+      "canonical": true,
+      "tokenX": "0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9",
+      "tokenY": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+      "binStep": 20,
+      "activeId": 8378559,
+      "priceQ128": "648792435575265289769716532399",
+      "trustedQuotePerBaseE18": "1903287032469969564528",
+      "createdAtBlock": "11334189",
+      "createdAtBlockHash": "0xe3e37f5582ab1785fc49f51c9970cfed78501899534486ebf83fe88053262d82",
+      "creationTransactionHash": "0xa17220e96249f975d548cba3e02e286ba5c193c58e90fa8f86848ef2a46c0cdb",
+      "creationLogIndex": 551,
+      "creator": "0xd1312029e339b7181b275f5fb8330ff0983AC1d9",
+      "liquidityStatus": "unfunded"
+    }
+  ],
+  "canonicalPools": [
+    "0x79EFAC7c0e75fa1aC41dbef2A864659A9097E440"
+  ],
+  "replacement": {
+    "status": "created-awaiting-user-liquidity",
+    "pair": "0x79EFAC7c0e75fa1aC41dbef2A864659A9097E440",
+    "binStep": 20,
+    "activeId": 8378559,
+    "creationTransactionHash": "0xa17220e96249f975d548cba3e02e286ba5c193c58e90fa8f86848ef2a46c0cdb",
+    "requirements": [
+      "Created through the reviewed Sepolia router path with the corrected wallet and chain gate.",
+      "Initial price was derived as USDC per WETH from a current READY Chainlink-backed trusted-price response.",
+      "Identity, active ID, bin step, fee parameters, and empty reserves were reconciled against the live factory and pair.",
+      "Liquidity is supplied by the user only after the replacement address is recorded here."
+    ]
+  }
+}

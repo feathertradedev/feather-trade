@@ -8,7 +8,8 @@ const publicDir = join(repoRoot, "apps/web/public");
 const allowedChainIdsByEnvironment = new Map([
   ["localnet", 31_337],
   ["robinhoodTestnet", 46_630],
-  ["robinhood", 4_663]
+  ["robinhood", 4_663],
+  ["sepolia", 11_155_111]
 ]);
 const allowedAddressRefsByEnvironment = new Map([
   ["localnet", new Set(["tokens.wnative", "tokens.usdc", "tokens.usdt", "tokens.weth"])]
@@ -19,14 +20,16 @@ const allowedReviewStatuses = new Set(["standard", "restricted", "blocked"]);
 const allowedTokenActions = new Set(["swap", "add-liquidity", "remove-liquidity"]);
 const allowedApprovalBehaviors = new Set(["standard-bool", "returns-false", "no-return", "zero-reset-required"]);
 const blockedTokenActions = [...allowedTokenActions];
-const publicEnvironments = new Set(["robinhood", "robinhoodTestnet"]);
+const publicEnvironments = new Set(["robinhood", "robinhoodTestnet", "sepolia"]);
 const publicManifestByEnvironment = new Map([
   ["robinhood", "deployments/examples/robinhood-mainnet.example.json"],
-  ["robinhoodTestnet", "deployments/examples/robinhood-testnet.example.json"]
+  ["robinhoodTestnet", "deployments/examples/robinhood-testnet.example.json"],
+  ["sepolia", "deployments/evm/sepolia/public.json"]
 ]);
 const webDefaultManifestByEnvironment = new Map([
   ["robinhood", "robinhoodDefaultManifest"],
-  ["robinhoodTestnet", "robinhoodTestnetDefaultManifest"]
+  ["robinhoodTestnet", "robinhoodTestnetDefaultManifest"],
+  ["sepolia", "sepoliaDefaultManifest"]
 ]);
 const webDefaultManifestsPath = "apps/web/src/default-manifests.ts";
 const addressPattern = /^0x[a-fA-F0-9]{40}$/;
@@ -242,23 +245,23 @@ function expectEnvironmentPolicy(environment, token, path, errors) {
 
   if (Array.isArray(token.tags)) {
     if (token.tags.includes("localnet")) {
-      errors.push(`${path}.tags: public Robinhood token lists must not include localnet tokens`);
+      errors.push(`${path}.tags: public token lists must not include localnet tokens`);
     }
 
     if (token.tags.includes("mock")) {
-      errors.push(`${path}.tags: public Robinhood token lists must not include mock tokens`);
+      errors.push(`${path}.tags: public token lists must not include mock tokens`);
     }
   }
 
   if (typeof token.name === "string" && /\bmock\b/i.test(token.name)) {
-    errors.push(`${path}.name: public Robinhood token lists must not label tokens as mock assets`);
+    errors.push(`${path}.name: public token lists must not label tokens as mock assets`);
   }
 }
 
 function expectRiskPolicy(environment, token, path, errors) {
   if (token.risk === undefined) {
     if (publicEnvironments.has(environment)) {
-      errors.push(`${path}.risk: public Robinhood tokens must include token-risk policy metadata`);
+      errors.push(`${path}.risk: public tokens must include token-risk policy metadata`);
     }
     return;
   }

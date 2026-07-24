@@ -124,6 +124,8 @@ test("jittered intervals use bounded triangular variance", () => {
 test("rejects mainnet and builds deterministic 15-day seed coverage", () => {
   assert.throws(() => assertNonMainnetEnvironment("mainnet"), /rejects mainnet/);
   assert.throws(() => assertNonMainnetEnvironment("robinhood"), /rejects mainnet/);
+  assert.doesNotThrow(() => assertNonMainnetEnvironment("sepolia"));
+  assert.throws(() => assertNonMainnetEnvironment("holesky"), /Unsupported market activity environment/);
   const now = 2_000_000_000;
   const schedule = buildHistoricalSchedule(now, 73);
   assert.deepEqual(schedule, buildHistoricalSchedule(now, 73));

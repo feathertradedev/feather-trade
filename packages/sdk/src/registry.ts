@@ -1,13 +1,23 @@
 import type { Address, Chain } from "viem";
 
 import type { EndpointConfig } from "./endpoints.js";
-import type { LocalnetDeploymentManifest, RobinhoodDeploymentManifest, SupportedHook } from "./manifest.js";
+import type {
+  LocalnetDeploymentManifest,
+  RobinhoodDeploymentManifest,
+  SepoliaDeploymentManifest,
+  SupportedHook
+} from "./manifest.js";
 import { assertLegacyRoutingDisabled } from "./routing-policy.js";
-import { localnetChain, robinhoodChain, robinhoodTestnetChain } from "./chains.js";
-import { localnetTokenListFromManifest, robinhoodTokenListFromManifest, type TokenMetadata } from "./tokens.js";
+import { localnetChain, robinhoodChain, robinhoodTestnetChain, sepoliaChain } from "./chains.js";
+import {
+  localnetTokenListFromManifest,
+  robinhoodTokenListFromManifest,
+  sepoliaTokenListFromManifest,
+  type TokenMetadata
+} from "./tokens.js";
 
 export interface DexRegistry {
-  environment: "localnet" | "robinhood" | "robinhoodTestnet";
+  environment: "localnet" | "robinhood" | "robinhoodTestnet" | "sepolia";
   chain: Chain;
   chainId: number;
   startBlock: number;
@@ -59,6 +69,37 @@ export function registryFromRobinhoodManifest(manifest: RobinhoodDeploymentManif
     endpoints: manifest.endpoints,
     supportedHooks: manifest.supportedHooks ?? [],
     supportedPairImplementations: manifest.supportedPairImplementations ?? [manifest.contracts.lbPairImplementation]
+  };
+}
+
+export function registryFromSepoliaManifest(manifest: SepoliaDeploymentManifest): DexRegistry {
+  if (manifest.environment !== "sepolia" || manifest.chainId !== sepoliaChain.id) {
+    throw new Error(`Expected the Ethereum Sepolia runtime manifest for chain ${sepoliaChain.id}`);
+  }
+  if (manifest.endpoints.rpcUrl.trim().length === 0) {
+    throw new Error("Sepolia runtime manifest requires endpoints.rpcUrl");
+  }
+  assertLegacyRoutingDisabled(manifest.constructorArgs);
+
+  const rpcUrl = manifest.endpoints.rpcUrl;
+  const runtimeChain = {
+    ...sepoliaChain,
+    rpcUrls: {
+      default: { http: [rpcUrl] },
+      public: { http: [rpcUrl] }
+    }
+  } as const satisfies Chain;
+
+  return {
+    environment: "sepolia",
+    chain: runtimeChain,
+    chainId: manifest.chainId,
+    startBlock: manifest.startBlock,
+    contracts: manifest.contracts,
+    tokens: sepoliaTokenListFromManifest(manifest),
+    endpoints: manifest.endpoints,
+    supportedHooks: [],
+    supportedPairImplementations: [manifest.contracts.lbPairImplementation]
   };
 }
 

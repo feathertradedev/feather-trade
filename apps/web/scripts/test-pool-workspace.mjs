@@ -23,9 +23,13 @@ try {
     buildBinDistribution,
     buildCenteredBinDistribution,
     buildCandleChartModel,
+    createPoolManageSelectionIntent,
     formatRatioPercentE18,
     formatUsdE18,
     joinPoolWorkspaceRows,
+    parsePoolManageSelectionIntent,
+    poolManageSelectionIntentHref,
+    resolvePoolManageSelectionIntent,
     shouldShowWorkspaceAnalyticsState,
     sortPoolWorkspaceRows,
     summarizePoolPosition,
@@ -137,6 +141,60 @@ try {
   });
   assert.equal(summarizePoolPosition([position("closed", "99", "0", "12")], "99"), null);
   assert.equal(summarizePoolPosition([position("range-a", "100", "1", "7"), position("range-c", "102", "1", "7")], "101")?.inActiveBin, false);
+
+  const manageIntent = createPoolManageSelectionIntent([
+    position("analytics-range-b", "101", "3", "8"),
+    position("analytics-range-a", "100", "2", "7")
+  ], pairB, pairA);
+  assert.deepEqual(manageIntent, {
+    binIds: ["100", "101"],
+    owner: pairB,
+    pair: pairA
+  });
+  assert.deepEqual(resolvePoolManageSelectionIntent(manageIntent, [
+    position("indexer-position-100", "100", "2", "9"),
+    position("indexer-position-101", "101", "3", "9"),
+    position("indexer-position-102", "102", "4", "9")
+  ], pairB, pairA), {
+    positionIds: ["indexer-position-100", "indexer-position-101"],
+    status: "ready"
+  });
+  assert.equal(resolvePoolManageSelectionIntent(
+    manageIntent,
+    [position("indexer-position-100", "100", "2", "9")],
+    pairB,
+    pairA
+  ).status, "incomplete");
+  assert.equal(resolvePoolManageSelectionIntent(
+    manageIntent,
+    [position("indexer-position-100", "100", "2", "9"), position("indexer-position-101", "101", "3", "9")],
+    tokenX,
+    pairA
+  ).status, "scope-mismatch");
+  const manageHref = poolManageSelectionIntentHref(
+    `#/pools/${pairA}/manage?returnTo=%23%2Fpools%3Fsort%3Dtvl`,
+    manageIntent
+  );
+  assert.match(manageHref, /^#\/pools\/.+\/manage\?/);
+  assert.equal(new URLSearchParams(manageHref.split("?")[1]).get("returnTo"), "#/pools?sort=tvl");
+  assert.deepEqual(parsePoolManageSelectionIntent(manageHref, pairA), {
+    intent: manageIntent,
+    status: "ready"
+  });
+  assert.deepEqual(parsePoolManageSelectionIntent(`#/pools/${pairA}/manage`, pairA), {
+    intent: null,
+    status: "absent"
+  });
+  assert.equal(parsePoolManageSelectionIntent(
+    `#/pools/${pairA}/manage?manageOwner=${pairB}&manageBins=100%2C100`,
+    pairA
+  ).status, "invalid");
+  assert.equal(resolvePoolManageSelectionIntent(
+    { binIds: [], owner: pairB, pair: pairA },
+    [],
+    pairB,
+    pairA
+  ).status, "invalid");
 
   const deposit = history("deposit", "DEPOSIT", "0xaaa", ["101", "100"]);
   const mintEcho = history("mint", "TRANSFER_IN", "0xaaa", ["100", "101"]);

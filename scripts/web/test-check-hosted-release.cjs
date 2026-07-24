@@ -13,6 +13,7 @@ const fixtureDir = path.join(__dirname, "test/fixtures/hosted-release");
 const indexHtml = fs.readFileSync(path.join(fixtureDir, "index.html"), "utf8");
 const js = fs.readFileSync(path.join(fixtureDir, "assets/index-1234abcd.js"), "utf8");
 const css = fs.readFileSync(path.join(fixtureDir, "assets/index-1234abcd.css"), "utf8");
+const manifest = path.join(fixtureDir, "manifest.json");
 
 main().catch((error) => {
   console.error(error);
@@ -21,6 +22,9 @@ main().catch((error) => {
 
 async function main() {
   await withServer({}, async (url) => expectPass("healthy hosted release", url));
+  await withServer({}, async (url) => expectPass("manifest-bound CSP", url, true));
+  await withServer({ missingManifestOrigin: true }, async (url) =>
+    expectFail("missing manifest CSP origin", url, /does not allow sealed manifest origin/i, true));
   await withServer({ rootRedirect: true }, async (url) => expectPass("same-origin root redirect", url));
   await withServer({ crossOriginRedirect: true }, async (url) => expectFail("cross-origin redirect", url, /redirect leaves the release origin/i));
   await withServer({ spaMissing: true }, async (url) => expectFail("missing SPA fallback", url, /SPA route returned HTTP 404|deployed index document/i));
@@ -39,21 +43,29 @@ async function main() {
   console.log("hosted release smoke fixture tests passed");
 }
 
-async function expectPass(name, url) {
-  const result = await runChecker(url, true);
+async function expectPass(name, url, withManifest = false) {
+  const result = await runChecker(url, true, withManifest);
   assert.equal(result.status, 0, `${name} should pass:\n${result.stdout}\n${result.stderr}`);
 }
 
-async function expectFail(name, url, pattern) {
-  const result = await runChecker(url, true);
+async function expectFail(name, url, pattern, withManifest = false) {
+  const result = await runChecker(url, true, withManifest);
   const output = `${result.stdout}\n${result.stderr}`;
   assert.notEqual(result.status, 0, `${name} should fail`);
   assert.match(output, pattern, `${name} produced unexpected output:\n${output}`);
 }
 
-function runChecker(url, allowHttp = false) {
+function runChecker(url, allowHttp = false, withManifest = false) {
   return new Promise((resolve, reject) => {
-    const child = childProcess.spawn(process.execPath, [checker, "--url", url, "--dist", fixtureDir, ...(allowHttp ? ["--allow-http"] : [])], {
+    const child = childProcess.spawn(process.execPath, [
+      checker,
+      "--url",
+      url,
+      "--dist",
+      fixtureDir,
+      ...(withManifest ? ["--manifest", manifest] : []),
+      ...(allowHttp ? ["--allow-http"] : [])
+    ], {
       cwd: repoRoot
     });
     let stdout = "";
@@ -70,7 +82,7 @@ function runChecker(url, allowHttp = false) {
 async function withServer(state, callback) {
   const server = http.createServer((request, response) => {
     const securityHeaders = {
-      "content-security-policy": `default-src 'self'; script-src 'self'${state.unsafeScript ? " 'unsafe-inline'" : ""}; connect-src ${state.broadCsp ? "https:" : "'self' https://rpc.example"}; frame-ancestors 'none'; base-uri 'self'`,
+      "content-security-policy": `default-src 'self'; script-src 'self'${state.unsafeScript ? " 'unsafe-inline'" : ""}; connect-src ${state.broadCsp ? "https:" : state.missingManifestOrigin ? "'self'" : "'self' https://rpc.example"}; frame-ancestors 'none'; base-uri 'self'`,
       "referrer-policy": "strict-origin-when-cross-origin",
       "strict-transport-security": state.weakHsts ? "max-age=300" : "max-age=31536000; includeSubDomains",
       "x-content-type-options": "nosniff"

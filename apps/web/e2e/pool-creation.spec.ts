@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, REOWN_API_PATTERN, test, type Page } from "./fixtures/test";
 import { decodeFunctionData, type Address } from "viem";
 
 import { lbRouterAbi } from "../../../packages/sdk/src/abi";
@@ -10,7 +10,12 @@ import {
   USDT,
   WNATIVE
 } from "./fixtures/mock-rpc";
-import { installMockWallet, LOCALNET_CHAIN_ID, readMockWallet } from "./fixtures/mock-wallet";
+import {
+  installMockWallet,
+  LOCALNET_CHAIN_ID,
+  openAndSelectMockWallet,
+  readMockWallet
+} from "./fixtures/mock-wallet";
 
 const ACTIVE_ID = 8_388_608;
 const NO_CODE_TOKEN = "0x4444444444444444444444444444444444444401" as Address;
@@ -25,10 +30,14 @@ const creationRpc = {
   priceQ128ByBin: { [String(ACTIVE_ID)]: Q128 }
 } as const;
 
+async function connectMockWallet(page: Page) {
+  await openAndSelectMockWallet(page);
+  await expect(page.getByTestId("wallet-account-button")).toContainText("0xf39F...2266");
+}
+
 async function openCreationWizard(page: Page) {
   await page.goto("/#/pools");
-  await page.getByTestId("wallet-connect-button").click();
-  await expect(page.getByTestId("wallet-account-button")).toContainText("0xf39F...2266");
+  await connectMockWallet(page);
   await page.getByTestId("pool-create-launch").click();
   await expect(page.getByTestId("pool-creation-wizard")).toBeVisible();
   await expect(page.getByTestId("pool-create-token-x")).not.toHaveValue("");
@@ -41,6 +50,7 @@ async function configureCreation(page: Page, createAndAdd = false) {
   await page.getByTestId("pool-create-token-y").selectOption(USDT);
   await page.getByRole("button", { name: "Continue to configure" }).click();
   await page.getByTestId("pool-create-bin-step").selectOption("10");
+  await expect(page.getByTestId("pool-create-price")).toHaveValue("");
   await page.getByTestId("pool-create-price").fill("1");
   if (createAndAdd) await page.getByLabel("After canonical creation, offer a separate fresh Create Position review").check();
   await page.getByTestId("pool-create-risk-ack").check();
@@ -54,6 +64,48 @@ async function submitReviewedCreation(page: Page) {
   await expect(page.getByTestId("gas-review")).toBeVisible();
   await page.getByTestId("pool-create-submit").click();
 }
+
+test("wallet chooser outage fallback and dismissal preserve pool configuration", async ({ context, page }) => {
+  await context.unroute(REOWN_API_PATTERN);
+  await context.route(REOWN_API_PATTERN, () => new Promise(() => {}));
+  await installMockRpc(page, creationRpc);
+  await installMockWallet(page, {
+    additionalProviders: [{
+      account: "0x1111111111111111111111111111111111111111",
+      name: "Backup Wallet",
+      rdns: "org.example.backup",
+      uuid: "robinhood-lb-backup-wallet"
+    }],
+    allowTransactions: false,
+    chainId: LOCALNET_CHAIN_ID
+  });
+  await page.goto("/#/pools");
+  await page.getByTestId("pool-create-launch").click();
+  await expect(page.getByTestId("pool-create-token-x")).toHaveValue(WNATIVE);
+  await expect(page.getByTestId("pool-create-token-y")).toHaveValue(USDT);
+  await page.getByRole("button", { name: "Continue to configure" }).click();
+  await page.getByTestId("pool-create-price").fill("1");
+  await page.getByTestId("pool-create-risk-ack").check();
+  await expect(page.getByTestId("pool-create-review-action")).toHaveText("Connect wallet to review");
+
+  await page.getByTestId("pool-create-review-action").click();
+  await expect(page.getByTestId("wallet-provider-choices")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(250);
+  await expect(page.getByTestId("pool-creation-wizard")).toBeVisible();
+  await expect(page.getByTestId("pool-create-price")).toHaveValue("1");
+  await expect.poll(() => page.evaluate(() => Object.entries(sessionStorage).filter(([key]) => key.includes("pool-creation-open")))).toEqual([
+    ["feather.pool-creation-open.v1.localnet", "true"]
+  ]);
+
+  await page.getByTestId("wallet-connect-button").click();
+  const walletChoices = page.getByTestId("wallet-provider-choices");
+  await expect(walletChoices).toBeVisible();
+  await walletChoices.getByRole("button", { name: /Mock MetaMask/i }).click();
+  await expect(page.getByTestId("wallet-account-button")).toContainText("0xf39F...2266");
+  await expect(page.getByTestId("pool-create-price")).toHaveValue("1");
+  await expect(page.getByTestId("pool-create-review-action")).toHaveText("Review exact creation");
+});
 
 test("Discover creates an exact empty pool and preserves an RPC workspace while indexing lags", async ({ page }) => {
   await installMockRpc(page, {
@@ -77,14 +129,19 @@ test("Discover creates an exact empty pool and preserves an RPC workspace while 
   await expect(review).toContainText("base 20 · variable 40000 · protocol 1000");
   await submitReviewedCreation(page);
 
-  await expect(page.getByTestId("pool-create-result")).toContainText(/indexing catching up|Empty pool created/i, { timeout: 15_000 });
+  await expect(page.getByTestId("pool-create-result")).toContainText(/discovery catching up|Pool verified/i, { timeout: 15_000 });
   await expect(page.getByTestId("pool-rpc-overlay")).toContainText("empty pool cannot quote swaps");
   await expect(page.getByTestId("pool-create-position")).toContainText("fresh review");
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 
   const positionHref = await page.getByTestId("pool-create-position").getAttribute("href");
-  await page.getByRole("link", { name: "Open exact pool workspace" }).click();
-  await page.locator(".pool-actions").getByRole("link", { name: "Swap" }).click();
+  await page.getByRole("link", { name: "Open confirmed pool" }).click();
+  const mobileTradeTab = page.getByRole("tablist", { name: "Pool workspace views" }).getByRole("tab", { name: "Trade" });
+  if ((page.viewportSize()?.width ?? 1_280) <= 720) {
+    await expect(mobileTradeTab).toBeVisible();
+    await mobileTradeTab.click();
+  }
+  await page.getByRole("navigation", { name: "Pool tasks" }).getByRole("link", { name: "Swap" }).click();
   await expect(page.getByTestId("swap-market-recovery")).toContainText(/empty|cannot quote|no swap liquidity/i);
   await expect(page.getByTestId("swap-submit-button")).toBeDisabled();
   await page.evaluate((href) => { window.location.hash = href!.slice(1); }, positionHref);
@@ -126,7 +183,7 @@ test("preexisting exact pool recovers fresh identity and reserves without a wall
   await page.getByTestId("pool-create-risk-ack").check();
   await page.getByRole("button", { name: "Review exact creation" }).click();
 
-  await expect(page.getByTestId("pool-create-result")).toContainText("Exact pool already exists");
+  await expect(page.getByTestId("pool-create-result")).toContainText("This pool already exists");
   await expect(page.getByTestId("pool-create-result")).toContainText(String(ACTIVE_ID + 3));
   await expect(page.getByTestId("pool-create-result")).toContainText("USDT / WNATIVE");
   await expect(page.getByRole("status").filter({ hasText: /reserves/i })).toContainText("77 X / 88 Y");
@@ -150,8 +207,8 @@ test("a final pre-wallet race recovers the winner and blocks blind create retry"
     pairTokenY: USDT
   });
   await page.getByTestId("pool-create-submit").click();
-  await expect(page.getByTestId("pool-create-result")).toContainText("Another creator won the race");
-  await expect(page.getByTestId("pool-create-result")).toContainText("No create transaction was sent");
+  await expect(page.getByTestId("pool-create-result")).toContainText("created first by another transaction");
+  await expect(page.getByTestId("pool-create-result")).toContainText("No duplicate creation was submitted");
   await expect(page.getByTestId("pool-create-position")).toContainText("fresh review");
   await expect(page.getByTestId("pool-create-submit")).toHaveCount(0);
   expect((await readMockWallet(page)).sentTransactions).toHaveLength(0);
@@ -195,7 +252,7 @@ test("exact simulation failure and wallet rejection never produce false creation
 
   rpc.update({ simulationMode: "success" });
   await page.getByTestId("pool-create-submit").click();
-  await expect(page.getByTestId("pool-create-result")).toContainText("Wallet rejected creation");
+  await expect(page.getByTestId("pool-create-result")).toContainText("Creation was not submitted");
   await expect(page.getByTestId("pool-rpc-overlay")).toHaveCount(0);
   expect((await readMockWallet(page)).sentTransactions).toHaveLength(1);
 });
@@ -205,7 +262,7 @@ test("a mined revert exposes no pool overlay or position handoff", async ({ page
   await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
   await configureCreation(page, true);
   await submitReviewedCreation(page);
-  await expect(page.getByTestId("pool-create-result")).toContainText("Creation reverted onchain", { timeout: 15_000 });
+  await expect(page.getByTestId("pool-create-result")).toContainText("Creation reverted on-chain", { timeout: 15_000 });
   await expect(page.getByTestId("pool-rpc-overlay")).toHaveCount(0);
   await expect(page.getByTestId("pool-create-position")).toHaveCount(0);
 });
@@ -228,7 +285,7 @@ test("a post-confirmation orphan removes the RPC overlay and requires a fresh re
   await expect(page.getByTestId("pool-rpc-overlay")).toBeVisible({ timeout: 15_000 });
 
   rpc.update({ blockHash: "0x4444444444444444444444444444444444444444444444444444444444444444" });
-  await expect(page.getByTestId("pool-create-result")).toContainText("Creation receipt was reorganized", { timeout: 15_000 });
+  await expect(page.getByTestId("pool-create-result")).toContainText("Confirmation changed after a chain reorganization", { timeout: 15_000 });
   await expect(page.getByTestId("pool-rpc-overlay")).toHaveCount(0);
   await expect(page.getByTestId("pool-create-position")).toHaveCount(0);
 });

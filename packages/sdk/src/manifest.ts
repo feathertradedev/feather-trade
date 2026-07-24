@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 
 import { getAddress, isAddress, zeroAddress, type Address } from "viem";
 
-import { ROBINHOOD_CHAIN_ID, ROBINHOOD_TESTNET_CHAIN_ID } from "./chains.js";
+import { ROBINHOOD_CHAIN_ID, ROBINHOOD_TESTNET_CHAIN_ID, SEPOLIA_CHAIN_ID } from "./chains.js";
 import { defaultEndpoints, type EndpointConfig } from "./endpoints.js";
 import { assertLegacyRoutingDisabled } from "./routing-policy.js";
 
@@ -106,7 +106,44 @@ export interface RobinhoodDeploymentManifestBase {
 
 export type RobinhoodDeploymentManifest = RobinhoodDeploymentManifestBase;
 
-export type DeploymentManifest = LocalnetDeploymentManifest | RobinhoodDeploymentManifest;
+export interface GenericEvmDeploymentManifest {
+  schemaVersion: "lb.evm.v1";
+  environment: string;
+  sourceCommit: string;
+  sourceTreeDirty: boolean;
+  chainId: number;
+  startBlock: number;
+  deployer: Address;
+  endpoints?: EndpointConfig;
+  contracts: CoreContracts;
+  ownership: DeploymentOwnership;
+  tokens: {
+    wrappedNative: Address;
+  };
+  chain: {
+    name: string;
+    nativeCurrency: string;
+    rpcEnvVar: string;
+    explorerUrl: string;
+    verifierUrl: string;
+  };
+  quoteAssets: Record<string, Address>;
+  factoryPreset: FactoryPreset;
+  constructorArgs: Record<string, unknown>;
+}
+
+export interface SepoliaRuntimeDeploymentManifest extends GenericEvmDeploymentManifest {
+  environment: "sepolia";
+  chainId: typeof SEPOLIA_CHAIN_ID;
+  endpoints: EndpointConfig;
+}
+
+export type SepoliaDeploymentManifest = SepoliaRuntimeDeploymentManifest;
+
+export type DeploymentManifest =
+  | LocalnetDeploymentManifest
+  | RobinhoodDeploymentManifest
+  | GenericEvmDeploymentManifest;
 
 export function readDeploymentManifest(path: string): DeploymentManifest {
   const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
@@ -132,7 +169,25 @@ function normalizeManifest(value: unknown, path: string): DeploymentManifest {
     return normalizeRobinhoodManifest(value, path);
   }
 
+  if (schemaVersion === "lb.evm.v1") {
+    return normalizeGenericEvmManifest(value, path);
+  }
+
   throw new Error(`Unsupported deployment manifest schemaVersion ${schemaVersion} in ${path}`);
+}
+
+export function assertSepoliaRuntimeManifest(
+  manifest: GenericEvmDeploymentManifest
+): asserts manifest is SepoliaRuntimeDeploymentManifest {
+  if (manifest.environment !== "sepolia") {
+    throw new Error(`Expected Sepolia runtime manifest environment "sepolia", got ${manifest.environment}`);
+  }
+  if (manifest.chainId !== SEPOLIA_CHAIN_ID) {
+    throw new Error(`Expected Sepolia runtime manifest chainId ${SEPOLIA_CHAIN_ID}, got ${manifest.chainId}`);
+  }
+  if (manifest.endpoints === undefined || manifest.endpoints.rpcUrl.trim().length === 0) {
+    throw new Error("Sepolia runtime manifest requires endpoints.rpcUrl");
+  }
 }
 
 function normalizeLocalnetManifest(value: Record<string, unknown>, path: string): LocalnetDeploymentManifest {
@@ -245,6 +300,208 @@ function normalizeRobinhoodManifest(value: Record<string, unknown>, path: string
     contracts: normalizedContracts,
     constructorArgs
   };
+}
+
+function normalizeGenericEvmManifest(value: Record<string, unknown>, path: string): GenericEvmDeploymentManifest {
+  expectOnlyKeys(value, "manifest", [
+    "chain",
+    "chainId",
+    "constructorArgs",
+    "contracts",
+    "deployer",
+    "endpoints",
+    "environment",
+    "factoryPreset",
+    "ownership",
+    "quoteAssets",
+    "schemaVersion",
+    "sourceCommit",
+    "sourceTreeDirty",
+    "startBlock",
+    "tokens"
+  ]);
+
+  const environment = expectString(value.environment, "environment");
+  if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(environment)) {
+    throw new Error(`Expected lowercase network slug for environment in ${path}`);
+  }
+
+  const sourceCommit = expectString(value.sourceCommit, "sourceCommit");
+  if (!/^[a-fA-F0-9]{40}$/.test(sourceCommit)) {
+    throw new Error("Expected sourceCommit to be a 40-character git commit");
+  }
+
+  const chain = expectObject(value.chain, "chain");
+  expectOnlyKeys(chain, "chain", ["explorerUrl", "name", "nativeCurrency", "rpcEnvVar", "verifierUrl"]);
+  const rpcEnvVar = expectString(chain.rpcEnvVar, "chain.rpcEnvVar");
+  if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(rpcEnvVar)) {
+    throw new Error("Expected chain.rpcEnvVar to be an environment variable name");
+  }
+
+  const contracts = normalizeCoreContracts(expectObject(value.contracts, "contracts"));
+  if (new Set(Object.values(contracts).map((address) => address.toLowerCase())).size !== Object.keys(contracts).length) {
+    throw new Error("Generic EVM core contract addresses must be unique");
+  }
+
+  const deployer = expectAddress(value.deployer, "deployer", { allowZero: false });
+  const ownership = normalizeRequiredOwnership(value.ownership);
+  for (const [key, address] of Object.entries(ownership)) {
+    if (address.toLowerCase() !== deployer.toLowerCase()) {
+      throw new Error(`Expected ownership.${key} to match deployer for lb.evm.v1`);
+    }
+  }
+
+  const tokens = expectObject(value.tokens, "tokens");
+  expectOnlyKeys(tokens, "tokens", ["wrappedNative"]);
+  const wrappedNative = expectAddress(tokens.wrappedNative, "tokens.wrappedNative", { allowZero: false });
+  const quoteAssets = normalizeGenericQuoteAssets(value.quoteAssets, wrappedNative);
+  const factoryPreset = normalizeFactoryPreset(expectObject(value.factoryPreset, "factoryPreset"));
+  assertGenericFactoryPreset(factoryPreset);
+  const constructorArgs = normalizeGenericConstructorArgs(
+    expectObject(value.constructorArgs, "constructorArgs"),
+    { contracts, ownership, wrappedNative }
+  );
+
+  return {
+    schemaVersion: "lb.evm.v1",
+    environment,
+    sourceCommit,
+    sourceTreeDirty: expectBoolean(value.sourceTreeDirty, "sourceTreeDirty"),
+    chainId: expectInteger(value.chainId, "chainId", { min: 1 }),
+    startBlock: expectInteger(value.startBlock, "startBlock", { min: 0 }),
+    deployer,
+    endpoints: value.endpoints === undefined ? undefined : normalizeRuntimeEndpoints(value.endpoints),
+    contracts,
+    ownership,
+    tokens: { wrappedNative },
+    chain: {
+      name: expectNonBlankString(chain.name, "chain.name"),
+      nativeCurrency: expectNonBlankString(chain.nativeCurrency, "chain.nativeCurrency"),
+      rpcEnvVar,
+      explorerUrl: expectStringValue(chain.explorerUrl, "chain.explorerUrl"),
+      verifierUrl: expectStringValue(chain.verifierUrl, "chain.verifierUrl")
+    },
+    quoteAssets,
+    factoryPreset,
+    constructorArgs
+  };
+}
+
+function normalizeRequiredOwnership(value: unknown): DeploymentOwnership {
+  const ownership = expectObject(value, "ownership");
+  expectOnlyKeys(ownership, "ownership", ["feeRecipient", "initialOwner", "lbFactoryOwner"]);
+  return {
+    feeRecipient: expectAddress(ownership.feeRecipient, "ownership.feeRecipient", { allowZero: false }),
+    initialOwner: expectAddress(ownership.initialOwner, "ownership.initialOwner", { allowZero: false }),
+    lbFactoryOwner: expectAddress(ownership.lbFactoryOwner, "ownership.lbFactoryOwner", { allowZero: false })
+  };
+}
+
+function normalizeGenericQuoteAssets(value: unknown, wrappedNative: Address): Record<string, Address> {
+  const assets = expectObject(value, "quoteAssets");
+  const keys = ["wrappedNative", "extra0", "extra1", "extra2", "extra3"] as const;
+  expectOnlyKeys(assets, "quoteAssets", keys);
+  const normalized = Object.fromEntries(
+    keys.map((key) => [key, expectAddress(assets[key], `quoteAssets.${key}`, { allowZero: key !== "wrappedNative" })])
+  ) as Record<(typeof keys)[number], Address>;
+
+  if (normalized.wrappedNative.toLowerCase() !== wrappedNative.toLowerCase()) {
+    throw new Error("Expected quoteAssets.wrappedNative to match tokens.wrappedNative");
+  }
+
+  const nonZero = Object.values(normalized).filter((address) => address !== zeroAddress);
+  if (new Set(nonZero.map((address) => address.toLowerCase())).size !== nonZero.length) {
+    throw new Error("Generic EVM quoteAssets contains duplicate non-zero addresses");
+  }
+
+  return normalized;
+}
+
+function normalizeGenericConstructorArgs(
+  value: Record<string, unknown>,
+  expected: { contracts: CoreContracts; ownership: DeploymentOwnership; wrappedNative: Address }
+): Record<string, unknown> {
+  const addressKeys = [
+    "feeRecipient",
+    "initialOwner",
+    "routerFactoryV1",
+    "routerLegacyFactoryV2",
+    "routerLegacyRouterV2",
+    "routerFactoryV2_1",
+    "routerWNative",
+    "quoterFactoryV1",
+    "quoterLegacyFactoryV2",
+    "quoterFactoryV2_1",
+    "quoterFactoryV2_2",
+    "quoterLegacyRouterV2",
+    "quoterRouterV2_1",
+    "quoterRouterV2_2"
+  ] as const;
+  expectOnlyKeys(value, "constructorArgs", [...addressKeys, "flashLoanFee"]);
+
+  const normalized: Record<string, unknown> = Object.fromEntries(
+    addressKeys.map((key) => [key, expectAddress(value[key], `constructorArgs.${key}`)])
+  );
+  normalized.flashLoanFee = expectInteger(value.flashLoanFee, "constructorArgs.flashLoanFee", { min: 0 });
+  if (normalized.flashLoanFee !== 5_000_000_000_000) {
+    throw new Error("Expected constructorArgs.flashLoanFee to be 5000000000000");
+  }
+
+  assertLegacyRoutingDisabled(normalized);
+  for (const key of [
+    "quoterFactoryV1",
+    "quoterLegacyFactoryV2",
+    "quoterFactoryV2_1",
+    "quoterLegacyRouterV2",
+    "quoterRouterV2_1"
+  ]) {
+    if ((normalized[key] as Address) !== zeroAddress) {
+      throw new Error(`Expected constructorArgs.${key} to be the zero address for V2.2-only routing`);
+    }
+  }
+
+  assertSameAddress(normalized.feeRecipient, expected.ownership.feeRecipient, "constructorArgs.feeRecipient");
+  assertSameAddress(normalized.initialOwner, expected.ownership.initialOwner, "constructorArgs.initialOwner");
+  assertSameAddress(normalized.routerWNative, expected.wrappedNative, "constructorArgs.routerWNative");
+  assertSameAddress(normalized.quoterFactoryV2_2, expected.contracts.lbFactory, "constructorArgs.quoterFactoryV2_2");
+  assertSameAddress(normalized.quoterRouterV2_2, expected.contracts.lbRouter, "constructorArgs.quoterRouterV2_2");
+  return normalized;
+}
+
+function assertGenericFactoryPreset(preset: FactoryPreset): void {
+  const expected: FactoryPreset = {
+    baseFactor: 10_000,
+    binStep: 10,
+    decayPeriod: 600,
+    filterPeriod: 30,
+    maxVolatilityAccumulator: 350_000,
+    open: true,
+    protocolShare: 0,
+    reductionFactor: 5_000,
+    variableFeeControl: 40_000
+  };
+  for (const [key, expectedValue] of Object.entries(expected)) {
+    if (preset[key as keyof FactoryPreset] !== expectedValue) {
+      throw new Error(`Expected factoryPreset.${key} to be ${String(expectedValue)} for lb.evm.v1`);
+    }
+  }
+}
+
+function normalizeRuntimeEndpoints(value: unknown): EndpointConfig {
+  const endpoints = expectObject(value, "endpoints");
+  expectOnlyKeys(endpoints, "endpoints", ["rpcUrl", "indexerUrl", "apiUrl", "tokenListUrl"]);
+  return {
+    rpcUrl: expectNonBlankString(endpoints.rpcUrl, "endpoints.rpcUrl"),
+    indexerUrl: endpoints.indexerUrl === undefined ? null : expectNullableString(endpoints.indexerUrl, "endpoints.indexerUrl"),
+    apiUrl: endpoints.apiUrl === undefined ? null : expectNullableString(endpoints.apiUrl, "endpoints.apiUrl"),
+    tokenListUrl: endpoints.tokenListUrl === undefined ? null : expectNullableString(endpoints.tokenListUrl, "endpoints.tokenListUrl")
+  };
+}
+
+function assertSameAddress(actual: unknown, expected: Address, path: string): void {
+  if (typeof actual !== "string" || actual.toLowerCase() !== expected.toLowerCase()) {
+    throw new Error(`Expected ${path} to match its deployed dependency`);
+  }
 }
 
 function normalizeSupportedPairImplementations(value: unknown, current: Address): Address[] | undefined {
@@ -476,6 +733,14 @@ function expectLiteral<T extends string>(value: unknown, expected: T, path: stri
 function expectString(value: unknown, path: string): string {
   if (typeof value !== "string" || value.length === 0) {
     throw new Error(`Expected ${path} to be a non-empty string`);
+  }
+
+  return value;
+}
+
+function expectStringValue(value: unknown, path: string): string {
+  if (typeof value !== "string") {
+    throw new Error(`Expected ${path} to be a string`);
   }
 
   return value;

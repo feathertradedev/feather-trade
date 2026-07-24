@@ -6,6 +6,18 @@ const path = require("node:path");
 const repoRoot = path.resolve(__dirname, "../..");
 
 const environments = {
+  sepolia: {
+    chainId: 11_155_111,
+    environment: "sepolia",
+    explorerUrl: "https://sepolia.etherscan.io",
+    indexerUrl: null,
+    name: "Ethereum Sepolia",
+    rpcEnvVar: "SEPOLIA_RPC_URL",
+    rpcUrl: "https://ethereum-sepolia.example.com",
+    schemaVersion: "lb.evm.v1",
+    tokenList: "packages/sdk/src/token-lists/sepolia.json",
+    verifierUrl: "https://api-sepolia.etherscan.io/api"
+  },
   robinhoodTestnet: {
     chainId: 46_630,
     environment: "testnet",
@@ -14,6 +26,7 @@ const environments = {
     name: "Robinhood Chain Testnet",
     rpcEnvVar: "ROBINHOOD_TESTNET_RPC_URL",
     rpcUrl: "https://rpc.testnet.example.com",
+    schemaVersion: "lb.robinhood.v1",
     tokenList: "packages/sdk/src/token-lists/robinhood-testnet.json",
     verifierUrl: "https://explorer.testnet.chain.robinhood.com/api/"
   },
@@ -25,6 +38,7 @@ const environments = {
     name: "Robinhood Chain",
     rpcEnvVar: "ROBINHOOD_RPC_URL",
     rpcUrl: "https://rpc.mainnet.example.com",
+    schemaVersion: "lb.robinhood.v1",
     tokenList: "packages/sdk/src/token-lists/robinhood.json",
     verifierUrl: "https://robinhoodchain.blockscout.com/api/"
   }
@@ -50,7 +64,7 @@ function main() {
 
   const config = environments[options.environment];
   if (config === undefined) {
-    throw new Error("--environment must be robinhoodTestnet or robinhood");
+    throw new Error("--environment must be sepolia, robinhoodTestnet, or robinhood");
   }
 
   if (typeof options.out !== "string" || options.out.length === 0) {
@@ -84,8 +98,13 @@ function buildManifest(config) {
     chainId: config.chainId,
     deployer: addresses.deployer,
     environment: config.environment,
-    schemaVersion: "lb.robinhood.v1",
-    sourceJoeV2Commit: "067c6ccf5b8ff1526d03fa3e4c65ec45d01c1f73",
+    schemaVersion: config.schemaVersion,
+    ...(config.schemaVersion === "lb.evm.v1"
+      ? {
+          sourceCommit: "067c6ccf5b8ff1526d03fa3e4c65ec45d01c1f73",
+          sourceTreeDirty: false
+        }
+      : { sourceJoeV2Commit: "067c6ccf5b8ff1526d03fa3e4c65ec45d01c1f73" }),
     startBlock: 1,
     endpoints: {
       rpcUrl: config.rpcUrl,
@@ -169,7 +188,7 @@ function toCamelCase(value) {
 }
 
 function printHelp() {
-  console.log("Usage: node scripts/web/create-public-config-fixture.cjs --environment <robinhoodTestnet|robinhood> --out <path>");
+  console.log("Usage: node scripts/web/create-public-config-fixture.cjs --environment <sepolia|robinhoodTestnet|robinhood> --out <path>");
 }
 
 try {

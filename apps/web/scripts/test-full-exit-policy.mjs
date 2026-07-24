@@ -10,14 +10,16 @@ const server = await createServer({ configFile: resolve(webRoot, "vite.config.ts
 try {
   const { fullExitBatchPolicy } = await server.ssrLoadModule("/src/full-exit-policy.ts");
   const localnet = fullExitBatchPolicy("localnet");
+  const sepolia = fullExitBatchPolicy("sepolia");
   const testnet = fullExitBatchPolicy("robinhoodTestnet");
   const mainnet = fullExitBatchPolicy("robinhood");
   assert(localnet.maxCandidateBins > testnet.maxCandidateBins);
+  assert.deepEqual(sepolia, testnet);
   assert(testnet.maxCandidateBins > mainnet.maxCandidateBins);
   assert(localnet.maxBlockGasBps > testnet.maxBlockGasBps);
   assert(testnet.maxBlockGasBps > mainnet.maxBlockGasBps);
   assert.throws(() => fullExitBatchPolicy("unsupported"), /not configured/);
-  for (const policy of [localnet, testnet, mainnet]) {
+  for (const policy of [localnet, sepolia, testnet, mainnet]) {
     assert(policy.maxCalldataBytes > 0);
     assert(policy.maxProbeCount >= policy.maxCandidateBins);
     assert(policy.maxBlockGasBps > 0n && policy.maxBlockGasBps <= 5_000n);

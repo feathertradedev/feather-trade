@@ -1,4 +1,4 @@
-import { formatUnits, type Address } from "viem";
+import { formatUnits, isAddress, type Address } from "viem";
 
 import type {
   AnalyticsHealth,
@@ -23,6 +23,7 @@ export interface WorkspaceMetricTile {
   label: string;
   value: string;
   status: AnalyticsStatus;
+  detail?: string | null;
 }
 
 export interface WorkspaceAnalyticsState {
@@ -73,6 +74,24 @@ export interface PoolPositionSummary {
   minBinId: string;
   positionIds: string[];
 }
+
+const POOL_MANAGE_SELECTION_BINS_PARAM = "manageBins";
+const POOL_MANAGE_SELECTION_OWNER_PARAM = "manageOwner";
+const MAX_POOL_MANAGE_SELECTION_BINS = 500;
+
+export interface PoolManageSelectionIntent {
+  binIds: string[];
+  owner: string;
+  pair: string;
+}
+
+export type PoolManageSelectionIntentParseResult =
+  | { intent: null; status: "absent" | "invalid" }
+  | { intent: PoolManageSelectionIntent; status: "ready" };
+
+export type PoolManageSelectionResolution =
+  | { positionIds: string[]; status: "ready" }
+  | { positionIds: []; status: "incomplete" | "invalid" | "scope-mismatch" };
 
 export function joinPoolWorkspaceRows<T extends PoolRow>(
   pools: readonly T[],
@@ -137,11 +156,23 @@ export function sortPoolWorkspaceRows<T extends PoolRow>(
 }
 
 export function workspaceMetricTiles(metric: PoolAnalyticsMetric | null): WorkspaceMetricTile[] {
+  const zeroTvlRatio = metric?.status === "READY" &&
+    metric.tvlUsdE18 !== null &&
+    BigInt(metric.tvlUsdE18) === 0n &&
+    metric.feeToTvlE18 === null;
   return [
     metricTile("tvl", "TVL", metric?.tvlUsdE18 ?? null, metric?.status ?? "UNAVAILABLE", formatUsdE18),
     metricTile("volume24h", "24h volume", metric?.volume24hUsdE18 ?? null, metric?.status ?? "UNAVAILABLE", formatUsdE18),
     metricTile("lpFees24h", "24h LP fees", metric?.lpFees24hUsdE18 ?? null, metric?.status ?? "UNAVAILABLE", formatUsdE18),
-    metricTile("feeToTvl", "24h LP fee / TVL", metric?.feeToTvlE18 ?? null, metric?.status ?? "UNAVAILABLE", formatRatioPercentE18),
+    zeroTvlRatio
+      ? {
+          key: "feeToTvl",
+          label: "24h LP fee / TVL",
+          value: "—",
+          status: "READY",
+          detail: "Undefined because TVL is $0."
+        }
+      : metricTile("feeToTvl", "24h LP fee / TVL", metric?.feeToTvlE18 ?? null, metric?.status ?? "UNAVAILABLE", formatRatioPercentE18),
     metricTile("price", "Indexed price", metric?.priceUsdE18 ?? null, metric?.status ?? "UNAVAILABLE", formatUsdE18)
   ];
 }
@@ -311,6 +342,181 @@ export function summarizePoolPosition(
   };
 }
 
+export function createPoolManageSelectionIntent(
+  positions: readonly PositionRow[],
+  owner: string | null,
+  pair: string
+): PoolManageSelectionIntent | null {
+  if (owner === null || !isAddress(owner) || !isAddress(pair)) return null;
+  const expectedOwner = owner.toLowerCase();
+  const expectedPair = pair.toLowerCase();
+  const binIds: string[] = [];
+
+  for (const position of positions) {
+    let liquidity: bigint;
+    try {
+      liquidity = BigInt(position.liquidity);
+    } catch {
+      return null;
+    }
+    if (liquidity <= 0n) continue;
+    if (
+      position.owner.toLowerCase() !== expectedOwner ||
+      position.pair.toLowerCase() !== expectedPair
+    ) {
+      return null;
+    }
+    const binId = normalizeBinId(position.binId);
+    if (binId === null) return null;
+    binIds.push(binId);
+  }
+
+  binIds.sort(compareDecimalStrings);
+  if (
+    binIds.length === 0 ||
+    binIds.length > MAX_POOL_MANAGE_SELECTION_BINS ||
+    new Set(binIds).size !== binIds.length
+  ) return null;
+  return { binIds, owner: expectedOwner, pair: expectedPair };
+}
+
+export function poolManageSelectionIntentHref(
+  href: string,
+  intent: PoolManageSelectionIntent
+): string {
+  const normalized = normalizePoolManageSelectionIntent(intent);
+  if (normalized === null) throw new Error("Invalid pool manage selection intent");
+  const queryIndex = href.indexOf("?");
+  const pathname = queryIndex === -1 ? href : href.slice(0, queryIndex);
+  const params = new URLSearchParams(queryIndex === -1 ? "" : href.slice(queryIndex + 1));
+  params.set(POOL_MANAGE_SELECTION_OWNER_PARAM, normalized.owner);
+  params.set(POOL_MANAGE_SELECTION_BINS_PARAM, normalized.binIds.join(","));
+  return `${pathname}?${params.toString()}`;
+}
+
+export function parsePoolManageSelectionIntent(
+  hash: string,
+  pair: string | null
+): PoolManageSelectionIntentParseResult {
+  const queryIndex = hash.indexOf("?");
+  if (queryIndex === -1) return { intent: null, status: "absent" };
+  const params = new URLSearchParams(hash.slice(queryIndex + 1));
+  const ownerValues = params.getAll(POOL_MANAGE_SELECTION_OWNER_PARAM);
+  const binValues = params.getAll(POOL_MANAGE_SELECTION_BINS_PARAM);
+  if (ownerValues.length === 0 && binValues.length === 0) {
+    return { intent: null, status: "absent" };
+  }
+  if (
+    pair === null ||
+    !isAddress(pair) ||
+    ownerValues.length !== 1 ||
+    binValues.length !== 1
+  ) {
+    return { intent: null, status: "invalid" };
+  }
+
+  const binIds = binValues[0]!.split(",");
+  const normalized = normalizePoolManageSelectionIntent({
+    binIds,
+    owner: ownerValues[0]!,
+    pair
+  });
+  return normalized === null
+    ? { intent: null, status: "invalid" }
+    : { intent: normalized, status: "ready" };
+}
+
+export function resolvePoolManageSelectionIntent(
+  intent: PoolManageSelectionIntent,
+  positions: readonly PositionRow[],
+  owner: string | null,
+  pair: string | null
+): PoolManageSelectionResolution {
+  const normalizedIntent = normalizePoolManageSelectionIntent(intent);
+  if (normalizedIntent === null) {
+    return { positionIds: [], status: "invalid" };
+  }
+  if (
+    owner === null ||
+    pair === null ||
+    !isAddress(owner) ||
+    !isAddress(pair) ||
+    normalizedIntent.owner !== owner.toLowerCase() ||
+    normalizedIntent.pair !== pair.toLowerCase()
+  ) {
+    return { positionIds: [], status: "scope-mismatch" };
+  }
+
+  const intendedBinIds = normalizedIntent.binIds;
+
+  const expectedOwner = owner.toLowerCase();
+  const expectedPair = pair.toLowerCase();
+  const positionsByBin = new Map<string, PositionRow>();
+  for (const position of positions) {
+    let liquidity: bigint;
+    try {
+      liquidity = BigInt(position.liquidity);
+    } catch {
+      return { positionIds: [], status: "invalid" };
+    }
+    if (liquidity <= 0n) continue;
+    if (
+      position.owner.toLowerCase() !== expectedOwner ||
+      position.pair.toLowerCase() !== expectedPair
+    ) {
+      return { positionIds: [], status: "invalid" };
+    }
+    const binId = normalizeBinId(position.binId);
+    if (binId === null || positionsByBin.has(binId)) {
+      return { positionIds: [], status: "invalid" };
+    }
+    positionsByBin.set(binId, position);
+  }
+
+  const positionIds: string[] = [];
+  for (const binId of intendedBinIds) {
+    const position = positionsByBin.get(binId!);
+    if (position === undefined) return { positionIds: [], status: "incomplete" };
+    positionIds.push(position.id);
+  }
+  if (new Set(positionIds).size !== positionIds.length) {
+    return { positionIds: [], status: "invalid" };
+  }
+  return { positionIds, status: "ready" };
+}
+
+function normalizePoolManageSelectionIntent(
+  intent: PoolManageSelectionIntent
+): PoolManageSelectionIntent | null {
+  if (
+    typeof intent !== "object" ||
+    intent === null ||
+    !Array.isArray(intent.binIds) ||
+    typeof intent.owner !== "string" ||
+    typeof intent.pair !== "string" ||
+    !isAddress(intent.owner) ||
+    !isAddress(intent.pair) ||
+    intent.binIds.length === 0 ||
+    intent.binIds.length > MAX_POOL_MANAGE_SELECTION_BINS
+  ) {
+    return null;
+  }
+  const binIds = intent.binIds.map((binId) =>
+    typeof binId === "string" ? normalizeBinId(binId) : null
+  );
+  if (
+    binIds.some((binId) => binId === null) ||
+    new Set(binIds).size !== binIds.length
+  ) {
+    return null;
+  }
+  return {
+    binIds: (binIds as string[]).sort(compareDecimalStrings),
+    owner: intent.owner.toLowerCase(),
+    pair: intent.pair.toLowerCase()
+  };
+}
+
 export function formatUsdE18(value: string | null): string {
   if (value === null) return "Unavailable";
   if (BigInt(value) > 0n && BigInt(value) < 10n ** 16n) return "<$0.01";
@@ -373,6 +579,15 @@ function compareDecimalStrings(left: string, right: string): number {
   const leftValue = BigInt(left);
   const rightValue = BigInt(right);
   return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
+}
+
+function normalizeBinId(value: string): string | null {
+  try {
+    const binId = BigInt(value);
+    return binId >= 0n && binId <= 16_777_215n ? binId.toString() : null;
+  } catch {
+    return null;
+  }
 }
 
 function canonical(address: Address): string {

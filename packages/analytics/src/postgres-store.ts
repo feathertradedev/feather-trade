@@ -1,4 +1,6 @@
-import { Pool, type PoolClient } from "pg";
+import { createHash } from "node:crypto";
+
+import { Pool, type PoolClient, type QueryConfig } from "pg";
 
 import type { AnalyticsCheckpoint, AnalyticsCheckpointMetadata } from "./engine.js";
 import {
@@ -13,12 +15,21 @@ import type { Candle } from "./types.js";
 
 const DEFAULT_REPLAY_SIZE = 2_048;
 const DEFAULT_GLOBAL_REPLAY_SIZE = 8_192;
+const WRITER_LEASE_NAMESPACE = "feather-analytics-writer:v1";
+
+export class AnalyticsWriterLeaseUnavailableError extends Error {
+  override readonly name = "AnalyticsWriterLeaseUnavailableError";
+}
 
 export interface PostgresAnalyticsStoreOptions {
   connectionString: string;
   schema?: string;
+  applicationName?: string;
   replaySize?: number;
   globalReplaySize?: number;
+  connectionTimeoutMs?: number;
+  healthcheckTimeoutMs?: number;
+  keepAliveInitialDelayMs?: number;
 }
 
 export class PostgresAnalyticsStore implements AnalyticsStateStore {
@@ -26,7 +37,15 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
   readonly #schema: string;
   readonly #replaySize: number;
   readonly #globalReplaySize: number;
+  readonly #healthcheckTimeoutMs: number;
   #initialization: Promise<void> | null = null;
+  #writerLeaseClient: PoolClient | null = null;
+  #writerLeaseAcquisition: Promise<void> | null = null;
+  #writerLeaseError: Error | null = null;
+  readonly #writerLeaseFailure: Promise<Error>;
+  readonly #resolveWriterLeaseFailure: (error: Error) => void;
+  #closePromise: Promise<void> | null = null;
+  #closing = false;
 
   constructor(options: PostgresAnalyticsStoreOptions) {
     if (!options.connectionString.trim()) throw new Error("PostgreSQL connection string is required");
@@ -38,15 +57,50 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
     if (!Number.isSafeInteger(this.#globalReplaySize) || this.#globalReplaySize <= 0) {
       throw new Error("Analytics global replay size must be positive");
     }
-    this.#pool = new Pool({ connectionString: options.connectionString, max: 5 });
+    const connectionTimeoutMs = options.connectionTimeoutMs ?? 5_000;
+    if (!Number.isSafeInteger(connectionTimeoutMs) || connectionTimeoutMs <= 0) {
+      throw new Error("Analytics PostgreSQL connection timeout must be positive");
+    }
+    this.#healthcheckTimeoutMs = options.healthcheckTimeoutMs ?? 2_000;
+    if (!Number.isSafeInteger(this.#healthcheckTimeoutMs) || this.#healthcheckTimeoutMs <= 0) {
+      throw new Error("Analytics PostgreSQL healthcheck timeout must be positive");
+    }
+    const keepAliveInitialDelayMs = options.keepAliveInitialDelayMs ?? 10_000;
+    if (!Number.isSafeInteger(keepAliveInitialDelayMs) || keepAliveInitialDelayMs <= 0) {
+      throw new Error("Analytics PostgreSQL keepalive initial delay must be positive");
+    }
+    const applicationName = options.applicationName ?? "feather-analytics";
+    if (!/^[A-Za-z0-9._:-]{1,63}$/.test(applicationName)) {
+      throw new Error("Analytics PostgreSQL application name is invalid");
+    }
+    let resolveWriterLeaseFailure!: (error: Error) => void;
+    this.#writerLeaseFailure = new Promise<Error>((resolve) => {
+      resolveWriterLeaseFailure = resolve;
+    });
+    this.#resolveWriterLeaseFailure = resolveWriterLeaseFailure;
+    this.#pool = new Pool({
+      application_name: applicationName,
+      connectionString: options.connectionString,
+      connectionTimeoutMillis: connectionTimeoutMs,
+      idle_in_transaction_session_timeout: 60_000,
+      keepAlive: true,
+      keepAliveInitialDelayMillis: keepAliveInitialDelayMs,
+      lock_timeout: 15_000,
+      max: 1,
+      query_timeout: 65_000,
+      statement_timeout: 60_000
+    });
   }
 
   async load(): Promise<AnalyticsCheckpoint | null> {
+    const client = this.#requireWriterLease();
     await this.#initialize();
-    const [metadata, blocks] = await Promise.all([
-      this.#pool.query<{ payload: unknown }>(`SELECT payload FROM ${this.#schema}.checkpoint WHERE singleton = TRUE`),
-      this.#pool.query<{ payload: unknown }>(`SELECT payload FROM ${this.#schema}.canonical_blocks ORDER BY number ASC`)
-    ]);
+    const metadata = await client.query<{ payload: unknown }>(
+      `SELECT payload FROM ${this.#schema}.checkpoint WHERE singleton = TRUE`
+    );
+    const blocks = await client.query<{ payload: unknown }>(
+      `SELECT payload FROM ${this.#schema}.canonical_blocks ORDER BY number ASC`
+    );
     if (metadata.rows[0] === undefined) return null;
     const checkpoint = decodePayload<AnalyticsCheckpoint>(metadata.rows[0].payload);
     checkpoint.blocks = blocks.rows.map((row) => decodePayload(row.payload));
@@ -76,8 +130,8 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
     events: readonly CandleStreamEvent[] | null,
     poolStates: readonly PoolStatePersistenceChange[] | null
   ): Promise<void> {
+    const client = this.#requireWriterLease();
     await this.#initialize();
-    const client = await this.#pool.connect();
     try {
       await client.query("BEGIN");
       await client.query(`CREATE TEMP TABLE incoming_analytics_blocks (number NUMERIC(78, 0) PRIMARY KEY, hash TEXT, parent_hash TEXT, timestamp BIGINT, payload JSONB) ON COMMIT DROP`);
@@ -124,8 +178,6 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;
-    } finally {
-      client.release();
     }
   }
 
@@ -155,8 +207,8 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
     events: readonly CandleStreamEvent[] | null,
     poolStates: readonly PoolStatePersistenceChange[] | null
   ): Promise<void> {
+    const client = this.#requireWriterLease();
     await this.#initialize();
-    const client = await this.#pool.connect();
     try {
       await client.query("BEGIN");
       await client.query(
@@ -197,14 +249,13 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;
-    } finally {
-      client.release();
     }
   }
 
   async loadCandleEvents(): Promise<CandleStreamEvent[]> {
+    const client = this.#requireWriterLease();
     await this.#initialize();
-    const result = await this.#pool.query<{ payload: unknown }>(
+    const result = await client.query<{ payload: unknown }>(
       `SELECT payload FROM ${this.#schema}.stream_events ORDER BY cursor ASC`
     );
     return result.rows.map((row) => decodePayload<CandleStreamEvent>(row.payload));
@@ -212,8 +263,8 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
 
   async appendCandleEvents(events: readonly CandleStreamEvent[]): Promise<void> {
     if (events.length === 0) return;
+    const client = this.#requireWriterLease();
     await this.#initialize();
-    const client = await this.#pool.connect();
     try {
       await client.query("BEGIN");
       await this.#writeStreamEvents(client, events);
@@ -221,22 +272,170 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;
-    } finally {
-      client.release();
     }
   }
 
+  async healthcheck(): Promise<void> {
+    this.#assertOpen();
+    if (this.#writerLeaseAcquisition !== null) await this.#writerLeaseAcquisition;
+    const query: QueryConfig & { query_timeout: number } = {
+      text: "SELECT 1",
+      query_timeout: this.#healthcheckTimeoutMs
+    };
+    await this.#requireWriterLease().query(query);
+  }
+
+  async acquireWriterLease(): Promise<void> {
+    this.#assertOpen();
+    this.#assertLeaseHasNotFailed();
+    this.#writerLeaseAcquisition ??= this.#acquireWriterLease();
+    return this.#writerLeaseAcquisition;
+  }
+
+  writerLeaseFailure(): Promise<Error> {
+    return this.#writerLeaseFailure;
+  }
+
+  hasWriterLease(): boolean {
+    return this.#writerLeaseClient !== null && this.#writerLeaseError === null && !this.#closing;
+  }
+
+  async releaseWriterLease(): Promise<void> {
+    const acquisition = this.#writerLeaseAcquisition;
+    if (acquisition !== null) await acquisition;
+    await this.#releaseWriterLease();
+    this.#writerLeaseAcquisition = null;
+  }
+
   async close(): Promise<void> {
-    await this.#pool.end();
+    this.#closePromise ??= this.#close();
+    return this.#closePromise;
+  }
+
+  async #acquireWriterLease(): Promise<void> {
+    const client = await this.#pool.connect();
+    const [leaseKeyHigh, leaseKeyLow] = writerLeaseKey(this.#schema);
+    try {
+      // PostgreSQL advisory locks are session scoped. Deploy through a direct
+      // database endpoint or PgBouncer session pooling; transaction pooling
+      // cannot preserve this process-lifetime writer fence.
+      const result = await client.query<{ acquired: boolean }>(
+        "SELECT pg_try_advisory_lock($1::integer, $2::integer) AS acquired",
+        [leaseKeyHigh, leaseKeyLow]
+      );
+      if (result.rows[0]?.acquired !== true) {
+        throw new AnalyticsWriterLeaseUnavailableError(
+          `Analytics writer lease is already held for PostgreSQL schema ${this.#schema}`
+        );
+      }
+      client.on("error", this.#recordWriterLeaseError);
+      client.on("end", this.#recordWriterLeaseEnd);
+      this.#writerLeaseClient = client;
+      this.#initialization ??= this.#createSchema(client);
+      await this.#initialization;
+    } catch (error) {
+      if (this.#writerLeaseClient === client) {
+        this.#writerLeaseClient = null;
+        client.off("error", this.#recordWriterLeaseError);
+        client.off("end", this.#recordWriterLeaseEnd);
+      }
+      client.release(true);
+      throw error;
+    }
+  }
+
+  async #releaseWriterLease(): Promise<void> {
+    const client = this.#writerLeaseClient;
+    if (client === null) return;
+    this.#writerLeaseClient = null;
+    client.off("error", this.#recordWriterLeaseError);
+    client.off("end", this.#recordWriterLeaseEnd);
+    const [leaseKeyHigh, leaseKeyLow] = writerLeaseKey(this.#schema);
+    let destroy = this.#writerLeaseError !== null;
+    try {
+      if (!destroy) {
+        const result = await client.query<{ released: boolean }>(
+          "SELECT pg_advisory_unlock($1::integer, $2::integer) AS released",
+          [leaseKeyHigh, leaseKeyLow]
+        );
+        if (result.rows[0]?.released !== true) {
+          destroy = true;
+          throw new Error(`Analytics writer lease was not held for PostgreSQL schema ${this.#schema}`);
+        }
+      }
+    } catch (error) {
+      destroy = true;
+      throw error;
+    } finally {
+      client.release(destroy);
+    }
+  }
+
+  async #close(): Promise<void> {
+    this.#closing = true;
+    try {
+      if (this.#writerLeaseAcquisition !== null) {
+        try {
+          await this.#writerLeaseAcquisition;
+        } catch {
+          // Acquisition failures already release their dedicated client.
+        }
+      }
+      await this.#releaseWriterLease();
+    } finally {
+      await this.#pool.end();
+    }
+  }
+
+  readonly #recordWriterLeaseError = (error: Error): void => {
+    this.#markWriterLeaseFailed(error);
+  };
+
+  readonly #recordWriterLeaseEnd = (): void => {
+    this.#markWriterLeaseFailed(
+      new Error("Analytics PostgreSQL writer lease connection ended unexpectedly")
+    );
+  };
+
+  #markWriterLeaseFailed(error: Error): void {
+    if (this.#writerLeaseError !== null || this.#closing) return;
+    this.#writerLeaseError = error;
+    this.#resolveWriterLeaseFailure(error);
+  }
+
+  #requireWriterLease(): PoolClient {
+    if (this.#writerLeaseError !== null) {
+      throw new Error("Analytics PostgreSQL writer lease connection failed", { cause: this.#writerLeaseError });
+    }
+    if (this.#writerLeaseClient === null) {
+      throw new AnalyticsWriterLeaseUnavailableError("Analytics PostgreSQL writer lease has not been acquired");
+    }
+    return this.#writerLeaseClient;
+  }
+
+  #assertOpen(): void {
+    if (this.#closing) throw new Error("Analytics PostgreSQL store is closed");
+  }
+
+  #assertLeaseHasNotFailed(): void {
+    if (this.#writerLeaseError !== null) {
+      throw new Error(
+        "Analytics PostgreSQL writer lease failed permanently; restart the process before acquiring another lease",
+        { cause: this.#writerLeaseError }
+      );
+    }
   }
 
   async #initialize(): Promise<void> {
-    this.#initialization ??= this.#createSchema();
+    if (this.#initialization === null) {
+      throw new AnalyticsWriterLeaseUnavailableError(
+        "Analytics PostgreSQL schema cannot initialize before the writer lease is acquired"
+      );
+    }
     return this.#initialization;
   }
 
-  async #createSchema(): Promise<void> {
-    const client = await this.#pool.connect();
+  async #createSchema(client: PoolClient): Promise<void> {
     try {
       await client.query("BEGIN");
       await client.query(`CREATE SCHEMA IF NOT EXISTS ${this.#schema}`);
@@ -245,8 +444,6 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;
-    } finally {
-      client.release();
     }
   }
 
@@ -354,6 +551,13 @@ export class PostgresAnalyticsStore implements AnalyticsStateStore {
       }
     }
   }
+}
+
+function writerLeaseKey(schema: string): [number, number] {
+  const digest = createHash("sha256")
+    .update(`${WRITER_LEASE_NAMESPACE}\0${schema}`)
+    .digest();
+  return [digest.readInt32BE(0), digest.readInt32BE(4)];
 }
 
 async function createTables(client: PoolClient, schema: string): Promise<void> {

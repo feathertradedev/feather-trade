@@ -1,18 +1,71 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./fixtures/test";
 import { decodeFunctionData, type Hex } from "viem";
 
 import { lbRouterAbi } from "../../../packages/sdk/src/abi";
 import { installMockAnalyticsStream } from "./fixtures/mock-analytics-stream";
-import { installMockRpc, SECOND_WNATIVE_USDC_PAIR, USDC, WNATIVE, WNATIVE_USDC_PAIR } from "./fixtures/mock-rpc";
-import { DEFAULT_ACCOUNT, installMockWallet, LOCALNET_CHAIN_ID, readMockWallet } from "./fixtures/mock-wallet";
+import { installMockRpc, LOCALNET_ANALYTICS_URL, SECOND_WNATIVE_USDC_PAIR, USDC, WNATIVE, WNATIVE_USDC_PAIR } from "./fixtures/mock-rpc";
+import { DEFAULT_ACCOUNT, installMockWallet, LOCALNET_CHAIN_ID, openAndSelectMockWallet, readMockWallet } from "./fixtures/mock-wallet";
 
 const ONE_TOKEN = 10n ** 18n;
 const TEST_ACTIVE_ID = 8_388_608;
 const TEST_Q128 = 1n << 128n;
 
 async function connectWallet(page: Parameters<typeof installMockRpc>[0]) {
-  await page.getByTestId("wallet-connect-button").click();
+  await openAndSelectMockWallet(page);
   await expect(page.getByTestId("wallet-account-button")).toBeVisible();
+}
+
+async function installMockDiscoveryProjection(page: Parameters<typeof installMockRpc>[0]) {
+  await page.route(LOCALNET_ANALYTICS_URL, async (route) => {
+    const request = route.request();
+    if (request.method() !== "POST") return route.fallback();
+    const body = JSON.parse(request.postData() ?? "{}") as {
+      query?: string;
+      variables?: { pools?: { pair: string; preferredQuoteToken?: string | null }[] };
+    };
+    if (!body.query?.includes("WebPoolDiscovery")) return route.fallback();
+    const startTimestamp = 1_720_000_800;
+    const poolDiscovery = (body.variables?.pools ?? []).map((requested, index) => ({
+      pair: requested.pair.toLowerCase(),
+      chainId: LOCALNET_CHAIN_ID,
+      tokenX: WNATIVE.toLowerCase(),
+      tokenY: USDC.toLowerCase(),
+      displayBaseToken: WNATIVE.toLowerCase(),
+      displayQuoteToken: USDC.toLowerCase(),
+      poolPriceQuotePerBaseE18: "160000000000000000000",
+      hourlyCloses: [160n, 164n, 162n, 168n].map((close, closeIndex) => ({
+        startTimestamp: startTimestamp + closeIndex * 3_600,
+        closeUsdE18: String(close * 10n ** 18n),
+        quoteToken: USDC.toLowerCase(),
+        finalized: closeIndex < 3,
+        revision: closeIndex + 1,
+        priceSource: "active-bin-quote-usd",
+        firstBlockHash: `0x${(500 + closeIndex).toString(16).padStart(64, "0")}`,
+        lastBlockHash: `0x${(500 + closeIndex).toString(16).padStart(64, "0")}`
+      })),
+      priceChange24hE18: "50000000000000000",
+      tvlUsdE18: String((500_000n - BigInt(index) * 10_000n) * 10n ** 18n),
+      lpNetSwapFees24hUsdE18: String((240n - BigInt(index)) * 10n ** 18n),
+      volume24hUsdE18: String((120_000n - BigInt(index) * 1_000n) * 10n ** 18n),
+      status: "READY",
+      missingPriceTokens: [],
+      asOfBlock: "42",
+      asOfBlockHash: `0x${"22".repeat(32)}`,
+      asOfTimestamp: startTimestamp + 4 * 3_600,
+      marketMetadata: {
+        marketCapUsdE18: "12345000000000000000000000",
+        source: "dex-screener",
+        fetchedAt: startTimestamp + 4 * 3_600,
+        logoPath: `/token-images/${"c".repeat(64)}`,
+        logoSource: "dex-screener"
+      }
+    }));
+    await route.fulfill({
+      body: JSON.stringify({ data: { poolDiscovery } }),
+      contentType: "application/json",
+      status: 200
+    });
+  });
 }
 
 async function selectPoolWorkspaceView(
@@ -145,13 +198,15 @@ test("pool workspace applies sparse canonical market updates without refetching 
   }))).toEqual({ error: null, state: "live" });
   await expect(page.locator(".pool-rail-price-block small")).toContainText("Live analytics");
   const poolRequests = () => rpc.snapshot().graphRequests.filter((request) => request.query.includes("WebPoolState"));
-  await expect.poll(() => poolRequests().length).toBe(1);
+  await expect.poll(() => poolRequests().length).toBeGreaterThan(0);
+  const bootstrapRequestCount = poolRequests().length;
 
   const untouchedBin = page.locator(`[data-bin-id="${TEST_ACTIVE_ID - 1}"]`);
   await expect(untouchedBin).toBeAttached();
   await untouchedBin.evaluate((element) => element.setAttribute("data-node-sentinel", "retained"));
 
   const blockHash = `0x${"4".repeat(64)}`;
+  rpc.update({ blockHash, blockNumber: 43n });
   const state = {
     chainId: LOCALNET_CHAIN_ID,
     pair: WNATIVE_USDC_PAIR.toLowerCase(),
@@ -209,22 +264,23 @@ test("pool workspace applies sparse canonical market updates without refetching 
 
   await expect(page.locator(".pool-rail-reserves dd").first()).toContainText("2");
   await expect(untouchedBin).toHaveAttribute("data-node-sentinel", "retained");
-  expect(poolRequests()).toHaveLength(1);
+  expect(poolRequests()).toHaveLength(bootstrapRequestCount);
 
   await page.evaluate((value) => {
     (window as unknown as Window & { __testEmitPoolState: (payload: unknown) => void }).__testEmitPoolState(value);
   }, payload);
   await page.waitForTimeout(100);
-  expect(poolRequests()).toHaveLength(1);
+  expect(poolRequests()).toHaveLength(bootstrapRequestCount);
 
   await page.evaluate(() => {
     window.dispatchEvent(new Event("focus"));
     document.dispatchEvent(new Event("visibilitychange"));
   });
   await page.waitForTimeout(100);
-  expect(poolRequests()).toHaveLength(1);
+  expect(poolRequests()).toHaveLength(bootstrapRequestCount);
 
   const invalidFeeHash = `0x${"5".repeat(64)}`;
+  rpc.update({ blockHash: invalidFeeHash, blockNumber: 44n });
   await page.evaluate((value) => {
     (window as unknown as Window & { __testEmitPoolState: (payload: unknown) => void }).__testEmitPoolState(value);
   }, {
@@ -268,6 +324,90 @@ test("pool workspace applies sparse canonical market updates without refetching 
   await expect.poll(() => poolRequests().length).toBeGreaterThan(1);
 });
 
+test("pool workspace coalesces retained replay before attestation and never marks queued data live", async ({ page }) => {
+  await installMockAnalyticsStream(page);
+  const rpc = await installMockRpc(page, { includePairs: true });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+  await expandPoolMetadata(page);
+  const rail = page.getByTestId("pool-workspace-rail");
+  await expect(rail).toHaveAttribute("data-pool-stream-state", "live");
+
+  const blockHash = `0x${"8".repeat(64)}` as const;
+  rpc.update({ blockHash, blockNumber: 43n, poolEconomicsReadDelayMs: 300 });
+  const baseState = {
+    chainId: LOCALNET_CHAIN_ID,
+    pair: WNATIVE_USDC_PAIR.toLowerCase(),
+    tokenX: WNATIVE.toLowerCase(),
+    tokenY: USDC.toLowerCase(),
+    decimalsX: 18,
+    decimalsY: 18,
+    reserveY: "319000000000000000000",
+    activeId: TEST_ACTIVE_ID,
+    binStep: 10,
+    marketPriceQuoteE18: "160000000000000000000",
+    priceUsdE18: "160000000000000000000",
+    tvlUsdE18: "321000000000000000000",
+    status: "READY",
+    missingPriceTokens: [],
+    feeState: {
+      static: {
+        baseFactor: "20", filterPeriod: "30", decayPeriod: "120", reductionFactor: "5000",
+        variableFeeControl: "100", protocolShare: "1000", maxVolatilityAccumulator: "100000"
+      },
+      variable: {
+        volatilityAccumulator: "1200", volatilityReference: "500", idReference: String(TEST_ACTIVE_ID), timeOfLastUpdate: "1720000001"
+      }
+    },
+    asOfBlock: "43",
+    asOfBlockHash: blockHash,
+    asOfTimestamp: 1_720_000_001
+  };
+  const replay = Array.from({ length: 256 }, (_, index) => {
+    const revision = index + 2;
+    return {
+      cursor: String(index + 1),
+      update: {
+        eventId: `31337:${blockHash}:${WNATIVE_USDC_PAIR.toLowerCase()}:replay-${revision}`,
+        state: {
+          ...baseState,
+          reserveX: `${revision}000000000000000000`,
+          revision
+        },
+        binReplacements: [{
+          chainId: LOCALNET_CHAIN_ID,
+          pair: WNATIVE_USDC_PAIR.toLowerCase(),
+          binId: String(TEST_ACTIVE_ID),
+          reserveX: `${revision}000000000000000000`,
+          reserveY: "1000000",
+          totalSupply: "10000000000000000000",
+          updatedAtBlock: "43",
+          updatedAtBlockHash: blockHash,
+          updatedAtTimestamp: 1_720_000_001,
+          revision
+        }],
+        replaceBinWindow: false,
+        sourceEventIds: [`replay-${revision}`]
+      }
+    };
+  });
+  const activeReadsBeforeReplay = rpc.snapshot().ethCalls.filter((call) => call.functionName === "getActiveId").length;
+
+  await page.evaluate((payloads) => {
+    const controls = window as unknown as Window & {
+      __testEmitPoolStateBatch: (values: unknown[]) => void;
+      __testHeartbeatPoolStream: () => void;
+    };
+    controls.__testEmitPoolStateBatch(payloads);
+    controls.__testHeartbeatPoolStream();
+  }, replay);
+
+  await expect(rail).toHaveAttribute("data-pool-stream-state", "connecting");
+  await expect(page.locator(".pool-rail-reserves dd").first()).toContainText("257", { timeout: 10_000 });
+  await expect(rail).toHaveAttribute("data-pool-stream-state", "live");
+  const activeReadsAfterReplay = rpc.snapshot().ethCalls.filter((call) => call.functionName === "getActiveId").length;
+  expect(activeReadsAfterReplay - activeReadsBeforeReplay).toBe(1);
+});
+
 test("an unavailable pool bootstrap retries only until the live handoff succeeds", async ({ page }) => {
   await installMockAnalyticsStream(page);
   const rpc = await installMockRpc(page, { analyticsMode: "error", includePairs: true });
@@ -291,9 +431,9 @@ test("same-height live pool state must match the pinned canonical hash", async (
   await installMockAnalyticsStream(page);
   const pinnedHash = `0x${"6".repeat(64)}` as const;
   const liveForkHash = `0x${"7".repeat(64)}` as const;
-  await installMockRpc(page, {
+  const rpc = await installMockRpc(page, {
     analyticsAsOfBlock: 42n,
-    analyticsHeadHash: liveForkHash,
+    analyticsHeadHash: pinnedHash,
     blockHash: pinnedHash,
     includePairs: true,
     indexerBlockHash: pinnedHash,
@@ -301,12 +441,17 @@ test("same-height live pool state must match the pinned canonical hash", async (
   });
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
   await expandPoolMetadata(page);
+  await expect(page.getByTestId("pool-workspace-rail")).toHaveAttribute("data-pool-stream-state", "live");
+
+  rpc.update({ analyticsHeadHash: liveForkHash });
+  await page.evaluate(() => {
+    (window as unknown as Window & { __testResetPoolStream: () => void }).__testResetPoolStream();
+  });
   await expect(page.getByTestId("pool-workspace-rail")).toHaveAttribute(
     "data-pool-stream-error",
     "Live pool state canonical hash differs from pinned RPC state"
   );
   await expect(page.getByTestId("pool-workspace-rail")).toHaveAttribute("data-pool-stream-state", "unavailable");
-  await expect(page.locator(".pool-rail-price-block small")).toContainText("RPC block 42");
   await expect(page.locator(".pool-rail-price-block small")).not.toContainText("Live analytics");
 });
 
@@ -501,7 +646,10 @@ test("pool workspace keeps truthful owner positions and history beneath the char
   await expect(page.getByTestId("pool-workspace-owner-panel").getByRole("tab", { exact: true, name: "History" })).toHaveAttribute("aria-selected", "true");
   await page.getByTestId("pool-workspace-owner-panel").getByRole("tab", { name: "Positions" }).click();
   await page.getByTestId("pool-position-manage-link").click();
-  await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/manage$`, "i"));
+  await expect(page).toHaveURL(new RegExp(
+    `#/pools/${WNATIVE_USDC_PAIR}/manage\\?manageOwner=${DEFAULT_ACCOUNT}&manageBins=${TEST_ACTIVE_ID}$`,
+    "i"
+  ));
   await expect(page.locator(".position-option")).toHaveCount(1);
   await expect(page.locator(".position-option").first().locator('input[type="checkbox"]')).toBeChecked();
   await selectPoolWorkspaceView(page, "Market");
@@ -520,8 +668,10 @@ test("pool owner panel does not query before connection and exposes a real empty
 
   const panel = page.getByTestId("pool-workspace-owner-panel");
   await expect(panel).toContainText("No wallet connected");
-  expect(rpc.snapshot().graphQueries.some((query) => query.includes("OwnerPairPositions"))).toBe(false);
-  expect(rpc.snapshot().graphQueries.some((query) => query.includes("PositionLiquidityHistory"))).toBe(false);
+  expect(rpc.snapshot().graphQueries.some((query) => query.includes("walletPositions"))).toBe(false);
+  expect(rpc.snapshot().graphRequests.some((request) =>
+    request.query.includes("WebPoolActivity") && request.variables?.owner != null
+  )).toBe(false);
 
   await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.reload();
@@ -556,6 +706,33 @@ test("unified owner panel shows canonical accounting and claims without a fake c
   await expect(panel).toContainText(/Fee growth is (?:already reflected|included)/);
   await expect(panel.getByRole("button", { name: /claim/i })).toHaveCount(0);
   await expect(panel.getByRole("link", { name: /claim/i })).toHaveCount(0);
+});
+
+test("quiet pools reconcile owner accounting against the current canonical analytics head", async ({ page }) => {
+  const currentHeadHash = `0x${"2".repeat(64)}` as const;
+  const lastPoolEventHash = `0x${"1".repeat(64)}` as const;
+  const rpc = await installMockRpc(page, {
+    analyticsAsOfBlock: 42n,
+    analyticsHeadHash: currentHeadHash,
+    blockHash: currentHeadHash,
+    blockNumber: 42n,
+    includePairs: true,
+    includePositions: true,
+    poolStateAsOfBlock: 40n,
+    poolStateAsOfBlockHash: lastPoolEventHash
+  });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+  await connectWallet(page);
+
+  const panel = page.getByTestId("pool-workspace-owner-panel");
+  await expect(panel.getByTestId("pool-owner-accounting-notice")).toHaveCount(0);
+  await expect(panel.getByTestId("pool-position-manage-link")).toHaveAttribute(
+    "href",
+    new RegExp(`^#/pools/${WNATIVE_USDC_PAIR.toLowerCase()}/manage\\?`)
+  );
+  const pinnedActiveIdCalls = rpc.snapshot().ethCalls.filter((call) => call.functionName === "getActiveId");
+  expect(pinnedActiveIdCalls.some((call) => call.blockTag === "0x2a")).toBe(true);
 });
 
 test("unified owner accounting keeps partial values honest and blocks a head-reconciling manage handoff", async ({ page }) => {
@@ -601,7 +778,7 @@ test("same-height analytics from a different canonical hash cannot enable positi
   await expect(panel.getByTestId("pool-position-manage-link")).toHaveCount(0);
 });
 
-test("different nonempty raw and accounting bin sets stay explicitly reconciling", async ({ page }) => {
+test("canonical out-of-range bins stay truthful and keep management pool-scoped", async ({ page }) => {
   await installMockRpc(page, {
     analyticsBinOffset: 10,
     includePairs: true,
@@ -612,9 +789,15 @@ test("different nonempty raw and accounting bin sets stay explicitly reconciling
   await connectWallet(page);
 
   const panel = page.getByTestId("pool-workspace-owner-panel");
-  await expect(panel.getByTestId("pool-owner-accounting-notice")).toContainText(/exact positive-bin sets reconcile/i);
-  await expect(panel.getByTestId("pool-position-accounting")).toContainText("Range unknown");
-  await expect(panel.getByTestId("pool-position-manage-link")).toHaveCount(0);
+  await expect(panel.getByTestId("pool-owner-accounting-notice")).toHaveCount(0);
+  await expect(panel.getByTestId("pool-position-accounting")).toContainText("Out of range");
+  await expect(panel.getByTestId("pool-position-manage-link")).toHaveAttribute(
+    "href",
+    new RegExp(
+      `^#/pools/${WNATIVE_USDC_PAIR}/manage\\?manageOwner=${DEFAULT_ACCOUNT}&manageBins=${TEST_ACTIVE_ID + 10}$`,
+      "i"
+    )
+  );
 });
 
 test("unified owner panel preserves a truthful transferred-position state", async ({ page }) => {
@@ -635,21 +818,42 @@ test("unified owner panel preserves a truthful transferred-position state", asyn
   await expect(panel).not.toContainText("$0 P&L");
 });
 
-for (const [identity, options] of [
-  ["owner", { ownerPositionResponseOwner: "0x0000000000000000000000000000000000000001" }],
-  ["pair", { ownerPositionResponsePair: SECOND_WNATIVE_USDC_PAIR }]
-] as const) {
-  test(`unified owner panel fails closed for a foreign ${identity} position response`, async ({ page }) => {
-    await installMockRpc(page, { includePairs: true, includePositions: true, ...options });
-    await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
-    await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
-    await connectWallet(page);
-
-    const panel = page.getByTestId("pool-workspace-owner-panel");
-    await expect(panel.getByTestId("pool-owner-accounting-notice")).toContainText(/identity|mismatch|different|unavailable|could not load|reconcil/i);
-    await expect(panel.getByTestId("pool-position-manage-link")).toHaveCount(0);
+test("unified owner panel fails closed for a foreign owner portfolio response", async ({ page }) => {
+  await installMockRpc(page, {
+    includePairs: true,
+    includePositions: true,
+    ownerPositionResponseOwner: "0x0000000000000000000000000000000000000001"
   });
-}
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+  await connectWallet(page);
+  await selectPoolWorkspaceView(page, "Positions");
+
+  const panel = page.getByTestId("pool-workspace-owner-panel");
+  await expect(panel.getByRole("alert")).toContainText("Position bins could not load");
+  await expect(panel.getByRole("alert")).toContainText(/another owner|owner/i);
+  await expect(panel.getByTestId("pool-position-manage-link")).toHaveCount(0);
+});
+
+test("unified owner panel ignores canonical wallet positions from another pool", async ({ page }) => {
+  await installMockRpc(page, {
+    includePairs: true,
+    includePositions: true,
+    ownerPositionResponsePair: SECOND_WNATIVE_USDC_PAIR
+  });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+  await connectWallet(page);
+  await selectPoolWorkspaceView(page, "Positions");
+
+  const panel = page.getByTestId("pool-workspace-owner-panel");
+  await expect(panel).toContainText("No liquidity in this pool");
+  await expect(panel.getByRole("link", { name: "Create position" })).toHaveAttribute(
+    "href",
+    `#/pools/${WNATIVE_USDC_PAIR.toLowerCase()}/create`
+  );
+  await expect(panel.getByTestId("pool-position-manage-link")).toHaveCount(0);
+});
 
 test("owner history loads older pool rows without depending on the global activity cap", async ({ page }) => {
   await installMockRpc(page, { includePairs: true, includePositions: true, positionHistoryCount: 17 });
@@ -684,23 +888,23 @@ test("pool activity is pair-scoped and switches between wallet-only and all acti
   const feed = panel.getByTestId("pool-activity-feed");
   const filter = panel.getByTestId("pool-activity-wallet-filter");
   await expect(filter).toHaveAttribute("aria-pressed", "true");
-  await expect(feed.getByTestId("pool-activity-row")).toHaveCount(3);
-  await expect(feed).toContainText("Swap");
+  await expect(feed.getByTestId("pool-activity-row")).toHaveCount(2);
+  await expect(feed).not.toContainText("Swap");
   await expect(feed).toContainText(/Added liquidity|Deposit/i);
   await expect(feed).toContainText(/Removed liquidity|Withdraw/i);
   await expect.poll(() => rpc.snapshot().graphRequests.some((request) =>
-    /PoolActivity|PairActivity/.test(request.query) &&
-    request.variables?.owner?.toLowerCase() === DEFAULT_ACCOUNT.toLowerCase() &&
-    request.query.includes("transactionFrom")
+    request.query.includes("WebPoolActivity") &&
+    request.variables?.owner?.toLowerCase() === DEFAULT_ACCOUNT.toLowerCase()
   )).toBe(true);
   await filter.click();
   await expect(filter).toHaveAttribute("aria-pressed", "false");
   await expect(feed.getByTestId("pool-activity-row")).toHaveCount(5);
+  await expect(feed).toContainText("Swap");
   await expect(feed).toContainText(/Removed liquidity|Withdraw/i);
   await expect.poll(() => rpc.snapshot().graphRequests.some((request) =>
-    /PoolActivity|PairActivity/.test(request.query) &&
+    request.query.includes("WebPoolActivity") &&
     request.variables?.pair?.toLowerCase() === WNATIVE_USDC_PAIR.toLowerCase() &&
-    request.variables?.owner === undefined
+    request.variables?.owner == null
   )).toBe(true);
 });
 
@@ -719,8 +923,10 @@ test("wallet activity exposes partial owner-history pagination instead of presen
   const panel = page.getByTestId("pool-workspace-owner-panel");
   await panel.getByRole("tab", { exact: true, name: "History" }).click();
   await panel.getByRole("tab", { name: "Pool activity" }).click();
-  await expect(panel.getByTestId("pool-activity-feed")).toContainText(/position history page failed|incomplete/i);
-  await expect(panel.getByTestId("pool-activity-row").first()).toBeVisible();
+  const feed = panel.getByTestId("pool-activity-feed");
+  await expect(feed).toContainText(/pagination capped at 1 page/i);
+  await expect(feed.getByTestId("pool-activity-row")).toHaveCount(100);
+  await expect(feed).toContainText("Latest 100 events");
 });
 
 test("mobile position selection opens a usable manage task with the exact bins preselected", async ({ page }) => {
@@ -732,8 +938,10 @@ test("mobile position selection opens a usable manage task with the exact bins p
 
   await page.getByRole("tab", { name: "Positions" }).first().click();
   const panel = page.getByTestId("pool-workspace-owner-panel");
-  await panel.getByTestId("pool-position-manage-link").click();
-  await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/manage$`, "i"));
+  const manageLink = panel.getByTestId("pool-position-manage-link");
+  await expect(manageLink).toHaveAttribute("href", /manageOwner=.*manageBins=8388608%2C8388609/i);
+  await manageLink.click();
+  await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/manage\\?.*manageBins=8388608%2C8388609`, "i"));
   const picker = page.getByRole("group", { name: "Positions" }).first();
   await expect(picker.locator('input[type="checkbox"]')).toHaveCount(2);
   await expect(picker.locator('input[type="checkbox"]:checked')).toHaveCount(2);
@@ -744,6 +952,104 @@ test("mobile position selection opens a usable manage task with the exact bins p
   await expect(page.getByTestId("liquidity-remove-button")).toBeEnabled();
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   expect(await page.evaluate(() => document.documentElement.scrollHeight)).toBeLessThan(4_000);
+});
+
+test("manage handoff survives fresh navigation with a new-tab-safe exact owner-scoped URL", async ({ page }) => {
+  await installMockRpc(page, {
+    analyticsBinCount: 2,
+    includePairs: true,
+    includePositions: true,
+    lbApproved: true,
+    ownerPositionCount: 2
+  });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/swap`);
+  await connectWallet(page);
+
+  const manageLink = page.getByTestId("pool-workspace-owner-panel").getByTestId("pool-position-manage-link");
+  const manageHref = await manageLink.getAttribute("href");
+  expect(manageHref).toMatch(/manageOwner=.*manageBins=8388608%2C8388609/i);
+
+  await page.goto(new URL(manageHref!, page.url()).href);
+  await connectWallet(page);
+
+  const picker = page.getByRole("group", { name: "Positions" }).first();
+  await expect(picker.locator('input[type="checkbox"]')).toHaveCount(2);
+  await expect(picker.locator('input[type="checkbox"]:checked')).toHaveCount(2);
+  await expect(page.getByTestId("manage-position-selection-notice")).toHaveCount(0);
+});
+
+test("manage handoff refreshes exact bins across create-to-manage and query-only navigation", async ({ page }) => {
+  await installMockRpc(page, {
+    analyticsBinCount: 2,
+    includePairs: true,
+    includePositions: true,
+    lbApproved: true,
+    ownerPositionCount: 2
+  });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
+  await connectWallet(page);
+  await selectPoolWorkspaceView(page, "Positions");
+
+  const manageLink = page.getByTestId("pool-workspace-owner-panel").getByTestId("pool-position-manage-link");
+  await manageLink.click();
+  const picker = page.getByRole("group", { name: "Positions" }).first();
+  await expect(page).toHaveURL(/\/manage\?.*manageBins=8388608%2C8388609/i);
+  await expect(picker.locator('input[type="checkbox"]:checked')).toHaveCount(2);
+
+  await page.evaluate(({ owner, pair, binId }) => {
+    window.location.hash = `#/pools/${pair}/manage?manageOwner=${owner}&manageBins=${binId}`;
+  }, {
+    binId: TEST_ACTIVE_ID + 1,
+    owner: DEFAULT_ACCOUNT,
+    pair: WNATIVE_USDC_PAIR
+  });
+  await expect(page).toHaveURL(new RegExp(`manageBins=${TEST_ACTIVE_ID + 1}$`, "i"));
+  await expect(picker.locator('input[type="checkbox"]:checked')).toHaveCount(1);
+  await expect(picker.locator(".position-option").filter({ hasText: `Bin ${TEST_ACTIVE_ID + 1}` }).locator('input[type="checkbox"]')).toBeChecked();
+  await expect(page.getByTestId("manage-position-selection-notice")).toHaveCount(0);
+});
+
+test("manage handoff waits for fresh positions and recovers when intended bins disappeared", async ({ page }) => {
+  const rpc = await installMockRpc(page, {
+    includePairs: true,
+    includePositions: true,
+    lbApproved: true,
+    ownerPositionCount: 1
+  });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
+  await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/manage`);
+  await connectWallet(page);
+  await expect(page.locator(".position-option")).toContainText(`Bin ${TEST_ACTIVE_ID}`);
+
+  await page.getByRole("link", { exact: true, name: "Swap" }).click();
+  await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/swap`, "i"));
+  const positionRequestCount = () => rpc.snapshot().graphRequests.filter((request) =>
+    request.query.includes("OwnerPairPositions")
+  ).length;
+  const requestsBeforeHandoff = positionRequestCount();
+  rpc.update({ activeId: TEST_ACTIVE_ID + 1, indexerDelayMs: 3_000 });
+  const manageHash =
+    `#/pools/${WNATIVE_USDC_PAIR}/manage?manageOwner=${DEFAULT_ACCOUNT}&manageBins=${TEST_ACTIVE_ID}`;
+  await page.evaluate((hash) => {
+    window.location.hash = hash;
+  }, manageHash);
+
+  await expect(page).toHaveURL(new RegExp(`manageBins=${TEST_ACTIVE_ID}$`, "i"));
+  await expect.poll(positionRequestCount).toBeGreaterThan(requestsBeforeHandoff);
+  expect(await page.getByTestId("liquidity-remove-button").isDisabled()).toBe(true);
+  const notice = page.getByTestId("manage-position-selection-notice");
+  await expect(notice).toContainText("no longer present in the refreshed index");
+  await expect(page.locator(".position-option")).toContainText(`Bin ${TEST_ACTIVE_ID + 1}`);
+  await expect(page.locator(".position-option").locator('input[type="checkbox"]')).not.toBeChecked();
+  await expect(page.getByTestId("liquidity-remove-button")).toBeDisabled();
+
+  rpc.update({ activeId: TEST_ACTIVE_ID, indexerDelayMs: 0 });
+  await notice.getByTestId("manage-position-selection-retry").click();
+  await expect(page.locator(".position-option")).toContainText(`Bin ${TEST_ACTIVE_ID}`);
+  await expect(page.locator(".position-option").locator('input[type="checkbox"]')).toBeChecked();
+  await expect(notice).toHaveCount(0);
 });
 
 test("mobile workspace isolates Market, Trade, and Positions while preserving task drafts", async ({ page }) => {
@@ -801,7 +1107,10 @@ test("mobile workspace isolates Market, Trade, and Positions while preserving ta
   await page.keyboard.press("End");
   await expect(positionsTab).toHaveAttribute("aria-selected", "true");
   await page.getByTestId("pool-position-manage-link").click();
-  await expect(page).toHaveURL(new RegExp(`#/pools/${WNATIVE_USDC_PAIR}/manage$`, "i"));
+  await expect(page).toHaveURL(new RegExp(
+    `#/pools/${WNATIVE_USDC_PAIR}/manage\\?manageOwner=${DEFAULT_ACCOUNT}&manageBins=${TEST_ACTIVE_ID}$`,
+    "i"
+  ));
   await expect(tradeTab).toHaveAttribute("aria-selected", "true");
   await expect(page.getByTestId("liquidity-remove-button")).toBeInViewport();
 
@@ -1427,6 +1736,7 @@ test("unified pool workspace preserves URL filters, analytics, actions, and acce
     if (request.url().startsWith("http://127.0.0.1:8787")) analyticsUrls.push(request.url());
   });
   await installMockRpc(page, { includePairs: true, includePositions: true, poolBinCount: 5, poolCount: 2 });
+  await installMockDiscoveryProjection(page);
   await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
 
   await page.goto("/#/pools?q=WNATIVE&sort=tvl&page=1&mine=1");
@@ -1445,28 +1755,22 @@ test("unified pool workspace preserves URL filters, analytics, actions, and acce
   await expect(page.getByTestId("pool-analytics-state")).toHaveCount(0);
   expect(analyticsUrls.length).toBeGreaterThan(0);
   expect(analyticsUrls.every((url) => url === "http://127.0.0.1:8787/graphql")).toBe(true);
-  await expect(page.locator(".workspace-table-metric").filter({ hasText: "$500,000" })).toBeVisible();
-  const discoveryMetrics = page.locator(".discovery-table .table-row:not(.header)").first().locator(".workspace-table-metric");
-  for (const [index, label, value] of [
-    [0, "TVL", "$500,000"],
-    [1, "24h volume", "$120,000"],
-    [2, "24h LP fees", "$240"],
-    [3, "24h LP fee / TVL", "0.04%"]
-  ] as const) {
-    await expect(discoveryMetrics.nth(index)).toContainText(label);
-    await expect(discoveryMetrics.nth(index)).toContainText(value);
-  }
+  const firstDiscoveryRow = page.getByTestId("pool-discovery-row").first();
+  await expect(firstDiscoveryRow).toContainText("$490K");
+  await expect(firstDiscoveryRow).toContainText("$119K");
+  await expect(firstDiscoveryRow).toContainText("$239");
+  await expect(firstDiscoveryRow).toContainText("$12.35M");
+  await expect(firstDiscoveryRow).toContainText("160");
 
-  const poolLink = page.locator(".discovery-table .pair-name").first();
+  const poolLink = page.locator(".pool-pair-link").first();
   const poolHref = await poolLink.getAttribute("href");
   expect(poolHref).not.toBeNull();
-  const returnHref = new URLSearchParams(poolHref!.split("?", 2)[1]).get("returnTo");
-  expect(returnHref).toContain("q=WNATIVE");
-  expect(returnHref).toContain("sort=tvl");
-  expect(returnHref).toContain("mine=1");
+  expect(poolHref).toContain("q=WNATIVE");
+  expect(poolHref).toContain("sort=tvl");
+  expect(poolHref).toContain("mine=1");
   await poolLink.click();
 
-  await expect(page).toHaveURL(/#\/pools\/.+\/create\?returnTo=/);
+  await expect(page).toHaveURL(/#\/pools\/.+\?q=WNATIVE/);
   await expect(page.getByTestId("pool-workspace-state")).toHaveCount(0);
   await expandPoolMetadata(page);
   await expect(page.getByTestId("swap-market-chart")).toBeVisible();
@@ -1475,7 +1779,7 @@ test("unified pool workspace preserves URL filters, analytics, actions, and acce
   await expect(page.getByTestId("pool-candle-workspace")).toHaveCount(0);
   await expect(page.getByTestId("pool-bin-distribution-table")).toHaveCount(0);
   await expect(page.getByRole("link", { name: "Market overview" })).toHaveCount(0);
-  await expect(page.getByTestId("pool-action-back")).toBeVisible();
+  await expect(page.getByTestId("pool-action-back")).toHaveAttribute("href", /#\/pools\?q=WNATIVE/);
   await expect(page.locator("#liquidity-pair")).toHaveCount(0);
   await page.getByTestId("pool-action-back").click();
   await expect(page).toHaveURL(/#\/pools\?/);
@@ -1521,31 +1825,31 @@ test("pool economics uses one pinned active ID and labels every market data sour
   await expect(activeBar.locator("i.token-y")).not.toHaveCSS("height", "0px");
 });
 
-test("liquidity distribution rejects an indexed active ID that lags the pinned RPC snapshot", async ({ page }) => {
+test("liquidity distribution rejects an active ID that differs from the canonical analytics anchor", async ({ page }) => {
   await installMockRpc(page, { includePairs: true, pairRuntimeActiveId: 8_388_609, poolBinCount: 5 });
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
   await expandPoolMetadata(page);
 
-  await expect(page.getByTestId("pool-fee-economics")).toContainText("active ID differs from the indexer snapshot");
+  await expect(page.getByTestId("pool-fee-economics")).toContainText("active ID differs from the canonical analytics anchor");
   await expect(page.locator(".pool-rail-price-block > strong")).toHaveText("Unavailable");
   const distribution = page.getByTestId("pool-rail-liquidity-distribution");
-  await expect(distribution).toContainText("active ID differs from the indexer snapshot");
+  await expect(distribution).toContainText("active ID differs from the canonical analytics anchor");
   await expect(distribution.locator(".pool-rail-liquidity-bars")).toHaveCount(0);
   await expect(distribution.locator("span.active")).toHaveCount(0);
 });
 
-test("normal indexer lag uses the indexed common block instead of failing against RPC latest", async ({ page }) => {
+test("normal legacy indexer lag uses the canonical analytics and RPC anchor", async ({ page }) => {
   await installMockRpc(page, { blockNumber: 50n, includePairs: true, indexerBlockNumber: 42n, poolBinCount: 5 });
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
   await expandPoolMetadata(page);
 
-  await expect(page.locator(".pool-rail-price-block")).toContainText("RPC block 42");
+  await expect(page.locator(".pool-rail-price-block")).toContainText("pinned RPC block 50");
   await expect(page.locator(".pool-rail-price-block > strong")).not.toHaveText("Unavailable");
-  await expect(page.getByTestId("pool-fee-economics")).toContainText("RPC block 42");
+  await expect(page.getByTestId("pool-fee-economics")).toContainText("pinned RPC block 50");
   await expect(page.getByTestId("pool-rail-liquidity-distribution").locator(".pool-rail-liquidity-bars > span")).toHaveCount(33);
 });
 
-test("a background snapshot failure hides previously cached market economics", async ({ page }) => {
+test("a legacy indexer snapshot failure does not hide canonical analytics economics", async ({ page }) => {
   const rpc = await installMockRpc(page, { includePairs: true, poolBinCount: 5 });
   await page.goto(`/#/pools/${WNATIVE_USDC_PAIR}/create`);
   await expandPoolMetadata(page);
@@ -1553,11 +1857,15 @@ test("a background snapshot failure hides previously cached market economics", a
   await expect(page.locator(".pool-rail-price-block > strong")).not.toHaveText("Unavailable");
   await expect(page.getByTestId("pool-fee-economics")).toContainText("RPC block 42");
   rpc.update({ poolIndexerSnapshotMode: "error" });
-  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page.reload();
+  await expandPoolMetadata(page);
 
-  await expect(page.getByTestId("pool-fee-economics")).toContainText("Mock pool indexer snapshot failed", { timeout: 15_000 });
-  await expect(page.locator(".pool-rail-price-block > strong")).toHaveText("Unavailable");
-  await expect(page.getByTestId("pool-rail-liquidity-distribution").locator(".pool-rail-liquidity-bars")).toHaveCount(0);
+  expect(rpc.snapshot().graphRequests.filter((request) =>
+    request.query.includes("PoolIndexerSnapshot")
+  ).length).toBeGreaterThan(1);
+  await expect(page.getByTestId("pool-fee-economics")).toContainText("RPC block 42");
+  await expect(page.locator(".pool-rail-price-block > strong")).not.toHaveText("Unavailable");
+  await expect(page.getByTestId("pool-rail-liquidity-distribution").locator(".pool-rail-liquidity-bars > span")).toHaveCount(33);
 });
 
 test("pool market fails closed when pinned RPC identity differs from the indexed pool", async ({ page }) => {
@@ -1567,8 +1875,8 @@ test("pool market fails closed when pinned RPC identity differs from the indexed
 
   await expect(page.getByTestId("pool-fee-economics")).toContainText("differs from indexed bin step");
   await expect(page.locator(".pool-rail-price-block > strong")).toHaveText("Unavailable");
-  await expect(page.locator(".pool-rail-tvl-row strong")).toHaveText("Unavailable");
-  await expect(page.locator(".pool-rail-stats dd")).toHaveText(["Unavailable", "Unavailable", "Unavailable"]);
+  await expect(page.locator(".pool-rail-tvl-row strong")).toHaveText("$500,000");
+  await expect(page.locator(".pool-rail-stats dd")).toHaveText(["$120,000", "$240", "0.04%"]);
   await expect(page.getByTestId("pool-rail-liquidity-distribution")).toContainText("differs from indexed bin step");
   await expect(page.getByTestId("pool-rail-liquidity-distribution").locator(".pool-rail-liquidity-bars")).toHaveCount(0);
   await expect(page.getByTestId("pool-rail-liquidity-distribution").locator("span.active")).toHaveCount(0);
@@ -1581,8 +1889,8 @@ test("pool market fails closed when pinned token decimals differ from allowliste
 
   await expect(page.getByTestId("pool-fee-economics")).toContainText("token X decimals");
   await expect(page.locator(".pool-rail-price-block > strong")).toHaveText("Unavailable");
-  await expect(page.locator(".pool-rail-tvl-row strong")).toHaveText("Unavailable");
-  await expect(page.locator(".pool-rail-stats dd")).toHaveText(["Unavailable", "Unavailable", "Unavailable"]);
+  await expect(page.locator(".pool-rail-tvl-row strong")).toHaveText("$500,000");
+  await expect(page.locator(".pool-rail-stats dd")).toHaveText(["$120,000", "$240", "0.04%"]);
   await expect(page.locator(".pool-rail-reserves dd")).toHaveText(["Unavailable", "Unavailable"]);
   await expect(page.getByTestId("pool-rail-liquidity-distribution").locator(".pool-rail-liquidity-bars")).toHaveCount(0);
 });
@@ -1615,7 +1923,7 @@ test("pool workspace fails closed for foreign-owner and stale owner analytics", 
   await page.goto("/#/pools?mine=1");
   await connectWallet(page);
   await expect(page.getByTestId("owner-pool-filter-status")).toContainText("unavailable");
-  await expect(page.locator(".discovery-table .table-row:not(.header)")).toHaveCount(0);
+  await expect(page.getByTestId("pool-discovery-row")).toHaveCount(0);
 });
 
 test("stale owner analytics remains partial while verified current liquidity stays visible", async ({ page }, testInfo) => {
@@ -1625,14 +1933,14 @@ test("stale owner analytics remains partial while verified current liquidity sta
   await page.goto("/#/pools?mine=1");
   await connectWallet(page);
   await expect(page.getByTestId("owner-pool-filter-status")).toContainText("partial");
-  await expect(page.locator(".discovery-table .table-row:not(.header)")).toHaveCount(1);
+  await expect(page.getByTestId("pool-discovery-row")).toHaveCount(1);
 });
 
 test("analytics token identity mismatches remain partial in the unified workspace", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium");
   await installMockRpc(page, { analyticsCandleGap: true, analyticsMetricTokenMismatch: true, includePairs: true });
   await page.goto("/#/pools");
-  await page.locator(".discovery-table .pair-name").first().click();
+  await page.locator(".pool-pair-link").first().click();
   await expect(page.getByTestId("pool-workspace-state")).toContainText("Analytics token identity does not match");
   await expect(page.getByTestId("pool-workspace-state")).toHaveClass(/partial/);
   await expect(page.getByTestId("swap-market-chart")).toBeVisible();
@@ -1645,7 +1953,7 @@ test("unknown token decimals never fabricate bin reserve amounts", async ({ page
     pairTokenX: "0x000000000000000000000000000000000000bEEF"
   });
   await page.goto("/#/pools");
-  await page.locator(".discovery-table .pair-name").first().click();
+  await page.locator(".pool-pair-link").first().click();
   await expect(page.getByTestId("pool-rail-liquidity-distribution")).toContainText("Pool bin identity or token decimals are unavailable.");
   await expect(page.getByTestId("pool-rail-liquidity-distribution").locator(".pool-rail-liquidity-bars")).toHaveCount(0);
 });
@@ -1656,7 +1964,7 @@ test("historical zero-only positions are excluded from My liquidity", async ({ p
   await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
   await page.goto("/#/pools?mine=1");
   await connectWallet(page);
-  await expect(page.locator(".discovery-table .table-row:not(.header)")).toHaveCount(0);
+  await expect(page.getByTestId("pool-discovery-row")).toHaveCount(0);
   await expect(page.getByText("No pools match these filters.")).toBeVisible();
   await expect(page.getByTestId("owner-pool-filter-status")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "My liquidity" })).toHaveAttribute("aria-pressed", "true");

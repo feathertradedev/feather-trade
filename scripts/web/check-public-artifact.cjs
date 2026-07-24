@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 
 const fs = require("node:fs");
+const crypto = require("node:crypto");
 const path = require("node:path");
 
 const repoRoot = path.resolve(__dirname, "../..");
+const walletVendorAuditFile = "wallet-vendor-audit.json";
+const walletVendorAuditSchema = "feather.wallet-vendor-audit.v1";
 const anvilAddresses = [
   "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
   "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
@@ -29,6 +32,10 @@ const localnetManifestAddresses = [
   "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
 ];
 const environmentConfig = {
+  sepolia: {
+    chainId: 11_155_111,
+    tokenList: "packages/sdk/src/token-lists/sepolia.json"
+  },
   robinhoodTestnet: {
     chainId: 46_630,
     tokenList: "packages/sdk/src/token-lists/robinhood-testnet.json"
@@ -39,6 +46,9 @@ const environmentConfig = {
   }
 };
 const secretCanaryEnvVars = [
+  "EVM_DEPLOYER_PRIVATE_KEY",
+  "EVM_DEPLOY_RPC_URL",
+  "SEPOLIA_RPC_URL",
   "ROBINHOOD_DEPLOYER_PRIVATE_KEY",
   "DEPLOYER_PRIVATE_KEY",
   "GOLDSKY_API_KEY",
@@ -54,6 +64,60 @@ const secretCanaryEnvVars = [
   "INDEXER_ROBINHOOD_ENDPOINT",
   "AVALANCHE_RPC_URL"
 ];
+const walletVendorAllowedForbiddenValues = new Set([
+  "http://127.0.0.1",
+  "https://127.0.0.1",
+  "http://localhost",
+  "https://localhost",
+  "ws://127.0.0.1",
+  "wss://127.0.0.1",
+  "ws://localhost",
+  "31337",
+  // viem's bundled Anvil/Hardhat chain definitions include this deterministic
+  // local deployment address. App-owned modules remain subject to the ban.
+  "0x5fbdb2315678afecb367f032d93f642f64180aa3"
+]);
+const walletVendorAllowedLocalEndpointUrls = new Set([
+  "http://127.0.0.1:8545",
+  "http://127.0.0.1:9944",
+  "http://localhost:15001/",
+  "http://localhost:15001/api/v2",
+  "http://localhost:15005/",
+  "http://localhost:15005/api",
+  "http://localhost:15045",
+  "http://localhost:15100",
+  "http://localhost:15200",
+  "http://localhost:3050",
+  "http://localhost:8011",
+  "http://localhost:8545",
+  "ws://127.0.0.1:8545",
+  "ws://localhost:15101",
+  "ws://localhost:15201",
+  "wss://127.0.0.1:9944"
+]);
+const forbiddenPublicBuildValues = [
+  "dry-run.json",
+  "lb.localnet.v1",
+  "http://0.0.0.0",
+  "https://0.0.0.0",
+  "http://127.0.0.1",
+  "https://127.0.0.1",
+  "http://localhost",
+  "https://localhost",
+  "http://[::1]",
+  "https://[::1]",
+  "ws://0.0.0.0",
+  "wss://0.0.0.0",
+  "ws://127.0.0.1",
+  "wss://127.0.0.1",
+  "ws://localhost",
+  "wss://localhost",
+  "ws://[::1]",
+  "wss://[::1]",
+  "31337",
+  ...anvilAddresses,
+  ...localnetManifestAddresses
+];
 
 function main() {
   const options = parseArgs(process.argv.slice(2));
@@ -64,7 +128,7 @@ function main() {
 
   const errors = [];
   const config = environmentConfig[options.environment];
-  if (config === undefined) errors.push("--environment must be robinhoodTestnet or robinhood");
+  if (config === undefined) errors.push("--environment must be sepolia, robinhoodTestnet, or robinhood");
   if (typeof options.manifest !== "string") errors.push("--manifest is required");
   if (typeof options.dist !== "string") errors.push("--dist is required");
   if (errors.length > 0) return finish(errors);
@@ -81,9 +145,9 @@ function main() {
 
   const files = listFiles(distPath);
   requireFile(distPath, "index.html", errors);
-  requireFile(distPath, "_redirects", errors);
-  requireFile(distPath, "_headers", errors);
-  requireFile(distPath, "_worker.js", errors);
+  for (const controlFile of ["_worker.js", "_headers", "_redirects"]) {
+    forbidFile(distPath, controlFile, errors);
+  }
   requireFile(distPath, "robots.txt", errors);
   requireFile(distPath, "sitemap.xml", errors);
   requireFile(distPath, "docs/index.html", errors);
@@ -102,19 +166,28 @@ function main() {
   }
 
   const searchableFiles = files.filter(isSearchableArtifactFile);
-  const haystack = searchableFiles.map((file) => fs.readFileSync(file, "utf8")).join("\n").toLowerCase();
+  const searchableArtifacts = searchableFiles.map((file) => ({
+    file,
+    relativePath: path.relative(distPath, file).split(path.sep).join("/"),
+    text: fs.readFileSync(file, "utf8").toLowerCase()
+  }));
+  const haystack = searchableArtifacts.map((artifact) => artifact.text).join("\n");
+  const auditedWalletVendorArtifacts = validateWalletVendorAudit(distPath, searchableArtifacts, errors);
   if (haystack.includes("sourcemappingurl")) {
     errors.push("dist artifact must not include sourceMappingURL comments");
   }
-  const selectedStrings = [
+  const selectedStrings = [...new Set([
     String(config.chainId),
     manifest.endpoints.rpcUrl,
     manifest.endpoints.indexerUrl,
     manifest.contracts.lbFactory,
+    manifest.contracts.lbPairImplementation,
     manifest.contracts.lbRouter,
     manifest.contracts.lbQuoter,
-    manifest.tokens.wrappedNative
-  ].filter((value) => typeof value === "string" && value.length > 0);
+    ...Object.values(manifest.tokens ?? {}),
+    ...Object.values(manifest.quoteAssets ?? {}),
+    ...(Array.isArray(tokenList.tokens) ? tokenList.tokens.map((token) => token.address) : [])
+  ].filter((value) => typeof value === "string" && value.length > 0))];
 
   for (const value of selectedStrings) {
     if (!haystack.includes(value.toLowerCase())) {
@@ -122,47 +195,11 @@ function main() {
     }
   }
 
-  for (const forbidden of [
-    "dry-run.json",
-    "lb.localnet.v1",
-    "http://0.0.0.0",
-    "https://0.0.0.0",
-    "http://127.0.0.1",
-    "https://127.0.0.1",
-    "http://localhost",
-    "https://localhost",
-    "http://[::1]",
-    "https://[::1]",
-    "ws://0.0.0.0",
-    "wss://0.0.0.0",
-    "ws://127.0.0.1",
-    "wss://127.0.0.1",
-    "ws://localhost",
-    "wss://localhost",
-    "ws://[::1]",
-    "wss://[::1]",
-    "31337",
-    ...anvilAddresses,
-    ...localnetManifestAddresses
-  ]) {
-    if (haystack.includes(forbidden.toLowerCase())) {
-      errors.push(`dist artifact contains forbidden public-build value: ${forbidden}`);
-    }
-  }
-  scanForLocalEndpointUrls(haystack, "dist artifact", errors);
-
-  for (const envVar of secretCanaryEnvVars) {
-    const value = process.env[envVar];
-    if (typeof value !== "string" || value.length < 8) continue;
-    if (haystack.includes(value.toLowerCase())) {
-      errors.push(`dist artifact contains secret canary value from ${envVar}`);
-    }
-  }
+  scanForForbiddenPublicValues(searchableArtifacts, errors, auditedWalletVendorArtifacts);
+  scanForSecretCanaries(searchableArtifacts, process.env, errors);
 
   validateTokenAssets(distPath, tokenList, errors);
   validateDocsArtifact(distPath, files, errors);
-  validateRedirects(distPath, errors);
-  validateHeaders(distPath, manifest, errors);
 
   finish(errors, `Validated public ${options.environment} web artifact in ${display(distPath)}.`);
 }
@@ -181,13 +218,6 @@ function validateDocsArtifact(distPath, files, errors) {
       'type="application/ld+json"'
     ]) {
       if (!docsIndex.includes(token)) errors.push(`docs/index.html is missing ${token}`);
-    }
-  }
-
-  const worker = readText(path.join(distPath, "_worker.js"), errors);
-  if (worker !== null) {
-    for (const token of ["app.feather.markets", "feather.markets", "env.ASSETS.fetch", "Response.redirect", "308"]) {
-      if (!worker.includes(token)) errors.push(`_worker.js is missing docs host-routing token: ${token}`);
     }
   }
 
@@ -212,74 +242,103 @@ function validateTokenAssets(distPath, tokenList, errors) {
   }
 }
 
-function validateRedirects(distPath, errors) {
-  const redirects = readText(path.join(distPath, "_redirects"), errors);
-  if (redirects !== null && !redirects.split(/\r?\n/).some((line) => line.trim() === "/* /index.html 200")) {
-    errors.push("_redirects must contain `/* /index.html 200` for SPA routing");
-  }
-}
-
-function validateHeaders(distPath, manifest, errors) {
-  const headers = readText(path.join(distPath, "_headers"), errors);
-  if (headers === null) return;
-  const lowerHeaders = headers.toLowerCase();
-
-  for (const token of [
-    "X-Content-Type-Options: nosniff",
-    "Referrer-Policy:",
-    "Content-Security-Policy:",
-    "connect-src",
-    "/assets/*",
-    "Cache-Control: public, max-age=31536000, immutable",
-    "/token-assets/*",
-    "/index.html",
-    "Cache-Control: no-store"
-  ]) {
-    if (!headers.includes(token)) {
-      errors.push(`_headers missing required public hosting directive: ${token}`);
-    }
-  }
-
-  for (const localToken of ["localhost", "127.0.0.1", "31337"]) {
-    if (lowerHeaders.includes(localToken)) {
-      errors.push(`_headers contains local-only value: ${localToken}`);
-    }
-  }
-  scanForLocalEndpointUrls(lowerHeaders, "_headers", errors);
-
-  const connectSrc = headers.match(/connect-src\s+([^;]+)/i)?.[1];
-  if (connectSrc === undefined) {
-    errors.push("_headers CSP must include a connect-src directive");
-    return;
-  }
-
-  const connectSources = connectSrc.split(/\s+/).map((source) => source.trim()).filter(Boolean);
-  for (const broadSource of ["http:", "https:", "ws:", "wss:"]) {
-    if (connectSources.includes(broadSource)) {
-      errors.push(`_headers CSP connect-src must not use broad scheme source: ${broadSource}`);
-    }
-  }
-
-  for (const endpoint of [
-    manifest.endpoints.rpcUrl,
-    manifest.endpoints.indexerUrl,
-    manifest.endpoints.apiUrl,
-    manifest.endpoints.tokenListUrl
-  ]) {
-    if (endpoint === null || endpoint === undefined || endpoint === "") continue;
-    const origin = new URL(endpoint).origin;
-    if (!connectSources.includes(origin)) {
-      errors.push(`_headers CSP must allow selected endpoint origin: ${origin}`);
-    }
-  }
-}
-
 function isSearchableArtifactFile(file) {
-  if (/\/_(?:headers|redirects)$/.test(file)) return true;
   return /\.(css|html|js|json|svg|txt|webmanifest)$/i.test(file);
 }
 
-function scanForLocalEndpointUrls(text, label, errors) {
+function scanForForbiddenPublicValues(artifacts, errors, auditedWalletVendorArtifacts = new Set()) {
+  for (const forbidden of forbiddenPublicBuildValues) {
+    const normalized = forbidden.toLowerCase();
+    for (const artifact of artifacts) {
+      if (!artifact.text.includes(normalized)) continue;
+      if (auditedWalletVendorArtifacts.has(artifact.relativePath) && walletVendorAllowedForbiddenValues.has(normalized)) {
+        continue;
+      }
+      errors.push(`${artifact.relativePath}: contains forbidden public-build value: ${forbidden}`);
+    }
+  }
+
+  for (const artifact of artifacts) {
+    const allowedUrls = auditedWalletVendorArtifacts.has(artifact.relativePath)
+      ? walletVendorAllowedLocalEndpointUrls
+      : undefined;
+    scanForLocalEndpointUrls(artifact.text, artifact.relativePath, errors, allowedUrls);
+  }
+}
+
+function validateWalletVendorAudit(distPath, artifacts, errors) {
+  const audited = new Set();
+  const auditPath = path.join(distPath, walletVendorAuditFile);
+  const audit = readJson(auditPath, errors);
+  if (audit.schemaVersion !== walletVendorAuditSchema) {
+    errors.push(`${display(auditPath)}: expected schemaVersion ${walletVendorAuditSchema}`);
+    return audited;
+  }
+  if (!Array.isArray(audit.artifacts)) {
+    errors.push(`${display(auditPath)}: artifacts must be an array`);
+    return audited;
+  }
+
+  const artifactByPath = new Map(artifacts.map((artifact) => [artifact.relativePath, artifact]));
+  for (const entry of audit.artifacts) {
+    if (entry === null || typeof entry !== "object" || typeof entry.file !== "string" || typeof entry.sha256 !== "string") {
+      errors.push(`${display(auditPath)}: each artifact requires file and sha256 strings`);
+      continue;
+    }
+    const relativePath = entry.file.replaceAll("\\", "/");
+    if (!isWalletVendorArtifact(relativePath)) {
+      errors.push(`${display(auditPath)}: invalid wallet-vendor artifact path ${entry.file}`);
+      continue;
+    }
+    if (!/^[a-f0-9]{64}$/.test(entry.sha256)) {
+      errors.push(`${display(auditPath)}: invalid sha256 for ${relativePath}`);
+      continue;
+    }
+    if (audited.has(relativePath)) {
+      errors.push(`${display(auditPath)}: duplicate artifact ${relativePath}`);
+      continue;
+    }
+
+    const artifact = artifactByPath.get(relativePath);
+    if (artifact === undefined) {
+      errors.push(`${display(auditPath)}: audited artifact is missing: ${relativePath}`);
+      continue;
+    }
+    const filePath = path.join(distPath, ...relativePath.split("/"));
+    const sha256 = crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+    if (sha256 !== entry.sha256) {
+      errors.push(`${relativePath}: wallet-vendor audit digest mismatch`);
+      continue;
+    }
+    audited.add(relativePath);
+  }
+
+  for (const artifact of artifacts) {
+    if (isWalletVendorArtifact(artifact.relativePath) && !audited.has(artifact.relativePath)) {
+      errors.push(`${artifact.relativePath}: wallet-vendor artifact is not present in the build audit inventory`);
+    }
+  }
+  return audited;
+}
+
+function scanForSecretCanaries(artifacts, env, errors) {
+  for (const envVar of secretCanaryEnvVars) {
+    const value = env[envVar];
+    if (typeof value !== "string" || value.length < 8) continue;
+    const normalized = value.toLowerCase();
+    for (const artifact of artifacts) {
+      if (artifact.text.includes(normalized)) {
+        errors.push(`${artifact.relativePath}: contains secret canary value from ${envVar}`);
+      }
+    }
+  }
+}
+
+function isWalletVendorArtifact(relativePath) {
+  return /^assets\/wallet-vendor-.+-[a-z0-9_-]{8}\.js$/i.test(relativePath.replaceAll("\\", "/"));
+}
+
+function scanForLocalEndpointUrls(text, label, errors, allowedUrls = undefined) {
   const matches = text.matchAll(/\b(?:https?|wss?):\/\/[^\s"'`<>\\]+/g);
   for (const match of matches) {
     const raw = match[0].replace(/[),.;]+$/g, "");
@@ -291,6 +350,7 @@ function scanForLocalEndpointUrls(text, label, errors) {
     }
 
     if (isLocalEndpointHost(url.hostname)) {
+      if (allowedUrls?.has(raw.toLowerCase())) continue;
       errors.push(`${label} contains local endpoint URL: ${raw}`);
     }
   }
@@ -337,6 +397,13 @@ function requireFile(root, relativePath, errors) {
   const filePath = path.join(root, relativePath);
   if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
     errors.push(`${display(filePath)}: required artifact file is missing`);
+  }
+}
+
+function forbidFile(root, relativePath, errors) {
+  const filePath = path.join(root, relativePath);
+  if (fs.existsSync(filePath)) {
+    errors.push(`${display(filePath)}: Cloudflare control file must not be published`);
   }
 }
 
@@ -387,12 +454,22 @@ function finish(errors, successMessage) {
 }
 
 function printHelp() {
-  console.log("Usage: node scripts/web/check-public-artifact.cjs --environment <robinhoodTestnet|robinhood> --manifest <path> --dist <apps/web/dist> [--token-list <path>]");
+  console.log("Usage: node scripts/web/check-public-artifact.cjs --environment <sepolia|robinhoodTestnet|robinhood> --manifest <path> --dist <apps/web/dist> [--token-list <path>]");
 }
 
-try {
-  main();
-} catch (error) {
-  console.error(error.message);
-  process.exitCode = 1;
+if (require.main === module) {
+  try {
+    main();
+  } catch (error) {
+    console.error(error.message);
+    process.exitCode = 1;
+  }
 }
+
+module.exports = {
+  isWalletVendorArtifact,
+  scanForForbiddenPublicValues,
+  scanForLocalEndpointUrls,
+  scanForSecretCanaries,
+  validateWalletVendorAudit
+};

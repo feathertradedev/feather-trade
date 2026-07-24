@@ -4,7 +4,8 @@
   "title": "Robinhood LB Deployment Manifest",
   "oneOf": [
     { "$ref": "#/$defs/localnetManifest" },
-    { "$ref": "#/$defs/robinhoodManifest" }
+    { "$ref": "#/$defs/robinhoodManifest" },
+    { "$ref": "#/$defs/evmManifest" }
   ],
   "$defs": {
     "address": {
@@ -162,6 +163,123 @@
           "minimum": 0
         }
       }
+    },
+    "genericEvmConstructorArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "feeRecipient",
+        "flashLoanFee",
+        "initialOwner",
+        "quoterFactoryV1",
+        "quoterFactoryV2_1",
+        "quoterFactoryV2_2",
+        "quoterLegacyFactoryV2",
+        "quoterLegacyRouterV2",
+        "quoterRouterV2_1",
+        "quoterRouterV2_2",
+        "routerFactoryV1",
+        "routerFactoryV2_1",
+        "routerLegacyFactoryV2",
+        "routerLegacyRouterV2",
+        "routerWNative"
+      ],
+      "properties": {
+        "feeRecipient": { "$ref": "#/$defs/nonZeroAddress" },
+        "flashLoanFee": { "const": 5000000000000 },
+        "initialOwner": { "$ref": "#/$defs/nonZeroAddress" },
+        "quoterFactoryV1": { "const": "0x0000000000000000000000000000000000000000" },
+        "quoterFactoryV2_1": { "const": "0x0000000000000000000000000000000000000000" },
+        "quoterFactoryV2_2": { "$ref": "#/$defs/nonZeroAddress" },
+        "quoterLegacyFactoryV2": { "const": "0x0000000000000000000000000000000000000000" },
+        "quoterLegacyRouterV2": { "const": "0x0000000000000000000000000000000000000000" },
+        "quoterRouterV2_1": { "const": "0x0000000000000000000000000000000000000000" },
+        "quoterRouterV2_2": { "$ref": "#/$defs/nonZeroAddress" },
+        "routerFactoryV1": { "const": "0x0000000000000000000000000000000000000000" },
+        "routerFactoryV2_1": { "const": "0x0000000000000000000000000000000000000000" },
+        "routerLegacyFactoryV2": { "const": "0x0000000000000000000000000000000000000000" },
+        "routerLegacyRouterV2": { "const": "0x0000000000000000000000000000000000000000" },
+        "routerWNative": { "$ref": "#/$defs/nonZeroAddress" }
+      }
+    },
+    "evmManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "chain",
+        "chainId",
+        "constructorArgs",
+        "contracts",
+        "deployer",
+        "environment",
+        "factoryPreset",
+        "ownership",
+        "quoteAssets",
+        "schemaVersion",
+        "sourceCommit",
+        "sourceTreeDirty",
+        "startBlock",
+        "tokens"
+      ],
+      "properties": {
+        "schemaVersion": { "const": "lb.evm.v1" },
+        "environment": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" },
+        "sourceCommit": { "type": "string", "pattern": "^[a-fA-F0-9]{40}$" },
+        "sourceTreeDirty": { "type": "boolean" },
+        "chainId": { "type": "integer", "minimum": 1 },
+        "startBlock": { "type": "integer", "minimum": 0 },
+        "deployer": { "$ref": "#/$defs/nonZeroAddress" },
+        "endpoints": { "$ref": "#/$defs/endpointConfig" },
+        "contracts": { "$ref": "#/$defs/contracts" },
+        "ownership": { "$ref": "#/$defs/ownership" },
+        "factoryPreset": { "$ref": "#/$defs/factoryPreset" },
+        "constructorArgs": { "$ref": "#/$defs/genericEvmConstructorArgs" },
+        "chain": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["explorerUrl", "name", "nativeCurrency", "rpcEnvVar", "verifierUrl"],
+          "properties": {
+            "explorerUrl": { "type": "string" },
+            "name": { "type": "string", "minLength": 1 },
+            "nativeCurrency": { "type": "string", "minLength": 1 },
+            "rpcEnvVar": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}$" },
+            "verifierUrl": { "type": "string" }
+          }
+        },
+        "tokens": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["wrappedNative"],
+          "properties": {
+            "wrappedNative": { "$ref": "#/$defs/nonZeroAddress" }
+          }
+        },
+        "quoteAssets": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["wrappedNative", "extra0", "extra1", "extra2", "extra3"],
+          "properties": {
+            "wrappedNative": { "$ref": "#/$defs/nonZeroAddress" },
+            "extra0": { "$ref": "#/$defs/address" },
+            "extra1": { "$ref": "#/$defs/address" },
+            "extra2": { "$ref": "#/$defs/address" },
+            "extra3": { "$ref": "#/$defs/address" }
+          }
+        }
+      }
+    },
+    "sepoliaRuntimeManifest": {
+      "allOf": [
+        { "$ref": "#/$defs/evmManifest" },
+        {
+          "type": "object",
+          "required": ["endpoints"],
+          "properties": {
+            "environment": { "const": "sepolia" },
+            "chainId": { "const": 11155111 }
+          }
+        }
+      ]
     },
     "localnetManifest": {
       "unevaluatedProperties": false,

@@ -28,6 +28,32 @@ export interface AnalyticsPage<T> {
   streamCursor: string | null;
 }
 
+export type CanonicalPoolActivityKind = "SWAP" | "DEPOSIT" | "WITHDRAW" | "POSITION_TRANSFER";
+
+export interface CanonicalPoolActivityEvent {
+  id: string;
+  pair: Address;
+  kind: CanonicalPoolActivityKind;
+  owner: Address | null;
+  from: Address | null;
+  to: Address | null;
+  amountX: string | null;
+  amountY: string | null;
+  binIds: string[];
+  blockNumber: string;
+  blockHash: string;
+  transactionHash: string | null;
+  logIndex: number | null;
+  sequence: number;
+  timestamp: number;
+  revision: number;
+}
+
+export interface CanonicalPoolActivityPage extends AnalyticsPage<CanonicalPoolActivityEvent> {
+  asOfBlock: string | null;
+  asOfBlockHash: string | null;
+}
+
 export interface PoolAnalyticsMetric {
   pair: Address;
   tokenX: Address;
@@ -44,6 +70,53 @@ export interface PoolAnalyticsMetric {
   asOfTimestamp: number;
   status: AnalyticsStatus;
   missingPriceTokens: Address[];
+}
+
+export interface PoolDiscoveryRequest {
+  pair: Address;
+  preferredQuoteToken?: Address | null;
+}
+
+export interface PoolDiscoveryHourlyClose {
+  startTimestamp: number;
+  closeUsdE18: string;
+  quoteToken: Address;
+  finalized: boolean;
+  revision: number;
+  priceSource: string;
+  firstBlockHash: string;
+  lastBlockHash: string;
+}
+
+/** Presentation-only metadata. It must never participate in protocol decisions. */
+export interface PoolDiscoveryMarketMetadata {
+  marketCapUsdE18: string | null;
+  source: string;
+  fetchedAt: number;
+  /** Same-origin relative path exposed by the analytics service image proxy. */
+  logoPath: string | null;
+  logoSource: string | null;
+}
+
+export interface PoolDiscoveryAnalytics {
+  pair: Address;
+  chainId: number | null;
+  tokenX: Address;
+  tokenY: Address;
+  displayBaseToken: Address;
+  displayQuoteToken: Address;
+  poolPriceQuotePerBaseE18: string | null;
+  hourlyCloses: PoolDiscoveryHourlyClose[];
+  priceChange24hE18: string | null;
+  tvlUsdE18: string | null;
+  lpFees24hUsdE18: string | null;
+  volume24hUsdE18: string | null;
+  status: AnalyticsStatus;
+  missingPriceTokens: Address[];
+  asOfBlock: string;
+  asOfBlockHash: string;
+  asOfTimestamp: number;
+  marketMetadata: PoolDiscoveryMarketMetadata | null;
 }
 
 export interface PoolStaticFeeParameters {
@@ -102,6 +175,14 @@ export interface LivePoolState {
   asOfBlockHash: string;
   asOfTimestamp: number;
   revision: number;
+}
+
+export interface PoolCatalogEntry extends LivePoolState {
+  factoryAddress: Address | null;
+  createdAtBlock: string | null;
+  createdAtBlockHash: string | null;
+  creationTransactionHash: string | null;
+  creationLogIndex: number | null;
 }
 
 export interface LivePoolSnapshot {
@@ -192,8 +273,10 @@ export interface AnalyticsLoadOptions {
 
 const DEFAULT_PAGE_SIZE = 100;
 const DEFAULT_MAX_PAGES = 5;
+const POOL_CATALOG_MAX_PAGES = 10;
 const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_TIMEOUT_MS = 60_000;
+export const POOL_DISCOVERY_BATCH_SIZE = 100;
 const MONDAY_EPOCH_OFFSET_SECONDS = 4 * 86_400;
 
 export const CANDLE_INTERVAL_SECONDS: Readonly<Record<CandleInterval, number>> = {
@@ -265,6 +348,39 @@ const POOL_METRICS_QUERY = `
   }
 `;
 
+const POOL_DISCOVERY_QUERY = `
+  query WebPoolDiscovery($pools: [PoolDiscoveryRequest!]!, $asOfTimestamp: Int) {
+    poolDiscovery(pools: $pools, asOfTimestamp: $asOfTimestamp) {
+      pair chainId tokenX tokenY displayBaseToken displayQuoteToken poolPriceQuotePerBaseE18
+      priceChange24hE18 tvlUsdE18 lpNetSwapFees24hUsdE18 volume24hUsdE18
+      status missingPriceTokens asOfBlock asOfBlockHash asOfTimestamp
+      hourlyCloses {
+        startTimestamp closeUsdE18 quoteToken finalized revision priceSource firstBlockHash lastBlockHash
+      }
+      marketMetadata { marketCapUsdE18 source fetchedAt logoPath logoSource }
+    }
+  }
+`;
+
+const POOL_CATALOG_QUERY = `
+  query WebPoolCatalog($first: Int!, $after: String) {
+    poolCatalog(first: $first, after: $after) {
+      nodes {
+        chainId pair factoryAddress tokenX tokenY decimalsX decimalsY
+        createdAtBlock createdAtBlockHash creationTransactionHash creationLogIndex
+        reserveX reserveY activeId binStep marketPriceQuoteE18
+        priceUsdE18 tvlUsdE18 status missingPriceTokens asOfBlock asOfBlockHash asOfTimestamp revision
+        feeState {
+          static { baseFactor filterPeriod decayPeriod reductionFactor variableFeeControl protocolShare maxVolatilityAccumulator }
+          variable { volatilityAccumulator volatilityReference idReference timeOfLastUpdate }
+        }
+      }
+      pageInfo { endCursor hasNextPage partial }
+      streamCursor
+    }
+  }
+`;
+
 const PAIR_CANDLES_QUERY = `
   query WebPairCandles($pair: ID!, $interval: CandleInterval!, $fromTimestamp: Int!, $toTimestamp: Int!, $first: Int!, $after: String) {
     pairCandles(pair: $pair, interval: $interval, fromTimestamp: $fromTimestamp, toTimestamp: $toTimestamp, first: $first, after: $after) {
@@ -294,6 +410,20 @@ const POOL_STATE_QUERY = `
         chainId pair binId reserveX reserveY totalSupply updatedAtBlock updatedAtBlockHash updatedAtTimestamp revision
       }
       streamCursor
+    }
+  }
+`;
+
+const POOL_ACTIVITY_QUERY = `
+  query WebPoolActivity($pair: ID!, $owner: ID, $first: Int!, $after: String) {
+    poolActivity(pair: $pair, owner: $owner, first: $first, after: $after) {
+      nodes {
+        id pair kind owner from to amountX amountY binIds blockNumber blockHash
+        transactionHash logIndex sequence timestamp revision
+      }
+      pageInfo { endCursor hasNextPage partial }
+      asOfBlock
+      asOfBlockHash
     }
   }
 `;
@@ -339,6 +469,152 @@ export async function loadPoolMetrics(
     status: missing.length > 0 && page.status === "READY" ? "PARTIAL" : page.status,
     error: missing.length > 0 ? joinErrors(page.error, `Missing metrics for ${missing.join(", ")}`) : page.error
   };
+}
+
+/**
+ * Loads one bounded discovery projection for the exact visible pool set. This
+ * deliberately does not replace loadPoolMetrics, which remains the detail-view
+ * API. Unknown pools are represented by omitted rows and a PARTIAL page.
+ */
+export async function loadPoolDiscovery(
+  endpoint: string | null,
+  pools: readonly PoolDiscoveryRequest[],
+  asOfTimestamp?: number,
+  options: Pick<AnalyticsLoadOptions, "timeoutMs"> = {}
+): Promise<AnalyticsPage<PoolDiscoveryAnalytics>> {
+  if (pools.length === 0 || pools.length > 100) throw new Error("Pool discovery requires between 1 and 100 pools");
+  const requested = pools.map((request) => ({
+    pair: parseAddress(request.pair),
+    preferredQuoteToken: request.preferredQuoteToken === undefined || request.preferredQuoteToken === null
+      ? null
+      : parseAddress(request.preferredQuoteToken)
+  }));
+  assertUnique(requested.map((request) => request.pair), "requested discovery pool");
+  if (asOfTimestamp !== undefined) parseSafeInteger(asOfTimestamp, "asOfTimestamp");
+  if (endpoint === null) return unavailablePage("Analytics endpoint is not configured");
+  const timeoutMs = normalizeBoundedPositive(options.timeoutMs, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, "timeoutMs");
+
+  try {
+    const data = asRecord(await fetchGraph(endpoint, POOL_DISCOVERY_QUERY, {
+      pools: requested,
+      asOfTimestamp
+    }, timeoutMs));
+    const rawRows = asArray(data.poolDiscovery, "poolDiscovery");
+    const requestedPairs = new Set(requested.map((request) => request.pair));
+    const rows = rawRows.map(parsePoolDiscoveryRow);
+    assertUnique(rows.map((row) => row.pair), "pool discovery result");
+    for (const row of rows) {
+      if (!requestedPairs.has(row.pair)) throw new Error(`poolDiscovery returned foreign pair ${row.pair}`);
+    }
+    const returnedOrder = rows.map((row) => requested.findIndex((request) => request.pair === row.pair));
+    if (returnedOrder.some((index, position) => position > 0 && index <= returnedOrder[position - 1]!)) {
+      throw new Error("poolDiscovery did not preserve requested order");
+    }
+    const partial = rows.length !== requested.length || rows.some((row) => row.status !== "READY");
+    return resultPage(
+      rows,
+      partial ? "PARTIAL" : "READY",
+      { endCursor: null, hasNextPage: false, partial },
+      1,
+      null
+    );
+  } catch (error) {
+    return unavailablePage(errorMessage(error));
+  }
+}
+
+/**
+ * Enumerates the bounded canonical pool catalog. Unlike poolDiscovery, this is
+ * a source query: it does not require a legacy indexer or a caller-supplied
+ * list of pair addresses.
+ */
+export async function loadPoolCatalog(
+  endpoint: string | null,
+  options: AnalyticsLoadOptions = {}
+): Promise<AnalyticsPage<PoolCatalogEntry>> {
+  if (endpoint === null) return unavailablePage("Analytics endpoint is not configured");
+  return loadConnection(
+    endpoint,
+    "poolCatalog",
+    POOL_CATALOG_QUERY,
+    {},
+    parsePoolCatalogEntry,
+    (row) => row.pair,
+    options,
+    POOL_CATALOG_MAX_PAGES
+  );
+}
+
+/**
+ * Loads discovery analytics for an arbitrary indexed pool set while keeping
+ * every individual GraphQL request within the server's 100-pool bound.
+ * Successful rows are always returned in the caller's original request order.
+ */
+export async function loadPoolDiscoveryBatches(
+  endpoint: string | null,
+  pools: readonly PoolDiscoveryRequest[],
+  asOfTimestamp?: number,
+  options: Pick<AnalyticsLoadOptions, "timeoutMs"> = {}
+): Promise<AnalyticsPage<PoolDiscoveryAnalytics>> {
+  if (pools.length === 0) throw new Error("Pool discovery requires at least one pool");
+  const requested = pools.map((request) => ({
+    pair: parseAddress(request.pair),
+    preferredQuoteToken: request.preferredQuoteToken === undefined || request.preferredQuoteToken === null
+      ? null
+      : parseAddress(request.preferredQuoteToken)
+  }));
+  assertUnique(requested.map((request) => request.pair), "requested discovery pool");
+
+  const batches: PoolDiscoveryRequest[][] = [];
+  for (let start = 0; start < requested.length; start += POOL_DISCOVERY_BATCH_SIZE) {
+    batches.push(requested.slice(start, start + POOL_DISCOVERY_BATCH_SIZE));
+  }
+  const pages = await Promise.all(
+    batches.map((batch) => loadPoolDiscovery(endpoint, batch, asOfTimestamp, options))
+  );
+  const byPair = new Map<Address, PoolDiscoveryAnalytics>();
+  for (const page of pages) {
+    for (const row of page.rows) {
+      if (byPair.has(row.pair)) throw new Error(`Duplicate batched pool discovery result for ${row.pair}`);
+      byPair.set(row.pair, row);
+    }
+  }
+  const rows = requested.flatMap(({ pair }) => {
+    const row = byPair.get(pair);
+    return row === undefined ? [] : [row];
+  });
+  const allUnavailable = pages.every((page) => page.status === "UNAVAILABLE");
+  const partial = rows.length !== requested.length || pages.some((page) => page.status !== "READY");
+  const status: AnalyticsStatus = allUnavailable ? "UNAVAILABLE" : partial ? "PARTIAL" : "READY";
+  const failedBatchCount = pages.filter((page) => page.status === "UNAVAILABLE").length;
+  const uniqueErrors = [...new Set(pages.flatMap((page) => page.error === null ? [] : [page.error]))];
+  const errorParts = [
+    ...(failedBatchCount > 0 && failedBatchCount < pages.length
+      ? [`${failedBatchCount} of ${pages.length} discovery batches were unavailable`]
+      : []),
+    ...uniqueErrors
+  ];
+  return resultPage(
+    rows,
+    status,
+    { endCursor: null, hasNextPage: false, partial },
+    pages.reduce((total, page) => total + page.pageInfo.pagesLoaded, 0),
+    errorParts.length === 0 ? null : errorParts.join("; ")
+  );
+}
+
+/** Resolves only analytics-owned relative proxy paths against its own origin. */
+export function resolveAnalyticsAssetUrl(endpoint: string | null, logoPath: string | null): string | null {
+  if (endpoint === null || logoPath === null || !/^\/token-images\/[0-9a-f]{64}$/.test(logoPath)) return null;
+  try {
+    const analyticsUrl = new URL(endpoint);
+    if ((analyticsUrl.protocol !== "http:" && analyticsUrl.protocol !== "https:") || analyticsUrl.username !== "" || analyticsUrl.password !== "") return null;
+    const assetUrl = new URL(logoPath, analyticsUrl.origin);
+    if (assetUrl.origin !== analyticsUrl.origin || assetUrl.username !== "" || assetUrl.password !== "") return null;
+    return assetUrl.toString();
+  } catch {
+    return null;
+  }
 }
 
 export async function loadPairCandles(
@@ -514,6 +790,122 @@ export function applyPoolStateUpdate(current: LivePoolSnapshot, update: LivePool
   };
 }
 
+export async function loadCanonicalPoolActivity(
+  endpoint: string | null,
+  pair: Address,
+  owner: Address | null = null,
+  options: AnalyticsLoadOptions = {}
+): Promise<CanonicalPoolActivityPage> {
+  const canonicalPair = parseAddress(pair);
+  const canonicalOwner = owner === null ? null : parseAddress(owner);
+  if (endpoint === null) {
+    return {
+      ...unavailablePage<CanonicalPoolActivityEvent>("Analytics endpoint is not configured"),
+      asOfBlock: null,
+      asOfBlockHash: null
+    };
+  }
+  const pageSize = normalizeBoundedPositive(options.pageSize, DEFAULT_PAGE_SIZE, DEFAULT_PAGE_SIZE, "pageSize");
+  const maxPages = normalizeBoundedPositive(options.maxPages, DEFAULT_MAX_PAGES, DEFAULT_MAX_PAGES, "maxPages");
+  const timeoutMs = normalizeBoundedPositive(options.timeoutMs, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, "timeoutMs");
+  const rows: CanonicalPoolActivityEvent[] = [];
+  const ids = new Set<string>();
+  let after: string | null = null;
+  let partial = false;
+  let asOfBlock: string | null = null;
+  let asOfBlockHash: string | null = null;
+  let previous: CanonicalPoolActivityEvent | null = null;
+
+  for (let pageNumber = 0; pageNumber < maxPages; pageNumber += 1) {
+    try {
+      const data = asRecord(await fetchGraph(endpoint, POOL_ACTIVITY_QUERY, {
+        pair: canonicalPair,
+        owner: canonicalOwner,
+        first: pageSize,
+        after
+      }, timeoutMs));
+      const rawConnection = asRecord(data.poolActivity);
+      const connection = parseConnection(rawConnection);
+      const pageAsOfBlock = parseNullableDecimal(rawConnection.asOfBlock, "poolActivity asOfBlock");
+      const pageAsOfBlockHash = parseNullableBlockHash(rawConnection.asOfBlockHash, "poolActivity asOfBlockHash");
+      if ((pageAsOfBlock === null) !== (pageAsOfBlockHash === null)) {
+        throw new Error("poolActivity canonical head identity is incomplete");
+      }
+      if (
+        (asOfBlock !== null || asOfBlockHash !== null) &&
+        (pageAsOfBlock !== asOfBlock || pageAsOfBlockHash !== asOfBlockHash)
+      ) {
+        throw new Error("poolActivity canonical head changed during pagination");
+      }
+      asOfBlock = pageAsOfBlock;
+      asOfBlockHash = pageAsOfBlockHash;
+      for (const raw of connection.nodes) {
+        const row = parseCanonicalPoolActivityEvent(raw, canonicalPair, canonicalOwner);
+        if (ids.has(row.id)) throw new Error(`poolActivity returned duplicate event ${row.id}`);
+        if (previous !== null && comparePoolActivityRows(previous, row) > 0) {
+          throw new Error("poolActivity ordering is not stable");
+        }
+        ids.add(row.id);
+        rows.push(row);
+        previous = row;
+      }
+      partial ||= connection.pageInfo.partial;
+      if (!connection.pageInfo.hasNextPage) {
+        return {
+          ...resultPage(
+            rows,
+            partial ? "PARTIAL" : "READY",
+            connection.pageInfo,
+            pageNumber + 1,
+            null
+          ),
+          asOfBlock,
+          asOfBlockHash
+        };
+      }
+      const next = connection.pageInfo.endCursor;
+      if (next === null || next === after) {
+        return {
+          ...resultPage(
+            rows,
+            "PARTIAL",
+            connection.pageInfo,
+            pageNumber + 1,
+            "poolActivity pagination cursor did not advance"
+          ),
+          asOfBlock,
+          asOfBlockHash
+        };
+      }
+      after = next;
+    } catch (error) {
+      return {
+        ...resultPage(
+          rows,
+          rows.length === 0 ? "UNAVAILABLE" : "PARTIAL",
+          { endCursor: after, hasNextPage: true, partial: true },
+          pageNumber,
+          errorMessage(error)
+        ),
+        asOfBlock,
+        asOfBlockHash
+      };
+    }
+  }
+
+  return {
+    ...resultPage(
+      rows,
+      "PARTIAL",
+      { endCursor: after, hasNextPage: true, partial: true },
+      maxPages,
+      `poolActivity pagination capped at ${maxPages} pages`
+    ),
+    asOfBlock,
+    asOfBlockHash
+  };
+}
+
 export async function loadAnalyticsHealth(
   endpoint: string | null,
   options: Pick<AnalyticsLoadOptions, "timeoutMs"> = {}
@@ -537,10 +929,11 @@ async function loadConnection<T>(
   variables: Record<string, unknown>,
   parseRow: (value: unknown) => T,
   stableKey: (row: T) => string,
-  options: AnalyticsLoadOptions
+  options: AnalyticsLoadOptions,
+  maximumPages = DEFAULT_MAX_PAGES
 ): Promise<AnalyticsPage<T>> {
   const pageSize = normalizeBoundedPositive(options.pageSize, DEFAULT_PAGE_SIZE, DEFAULT_PAGE_SIZE, "pageSize");
-  const maxPages = normalizeBoundedPositive(options.maxPages, DEFAULT_MAX_PAGES, DEFAULT_MAX_PAGES, "maxPages");
+  const maxPages = normalizeBoundedPositive(options.maxPages, maximumPages, maximumPages, "maxPages");
   const timeoutMs = normalizeBoundedPositive(options.timeoutMs, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, "timeoutMs");
   const rows: T[] = [];
   const keys = new Set<string>();
@@ -595,10 +988,159 @@ function parsePoolMetric(value: unknown): PoolAnalyticsMetric {
     asOfBlock: parseDecimal(row.asOfBlock, "asOfBlock"), asOfTimestamp: parseSafeInteger(row.asOfTimestamp, "asOfTimestamp"),
     status, missingPriceTokens
   };
-  if (status === "READY" && (!result.feeBreakdownComplete || missingPriceTokens.length > 0 || Object.values(result).some((item) => item === null))) {
-    throw new Error(`READY pool metrics are incomplete for ${result.pair}`);
+  if (status === "READY") {
+    const required = [
+      result.tvlUsdE18,
+      result.volume24hUsdE18,
+      result.totalSwapFees24hUsdE18,
+      result.protocolSwapFees24hUsdE18,
+      result.lpFees24hUsdE18,
+      result.priceUsdE18
+    ];
+    if (!result.feeBreakdownComplete || missingPriceTokens.length > 0 || required.some((item) => item === null)) {
+      throw new Error(`READY pool metrics are incomplete for ${result.pair}`);
+    }
+    const zeroTvl = BigInt(result.tvlUsdE18!) === 0n;
+    if ((zeroTvl && result.feeToTvlE18 !== null) || (!zeroTvl && result.feeToTvlE18 === null)) {
+      throw new Error(`READY pool metrics have an invalid LP fee / TVL ratio for ${result.pair}`);
+    }
   }
   return result;
+}
+
+function parsePoolCatalogEntry(value: unknown): PoolCatalogEntry {
+  const row = asRecord(value);
+  const pair = parseAddress(row.pair);
+  const state = parseLivePoolState(row, pair);
+  const factoryAddress = row.factoryAddress === null || row.factoryAddress === undefined
+    ? null
+    : parseAddress(row.factoryAddress);
+  const createdAtBlock = row.createdAtBlock === null || row.createdAtBlock === undefined
+    ? null
+    : parseDecimal(row.createdAtBlock, "createdAtBlock");
+  const createdAtBlockHash = row.createdAtBlockHash === null || row.createdAtBlockHash === undefined
+    ? null
+    : parseBlockHash(row.createdAtBlockHash, "createdAtBlockHash");
+  const creationTransactionHash = row.creationTransactionHash === null || row.creationTransactionHash === undefined
+    ? null
+    : parseHash(row.creationTransactionHash, "creationTransactionHash");
+  const creationLogIndex = row.creationLogIndex === null || row.creationLogIndex === undefined
+    ? null
+    : parseSafeInteger(row.creationLogIndex, "creationLogIndex");
+  if (createdAtBlock !== null && BigInt(createdAtBlock) > BigInt(state.asOfBlock)) {
+    throw new Error(`Pool catalog creation block is newer than its state for ${pair}`);
+  }
+  const provenance = [
+    factoryAddress,
+    createdAtBlock,
+    createdAtBlockHash,
+    creationTransactionHash,
+    creationLogIndex
+  ];
+  const provenanceFields = provenance.filter((item) => item !== null).length;
+  if (provenanceFields !== 0 && provenanceFields !== provenance.length) {
+    throw new Error(`Pool catalog creation provenance is incomplete for ${pair}`);
+  }
+  return {
+    ...state,
+    factoryAddress,
+    createdAtBlock,
+    createdAtBlockHash,
+    creationTransactionHash,
+    creationLogIndex
+  };
+}
+
+function parsePoolDiscoveryRow(value: unknown): PoolDiscoveryAnalytics {
+  const row = asRecord(value);
+  const pair = parseAddress(row.pair);
+  const tokenX = parseAddress(row.tokenX);
+  const tokenY = parseAddress(row.tokenY);
+  if (tokenX === tokenY) throw new Error(`poolDiscovery returned an identical token pair for ${pair}`);
+  const displayBaseToken = parseAddress(row.displayBaseToken);
+  const displayQuoteToken = parseAddress(row.displayQuoteToken);
+  const canonicalTokens = new Set([tokenX, tokenY]);
+  if (
+    displayBaseToken === displayQuoteToken ||
+    !canonicalTokens.has(displayBaseToken) ||
+    !canonicalTokens.has(displayQuoteToken)
+  ) throw new Error(`poolDiscovery returned an invalid display orientation for ${pair}`);
+
+  const rawCloses = asArray(row.hourlyCloses, "hourlyCloses");
+  if (rawCloses.length > 24) throw new Error(`poolDiscovery returned more than 24 hourly closes for ${pair}`);
+  let previousTimestamp: number | null = null;
+  const hourlyCloses = rawCloses.map((value) => {
+    const close = asRecord(value);
+    const startTimestamp = parseSafeInteger(close.startTimestamp, "hourly close startTimestamp");
+    if (startTimestamp % CANDLE_INTERVAL_SECONDS.HOUR !== 0) throw new Error("Hourly close is not aligned to an hour boundary");
+    if (previousTimestamp !== null && startTimestamp <= previousTimestamp) throw new Error("Hourly closes are not strictly ordered");
+    previousTimestamp = startTimestamp;
+    const quoteToken = parseAddress(close.quoteToken);
+    if (quoteToken !== displayQuoteToken) throw new Error("Hourly close quote token differs from the display quote token");
+    const closeUsdE18 = parseDecimal(close.closeUsdE18, "hourly closeUsdE18");
+    if (BigInt(closeUsdE18) === 0n) throw new Error("Hourly close price must be positive");
+    return {
+      startTimestamp,
+      closeUsdE18,
+      quoteToken,
+      finalized: parseBoolean(close.finalized, "hourly close finalized"),
+      revision: parseSafeInteger(close.revision, "hourly close revision"),
+      priceSource: parseNonEmptyString(close.priceSource, "hourly close priceSource"),
+      firstBlockHash: parseBlockHash(close.firstBlockHash, "hourly close firstBlockHash"),
+      lastBlockHash: parseBlockHash(close.lastBlockHash, "hourly close lastBlockHash")
+    };
+  });
+  const status = parseStatus(row.status);
+  const missingPriceTokens = parseAddresses(row.missingPriceTokens, "pool discovery missingPriceTokens");
+  if (missingPriceTokens.some((token) => !canonicalTokens.has(token))) {
+    throw new Error(`poolDiscovery returned a foreign missing-price token for ${pair}`);
+  }
+  let marketMetadata: PoolDiscoveryMarketMetadata | null = null;
+  if (row.marketMetadata !== null) {
+    // Provider enrichment is presentation-only and failure-isolated. A malformed
+    // provider payload must not discard otherwise canonical pool economics.
+    try { marketMetadata = parsePoolDiscoveryMarketMetadata(row.marketMetadata); } catch { marketMetadata = null; }
+  }
+  const parsedPoolPrice = parseNullableDecimal(row.poolPriceQuotePerBaseE18, "poolPriceQuotePerBaseE18");
+  const result: PoolDiscoveryAnalytics = {
+    pair,
+    chainId: parseNullablePositiveInteger(row.chainId, "pool discovery chainId"),
+    tokenX,
+    tokenY,
+    displayBaseToken,
+    displayQuoteToken,
+    poolPriceQuotePerBaseE18: parsedPoolPrice === "0" ? null : parsedPoolPrice,
+    hourlyCloses,
+    priceChange24hE18: parseNullableSignedDecimal(row.priceChange24hE18, "priceChange24hE18"),
+    tvlUsdE18: parseNullableDecimal(row.tvlUsdE18, "pool discovery tvlUsdE18"),
+    lpFees24hUsdE18: parseNullableDecimal(row.lpNetSwapFees24hUsdE18, "pool discovery lpNetSwapFees24hUsdE18"),
+    volume24hUsdE18: parseNullableDecimal(row.volume24hUsdE18, "pool discovery volume24hUsdE18"),
+    status,
+    missingPriceTokens,
+    asOfBlock: parseDecimal(row.asOfBlock, "pool discovery asOfBlock"),
+    asOfBlockHash: parseBlockHash(row.asOfBlockHash, "pool discovery asOfBlockHash"),
+    asOfTimestamp: parseSafeInteger(row.asOfTimestamp, "pool discovery asOfTimestamp"),
+    marketMetadata
+  };
+  return result;
+}
+
+function parsePoolDiscoveryMarketMetadata(value: unknown): PoolDiscoveryMarketMetadata {
+  const row = asRecord(value);
+  const logoPath = parseNullableRelativeAssetPath(row.logoPath, "market metadata logoPath");
+  const logoSource = parseNullableString(row.logoSource, "market metadata logoSource");
+  if ((logoPath === null) !== (logoSource === null)) throw new Error("Market metadata logo path and source must be present together");
+  const source = parseNonEmptyString(row.source, "market metadata source");
+  if (source !== "dex-screener" || (logoSource !== null && logoSource !== "dex-screener")) {
+    throw new Error("Unsupported market metadata source");
+  }
+  return {
+    marketCapUsdE18: parseNullableDecimal(row.marketCapUsdE18, "market metadata marketCapUsdE18"),
+    source,
+    fetchedAt: parseSafeInteger(row.fetchedAt, "market metadata fetchedAt"),
+    logoPath,
+    logoSource
+  };
 }
 
 function parseCandle(value: unknown, pair: Address, interval: CandleInterval, from: number, to: number): PairCandle {
@@ -790,6 +1332,87 @@ function parseHealth(value: unknown): AnalyticsHealth {
   };
 }
 
+function parseCanonicalPoolActivityEvent(
+  value: unknown,
+  expectedPair: Address,
+  expectedOwner: Address | null
+): CanonicalPoolActivityEvent {
+  const row = asRecord(value);
+  const id = parseNonEmptyString(row.id, "pool activity id");
+  if (id.length > 2_048) throw new Error("Invalid pool activity id");
+  const pair = parseAddress(row.pair);
+  if (pair !== expectedPair) throw new Error(`poolActivity returned foreign pair ${pair}`);
+  const kind = parsePoolActivityKind(row.kind);
+  const owner = row.owner === null ? null : parseAddress(row.owner);
+  const from = row.from === null ? null : parseAddress(row.from);
+  const to = row.to === null ? null : parseAddress(row.to);
+  if (expectedOwner !== null && owner !== expectedOwner && from !== expectedOwner && to !== expectedOwner) {
+    throw new Error(`poolActivity returned an event unrelated to owner ${expectedOwner}`);
+  }
+  const amountX = parseNullableDecimal(row.amountX, "pool activity amountX");
+  const amountY = parseNullableDecimal(row.amountY, "pool activity amountY");
+  const binIds = asArray(row.binIds, "pool activity binIds")
+    .map((binId) => parseDecimal(binId, "pool activity binId"));
+  assertUnique(binIds, "pool activity bin");
+  const transactionHash = parseNullableBlockHash(row.transactionHash, "pool activity transactionHash");
+  const logIndex = row.logIndex === null ? null : parseSafeInteger(row.logIndex, "pool activity logIndex");
+  if ((transactionHash === null) !== (logIndex === null)) {
+    throw new Error("pool activity log identity is incomplete");
+  }
+  const revision = parseSafeInteger(row.revision, "pool activity revision");
+  if (revision < 1) throw new Error("pool activity revision must be positive");
+
+  if (kind === "SWAP" && (owner !== null || from !== null || to !== null || binIds.length !== 0)) {
+    throw new Error("pool activity swap ownership fields are invalid");
+  }
+  if (
+    (kind === "DEPOSIT" || kind === "WITHDRAW") &&
+    (owner === null || from !== null || to !== null || binIds.length === 0)
+  ) {
+    throw new Error("pool activity liquidity ownership fields are invalid");
+  }
+  if (
+    kind === "POSITION_TRANSFER" &&
+    (owner !== null || from === null || to === null || amountX !== null || amountY !== null || binIds.length === 0)
+  ) {
+    throw new Error("pool activity position-transfer fields are invalid");
+  }
+
+  return {
+    id,
+    pair,
+    kind,
+    owner,
+    from,
+    to,
+    amountX,
+    amountY,
+    binIds,
+    blockNumber: parseDecimal(row.blockNumber, "pool activity blockNumber"),
+    blockHash: parseBlockHash(row.blockHash, "pool activity blockHash"),
+    transactionHash,
+    logIndex,
+    sequence: parseSafeInteger(row.sequence, "pool activity sequence"),
+    timestamp: parseSafeInteger(row.timestamp, "pool activity timestamp"),
+    revision
+  };
+}
+
+function comparePoolActivityRows(left: CanonicalPoolActivityEvent, right: CanonicalPoolActivityEvent): number {
+  const leftBlock = BigInt(left.blockNumber);
+  const rightBlock = BigInt(right.blockNumber);
+  if (leftBlock !== rightBlock) return leftBlock > rightBlock ? -1 : 1;
+  if (left.sequence !== right.sequence) return right.sequence - left.sequence;
+  return left.id.localeCompare(right.id);
+}
+
+function parsePoolActivityKind(value: unknown): CanonicalPoolActivityKind {
+  if (value === "SWAP" || value === "DEPOSIT" || value === "WITHDRAW" || value === "POSITION_TRANSFER") {
+    return value;
+  }
+  throw new Error("Invalid pool activity kind");
+}
+
 function truthfulHealthStatus(health: AnalyticsHealth): AnalyticsStatus {
   if (health.status === "UNAVAILABLE" || health.headBlock === null) return "UNAVAILABLE";
   const ready = health.fresh && health.backfillStatus === "complete" && health.coverageStartTimestamp !== null && health.coverageThroughTimestamp !== null && health.partialEventCount === 0 && health.missingPriceTokens.length === 0 && health.prices.every((price) => price.status === "available");
@@ -833,10 +1456,13 @@ function parseSignedDecimal(value: unknown, label: string): string { if (typeof 
 function parseNullableSignedDecimal(value: unknown, label: string): string | null { return value === null ? null : parseSignedDecimal(value, label); }
 function parseSafeInteger(value: unknown, label: string): number { if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new Error(`Invalid ${label}`); return value; }
 function parseNullableInteger(value: unknown, label: string): number | null { return value === null ? null : parseSafeInteger(value, label); }
+function parseNullablePositiveInteger(value: unknown, label: string): number | null { const parsed = parseNullableInteger(value, label); if (parsed === 0) throw new Error(`Invalid ${label}`); return parsed; }
 function parseString(value: unknown, label: string): string { if (typeof value !== "string") throw new Error(`Invalid ${label}`); return value; }
 function parseNullableString(value: unknown, label: string): string | null { return value === null ? null : parseString(value, label); }
+function parseNullableRelativeAssetPath(value: unknown, label: string): string | null { if (value === null) return null; const path = parseString(value, label); if (!/^\/token-images\/[0-9a-f]{64}$/.test(path)) throw new Error(`Invalid ${label}`); return path; }
 function parseHash(value: unknown, label: string): string { if (typeof value !== "string" || !/^0x[0-9a-fA-F]+$/.test(value)) throw new Error(`Invalid ${label}`); return value.toLowerCase(); }
 function parseBlockHash(value: unknown, label: string): string { if (typeof value !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(value)) throw new Error(`Invalid ${label}`); return value.toLowerCase(); }
+function parseNullableBlockHash(value: unknown, label: string): string | null { return value === null ? null : parseBlockHash(value, label); }
 function parseBoolean(value: unknown, label: string): boolean { if (typeof value !== "boolean") throw new Error(`Invalid ${label}`); return value; }
 function parseCursor(value: unknown): string { return parseDecimal(value, "stream cursor"); }
 function parseNonEmptyString(value: unknown, label: string): string { const parsed = parseString(value, label); if (parsed.trim() === "") throw new Error(`Invalid ${label}`); return parsed; }

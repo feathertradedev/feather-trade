@@ -1,0 +1,8 @@
+{
+  "endpoints": {
+    "rpcUrl": "https://rpc.example/",
+    "indexerUrl": null,
+    "apiUrl": null,
+    "tokenListUrl": null
+  }
+}

@@ -5,6 +5,8 @@ export async function installMockAnalyticsStream(page: Page) {
     type TestWindow = Window & {
       __testEmitCandle: (payload: unknown) => void;
       __testEmitPoolState: (payload: unknown) => void;
+      __testEmitPoolStateBatch: (payloads: unknown[]) => void;
+      __testHeartbeatPoolStream: () => void;
       __testAdvanceCandleClock: (milliseconds: number) => void;
       __testFailCandleStream: () => void;
       __testFailPoolStream: () => void;
@@ -38,6 +40,15 @@ export async function installMockAnalyticsStream(page: Page) {
     const latest = (path: string) => [...streams].reverse().find((stream) => stream.url.includes(path) && stream.readyState !== 2) ?? null;
     testWindow.__testEmitCandle = (payload) => latest("/events/candles")?.dispatchEvent(new MessageEvent("candle", { data: JSON.stringify(payload) }));
     testWindow.__testEmitPoolState = (payload) => latest("/events/pools")?.dispatchEvent(new MessageEvent("pool-state", { data: JSON.stringify(payload) }));
+    testWindow.__testEmitPoolStateBatch = (payloads) => {
+      const stream = latest("/events/pools");
+      for (const payload of payloads) {
+        stream?.dispatchEvent(new MessageEvent("pool-state", { data: JSON.stringify(payload) }));
+      }
+    };
+    testWindow.__testHeartbeatPoolStream = () => {
+      latest("/events/pools")?.dispatchEvent(new MessageEvent("heartbeat", { data: "{}" }));
+    };
     const originalNow = Date.now;
     testWindow.__testAdvanceCandleClock = (milliseconds) => {
       Date.now = () => originalNow() + milliseconds;

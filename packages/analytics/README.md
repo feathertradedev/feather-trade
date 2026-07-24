@@ -11,6 +11,8 @@ The package provides:
   TVL, and LP-net fee/TVL metrics;
 - 1m, 5m, 15m, 1h, 4h, 1d, and Monday-aligned 1w OHLC/volume/fee/TVL candles;
 - bounded historical GraphQL pages plus resumable SSE candle replacements;
+- a bounded, visible-pool discovery query with canonical hourly trends and
+  failure-isolated presentation metadata;
 - grouped owner/pair/bin balances with cost basis and realized/unrealized P&L;
 - parent-hash reorg rollback and deterministic replay;
 - resumable, capped backfill helpers and cursor-limited query methods; and
@@ -53,10 +55,26 @@ ANALYTICS_PRICE_VERIFIER_MODULE=/absolute/path/chainlink-verifier.mjs \
 ANALYTICS_BLOCK_SOURCE_MODULE=/absolute/path/archive-block-source.mjs \
 ANALYTICS_POSITION_SNAPSHOT_MODULE=/absolute/path/position-snapshot-provider.mjs \
 ANALYTICS_CORS_ORIGINS=https://app.testnet.example.com \
+ANALYTICS_ENVIRONMENT=localnet \
 ANALYTICS_STATE_PATH=.local/analytics/checkpoint.json \
 ANALYTICS_INGEST_TOKEN='replace-with-a-secret' \
 pnpm --filter @robinhood-lb/analytics start
 ```
+
+That checkpoint example is local-development configuration. Outside localnet,
+the CLI requires managed PostgreSQL with exactly `sslmode=verify-full` plus an
+`ANALYTICS_DEPLOYMENT_IDENTITY`, canonical `ANALYTICS_RUNTIME_CUSTODY` inventory,
+and its `ANALYTICS_RUNTIME_CUSTODY_SHA256`. Generate the inventory from the four
+reviewed policy/adapter files with `pnpm analytics:custody:build ...` as shown
+in [`infra/vps/README.md`](../../infra/vps/README.md). Production startup verifies
+regular non-symlink files and imports the held, hash-verified module bytes.
+
+Mainnet rollout remains blocked on the checkpoint-v2 materialized-anchor and
+bounded-suffix migration documented in the VPS runbook. Checkpoint v1 rebuilds
+derived state from the complete canonical block history; pruning that history
+without a persisted anchor would silently corrupt reorg recovery, candles, and
+position cost basis. The current engine is suitable for deterministic/local
+validation, not unbounded mainnet retention.
 
 The server binds to `127.0.0.1:8787` by default. `POST /graphql` serves bounded
 queries. `POST /internal/blocks` accepts tagged-JSON `BlockSubmission` payloads
@@ -65,10 +83,25 @@ bearer token; ingestion stays disabled if no token is configured. Use exported
 `encodeTaggedJson` for bigint-safe payloads.
 
 `ANALYTICS_CORS_ORIGINS` is a comma-separated exact-origin allowlist for the
-browser-facing `/graphql` endpoint. Allowed origins receive bounded OPTIONS
-preflight responses and CORS headers; wildcards are not supported and the
-authenticated ingestion endpoint is never exposed through CORS. A same-origin
-reverse proxy may leave the allowlist empty.
+browser-facing `/graphql`, candle/pool event, and token-image proxy endpoints.
+Allowed origins receive bounded OPTIONS preflight responses and CORS headers;
+wildcards are not supported and the authenticated ingestion endpoint is never
+exposed through CORS. A same-origin reverse proxy that preserves the browser's
+`Origin` header must configure the exact public app origin. The VPS Compose
+configuration does this automatically. Local stack startup explicitly allows
+both `http://127.0.0.1:15173` and `http://localhost:15173`.
+
+`poolDiscovery` accepts between one and 100 unique canonical pair addresses and
+returns only canonical engine metrics, active-bin prices, and the latest 24
+hourly candle closes for those requested pools. DEX Screener enrichment is
+presentation-only: exact chain/base-token matches may supply market cap and a
+relative `/token-images/<opaque-key>` fallback logo. FDV is never substituted.
+Successes and failures are bounded in an in-memory TTL/LRU cache. The image
+proxy cannot accept a provider URL; it serves only URLs already retained by
+that cache, restricts sources to the official `cdn.dexscreener.com` host, and
+validates HTTPS, raster content type, file signature, and response size. None
+of this provider data participates in trusted pricing, TVL, allowlisting,
+routing, or transactions.
 
 The CLI refuses to serve until `ANALYTICS_BLOCK_SOURCE_MODULE` completes a
 canonical startup reconciliation. The module exports `createBlockSource()`,
@@ -84,15 +117,43 @@ required at startup; authenticated `/internal/blocks` is only an additional
 ingestion path.
 
 `ANALYTICS_PRICE_VERIFIER_MODULE` exports `createPriceVerifier()`, returning a
-`PriceSampleVerifier`. The verifier receives the signed Chainlink report and
-must authenticate/decode it with the current Chainlink verifier/SDK; only the
-trusted sample it returns reaches the engine. The service rejects missing,
-forged, or mismatched reports and cannot be bypassed with a caller-provided
-boolean. `fixed-test` pricing is disabled by default. Source/feed/freshness/
-confidence checks are independently enforced inside the replay core.
+`PriceSampleVerifier`. The factory receives the custody-verified price policies.
+For Chainlink Data Streams, the verifier authenticates and decodes the signed
+report. For on-chain Chainlink Data Feeds, the submission carries no signed
+report: the verifier independently reads `latestRoundData()` at the submitted
+canonical block hash and reconstructs the sample. Only the trusted sample it
+returns reaches the engine. The service rejects missing, forged, or mismatched
+evidence and cannot be bypassed with a caller-provided boolean. `fixed-test`
+pricing is disabled by default. Source/feed/freshness/confidence checks are
+independently enforced inside the replay core.
 
 `ANALYTICS_POSITION_SNAPSHOT_MODULE` exports
 `createPositionSnapshotProvider()`. The provider performs a bounded owner query
 at the requested canonical head and returns raw per-bin token claims. The
-service attaches/reconciles those snapshots at that exact head before resolving
-`walletPositions`; it never enumerates every holder on every block.
+service applies those snapshots to an isolated, head-checked response view
+before resolving `walletPositions`; a public read cannot mutate or persist the
+canonical engine state. The provider never enumerates every holder on every
+block.
+
+## Pool workspace data ownership
+
+The VPS deployment has one explicit source of truth per pool-workspace
+dataset. It does not treat the analytics endpoint as a legacy Graph schema:
+
+- `poolCatalog`, `poolState`, `pairCandles`, and `poolActivity` are derived
+  only from retained canonical block envelopes persisted in PostgreSQL.
+- `walletPositions` combines canonical position accounting with a bounded
+  head-exact RPC snapshot in an isolated response view. Current wallet claims
+  never become canonical merely because a browser requested them.
+- `poolActivity(pair, owner, first, after)` returns swaps, liquidity changes,
+  and ERC-1155 position transfers from the retained canonical chain. Each row
+  includes its block hash, transaction/log identity, timestamp, and immutable
+  row revision. Owner filtering matches only the canonical liquidity owner or
+  transfer endpoints; swaps are omitted from owner-filtered results because
+  the indexed Swap event does not identify the initiating wallet.
+- Activity cursors are bound to the canonical head hash. A reorg expires an
+  old cursor and the client refetches the replacement history. The pool
+  workspace polls this bounded connection for live updates; no separate raw
+  indexer is required for activity or position history.
+- DEX Screener enrichment remains presentation-only and is never a source for
+  positions, activity, pricing, TVL, or transaction decisions.

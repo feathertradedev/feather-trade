@@ -7,6 +7,7 @@ import {
   AnalyticsApiService,
   AnalyticsEngine,
   PostgresAnalyticsStore,
+  AnalyticsWriterLeaseUnavailableError,
   USD_SCALE,
   type AnalyticsCheckpoint,
   type BlockEnvelope,
@@ -24,6 +25,89 @@ const policies: PricePolicy[] = [
   { token: TOKEN_X, source: "chainlink-data-streams", feedId: "x-usd", maxAgeSeconds: 300, maxConfidenceBps: 100 },
   { token: TOKEN_Y, source: "chainlink-data-streams", feedId: "y-usd", maxAgeSeconds: 300, maxConfidenceBps: 100 }
 ];
+
+test("fences PostgreSQL writers with a process-lifetime schema lease", { skip: DATABASE_URL === undefined }, async () => {
+  const schema = `feather_lease_${process.pid}_${Date.now()}`;
+  const otherSchema = `${schema}_other`;
+  const first = new PostgresAnalyticsStore({ connectionString: DATABASE_URL!, schema });
+  const contender = new PostgresAnalyticsStore({ connectionString: DATABASE_URL!, schema });
+  const independent = new PostgresAnalyticsStore({ connectionString: DATABASE_URL!, schema: otherSchema });
+  let successor: PostgresAnalyticsStore | null = null;
+  const cleanup = new Pool({ connectionString: DATABASE_URL });
+  try {
+    await assert.rejects(() => contender.load(), AnalyticsWriterLeaseUnavailableError);
+    await first.acquireWriterLease();
+    await first.healthcheck();
+    assert.equal(first.hasWriterLease(), true);
+    await assert.rejects(
+      () => contender.acquireWriterLease(),
+      (error: unknown) => error instanceof AnalyticsWriterLeaseUnavailableError && /already held/.test(error.message)
+    );
+
+    await independent.acquireWriterLease();
+    assert.equal(independent.hasWriterLease(), true, "a separate schema owns an independent lease");
+
+    await first.releaseWriterLease();
+    assert.equal(first.hasWriterLease(), false);
+    await assert.rejects(() => first.healthcheck(), AnalyticsWriterLeaseUnavailableError);
+    successor = new PostgresAnalyticsStore({ connectionString: DATABASE_URL!, schema });
+    await successor.acquireWriterLease();
+    await successor.healthcheck();
+  } finally {
+    await Promise.allSettled([first.close(), contender.close(), independent.close(), successor?.close()]);
+    await cleanup.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    await cleanup.query(`DROP SCHEMA IF EXISTS ${otherSchema} CASCADE`);
+    await cleanup.end();
+  }
+});
+
+test("treats PostgreSQL writer-session loss as a permanent fatal lease failure", { skip: DATABASE_URL === undefined }, async () => {
+  const schema = `feather_lease_loss_${process.pid}_${Date.now()}`;
+  const applicationName = `feather-lease-loss-${process.pid}-${Date.now()}`;
+  const store = new PostgresAnalyticsStore({
+    connectionString: DATABASE_URL!,
+    schema,
+    applicationName
+  });
+  const admin = new Pool({ connectionString: DATABASE_URL });
+  let successor: PostgresAnalyticsStore | null = null;
+  try {
+    await store.acquireWriterLease();
+    const backend = await admin.query<{ pid: number }>(
+      "SELECT pid FROM pg_stat_activity WHERE application_name = $1 AND pid <> pg_backend_pid()",
+      [applicationName]
+    );
+    assert.equal(backend.rowCount, 1, "the dedicated lease session is identifiable");
+    const fatalFailure = store.writerLeaseFailure();
+    const terminated = await admin.query<{ terminated: boolean }>(
+      "SELECT pg_terminate_backend($1) AS terminated",
+      [backend.rows[0]!.pid]
+    );
+    assert.equal(terminated.rows[0]?.terminated, true);
+    const fatal = await Promise.race([
+      fatalFailure,
+      new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error("writer lease failure signal timed out")), 5_000).unref();
+      })
+    ]);
+    assert(fatal instanceof Error);
+    assert.equal(store.hasWriterLease(), false);
+    await assert.rejects(() => store.healthcheck(), /writer lease connection failed/);
+    await store.releaseWriterLease();
+    await assert.rejects(
+      () => store.acquireWriterLease(),
+      /failed permanently; restart the process/
+    );
+
+    successor = new PostgresAnalyticsStore({ connectionString: DATABASE_URL!, schema });
+    await successor.acquireWriterLease();
+    await successor.healthcheck();
+  } finally {
+    await Promise.allSettled([store.close(), successor?.close()]);
+    await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    await admin.end();
+  }
+});
 
 test("persists canonical blocks, candles, and replay events in PostgreSQL", { skip: DATABASE_URL === undefined }, async () => {
   const schema = `feather_test_${process.pid}_${Date.now()}`;
@@ -60,6 +144,7 @@ test("persists canonical blocks, candles, and replay events in PostgreSQL", { sk
   };
   const cleanup = new Pool({ connectionString: DATABASE_URL });
   try {
+    await store.acquireWriterLease();
     engine.ingestBlock(block);
     await store.save(engine.exportCheckpoint(), engine.listCandles());
     const firstMinute = engine.listCandles().find((candle) => candle.interval === "minute")!;
@@ -207,7 +292,7 @@ test("fails closed instead of truncating a conflicting legacy stream cursor", { 
     );
 
     store = new PostgresAnalyticsStore({ connectionString: DATABASE_URL!, schema });
-    await assert.rejects(() => store!.load(), /Legacy candle stream cursor conflicts/);
+    await assert.rejects(() => store!.acquireWriterLease(), /Legacy candle stream cursor conflicts/);
     assert.equal(
       (await admin.query<{ count: string }>(`SELECT COUNT(*)::text AS count FROM ${schema}.candle_stream_events`)).rows[0]?.count,
       "1",
@@ -221,6 +306,7 @@ test("fails closed instead of truncating a conflicting legacy stream cursor", { 
       [`candle:${PAIR}:minute`]
     );
     store = new PostgresAnalyticsStore({ connectionString: DATABASE_URL!, schema });
+    await store.acquireWriterLease();
     assert.equal(await store.load(), null);
     assert.equal(
       (await admin.query<{ count: string }>(`SELECT COUNT(*)::text AS count FROM ${schema}.candle_stream_events`)).rows[0]?.count,
@@ -244,6 +330,7 @@ test("atomically rolls back canonical state when outbox persistence fails across
     replaySize: 32
   });
   try {
+    await store.acquireWriterLease();
     const service = await AnalyticsApiService.create({
       engine: new AnalyticsEngine(fixedPolicies, { assumeCompleteHistory: true }),
       store,
@@ -276,6 +363,7 @@ test("atomically rolls back canonical state when outbox persistence fails across
     await store.close();
     store = null;
     store = new PostgresAnalyticsStore({ connectionString: DATABASE_URL!, schema, replaySize: 32 });
+    await store.acquireWriterLease();
     const restarted = await AnalyticsApiService.create({
       engine: new AnalyticsEngine(fixedPolicies, { assumeCompleteHistory: true }),
       store,
@@ -294,6 +382,7 @@ test("atomically rolls back canonical state when outbox persistence fails across
     await store.close();
     store = null;
     store = new PostgresAnalyticsStore({ connectionString: DATABASE_URL!, schema, replaySize: 32 });
+    await store.acquireWriterLease();
     const committedRestart = await AnalyticsApiService.create({
       engine: new AnalyticsEngine(fixedPolicies, { assumeCompleteHistory: true }),
       store,
@@ -337,6 +426,7 @@ test("atomically materializes pool state and sparse bin replacements with the sh
   const firstState = persistedPoolState(1, hash(1));
   const firstBins = [persistedPoolBin(firstState, "8388607", 1n), persistedPoolBin(firstState, "8388608", 2n)];
   try {
+    await store.acquireWriterLease();
     await store.save(checkpoint, [], [{ state: firstState, bins: firstBins, replaceBinWindow: true }]);
     const secondState = { ...firstState, asOfBlock: 2n, asOfBlockHash: hash(2), asOfTimestamp: 120, revision: 2 };
     const replacement = { ...persistedPoolBin(secondState, "8388608", 9n), revision: 2 };

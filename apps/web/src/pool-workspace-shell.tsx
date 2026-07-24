@@ -8,7 +8,7 @@ import {
 import { quoteCurrentFeeRates, type CurrentFeeRates } from "@robinhood-lb/sdk/liquidity-review";
 
 import { formatCompactAddress, formatTokenAmount, tokenSymbol, type PoolRow } from "./data";
-import { returnHrefFromAction, samePairPools } from "./pool-discovery";
+import { returnHrefForPoolWorkspace, samePairPools } from "./pool-discovery";
 import { buildCenteredBinDistribution, formatRatioPercentE18, workspaceMetricTiles } from "./pool-workspace";
 import { PoolWorkspaceProvider, usePoolWorkspace } from "./pool-workspace-context";
 import { parsePoolWorkspaceRoute, poolWorkspaceHref, type PoolWorkspaceTask } from "./pool-workspace-route";
@@ -48,7 +48,7 @@ export function PoolWorkspaceShell({
 }
 
 function PoolWorkspaceScaffold({ children, pool, pools }: { children: ReactNode; pool: PoolRow; pools: PoolRow[] }) {
-  const returnHref = returnHrefFromAction(window.location.hash);
+  const returnHref = returnHrefForPoolWorkspace(window.location.hash);
   const routeTask = parsePoolWorkspaceRoute(window.location.hash)?.task ?? "create";
   const tradePanelId = routeTask === "swap" ? "swap-task-panel" : routeTask === "manage" ? "liquidity-withdraw" : "liquidity-add";
   const mobileWorkspaceNavigation = useMediaQuery("(max-width: 720px)");
@@ -146,7 +146,7 @@ function PoolMobileWorkspaceNav({
 
 export function PoolWorkspaceTaskTabs({ task }: { task: PoolWorkspaceTask }) {
   const workspace = usePoolWorkspace();
-  const returnHref = returnHrefFromAction(window.location.hash);
+  const returnHref = returnHrefForPoolWorkspace(window.location.hash);
 
   return (
     <nav aria-label="Pool tasks" className="pool-workspace-tasks">
@@ -172,7 +172,7 @@ function PoolBinStepSelector({ pool, pools }: { pool: PoolRow; pools: PoolRow[] 
   });
   if (choices.length <= 1) return null;
   const routeTask = parsePoolWorkspaceRoute(window.location.hash)?.task ?? "create";
-  const returnHref = returnHrefFromAction(window.location.hash);
+  const returnHref = returnHrefForPoolWorkspace(window.location.hash);
 
   return (
     <label className="pool-workspace-tier-selector">
@@ -195,12 +195,7 @@ function PoolBinStepSelector({ pool, pools }: { pool: PoolRow; pools: PoolRow[] 
 
 function PoolWorkspaceRail({ mobileWorkspaceNavigation }: { mobileWorkspaceNavigation: boolean }) {
   const workspace = usePoolWorkspace();
-  const marketIdentityAvailable = workspace.liveMarket.value !== null || workspace.economics.value !== null;
-  const metricTiles = workspaceMetricTiles(workspace.analytics.row.metric).map((tile) => !marketIdentityAvailable
-    ? workspace.economics.state === "loading" || workspace.liveMarket.state === "connecting"
-      ? { ...tile, status: "PARTIAL" as const, value: "Loading…" }
-      : { ...tile, status: "UNAVAILABLE" as const, value: "Unavailable" }
-    : tile);
+  const metricTiles = workspaceMetricTiles(workspace.analytics.row.metric);
   const tvl = metricTiles.find((tile) => tile.key === "tvl")!;
   const volume = metricTiles.find((tile) => tile.key === "volume24h")!;
   const fees = metricTiles.find((tile) => tile.key === "lpFees24h")!;
@@ -311,7 +306,7 @@ function PoolWorkspaceRail({ mobileWorkspaceNavigation }: { mobileWorkspaceNavig
         <dl aria-label="Pool analytics">
           <div data-analytics-status={volume.status}><dt>24h volume</dt><dd>{volume.value}</dd></div>
           <div data-analytics-status={fees.status}><dt>24h LP fees</dt><dd>{fees.value}</dd></div>
-          <div data-analytics-status={feeToTvl.status}><dt>24h LP fees / TVL</dt><dd>{feeToTvl.value}</dd></div>
+          <div data-analytics-status={feeToTvl.status} title={feeToTvl.detail ?? undefined}><dt>24h LP fees / TVL</dt><dd>{feeToTvl.value}</dd></div>
         </dl>
         <small className="pool-rail-data-source">Analytics · {metricSourceLabel(workspace.analytics.row.metric)}</small>
       </section>
