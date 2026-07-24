@@ -23,6 +23,7 @@
     "test:lb-operator-approval": "node scripts/test-lb-operator-approval.mjs",
     "test:pool-selection": "node scripts/test-pool-selection.mjs",
     "test:pool-creation-defaults": "node scripts/test-pool-creation-defaults.mjs",
+    "test:pool-creation-progress": "node scripts/test-pool-creation-progress.mjs",
     "test:pool-creation-safety": "node scripts/test-pool-creation-safety.mjs",
     "test:pool-discovery": "node scripts/test-pool-discovery.mjs && node scripts/test-pool-discovery-model.mjs",
     "test:pool-economics": "node scripts/test-pool-economics.mjs",

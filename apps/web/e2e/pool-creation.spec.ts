@@ -14,7 +14,8 @@ import {
   installMockWallet,
   LOCALNET_CHAIN_ID,
   openAndSelectMockWallet,
-  readMockWallet
+  readMockWallet,
+  ROBINHOOD_TESTNET_CHAIN_ID
 } from "./fixtures/mock-wallet";
 
 const ACTIVE_ID = 8_388_608;
@@ -107,6 +108,58 @@ test("wallet chooser outage fallback and dismissal preserve pool configuration",
   await expect(page.getByTestId("pool-create-review-action")).toHaveText("Review exact creation");
 });
 
+test("wrong-chain review switches safely without discarding the configured pair or price", async ({ page }) => {
+  await installMockRpc(page, creationRpc);
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID, switchMode: "ready" });
+  await page.goto("/#/pools");
+  await connectMockWallet(page);
+  await page.getByTestId("pool-create-launch").click();
+  await page.getByTestId("pool-create-token-x").fill(WNATIVE);
+  await page.getByTestId("pool-create-token-y").selectOption(USDT);
+  await page.getByRole("button", { name: "Continue to configure" }).click();
+  await page.getByTestId("pool-create-bin-step").selectOption("25");
+  await page.getByTestId("pool-create-price").fill("1.25");
+  await page.getByTestId("pool-create-risk-ack").check();
+  await page.evaluate((chainId) => window.__mockWalletControl.setChain(chainId), ROBINHOOD_TESTNET_CHAIN_ID);
+
+  const reviewAction = page.getByTestId("pool-create-review-action");
+  await expect(reviewAction).toHaveText(/Switch to/i);
+  await reviewAction.click();
+  await expect.poll(async () => (await readMockWallet(page)).chainId).toBe(LOCALNET_CHAIN_ID);
+  await expect(page.getByTestId("pool-create-bin-step")).toHaveValue("25");
+  await expect(page.getByTestId("pool-create-price")).toHaveValue("1.25");
+  await expect(reviewAction).toHaveText("Review exact creation");
+});
+
+test("trusted pricing is explicit and a stale refresh fails closed without changing user input", async ({ page }) => {
+  const rpc = await installMockRpc(page, {
+    ...creationRpc,
+    trustedPriceQuotePerBaseE18: "160000000000000000000",
+    trustedPriceStatus: "ready"
+  });
+  await installMockWallet(page, { chainId: LOCALNET_CHAIN_ID });
+  await openCreationWizard(page);
+  await page.getByTestId("pool-create-token-x").fill(WNATIVE);
+  await page.getByTestId("pool-create-token-y").selectOption(USDT);
+  await page.getByRole("button", { name: "Continue to configure" }).click();
+
+  const trusted = page.getByTestId("pool-create-trusted-price");
+  await expect(trusted).toContainText("Trusted oracle suggestion");
+  await expect(trusted).toContainText("160 USDT per WNATIVE");
+  await expect(trusted).toContainText("chainlink-data-feed");
+  await page.getByTestId("pool-create-use-trusted-price").click();
+  await expect(page.getByTestId("pool-create-price")).toHaveValue("160");
+  await page.getByTestId("pool-create-risk-ack").check();
+
+  rpc.update({ trustedPriceStatus: "partial" });
+  await page.getByTestId("pool-create-review-action").click();
+  await expect(page.getByRole("status").filter({ hasText: /became unavailable/i })).toContainText(
+    "Feather kept your value as explicit input"
+  );
+  await expect(page.getByTestId("pool-create-price")).toHaveValue("160");
+  await expect(page.getByTestId("pool-create-review")).toHaveCount(0);
+});
+
 test("Discover creates an exact empty pool and preserves an RPC workspace while indexing lags", async ({ page }) => {
   await installMockRpc(page, {
     ...creationRpc,
@@ -157,6 +210,39 @@ test("Discover creates an exact empty pool and preserves an RPC workspace while 
     functionName: "createLBPair",
     args: [WNATIVE, USDT, 8_388_608, 10]
   });
+});
+
+test("pool-creation progress resumes after reload without duplicate submission", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await installMockRpc(page, {
+    ...creationRpc,
+    binReserveX: 0n,
+    binReserveY: 0n,
+    binTotalSupply: 0n,
+    blockNumberAfterReceipt: 44n,
+    createdPairAddress: CREATED_WETH_USDT_PAIR,
+    pairReserveX: 0n,
+    pairReserveY: 0n,
+    receiptBlockNumber: 43n
+  });
+  await installMockWallet(page, { allowTransactions: true, chainId: LOCALNET_CHAIN_ID });
+  await configureCreation(page);
+  await submitReviewedCreation(page);
+  const result = page.getByTestId("pool-create-result");
+  await expect(result).toContainText(/Pool identity verified|discovery catching up|Empty pool/i, { timeout: 15_000 });
+  await expect(result.locator(".pool-creation-progress-track")).toBeVisible();
+  await expect.poll(() => result.locator(".pool-creation-progress-track").evaluate((element) =>
+    element.getAnimations({ subtree: true }).length
+  )).toBe(0);
+  const hashBeforeReload = await result.locator(".pool-creation-transaction code").textContent();
+
+  await page.reload();
+  await connectMockWallet(page);
+  const resumed = page.getByTestId("pool-create-result");
+  await expect(resumed).toBeVisible({ timeout: 15_000 });
+  await expect(resumed.locator(".pool-creation-transaction code")).toHaveText(hashBeforeReload ?? "");
+  await expect(resumed).toContainText(/Pool identity verified|discovery catching up|Empty pool|Confirmed on-chain/i);
+  await expect(page.getByTestId("pool-create-submit")).toHaveCount(0);
 });
 
 test("preexisting exact pool recovers fresh identity and reserves without a wallet send", async ({ page }) => {

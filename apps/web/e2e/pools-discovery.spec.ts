@@ -4,6 +4,7 @@ import {
   LOCALNET_ANALYTICS_URL,
   USDC,
   WNATIVE,
+  WNATIVE_USDC_PAIR,
   installMockRpc
 } from "./fixtures/mock-rpc";
 import { LOCALNET_CHAIN_ID, installMockWallet } from "./fixtures/mock-wallet";
@@ -152,6 +153,28 @@ test("pair navigation preserves the discovery context", async ({ page }) => {
   await expect(pair).toHaveAttribute("href", /#\/pools\/.+\?sort=tvl&direction=asc&minTvl=1000/);
   await pair.click();
   await expect(page).toHaveURL(/#\/pools\/.+/);
+});
+
+test("canonical discovery survives reload and removes an orphaned catalog entry", async ({ page }) => {
+  const rpc = await installMockRpc(page, { includePairs: true, poolCount: 1 });
+  const route = `/#/pools/${WNATIVE_USDC_PAIR}`;
+  await page.goto(route);
+  await expect(page.getByTestId("canonical-pool-workspace")).toHaveAttribute(
+    "data-pool-id",
+    WNATIVE_USDC_PAIR.toLowerCase()
+  );
+
+  await page.reload();
+  await expect(page.getByTestId("canonical-pool-workspace")).toHaveAttribute(
+    "data-pool-id",
+    WNATIVE_USDC_PAIR.toLowerCase()
+  );
+  await expect(page.getByText(/Pool discovery is not online yet/i)).toHaveCount(0);
+
+  rpc.update({ includePairs: false, pairByIdMode: "missing" });
+  await page.reload();
+  await expect(page.getByTestId("requested-pool-state")).toContainText("The requested pool was not found.");
+  await expect(page.getByTestId("canonical-pool-workspace")).toHaveCount(0);
 });
 
 test("missing market cap is isolated and announced without a page warning", async ({ page }) => {

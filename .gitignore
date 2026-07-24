@@ -52,3 +52,4 @@ deployments/evm/*
 deployments/evm/sepolia/*
 !deployments/evm/sepolia/public.json
 !deployments/evm/sepolia/pool-releases.json
+!deployments/evm/sepolia/preset-policy.json

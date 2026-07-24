@@ -18,6 +18,38 @@ It registers wrapped native plus up to four existing quote assets and installs
 the standard bin-step-10 preset. It does not deploy mock tokens, create a pool,
 seed liquidity, change transaction builders, or modify protocol contracts.
 
+## Chain-scoped preset policy
+
+Sepolia's approved factory preset matrix is versioned in
+`deployments/evm/sepolia/preset-policy.json`. It deliberately approves only
+steps 10 and 20. Both use a 0.10% static fee and a calculated 0.59% maximum
+fee; step 10 provides finer volatile-market granularity while step 20 provides
+a wider high-volatility testnet option. The step-10 WETH/USDC identity remains
+deprecated and unfunded, while the step-20 identity is canonical.
+The policy records the reviewed Liquidity Book `bips-config.sol` parameter
+reference and the explicit Sepolia step-20 adaptation instead of implying the
+live values were copied blindly.
+
+Mainnet does not inherit this matrix. It requires a separate explicit policy
+approval before any owner transaction.
+
+Run the read-only live diff:
+
+```sh
+pnpm evm:presets:check
+```
+
+Use `EVM_PRESET_RPC_URL` to select another endpoint. The command fails if the
+chain, factory owner, configured/open step set, exact parameters, or calculated
+fee bounds differ from policy. `pnpm evm:presets:plan` first simulates every
+owner-only `setPreset` call and prints deterministic `cast send` commands; it
+never broadcasts. An operator must review the diff and simulation before
+explicitly executing any printed command with the factory-owner key.
+
+Closing or replacing a preset affects only future creation. Existing pools
+remain immutable and addressable by exact pair plus bin step; a migration or
+deprecation requires a new versioned policy rather than silent rerouting.
+
 ## Inputs
 
 Required variables:

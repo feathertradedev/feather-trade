@@ -55,13 +55,24 @@ test("pool discovery is bounded, validates canonical unique requests, and omits 
 test("pool catalog enumerates canonical pool state with factory creation provenance", () => {
   const engine = new AnalyticsEngine(policies, { assumeCompleteHistory: true });
   const factory = "0x00000000000000000000000000000000000000f1";
+  const parentBlockHash = `0x${"00".padStart(64, "0")}` as `0x${string}`;
   const blockHash = `0x${"01".padStart(64, "0")}` as `0x${string}`;
+  const replacementBlockHash = `0x${"02".padStart(64, "0")}` as `0x${string}`;
   const transactionHash = `0x${"ab".repeat(32)}` as `0x${string}`;
+  engine.ingestBlock({
+    chainId: 4663,
+    number: 6n,
+    hash: parentBlockHash,
+    parentHash: "0x00",
+    timestamp: 90,
+    prices: [],
+    events: []
+  });
   engine.ingestBlock({
     chainId: 4663,
     number: 7n,
     hash: blockHash,
-    parentHash: "0x00",
+    parentHash: parentBlockHash,
     timestamp: 100,
     prices: [
       fixedPrice(TOKEN_X, "x-usd", 2_000n * USD_SCALE, 100, 1n),
@@ -121,6 +132,21 @@ test("pool catalog enumerates canonical pool state with factory creation provena
   assert.equal(catalog.nodes[0]?.creationLogIndex, 3);
   assert.equal(catalog.nodes[0]?.tvlUsdE18, 0n);
   assert.equal(catalog.pageInfo.hasNextPage, false);
+
+  assert.equal(engine.ingestBlock({
+    chainId: 4663,
+    number: 7n,
+    hash: replacementBlockHash,
+    parentHash: parentBlockHash,
+    timestamp: 101,
+    prices: [],
+    events: []
+  }), "reorg");
+  assert.equal(
+    engine.queryPoolCatalog({ first: 10 }).nodes.length,
+    0,
+    "an orphaned creation disappears from durable discovery after canonical replay"
+  );
 });
 
 test("trusted pair price uses only current trusted token samples and exposes head identity", () => {
